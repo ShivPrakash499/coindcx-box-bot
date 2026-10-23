@@ -199,9 +199,9 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
 
     try:
         body = payload.copy() if payload else {}
-        # CoinDCX accepts epoch milliseconds in timestamp
+        # CoinDCX Futures endpoints accept and expect standard epoch seconds
         if "timestamp" not in body:
-            body["timestamp"] = int(round(time.time() * 1000))
+            body["timestamp"] = int(time.time())
 
         json_body = json.dumps(body, separators=(',', ':'))
         signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
@@ -217,9 +217,9 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
         else:
             res = requests.post(url, data=json_body, headers=headers, timeout=timeout)
 
-        # If timestamp validation fails with ms, retry with seconds
+        # If timestamp validation fails with seconds (e.g. legacy endpoint), retry with milliseconds
         if res.status_code == 400 and "timestamp" in res.text.lower():
-            body["timestamp"] = int(time.time())
+            body["timestamp"] = int(round(time.time() * 1000))
             json_body = json.dumps(body, separators=(',', ':'))
             signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
             headers['X-AUTH-SIGNATURE'] = signature
@@ -232,13 +232,43 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
     except Exception as e:
         return None, str(e)
 
+_LIVE_USDT_INR_CACHE = {"rate": 102.0, "timestamp": 0.0}
+
+def get_coindcx_live_usdt_inr_rate() -> float:
+    """
+    Fetches the live USDT/INR spot rate directly from CoinDCX ticker (/exchange/ticker).
+    Caches the rate for 60 seconds to avoid spamming the public ticker endpoint.
+    Falls back gracefully to USD_INR_RATE from .env (or 102.0).
+    """
+    now = time.time()
+    if now - _LIVE_USDT_INR_CACHE["timestamp"] < 60.0:
+        return _LIVE_USDT_INR_CACHE["rate"]
+
+    try:
+        resp = requests.get("https://api.coindcx.com/exchange/ticker", timeout=5)
+        if resp.status_code == 200:
+            for item in resp.json():
+                if item.get("market") == "USDTINR":
+                    price = float(item.get("last_price", 0.0) or 0.0)
+                    if price > 50.0:
+                        _LIVE_USDT_INR_CACHE["rate"] = round(price, 2)
+                        _LIVE_USDT_INR_CACHE["timestamp"] = now
+                        return round(price, 2)
+    except Exception:
+        pass
+
+    env_rate = float(os.getenv("USD_INR_RATE", 102.0))
+    _LIVE_USDT_INR_CACHE["rate"] = env_rate
+    _LIVE_USDT_INR_CACHE["timestamp"] = now
+    return env_rate
+
 def fetch_coindcx_futures_balance():
     """
     Fetches real-time futures wallet balance directly from CoinDCX Futures API.
-    Combines USDT Futures Wallet, INR Wallet, and calculates total INR equivalent.
+    Combines USDT Futures Wallet, INR Wallet, locked margin, and calculates total INR equivalent.
     Falls back gracefully to TOTAL_WALLET_INR from .env if credentials are not configured.
     """
-    usd_inr = float(os.getenv("USD_INR_RATE", 85.0))
+    usd_inr = get_coindcx_live_usdt_inr_rate()
     default_balance = float(os.getenv("TOTAL_WALLET_INR", 250000))
 
     api_key = os.getenv("COINDCX_API_KEY", "").strip()
@@ -249,6 +279,7 @@ def fetch_coindcx_futures_balance():
             "total_inr": default_balance,
             "available_inr": default_balance,
             "inr_cash": default_balance,
+            "locked_inr": 0.0,
             "usdt_cash": 0.0,
             "locked_margin_usd": 0.0,
             "cross_user_margin_usd": 0.0,
@@ -258,6 +289,7 @@ def fetch_coindcx_futures_balance():
 
     usdt_balance = 0.0
     inr_balance = 0.0
+    locked_inr = 0.0
     locked_margin_usd = 0.0
     cross_margin_usd = 0.0
     is_live = False
@@ -279,6 +311,7 @@ def fetch_coindcx_futures_balance():
                         cross_margin_usd += cross
                     elif curr == "INR":
                         inr_balance += bal
+                        locked_inr += locked
                 is_live = True
         except Exception as e:
             print(f"[Futures Wallet Parse Error]: {e}")
@@ -302,17 +335,19 @@ def fetch_coindcx_futures_balance():
                 print(f"[Spot Balance Parse Error]: {e}")
 
     if is_live:
-        total_inr = inr_balance + (usdt_balance * usd_inr)
+        total_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
         avail_usdt = max(0.0, usdt_balance - locked_margin_usd - cross_margin_usd)
         avail_inr = inr_balance + (avail_usdt * usd_inr)
         return {
             "total_inr": round(total_inr, 2),
             "available_inr": round(avail_inr, 2),
             "inr_cash": round(inr_balance, 2),
+            "locked_inr": round(locked_inr, 2),
             "usdt_cash": round(usdt_balance, 4),
             "available_usdt": round(avail_usdt, 4),
             "locked_margin_usd": round(locked_margin_usd, 4),
             "cross_user_margin_usd": round(cross_margin_usd, 4),
+            "live_usd_inr": usd_inr,
             "is_live_api": True,
             "source": "CoinDCX Live Futures API"
         }
@@ -321,6 +356,7 @@ def fetch_coindcx_futures_balance():
         "total_inr": default_balance,
         "available_inr": default_balance,
         "inr_cash": default_balance,
+        "locked_inr": 0.0,
         "usdt_cash": 0.0,
         "locked_margin_usd": 0.0,
         "cross_user_margin_usd": 0.0,
@@ -331,9 +367,11 @@ def fetch_coindcx_futures_balance():
 def fetch_coindcx_active_positions():
     """
     Fetches real-time active open trades/positions from CoinDCX Futures API.
-    Filters positions where active_pos != 0 and computes live PnL and ROE metrics.
+    Filters positions where active_pos != 0 and computes live PnL and ROE metrics
+    using real-time market mark prices and CoinDCX's exact settlement currency
+    conversion price (settlement_currency_avg_price).
     """
-    usd_inr = float(os.getenv("USD_INR_RATE", 85.0))
+    live_usdt_inr = get_coindcx_live_usdt_inr_rate()
     payload = {
         "page": "1",
         "size": "20",
@@ -348,33 +386,88 @@ def fetch_coindcx_active_positions():
     try:
         data = res.json()
         if isinstance(data, list):
+            # Fast batch fetch live market prices to guarantee real-time PnL & ROE accuracy
+            live_prices = {}
+            try:
+                r_bin = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=2.5)
+                if r_bin.status_code == 200:
+                    for it in r_bin.json():
+                        live_prices[it["symbol"]] = float(it["price"])
+            except Exception:
+                pass
+
+            if not live_prices:
+                try:
+                    r_dcx = requests.get("https://public.coindcx.com/exchange/ticker", timeout=2.5)
+                    if r_dcx.status_code == 200:
+                        for it in r_dcx.json():
+                            live_prices[it.get("market", "")] = float(it.get("last_price", 0.0) or 0.0)
+                except Exception:
+                    pass
+
             for item in data:
                 active_pos_qty = float(item.get("active_pos", 0.0) or 0.0)
                 if abs(active_pos_qty) > 0:
                     pair = item.get("pair", "")
                     direction = "LONG" if active_pos_qty > 0 else "SHORT"
                     entry_price = float(item.get("avg_price", 0.0) or 0.0)
-                    mark_price = float(item.get("mark_price", 0.0) or 0.0)
                     liq_price = float(item.get("liquidation_price", 0.0) or 0.0)
                     leverage = float(item.get("leverage", 1.0) or 1.0)
-                    locked_margin = float(item.get("locked_margin", 0.0) or 0.0)
-                    tp = item.get("take_profit_trigger")
-                    sl = item.get("stop_loss_trigger")
-                    margin_type = item.get("margin_type", "crossed")
 
-                    # Calculate live PnL
+                    # Determine live market mark price
+                    clean_sym = pair.replace("B-", "").replace("I-", "").replace("_", "")
+                    live_p = live_prices.get(clean_sym, 0.0)
+                    if live_p <= 0:
+                        live_p = live_prices.get(pair.replace("B-", "").replace("I-", ""), 0.0)
+                    if live_p <= 0:
+                        # Fallback to single pair live ticker
+                        try:
+                            t_single = fetch_live_ticker(pair)
+                            live_p = float(t_single.get("last_price", 0.0) or 0.0)
+                        except Exception:
+                            pass
+
+                    # If live market price obtained, use it; otherwise fall back to exchange snapshot mark_price
+                    raw_mark = float(item.get("mark_price", 0.0) or 0.0)
+                    mark_price = live_p if live_p > 0 else raw_mark
+
+                    # Exact CoinDCX settlement conversion rate for this position
+                    settlement_rate = float(item.get("settlement_currency_avg_price", 0.0) or 0.0)
+                    if settlement_rate <= 0:
+                        settlement_rate = live_usdt_inr
+
+                    # Margin currency and locked margin
+                    margin_currency = item.get("margin_currency_short_name", "INR").upper()
+                    raw_locked_margin = float(item.get("locked_margin", 0.0) or 0.0)
+
+                    # In CoinDCX INR-margined futures:
+                    # raw_locked_margin is in USDT; multiplying by settlement_rate yields the exact INR margin (e.g. 511.106 * 102 = ₹52,132.83)
+                    if margin_currency == "INR":
+                        locked_margin_inr = raw_locked_margin * settlement_rate
+                        locked_margin_usd = raw_locked_margin
+                    else:
+                        locked_margin_usd = raw_locked_margin
+                        locked_margin_inr = locked_margin_usd * settlement_rate
+
                     qty = abs(active_pos_qty)
+                    notional_usd = mark_price * qty
+                    notional_inr = notional_usd * settlement_rate
+
+                    # Calculate live real-time PnL and ROE matching CoinDCX calculation exactly
                     if mark_price > 0 and entry_price > 0:
                         price_diff = (mark_price - entry_price) if direction == "LONG" else (entry_price - mark_price)
                         pnl_usd = price_diff * qty
-                        pnl_inr = pnl_usd * usd_inr
-                        notional_usd = entry_price * qty
-                        margin_used_usd = (notional_usd / leverage) if leverage > 0 else locked_margin
-                        roe_pct = (pnl_usd / margin_used_usd * 100.0) if margin_used_usd > 0 else 0.0
+                        pnl_inr = pnl_usd * settlement_rate
+                        # Exact CoinDCX ROE formula: PnL (INR) / Locked Margin (INR)
+                        roe_pct = (pnl_inr / locked_margin_inr * 100.0) if locked_margin_inr > 0 else 0.0
                     else:
                         pnl_usd = 0.0
                         pnl_inr = 0.0
                         roe_pct = 0.0
+
+                    tp = item.get("take_profit_trigger")
+                    sl = item.get("stop_loss_trigger")
+                    margin_type = item.get("margin_type", "isolated")
 
                     active_positions.append({
                         "id": item.get("id", ""),
@@ -385,7 +478,12 @@ def fetch_coindcx_active_positions():
                         "mark_price": round_asset_price(mark_price),
                         "liquidation_price": round_asset_price(liq_price),
                         "leverage": leverage,
-                        "locked_margin_usd": round(locked_margin, 2),
+                        "settlement_rate": round(settlement_rate, 2),
+                        "margin_currency": margin_currency,
+                        "locked_margin_usd": round(locked_margin_usd, 2),
+                        "locked_margin_inr": round(locked_margin_inr, 2),
+                        "notional_usd": round(notional_usd, 2),
+                        "notional_inr": round(notional_inr, 2),
                         "pnl_usd": round(pnl_usd, 2),
                         "pnl_inr": round(pnl_inr, 2),
                         "roe_pct": round(roe_pct, 2),
@@ -434,6 +532,213 @@ def fetch_coindcx_open_orders():
             pass
 
     return orders
+
+def exit_coindcx_position(position_id: str) -> tuple[bool, str]:
+    """
+    Market exits a specific open futures position on CoinDCX by position ID.
+    Calls POST /exchange/v1/derivatives/futures/positions/exit.
+    """
+    if not position_id:
+        return False, "Invalid position ID"
+
+    payload = {"id": str(position_id).strip()}
+    res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/exit", payload)
+    if res and res.status_code == 200:
+        return True, f"Successfully executed market exit for position {position_id}"
+    msg = res.text if res else (err or "Exit request failed")
+    return False, msg
+
+def exit_all_coindcx_positions() -> tuple[int, int, str]:
+    """
+    Emergency Close All: Exits every active open position and cancels all pending orders.
+    Returns (positions_closed_count, total_positions, summary_message).
+    """
+    positions = fetch_coindcx_active_positions()
+    cancel_payload = {
+        "timestamp": int(time.time()),
+        "margin_currency_short_name": ["INR", "USDT"]
+    }
+    if not positions:
+        # Still cancel open orders just in case
+        _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/cancel_all_open_orders", cancel_payload)
+        return 0, 0, "No active positions to close. All pending orders cleared."
+
+    success_count = 0
+    for p in positions:
+        pos_id = p.get("id")
+        if pos_id:
+            ok, _ = exit_coindcx_position(pos_id)
+            if ok:
+                success_count += 1
+
+    # Clear all remaining open bracket/limit orders
+    _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/cancel_all_open_orders", cancel_payload)
+    return success_count, len(positions), f"Closed {success_count}/{len(positions)} active positions and cancelled all pending orders."
+
+def update_coindcx_position_tpsl(position_id: str, tp_price: float = None, sl_price: float = None, pair: str = None) -> tuple[bool, str]:
+    """
+    Attaches or updates Take Profit and Stop Loss bracket triggers directly on an active position.
+    Cancels any existing TP or SL orders for this pair first to prevent 'TP already exists' errors.
+    Calls POST /exchange/v1/derivatives/futures/positions/create_tpsl.
+    """
+    if not position_id:
+        return False, "Missing position ID"
+
+    # Step 1: Pre-cancel existing TP/SL triggers for this pair if open
+    try:
+        open_orders = fetch_coindcx_open_orders()
+        for o in open_orders:
+            o_pair = o.get("pair")
+            o_stage = o.get("stage")
+            o_type = o.get("order_type", "")
+            o_id = o.get("id")
+            if o_id and (not pair or o_pair == pair) and o_stage == "tpsl_exit":
+                if tp_price is not None and "take_profit" in o_type:
+                    _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(time.time())})
+                if sl_price is not None and "stop" in o_type:
+                    _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(time.time())})
+    except Exception as e:
+        print(f"[TP/SL Pre-Cancel Notice]: {e}")
+
+    # Step 2: Create new TP/SL triggers
+    payload = {
+        "timestamp": int(time.time()),
+        "id": str(position_id).strip()
+    }
+    if tp_price is not None and tp_price > 0:
+        payload["take_profit"] = {
+            "stop_price": str(tp_price),
+            "order_type": "take_profit_market"
+        }
+    if sl_price is not None and sl_price > 0:
+        payload["stop_loss"] = {
+            "stop_price": str(sl_price),
+            "order_type": "stop_market"
+        }
+
+    res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/create_tpsl", payload)
+    if res and res.status_code == 200:
+        return True, "Take Profit and Stop Loss successfully updated on CoinDCX!"
+    msg = res.text if res else (err or "Failed to update TP/SL on exchange")
+    return False, msg
+
+def place_coindcx_futures_order(
+    pair: str,
+    side: str,
+    quantity: float,
+    leverage: int = 5,
+    order_type: str = "market_order",
+    price: float = None,
+    margin_currency: str = "INR",
+    tp_price: float = None,
+    sl_price: float = None
+) -> tuple[bool, str, dict]:
+    """
+    Executes a real futures order directly on CoinDCX exchange via API.
+    Supports market_order or limit_order, leverage multiplier, and optional auto TP/SL attachments.
+    """
+    side_lower = side.lower()
+    order_side = "buy" if side_lower in ["buy", "long"] else "sell"
+
+    order_payload = {
+        "side": order_side,
+        "pair": pair,
+        "order_type": order_type,
+        "total_quantity": float(quantity),
+        "leverage": int(leverage),
+        "margin_currency_short_name": margin_currency.upper(),
+        "notification": "email_notification",
+        "hidden": False,
+        "post_only": False
+    }
+
+    if order_type == "limit_order":
+        if price is None or price <= 0:
+            return False, "Limit order requires a valid price", {}
+        order_payload["price"] = float(price)
+        order_payload["time_in_force"] = "good_till_cancel"
+
+    body = {
+        "timestamp": int(time.time()),
+        "order": order_payload
+    }
+
+    res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/create", body)
+    if not res:
+        return False, f"Connection error: {err}", {}
+
+    if res.status_code == 200:
+        data = res.json()
+        # If TP or SL specified, attach them once order is registered
+        if tp_price or sl_price:
+            time.sleep(1.0)
+            positions = fetch_coindcx_active_positions()
+            matched_pos = next((p for p in positions if p["pair"] == pair), None)
+            if matched_pos and matched_pos.get("id"):
+                update_coindcx_position_tpsl(matched_pos["id"], tp_price=tp_price, sl_price=sl_price, pair=pair)
+
+        return True, f"Successfully placed {order_side.upper()} order for {quantity} {pair} on CoinDCX!", data
+    else:
+        return False, f"CoinDCX API Error ({res.status_code}): {res.text}", {}
+
+def get_current_session_info(dt: datetime = None) -> dict:
+    """
+    Identifies the institutional market session based on Indian Standard Time (IST):
+    - 🌅 Asia Open: 07:00 - 08:30 IST (Center 07:30 IST)
+    - 🏛️ London Open: 13:00 - 14:30 IST (Center 13:30 IST)
+    - ⚡ New York Open: 18:45 - 20:15 IST (Center 19:15 IST)
+    - 🌐 24/7 Intraday Monitor: Continuous Zone Watcher
+    """
+    now = dt or datetime.now(IST)
+    minute_of_day = now.hour * 60 + now.minute
+
+    # 07:00 - 08:30 IST (420 to 510 mins)
+    if 420 <= minute_of_day <= 510:
+        return {
+            "session_id": "ASIA",
+            "name": "Asia / Tokyo Open",
+            "emoji": "🌅",
+            "window": "07:00 - 08:30 IST",
+            "peak": "07:30 AM IST",
+            "is_prime": True,
+            "badge_color": "#d97706",
+            "description": "Asian Institutional Open (Tokyo, Hong Kong, Singapore desks)"
+        }
+    # 13:00 - 14:30 IST (780 to 870 mins)
+    elif 780 <= minute_of_day <= 870:
+        return {
+            "session_id": "LONDON",
+            "name": "London / Europe Open",
+            "emoji": "🏛️",
+            "window": "13:00 - 14:30 IST",
+            "peak": "01:30 PM IST",
+            "is_prime": True,
+            "badge_color": "#0284c7",
+            "description": "London Institutional Open (Highest European Forex & Crypto Volatility)"
+        }
+    # 18:45 - 20:15 IST (1125 to 1215 mins)
+    elif 1125 <= minute_of_day <= 1215:
+        return {
+            "session_id": "NEW_YORK",
+            "name": "New York / US Open",
+            "emoji": "⚡",
+            "window": "18:45 - 20:15 IST",
+            "peak": "07:15 PM IST",
+            "is_prime": True,
+            "badge_color": "#7c3aed",
+            "description": "Wall Street Open (US Equities, CME Futures & Institutional ETF flow)"
+        }
+    else:
+        return {
+            "session_id": "INTRADAY",
+            "name": "24/7 Intraday Monitor",
+            "emoji": "🌐",
+            "window": "Continuous Active",
+            "peak": "Real-Time",
+            "is_prime": False,
+            "badge_color": "#475569",
+            "description": "Continuous 24/7 Box Level & Liquidity Pool Monitor"
+        }
 
 def calculate_trade_costs_and_safe_tp(direction="BUY", entry_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0):
     """
@@ -684,10 +989,14 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
         "target_roe_met": roe_tp1 >= 5.0
     }
 
-def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, leverage=5, usd_inr=85.0):
+def evaluate_tri_session_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, leverage=5, usd_inr=85.0, trigger_alert: bool = True):
     """
-    Evaluates the 19:00 - 19:15 IST (US Open) 15-minute candle relative to Box levels.
-    Enforces minimum 5% ROE on TP1 (Midpoint) and 5x leverage on margin allocation.
+    Evaluates 15-minute candles and real-time prices across the Three Institutional Opens:
+    - 🌅 Asia Open (07:00 - 08:30 IST)
+    - 🏛️ London Open (13:00 - 14:30 IST)
+    - ⚡ New York / US Open (18:45 - 20:15 IST)
+    - 🌐 24/7 Intraday Monitor
+    Automatically triggers email notification when an institutional sweep occurs.
     """
     if not levels:
         levels = calculate_daily_box_levels(pair)
@@ -700,23 +1009,30 @@ def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, le
 
     df_15m['ist_dt'] = pd.to_datetime(df_15m['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
     now_ist = datetime.now(IST)
+    session = get_current_session_info(now_ist)
 
     today_date = now_ist.date()
+
+    # Determine whether we are evaluating an institutional session candle or latest active bar
     target_candle_df = df_15m[
         (df_15m['ist_dt'].dt.date == today_date) & 
-        (df_15m['ist_dt'].dt.hour == 19) & 
-        (df_15m['ist_dt'].dt.minute == 0)
+        (
+            ((df_15m['ist_dt'].dt.hour == 7) & (df_15m['ist_dt'].dt.minute >= 15) & (df_15m['ist_dt'].dt.minute <= 45)) |
+            ((df_15m['ist_dt'].dt.hour == 13) & (df_15m['ist_dt'].dt.minute >= 15) & (df_15m['ist_dt'].dt.minute <= 45)) |
+            ((df_15m['ist_dt'].dt.hour == 19) & (df_15m['ist_dt'].dt.minute == 0))
+        )
     ]
 
-    is_us_open_candle = False
-    if not target_candle_df.empty:
-        eval_candle = target_candle_df.iloc[0]
-        candle_label = "19:00 - 19:15 IST (US Open Completed)"
-        is_us_open_candle = True
+    is_prime_session_candle = False
+    if not target_candle_df.empty and session["is_prime"]:
+        eval_candle = target_candle_df.iloc[-1]
+        candle_time_str = eval_candle['ist_dt'].strftime('%H:%M IST')
+        candle_label = f"{session['emoji']} {session['name']} Candle ({candle_time_str})"
+        is_prime_session_candle = True
     else:
         eval_candle = df_15m.iloc[-1]
         candle_time_str = eval_candle['ist_dt'].strftime('%H:%M IST')
-        candle_label = f"Latest Candle ({candle_time_str})"
+        candle_label = f"Latest Candle ({candle_time_str}) [{session['emoji']} {session['name']}]"
 
     close_price = float(eval_candle['close'])
     high_price = float(eval_candle['high'])
@@ -736,7 +1052,7 @@ def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, le
     # Top Liquidity Sweep: Swept RH/SH and closed back below RH
     if high_price >= rh and close_price < rh:
         signal_type = "SHORT"
-        setup = "SELL (Short): Liquidity Sweep Rejection at Range High"
+        setup = f"SELL (Short): Liquidity Sweep Rejection at Range High ({session['name']})"
         stop_loss = round_asset_price(max(high_price, sh) * 1.002, rh)
         tp1 = mid
         tp2 = rl
@@ -744,7 +1060,7 @@ def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, le
     # Bottom Liquidity Sweep: Swept RL/SL and closed back above RL
     elif low_price <= rl and close_price > rl:
         signal_type = "LONG"
-        setup = "BUY (Long): Liquidity Sweep Rejection at Range Low"
+        setup = f"BUY (Long): Liquidity Sweep Rejection at Range Low ({session['name']})"
         stop_loss = round_asset_price(min(low_price, sl) * 0.998, rh)
         tp1 = mid
         tp2 = rh
@@ -762,16 +1078,39 @@ def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, le
     roe_sl = round((risk_per_unit / entry) * leverage * 100, 2) if entry > 0 else 0
 
     profit_tp1_inr = round((reward_tp1 * crypto_qty) * usd_inr, 2)
+    profit_tp2_inr = round((reward_tp2 * crypto_qty) * usd_inr, 2)
     loss_sl_inr = round((risk_per_unit * crypto_qty) * usd_inr, 2)
 
     target_roe_met = roe_tp1 >= 5.0
     if signal_type != "NEUTRAL" and not target_roe_met:
         setup += f" [Warning: TP1 ROE ({roe_tp1}%) < 5% target]"
 
+    # Automated Email Alert Dispatch if signal is active
+    if trigger_alert and signal_type != "NEUTRAL":
+        try:
+            from alert_notifier import send_sweep_alert
+            send_sweep_alert(
+                pair=pair,
+                signal_type=signal_type,
+                session_name=f"{session['emoji']} {session['name']} ({session['peak']})",
+                live_price=close_price,
+                entry=entry,
+                stop_loss=stop_loss,
+                tp1=tp1,
+                tp2=tp2,
+                roe_tp1=roe_tp1,
+                box_levels=levels
+            )
+        except Exception as e:
+            print(f"[Alert Dispatch Notice]: {e}")
+
     return {
         "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
         "candle_evaluated": candle_label,
-        "is_us_open_candle": is_us_open_candle,
+        "session": session,
+        "session_name": f"{session['emoji']} {session['name']}",
+        "is_prime_session": session["is_prime"],
+        "is_us_open_candle": session["session_id"] == "NEW_YORK",
         "pair": pair,
         "signal": signal_type,
         "setup": setup,
@@ -788,6 +1127,14 @@ def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, le
         "roe_sl": roe_sl,
         "target_roe_met": target_roe_met,
         "profit_tp1_inr": profit_tp1_inr,
+        "profit_tp2_inr": profit_tp2_inr,
         "loss_sl_inr": loss_sl_inr,
         "levels": levels
     }
+
+def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, leverage=5, usd_inr=85.0):
+    """
+    Backwards compatibility alias for evaluate_tri_session_signal.
+    """
+    return evaluate_tri_session_signal(pair, levels, margin_inr, leverage, usd_inr)
+

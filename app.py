@@ -10,6 +10,8 @@ from coindcx_engine import (
     GLOBAL_FUTURES_PAIRS,
     calculate_daily_box_levels,
     evaluate_715_pm_signal,
+    evaluate_tri_session_signal,
+    get_current_session_info,
     fetch_coindcx_candles,
     fetch_live_ticker,
     calculate_trade_setup_details,
@@ -17,10 +19,16 @@ from coindcx_engine import (
     fetch_coindcx_futures_balance,
     fetch_coindcx_active_positions,
     fetch_coindcx_open_orders,
+    exit_coindcx_position,
+    exit_all_coindcx_positions,
+    update_coindcx_position_tpsl,
+    place_coindcx_futures_order,
     calculate_trade_costs_and_safe_tp,
-    round_asset_price
+    round_asset_price,
+    get_coindcx_live_usdt_inr_rate
 )
 from sheets_logger import log_trade_to_google_sheet
+from alert_notifier import send_sweep_alert, send_email_notification
 
 load_dotenv()
 
@@ -185,8 +193,42 @@ margin_inr = st.sidebar.number_input("Margin per Trade (INR)", value=int(default
 default_lev = int(os.getenv("LEVERAGE", 5))
 leverage = st.sidebar.slider("Leverage Multiplier", min_value=1, max_value=20, value=default_lev)
 
-default_usd_inr = float(os.getenv("USD_INR_RATE", 85.0))
-usd_inr = st.sidebar.number_input("USD / INR Conversion Rate", value=default_usd_inr, step=0.5)
+live_crypto_rate = get_coindcx_live_usdt_inr_rate()
+usd_inr = st.sidebar.number_input("USDT / INR Rate (Live CoinDCX)", value=float(live_crypto_rate), step=0.5)
+st.sidebar.caption(f"🟢 CoinDCX Live Spot USDT: **₹{live_crypto_rate:,.2f} INR**")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📧 Email Alerts & Server Link")
+alert_enabled = os.getenv("ALERT_EMAIL_ENABLED", "True").lower() in ["true", "1", "yes"]
+st.sidebar.caption(f"Status: **{'🟢 Active' if alert_enabled else '🔴 Disabled'}** | Cooldown: 15 mins")
+cfg_receiver = os.getenv("RECEIVER_EMAIL", "jwalashiva@gmail.com")
+cfg_app_url = os.getenv("APP_WEB_URL", "http://localhost:8501")
+custom_url = st.sidebar.text_input("Server Web App URL (Included in Alerts):", value=cfg_app_url, key="input_app_web_url")
+if custom_url != os.getenv("APP_WEB_URL", ""):
+    os.environ["APP_WEB_URL"] = custom_url
+st.sidebar.caption(f"Receiver: `{cfg_receiver}`")
+
+if st.sidebar.button("📩 Send Test Alert Email", key="btn_send_test_email", use_container_width=True):
+    with st.sidebar:
+        with st.spinner("Dispatching test alert email..."):
+            test_ticker = get_cached_ticker(st.session_state.selected_pair)
+            test_lp = test_ticker.get("last_price", 100.0)
+            ok, msg = send_sweep_alert(
+                pair=st.session_state.selected_pair,
+                signal_type="BUY",
+                session_name="🏛️ London Open (01:30 PM IST)",
+                live_price=test_lp,
+                entry=test_lp,
+                stop_loss=round(test_lp * 0.985, 2),
+                tp1=round(test_lp * 1.025, 2),
+                tp2=round(test_lp * 1.045, 2),
+                roe_tp1=12.5,
+                force=True
+            )
+            if ok:
+                st.success(f"✅ {msg}")
+            else:
+                st.error(f"❌ {msg}")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚡ Live Refresh Settings")
@@ -202,8 +244,9 @@ chart_refresh_rate = st.sidebar.selectbox(
 top_col1, top_col2, top_col3, top_col4 = st.columns([1.8, 1.4, 1.6, 2.0])
 
 with top_col1:
+    cur_session = get_current_session_info()
     st.title("⚡ CoinDCX Box Terminal")
-    st.caption(f"Asset: **`{st.session_state.selected_pair}`** | Time: {datetime.now(IST).strftime('%I:%M:%S %p IST')}")
+    st.caption(f"Asset: **`{st.session_state.selected_pair}`** | **{cur_session['emoji']} {cur_session['name']}** ({cur_session['window']})")
 
 # REQUIREMENT 1: LIVE PRICE + FUNDING RATE
 with top_col2:
@@ -239,9 +282,6 @@ with top_col3:
     def render_live_pnl_header(pair):
         live_positions = get_cached_positions()
         matching_live = next((p for p in live_positions if p["pair"] == pair), None)
-        if not matching_live and len(live_positions) > 0:
-            matching_live = live_positions[0]
-
         if matching_live:
             pnl_inr = matching_live["pnl_inr"]
             pnl_usd = matching_live["pnl_usd"]
@@ -261,6 +301,26 @@ with top_col3:
                     <div style="margin-top:4px;">
                         <span style="font-size:1.5rem; font-weight:800; color:{pnl_col};">{pnl_sgn}₹{pnl_inr:,.2f}</span>
                         <span style="font-size:0.95rem; font-weight:700; color:{pnl_col}; margin-left:6px;">{pnl_sgn}{roe_pct:.2f}% ROE (${pnl_usd:,.2f})</span>
+                    </div>
+                </div>
+            """)
+            return
+        elif len(live_positions) > 0:
+            total_pnl_inr = sum(p["pnl_inr"] for p in live_positions)
+            total_pnl_usd = sum(p["pnl_usd"] for p in live_positions)
+            pnl_col = "#16a34a" if total_pnl_inr >= 0 else "#dc2626"
+            pnl_sgn = "+" if total_pnl_inr >= 0 else ""
+            pos_labels = ", ".join(p["pair"].replace("B-", "").replace("_USDT", "") for p in live_positions)
+
+            st.html(f"""
+                <div style="background:{card_bg}; border:1px solid {pnl_col}; border-radius:10px; padding:8px 12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-weight:700; color:{pnl_col}; font-size:0.8rem;">● PORTFOLIO PnL ({len(live_positions)} Open: {pos_labels})</span>
+                        <span style="font-size:0.75rem; color:{subtext_color};">FLAT on {pair.replace('B-', '').replace('_USDT', '')}</span>
+                    </div>
+                    <div style="margin-top:4px;">
+                        <span style="font-size:1.5rem; font-weight:800; color:{pnl_col};">{pnl_sgn}₹{total_pnl_inr:,.2f}</span>
+                        <span style="font-size:0.95rem; font-weight:700; color:{pnl_col}; margin-left:6px;">({pnl_sgn}${total_pnl_usd:,.2f} USD)</span>
                     </div>
                 </div>
             """)
@@ -664,7 +724,7 @@ with tabs[0]:
 # TAB 1: LIVE TRADE EXECUTION, FEES & CAPITAL PRESERVATION (REQUIREMENTS 2, 3, 4, 5)
 # ==============================================================================
 with tabs[1]:
-    @st.fragment
+    @st.fragment(run_every=5)
     def render_trade_execution_fragment(pair, box_levels):
         st.subheader(f"⚡ Live Trade Execution Station — {pair}")
 
@@ -687,11 +747,10 @@ with tabs[1]:
         w1, w2, w3, w4 = st.columns(4)
         with w1:
             st.metric("Total Futures Balance", f"₹{wallet['total_inr']:,.2f}")
-            st.caption(f"Source: {wallet['source']}")
+            st.caption(f"Locked Margin: ₹{wallet.get('locked_inr', 0.0):,.2f}")
         with w2:
-            st.metric("Available Margin", f"₹{wallet['available_inr']:,.2f}")
-            usdt_cash = wallet.get('usdt_cash', 0.0)
-            st.caption(f"USDT Balance: ${usdt_cash:,.2f}")
+            st.metric("Available Free Margin", f"₹{wallet['available_inr']:,.2f}")
+            st.caption(f"Rate: ₹{wallet.get('live_usd_inr', 100.0):,.2f}/USDT")
         with w3:
             fund_sign = "+" if fund["is_positive"] else ""
             st.metric(
@@ -703,14 +762,23 @@ with tabs[1]:
         with w4:
             live_positions = get_cached_positions()
             active_p = st.session_state.active_position
-            if live_positions:
-                pos_status = f"{len(live_positions)} Live Open ({live_positions[0]['pair']})"
-                st.metric("CoinDCX Positions", pos_status)
-                st.caption(f"Unrealized: ₹{sum(p['pnl_inr'] for p in live_positions):,.2f}")
+            matching_pos = next((p for p in live_positions if p["pair"] == pair), None) if live_positions else None
+
+            if matching_pos:
+                m_pnl = matching_pos["pnl_inr"]
+                m_roe = matching_pos["roe_pct"]
+                p_sgn = "+" if m_pnl >= 0 else ""
+                st.metric("Live Position", f"{matching_pos['direction']} {matching_pos['quantity']} {cur_asset}")
+                st.caption(f"PnL: {p_sgn}₹{m_pnl:,.2f} ({p_sgn}{m_roe:.2f}% ROE)")
+            elif live_positions:
+                tot_pnl = sum(p['pnl_inr'] for p in live_positions)
+                p_sgn = "+" if tot_pnl >= 0 else ""
+                st.metric("CoinDCX Positions", f"{len(live_positions)} Live Open")
+                st.caption(f"Total Unrealized: {p_sgn}₹{tot_pnl:,.2f}")
             elif active_p:
                 pos_status = f"{active_p['direction']} {active_p['crypto_qty']} {cur_asset}"
                 st.metric("Simulated Position", pos_status)
-                if st.button("Close Active Position Now", key=f"btn_close_pos_{pair}"):
+                if st.button("Close Simulated Position", key=f"btn_close_pos_{pair}"):
                     is_b = active_p["direction"] == "BUY"
                     diff = (cur_price - active_p["entry"]) if is_b else (active_p["entry"] - cur_price)
                     real_inr = diff * active_p["crypto_qty"] * active_p.get("usd_inr", 85.0)
@@ -722,27 +790,86 @@ with tabs[1]:
                 st.metric("Active Position", "FLAT (0 Open)")
                 st.caption("No open exposure")
 
-        # LIVE COINDCX POSITIONS TABLE
+        # LIVE COINDCX POSITIONS
         live_positions = get_cached_positions()
         if live_positions:
-            st.markdown("#### 🔥 Active CoinDCX Futures Positions")
-            pos_rows = []
+            col_pos_head, col_pos_close_all = st.columns([2.2, 1.8])
+            with col_pos_head:
+                st.markdown("#### 🔥 Active CoinDCX Futures Positions")
+                st.caption(f"{len(live_positions)} active position(s) streaming live from CoinDCX")
+            with col_pos_close_all:
+                st.write("")
+                if st.button("🚨 CLOSE ALL POSITIONS & CANCEL ORDERS", key="btn_close_all_positions", type="primary", use_container_width=True):
+                    with st.spinner("Executing Emergency Close All on CoinDCX..."):
+                        closed, total, msg = exit_all_coindcx_positions()
+                        st.warning(f"🚨 {msg}")
+                        st.rerun()
+
             for p in live_positions:
-                p_inr = p['pnl_inr']
-                r_pct = p['roe_pct']
-                pos_rows.append({
-                    "Pair": p["pair"],
-                    "Side": p["direction"],
-                    "Quantity": p["quantity"],
-                    "Entry Price": f"${p['entry_price']:,.2f}",
-                    "Mark Price": f"${p['mark_price']:,.2f}",
-                    "Leverage": f"{p['leverage']}x",
-                    "Unrealized PnL (INR)": f"{'+' if p_inr >= 0 else ''}₹{p_inr:,.2f}",
-                    "ROE (%)": f"{'+' if r_pct >= 0 else ''}{r_pct:.2f}%",
-                    "Liquidation": f"${p['liquidation_price']:,.2f}" if p['liquidation_price'] > 0 else "Safe",
-                    "Margin Mode": p.get("margin_type", "crossed").upper()
-                })
-            st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
+                pos_id = p["id"]
+                pair_name = p["pair"]
+                direction = p["direction"]
+                qty = p["quantity"]
+                entry_p = p["entry_price"]
+                mark_p = p["mark_price"]
+                pnl_inr = p["pnl_inr"]
+                pnl_usd = p["pnl_usd"]
+                roe_pct = p["roe_pct"]
+                liq_p = p["liquidation_price"]
+                lev = p["leverage"]
+                cur_tp = p.get("take_profit")
+                cur_sl = p.get("stop_loss")
+                pnl_col = "#16a34a" if pnl_inr >= 0 else "#dc2626"
+                pnl_sgn = "+" if pnl_inr >= 0 else ""
+
+                with st.container(border=True):
+                    c_title, c_metrics, c_actions = st.columns([1.5, 2.0, 1.5])
+                    with c_title:
+                        dir_badge = f"<span class='badge-buy'>{direction} {pair_name}</span>" if direction == "LONG" else f"<span class='badge-sell'>{direction} {pair_name}</span>"
+                        st.markdown(f"{dir_badge} **{qty}** @ ${entry_p:,.2f} ({lev}x)", unsafe_allow_html=True)
+                        st.caption(f"Mark: ${mark_p:,.2f} | Liq: ${liq_p:,.2f} | Mode: {p.get('margin_type', 'isolated').upper()}")
+                    with c_metrics:
+                        st.markdown(f"<div style='font-size:1.15rem; font-weight:800; color:{pnl_col};'>{pnl_sgn}₹{pnl_inr:,.2f} ({pnl_sgn}{roe_pct:.2f}% ROE)</div>", unsafe_allow_html=True)
+                        st.caption(f"Margin: ₹{p.get('locked_margin_inr', 0.0):,.2f} | Size: ₹{p.get('notional_inr', 0.0):,.2f} | Rate: ₹{p.get('settlement_rate', 100.0):.2f}/USDT")
+                    with c_actions:
+                        if st.button(f"❌ Close {pair_name}", key=f"btn_close_one_{pos_id}", use_container_width=True):
+                            with st.spinner(f"Closing {pair_name} on CoinDCX..."):
+                                ok, msg = exit_coindcx_position(pos_id)
+                                if ok:
+                                    st.success(f"✅ Closed {pair_name} position!")
+                                else:
+                                    st.error(f"❌ {msg}")
+                                st.rerun()
+
+                    # In-position adjustment of Take Profit & Stop Loss
+                    with st.expander(f"⚙️ Adjust TP / SL for {pair_name}", expanded=False):
+                        t_col1, t_col2, t_col3 = st.columns([1.5, 1.5, 1.2])
+                        with t_col1:
+                            new_tp_val = st.number_input(
+                                "New Take Profit ($):",
+                                value=float(cur_tp) if cur_tp else float(round_asset_price(mark_p * (1.02 if direction == "LONG" else 0.98), mark_p)),
+                                step=0.5 if mark_p > 1.0 else 0.0001,
+                                format="%.4f" if mark_p < 1.0 else "%.2f",
+                                key=f"input_tp_{pos_id}"
+                            )
+                        with t_col2:
+                            new_sl_val = st.number_input(
+                                "New Stop Loss ($):",
+                                value=float(cur_sl) if cur_sl else float(round_asset_price(mark_p * (0.98 if direction == "LONG" else 1.02), mark_p)),
+                                step=0.5 if mark_p > 1.0 else 0.0001,
+                                format="%.4f" if mark_p < 1.0 else "%.2f",
+                                key=f"input_sl_{pos_id}"
+                            )
+                        with t_col3:
+                            st.write("")
+                            if st.button("💾 Save TP/SL", key=f"btn_update_tpsl_{pos_id}", use_container_width=True):
+                                with st.spinner("Updating triggers on CoinDCX..."):
+                                    ok, msg = update_coindcx_position_tpsl(pos_id, new_tp_val, new_sl_val, pair=pair_name)
+                                    if ok:
+                                        st.success("✅ TP and SL updated on CoinDCX!")
+                                    else:
+                                        st.error(f"❌ {msg}")
+                                    st.rerun()
 
         st.markdown("---")
 
@@ -751,12 +878,13 @@ with tabs[1]:
         inp_col1, inp_col2, inp_col3 = st.columns([1.5, 1.5, 1])
 
         with inp_col1:
+            avail_margin_int = max(1000, int(wallet["available_inr"]))
             trade_margin_inr = st.number_input(
                 "Margin Allocation for this Trade (INR):",
-                min_value=5000,
-                max_value=int(wallet["available_inr"]),
-                value=min(100000, int(wallet["available_inr"])),
-                step=10000,
+                min_value=500,
+                max_value=max(avail_margin_int, 500000),
+                value=min(100000, avail_margin_int),
+                step=1000,
                 key=f"exec_margin_inr_{pair}"
             )
             # Preset percentage chips
@@ -791,7 +919,7 @@ with tabs[1]:
         # Compute Setups and Costs based on dynamic margin & leverage
         b_setup = calculate_trade_setup_details("BUY", box_levels, cur_price, trade_margin_inr, trade_leverage, trade_usd_inr)
         s_setup = calculate_trade_setup_details("SELL", box_levels, cur_price, trade_margin_inr, trade_leverage, trade_usd_inr)
-        sig_data = evaluate_715_pm_signal(pair, box_levels, trade_margin_inr, trade_leverage, trade_usd_inr)
+        sig_data = evaluate_tri_session_signal(pair, box_levels, trade_margin_inr, trade_leverage, trade_usd_inr, trigger_alert=False)
 
         exec_left, exec_right = st.columns([1.1, 1.1])
 
@@ -802,7 +930,7 @@ with tabs[1]:
                 [
                     f"🟢 BUY / LONG Setup (Entry at Range Low: {fmt(b_setup['entry'])})",
                     f"🔴 SELL / SHORT Setup (Entry at Range High: {fmt(s_setup['entry'])})",
-                    f"⚡ Auto-Detected 7:15 PM Signal ({sig_data['signal']}: {sig_data['setup']})"
+                    f"⚡ {sig_data['session_name']} Signal ({sig_data['signal']}: {sig_data['setup']})"
                 ],
                 index=0,
                 key=f"trade_choice_exec_{pair}"
@@ -811,15 +939,114 @@ with tabs[1]:
             if "BUY" in trade_choice:
                 active_trade = b_setup
                 trade_dir = "BUY"
+                setup_tag = "BUY"
                 color_class = "badge-buy"
             elif "SELL" in trade_choice:
                 active_trade = s_setup
                 trade_dir = "SELL"
+                setup_tag = "SELL"
                 color_class = "badge-sell"
             else:
-                trade_dir = sig_data["signal"] if sig_data["signal"] != "NEUTRAL" else "BUY"
+                trade_dir = "BUY" if sig_data["signal"] in ["BUY", "LONG"] else ("SELL" if sig_data["signal"] in ["SELL", "SHORT"] else "BUY")
                 active_trade = b_setup if trade_dir == "BUY" else s_setup
+                setup_tag = "SIGNAL"
                 color_class = "badge-buy" if trade_dir == "BUY" else "badge-sell"
+
+            # Dynamically track and synchronize inputs when switching setups
+            entry_key = f"custom_entry_{pair}_{setup_tag}"
+            sl_key = f"custom_sl_{pair}_{setup_tag}"
+            tp1_key = f"custom_tp1_{pair}_{setup_tag}"
+            tp2_key = f"custom_tp2_{pair}_{setup_tag}"
+            choice_tracker_key = f"last_setup_tag_{pair}"
+            levels_tracker_key = f"last_formula_entry_{pair}_{setup_tag}"
+
+            # Whenever the setup choice changes or underlying formula levels change, update session state values
+            if st.session_state.get(choice_tracker_key) != setup_tag or st.session_state.get(levels_tracker_key) != float(active_trade["entry"]):
+                st.session_state[choice_tracker_key] = setup_tag
+                st.session_state[levels_tracker_key] = float(active_trade["entry"])
+                st.session_state[entry_key] = float(active_trade["entry"])
+                st.session_state[sl_key] = float(active_trade["stop_loss"])
+                st.session_state[tp1_key] = float(active_trade["tp1"])
+                st.session_state[tp2_key] = float(active_trade["tp2"])
+
+            # REQUIREMENT 3: MANUAL ADJUSTMENT OF TP1, TP2, AND SL BEFORE EXECUTION
+            with st.expander(f"✏️ Customize Order Levels ({trade_dir}: Entry, SL, TP1, TP2)", expanded=True):
+                exp_h1, exp_h2 = st.columns([3, 1.2])
+                with exp_h1:
+                    st.caption(f"Prefilled with **{trade_dir}** formula values. Adjust any level manually before placing your trade:")
+                with exp_h2:
+                    if st.button("↺ Reset to Formula", key=f"btn_reset_levels_{pair}_{setup_tag}", use_container_width=True, help="Reset levels back to calculated box values"):
+                        st.session_state[entry_key] = float(active_trade["entry"])
+                        st.session_state[sl_key] = float(active_trade["stop_loss"])
+                        st.session_state[tp1_key] = float(active_trade["tp1"])
+                        st.session_state[tp2_key] = float(active_trade["tp2"])
+                        st.rerun(scope="fragment")
+
+                adj_col1, adj_col2 = st.columns(2)
+                p_ref = active_trade["entry"]
+                step_val = 0.5 if p_ref > 1.0 else (0.0001 if p_ref > 0.001 else 0.000001)
+                fmt_str = "%.2f" if p_ref > 1.0 else ("%.4f" if p_ref > 0.001 else "%.6f")
+
+                with adj_col1:
+                    custom_entry = st.number_input(
+                        "Planned Entry Price ($):",
+                        value=float(st.session_state.get(entry_key, active_trade["entry"])),
+                        step=step_val,
+                        format=fmt_str,
+                        key=entry_key
+                    )
+                    custom_sl = st.number_input(
+                        "Stop Loss SL ($):",
+                        value=float(st.session_state.get(sl_key, active_trade["stop_loss"])),
+                        step=step_val,
+                        format=fmt_str,
+                        key=sl_key
+                    )
+                with adj_col2:
+                    custom_tp1 = st.number_input(
+                        "Take Profit 1 (MID) ($):",
+                        value=float(st.session_state.get(tp1_key, active_trade["tp1"])),
+                        step=step_val,
+                        format=fmt_str,
+                        key=tp1_key
+                    )
+                    custom_tp2 = st.number_input(
+                        "Take Profit 2 (Extreme) ($):",
+                        value=float(st.session_state.get(tp2_key, active_trade["tp2"])),
+                        step=step_val,
+                        format=fmt_str,
+                        key=tp2_key
+                    )
+
+            # Recalculate metrics dynamically based on custom user inputs
+            pos_usd = (trade_margin_inr * trade_leverage) / trade_usd_inr
+            c_qty = round(pos_usd / custom_entry, 4) if custom_entry > 0 else 0
+            rew_tp1 = abs(custom_tp1 - custom_entry)
+            rew_tp2 = abs(custom_tp2 - custom_entry)
+            r_sl = abs(custom_entry - custom_sl)
+
+            c_roe_tp1 = round((rew_tp1 / custom_entry) * trade_leverage * 100, 2) if custom_entry > 0 else 0
+            c_roe_tp2 = round((rew_tp2 / custom_entry) * trade_leverage * 100, 2) if custom_entry > 0 else 0
+            c_roe_sl = round((r_sl / custom_entry) * trade_leverage * 100, 2) if custom_entry > 0 else 0
+
+            c_profit_tp1_inr = round((rew_tp1 * c_qty) * trade_usd_inr, 2)
+            c_profit_tp2_inr = round((rew_tp2 * c_qty) * trade_usd_inr, 2)
+            c_loss_sl_inr = round((r_sl * c_qty) * trade_usd_inr, 2)
+
+            active_trade = {
+                **active_trade,
+                "entry": custom_entry,
+                "stop_loss": custom_sl,
+                "tp1": custom_tp1,
+                "tp2": custom_tp2,
+                "crypto_qty": c_qty,
+                "roe_tp1": c_roe_tp1,
+                "roe_tp2": c_roe_tp2,
+                "roe_sl": c_roe_sl,
+                "profit_tp1_inr": c_profit_tp1_inr,
+                "profit_tp2_inr": c_profit_tp2_inr,
+                "loss_sl_inr": c_loss_sl_inr
+            }
 
             # Compute detailed costs and capital-preservation safe TP
             cost_details = calculate_trade_costs_and_safe_tp(
@@ -851,6 +1078,10 @@ with tabs[1]:
                         <td style="text-align:right; color:#0284c7; font-weight:700;">{fmt(active_trade['tp1'])} (+{active_trade['roe_tp1']}%)</td>
                     </tr>
                     <tr style="border-bottom:1px solid {card_border};">
+                        <td style="padding:6px 0;"><b>Take Profit 2 (Extreme):</b></td>
+                        <td style="text-align:right; color:#16a34a; font-weight:700;">{fmt(active_trade['tp2'])} (+{active_trade['roe_tp2']}%)</td>
+                    </tr>
+                    <tr style="border-bottom:1px solid {card_border};">
                         <td style="padding:6px 0;"><b>Order Quantity:</b></td>
                         <td style="text-align:right; font-weight:700;">{active_trade['crypto_qty']} {cur_asset}</td>
                     </tr>
@@ -868,41 +1099,74 @@ with tabs[1]:
             st.html(ticket_html)
 
             st.write("")
-            btn_label = f"🚀 EXECUTE {trade_dir} ORDER & ACTIVATE LIVE PnL"
+            exec_mode = st.radio(
+                "Execution Target:",
+                ["⚡ Live CoinDCX Exchange Order (Real Funds API)", "📝 Simulated Paper Trade (Track in App & Google Sheet)"],
+                index=0 if wallet["is_live_api"] else 1,
+                key=f"exec_mode_choice_{pair}"
+            )
+
+            btn_label = f"🚀 EXECUTE {trade_dir} ORDER ({'COINDCX LIVE' if 'Live' in exec_mode else 'PAPER SIM'})"
             if st.button(btn_label, key=f"btn_exec_{pair}", type="primary", use_container_width=True):
                 exec_time = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-                order_record = {
-                    "timestamp": exec_time,
-                    "pair": pair,
-                    "signal": trade_dir,
-                    "setup": active_trade["setup"],
-                    "entry": active_trade["entry"],
-                    "stop_loss": active_trade["stop_loss"],
-                    "tp1": active_trade["tp1"],
-                    "tp2": active_trade["tp2"],
-                    "crypto_qty": active_trade["crypto_qty"],
-                    "margin_inr": trade_margin_inr,
-                    "leverage": trade_leverage,
-                    "usd_inr": trade_usd_inr,
-                    "profit_tp1_inr": active_trade["profit_tp1_inr"],
-                    "loss_sl_inr": active_trade["loss_sl_inr"],
-                    "status": "EXECUTED_LIVE"
-                }
+                live_api_msg = ""
+                order_placed_ok = True
 
-                # Save active position for top bar live PnL tracking
-                st.session_state.active_position = order_record
-                st.session_state.executed_trades.insert(0, order_record)
+                if "Live" in exec_mode:
+                    if not wallet["is_live_api"]:
+                        st.error("❌ CoinDCX API credentials not configured in .env. Cannot place live exchange order.")
+                        order_placed_ok = False
+                    else:
+                        with st.spinner("Submitting order to CoinDCX Futures API..."):
+                            ok, api_msg, _ = place_coindcx_futures_order(
+                                pair=pair,
+                                side=trade_dir,
+                                quantity=active_trade["crypto_qty"],
+                                leverage=trade_leverage,
+                                order_type="market_order",
+                                margin_currency="INR",
+                                tp_price=active_trade["tp1"],
+                                sl_price=active_trade["stop_loss"]
+                            )
+                            order_placed_ok = ok
+                            live_api_msg = api_msg
+                            if not ok:
+                                st.error(f"❌ CoinDCX Execution Failed: {api_msg}")
 
-                sheet_success, sheet_msg = log_trade_to_google_sheet(order_record, return_details=True)
+                if order_placed_ok:
+                    order_record = {
+                        "timestamp": exec_time,
+                        "pair": pair,
+                        "signal": trade_dir,
+                        "setup": active_trade["setup"],
+                        "entry": active_trade["entry"],
+                        "stop_loss": active_trade["stop_loss"],
+                        "tp1": active_trade["tp1"],
+                        "tp2": active_trade["tp2"],
+                        "crypto_qty": active_trade["crypto_qty"],
+                        "margin_inr": trade_margin_inr,
+                        "leverage": trade_leverage,
+                        "usd_inr": trade_usd_inr,
+                        "profit_tp1_inr": active_trade["profit_tp1_inr"],
+                        "loss_sl_inr": active_trade["loss_sl_inr"],
+                        "status": "LIVE_FILLED" if "Live" in exec_mode else "PAPER_EXECUTED"
+                    }
 
-                st.success(f"""
-                ✅ **ORDER EXECUTED & LIVE TRACKING ACTIVATED!**  
-                • **Order:** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(active_trade['entry'])}  
-                • **Margin:** ₹{trade_margin_inr:,.0f} at {trade_leverage}x Leverage  
-                • **Live PnL:** Now active at top bar!  
-                • **Google Sheets:** {sheet_msg}
-                """)
-                st.rerun()
+                    # Save active position for tracking
+                    st.session_state.active_position = order_record
+                    st.session_state.executed_trades.insert(0, order_record)
+
+                    sheet_success, sheet_msg = log_trade_to_google_sheet(order_record, return_details=True)
+
+                    status_headline = "LIVE COINDCX ORDER EXECUTED!" if "Live" in exec_mode else "PAPER ORDER RECORDED!"
+                    st.success(f"""
+                    ✅ **{status_headline}**  
+                    • **Order:** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(active_trade['entry'])}  
+                    • **Margin:** ₹{trade_margin_inr:,.0f} at {trade_leverage}x Leverage  
+                    • **CoinDCX Status:** {live_api_msg or 'Paper Simulation Active'}  
+                    • **Google Sheets:** {sheet_msg}
+                    """)
+                    st.rerun()
 
         # REQUIREMENTS 3 & 5: ROUND-TRIP FEES & ANTI-DECAY SAFE TP SHIELD
         with exec_right:
