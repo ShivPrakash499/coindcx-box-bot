@@ -398,9 +398,10 @@ with top_col3:
         cur_p = tick.get("last_price", 0.0)
 
         if pos and pos.get("pair") == pair and cur_p > 0:
-            entry_p = pos["entry"]
-            qty = pos["crypto_qty"]
-            is_buy = pos["direction"] == "BUY"
+            entry_p = pos.get("entry", 0.0)
+            qty = pos.get("crypto_qty", 0.0)
+            pos_dir = pos.get("direction") or pos.get("signal", "BUY")
+            is_buy = str(pos_dir).upper() in ["BUY", "LONG"]
             u_inr = pos.get("usd_inr", 85.0)
             m_inr = pos.get("margin_inr", 100000)
 
@@ -415,7 +416,7 @@ with top_col3:
             st.html(f"""
                 <div style="background:{card_bg}; border:1px solid {pnl_col}; border-radius:10px; padding:8px 12px;">
                     <div style="display:flex; justify-content:space-between; align-items:center;">
-                        <span style="font-weight:700; color:{pnl_col}; font-size:0.8rem;">● LIVE PnL ({pos['direction']})</span>
+                        <span style="font-weight:700; color:{pnl_col}; font-size:0.8rem;">● LIVE PnL ({pos_dir})</span>
                         <span style="font-size:0.75rem; color:{subtext_color};">Entry: ${entry_p:,.2f}</span>
                     </div>
                     <div style="margin-top:4px;">
@@ -843,12 +844,15 @@ with tabs[1]:
                 st.metric("CoinDCX Positions", f"{len(live_positions)} Live Open")
                 st.caption(f"Total Unrealized: {p_sgn}₹{tot_pnl:,.2f}")
             elif active_p:
-                pos_status = f"{active_p['direction']} {active_p['crypto_qty']} {cur_asset}"
+                pos_dir = active_p.get("direction") or active_p.get("signal", "BUY")
+                pos_qty = active_p.get("crypto_qty", 0.0)
+                pos_status = f"{pos_dir} {pos_qty} {cur_asset}"
                 st.metric("Simulated Position", pos_status)
                 if st.button("Close Simulated Position", key=f"btn_close_pos_{pair}"):
-                    is_b = active_p["direction"] == "BUY"
-                    diff = (cur_price - active_p["entry"]) if is_b else (active_p["entry"] - cur_price)
-                    real_inr = diff * active_p["crypto_qty"] * active_p.get("usd_inr", 85.0)
+                    is_b = str(pos_dir).upper() in ["BUY", "LONG"]
+                    entry_price = active_p.get("entry", cur_price)
+                    diff = (cur_price - entry_price) if is_b else (entry_price - cur_price)
+                    real_inr = diff * pos_qty * active_p.get("usd_inr", 85.0)
                     st.session_state.realized_pnl_inr += real_inr
                     st.session_state.active_position = None
                     st.success(f"Position closed! Realized PnL: ₹{real_inr:,.2f}")
@@ -1205,7 +1209,8 @@ with tabs[1]:
                         "timestamp": exec_time,
                         "pair": pair,
                         "signal": trade_dir,
-                        "setup": active_trade["setup"],
+                        "direction": trade_dir,
+                        "setup": active_trade.get("setup", "Box Setup"),
                         "entry": active_trade["entry"],
                         "stop_loss": active_trade["stop_loss"],
                         "tp1": active_trade["tp1"],
