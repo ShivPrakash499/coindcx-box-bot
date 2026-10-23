@@ -186,66 +186,254 @@ def fetch_futures_funding_rate(pair="B-ETH_USDT"):
         "status": "DEFAULT"
     }
 
+def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
+    """
+    Helper to execute signed CoinDCX REST API requests with HMAC-SHA256 authentication.
+    Handles timestamp formatting and secret sanitation.
+    """
+    api_key = os.getenv("COINDCX_API_KEY", "").strip()
+    api_secret = os.getenv("COINDCX_API_SECRET", "").strip()
+
+    if not api_key or not api_secret or api_secret == "your_coindcx_secret_key_here":
+        return None, "API credentials not configured in .env"
+
+    try:
+        body = payload.copy() if payload else {}
+        # CoinDCX accepts epoch milliseconds in timestamp
+        if "timestamp" not in body:
+            body["timestamp"] = int(round(time.time() * 1000))
+
+        json_body = json.dumps(body, separators=(',', ':'))
+        signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        headers = {
+            'Content-Type': 'application/json',
+            'X-AUTH-APIKEY': api_key,
+            'X-AUTH-SIGNATURE': signature
+        }
+
+        if method.upper() == "GET":
+            res = requests.get(url, data=json_body, headers=headers, timeout=timeout)
+        else:
+            res = requests.post(url, data=json_body, headers=headers, timeout=timeout)
+
+        # If timestamp validation fails with ms, retry with seconds
+        if res.status_code == 400 and "timestamp" in res.text.lower():
+            body["timestamp"] = int(time.time())
+            json_body = json.dumps(body, separators=(',', ':'))
+            signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+            headers['X-AUTH-SIGNATURE'] = signature
+            if method.upper() == "GET":
+                res = requests.get(url, data=json_body, headers=headers, timeout=timeout)
+            else:
+                res = requests.post(url, data=json_body, headers=headers, timeout=timeout)
+
+        return res, None
+    except Exception as e:
+        return None, str(e)
+
 def fetch_coindcx_futures_balance():
     """
-    Fetches real-time futures wallet balance from CoinDCX API using HMAC-SHA256 authentication.
-    Falls back gracefully to TOTAL_WALLET_INR from .env if credentials are placeholder.
+    Fetches real-time futures wallet balance directly from CoinDCX Futures API.
+    Combines USDT Futures Wallet, INR Wallet, and calculates total INR equivalent.
+    Falls back gracefully to TOTAL_WALLET_INR from .env if credentials are not configured.
     """
-    api_key = os.getenv("COINDCX_API_KEY", "")
-    api_secret = os.getenv("COINDCX_API_SECRET", "")
+    usd_inr = float(os.getenv("USD_INR_RATE", 85.0))
     default_balance = float(os.getenv("TOTAL_WALLET_INR", 250000))
 
-    if api_key and api_secret and api_secret != "your_coindcx_secret_key_here":
+    api_key = os.getenv("COINDCX_API_KEY", "").strip()
+    api_secret = os.getenv("COINDCX_API_SECRET", "").strip()
+
+    if not api_key or not api_secret or api_secret == "your_coindcx_secret_key_here":
+        return {
+            "total_inr": default_balance,
+            "available_inr": default_balance,
+            "inr_cash": default_balance,
+            "usdt_cash": 0.0,
+            "locked_margin_usd": 0.0,
+            "cross_user_margin_usd": 0.0,
+            "is_live_api": False,
+            "source": "Configured in .env (Waiting for API Secret)"
+        }
+
+    usdt_balance = 0.0
+    inr_balance = 0.0
+    locked_margin_usd = 0.0
+    cross_margin_usd = 0.0
+    is_live = False
+
+    # 1. Primary: CoinDCX Futures Wallet Endpoint (/exchange/v1/derivatives/futures/wallets)
+    res_fut, err_fut = _send_coindcx_signed_request("GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets")
+    if res_fut and res_fut.status_code == 200:
         try:
-            timeStamp = int(round(time.time() * 1000))
-            body = {"timestamp": timeStamp}
-            json_body = json.dumps(body, separators=(',', ':'))
-            signature = hmac.new(api_secret.encode(), json_body.encode(), hashlib.sha256).hexdigest()
-
-            headers = {
-                'Content-Type': 'application/json',
-                'X-AUTH-APIKEY': api_key,
-                'X-AUTH-SIGNATURE': signature
-            }
-
-            url = "https://api.coindcx.com/exchange/v1/users/balances"
-            res = requests.post(url, data=json_body, headers=headers, timeout=5)
-            if res.status_code == 200:
-                data = res.json()
-                inr_balance = 0.0
-                usdt_balance = 0.0
-                if isinstance(data, list):
-                    for item in data:
-                        curr = item.get("currency", "")
-                        bal = float(item.get("balance", 0.0))
-                        if curr == "INR":
-                            inr_balance = bal
-                        elif curr == "USDT":
-                            usdt_balance = bal
-
-                total_inr_equivalent = inr_balance + (usdt_balance * float(os.getenv("USD_INR_RATE", 85.0)))
-                final_bal = total_inr_equivalent if total_inr_equivalent > 0 else default_balance
-
-                return {
-                    "total_inr": round(final_bal, 2),
-                    "available_inr": round(final_bal, 2),
-                    "inr_cash": round(inr_balance, 2),
-                    "usdt_cash": round(usdt_balance, 2),
-                    "is_live_api": True,
-                    "source": "CoinDCX Live API"
-                }
+            wallets = res_fut.json()
+            if isinstance(wallets, list):
+                for w in wallets:
+                    curr = w.get("currency_short_name", "").upper()
+                    bal = float(w.get("balance", 0.0) or 0.0)
+                    locked = float(w.get("locked_balance", 0.0) or 0.0)
+                    cross = float(w.get("cross_user_margin", 0.0) or 0.0)
+                    if curr == "USDT":
+                        usdt_balance += bal
+                        locked_margin_usd += locked
+                        cross_margin_usd += cross
+                    elif curr == "INR":
+                        inr_balance += bal
+                is_live = True
         except Exception as e:
-            print(f"[CoinDCX Balance Fetch Notice]: {e}")
+            print(f"[Futures Wallet Parse Error]: {e}")
 
-    # Fallback to configured balance
+    # 2. Secondary / Fallback: CoinDCX Spot & General Balances (/exchange/v1/users/balances)
+    if not is_live or (usdt_balance == 0.0 and inr_balance == 0.0):
+        res_spot, err_spot = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/users/balances")
+        if res_spot and res_spot.status_code == 200:
+            try:
+                balances = res_spot.json()
+                if isinstance(balances, list):
+                    for item in balances:
+                        curr = item.get("currency", "").upper()
+                        bal = float(item.get("balance", 0.0) or 0.0)
+                        if curr == "INR":
+                            inr_balance = max(inr_balance, bal)
+                        elif curr == "USDT":
+                            usdt_balance = max(usdt_balance, bal)
+                    is_live = True
+            except Exception as e:
+                print(f"[Spot Balance Parse Error]: {e}")
+
+    if is_live:
+        total_inr = inr_balance + (usdt_balance * usd_inr)
+        avail_usdt = max(0.0, usdt_balance - locked_margin_usd - cross_margin_usd)
+        avail_inr = inr_balance + (avail_usdt * usd_inr)
+        return {
+            "total_inr": round(total_inr, 2),
+            "available_inr": round(avail_inr, 2),
+            "inr_cash": round(inr_balance, 2),
+            "usdt_cash": round(usdt_balance, 4),
+            "available_usdt": round(avail_usdt, 4),
+            "locked_margin_usd": round(locked_margin_usd, 4),
+            "cross_user_margin_usd": round(cross_margin_usd, 4),
+            "is_live_api": True,
+            "source": "CoinDCX Live Futures API"
+        }
+
     return {
         "total_inr": default_balance,
         "available_inr": default_balance,
         "inr_cash": default_balance,
         "usdt_cash": 0.0,
+        "locked_margin_usd": 0.0,
+        "cross_user_margin_usd": 0.0,
         "is_live_api": False,
-        "source": "Configured in .env (Simulated)"
+        "source": "Configured in .env (API Response Offline)"
     }
+
+def fetch_coindcx_active_positions():
+    """
+    Fetches real-time active open trades/positions from CoinDCX Futures API.
+    Filters positions where active_pos != 0 and computes live PnL and ROE metrics.
+    """
+    usd_inr = float(os.getenv("USD_INR_RATE", 85.0))
+    payload = {
+        "page": "1",
+        "size": "20",
+        "margin_currency_short_name": ["USDT", "INR"]
+    }
+
+    res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions", payload)
+    if not res or res.status_code != 200:
+        return []
+
+    active_positions = []
+    try:
+        data = res.json()
+        if isinstance(data, list):
+            for item in data:
+                active_pos_qty = float(item.get("active_pos", 0.0) or 0.0)
+                if abs(active_pos_qty) > 0:
+                    pair = item.get("pair", "")
+                    direction = "LONG" if active_pos_qty > 0 else "SHORT"
+                    entry_price = float(item.get("avg_price", 0.0) or 0.0)
+                    mark_price = float(item.get("mark_price", 0.0) or 0.0)
+                    liq_price = float(item.get("liquidation_price", 0.0) or 0.0)
+                    leverage = float(item.get("leverage", 1.0) or 1.0)
+                    locked_margin = float(item.get("locked_margin", 0.0) or 0.0)
+                    tp = item.get("take_profit_trigger")
+                    sl = item.get("stop_loss_trigger")
+                    margin_type = item.get("margin_type", "crossed")
+
+                    # Calculate live PnL
+                    qty = abs(active_pos_qty)
+                    if mark_price > 0 and entry_price > 0:
+                        price_diff = (mark_price - entry_price) if direction == "LONG" else (entry_price - mark_price)
+                        pnl_usd = price_diff * qty
+                        pnl_inr = pnl_usd * usd_inr
+                        notional_usd = entry_price * qty
+                        margin_used_usd = (notional_usd / leverage) if leverage > 0 else locked_margin
+                        roe_pct = (pnl_usd / margin_used_usd * 100.0) if margin_used_usd > 0 else 0.0
+                    else:
+                        pnl_usd = 0.0
+                        pnl_inr = 0.0
+                        roe_pct = 0.0
+
+                    active_positions.append({
+                        "id": item.get("id", ""),
+                        "pair": pair,
+                        "direction": direction,
+                        "quantity": qty,
+                        "entry_price": round_asset_price(entry_price),
+                        "mark_price": round_asset_price(mark_price),
+                        "liquidation_price": round_asset_price(liq_price),
+                        "leverage": leverage,
+                        "locked_margin_usd": round(locked_margin, 2),
+                        "pnl_usd": round(pnl_usd, 2),
+                        "pnl_inr": round(pnl_inr, 2),
+                        "roe_pct": round(roe_pct, 2),
+                        "take_profit": float(tp) if tp else None,
+                        "stop_loss": float(sl) if sl else None,
+                        "margin_type": margin_type,
+                        "updated_at": item.get("updated_at")
+                    })
+    except Exception as e:
+        print(f"[CoinDCX Positions Parse Error]: {e}")
+
+    return active_positions
+
+def fetch_coindcx_open_orders():
+    """
+    Fetches open/pending futures orders (Limit, TP/SL, Untriggered) from CoinDCX Futures API.
+    """
+    payload = {
+        "status": "open,partially_filled,untriggered",
+        "side": "buy",
+        "page": "1",
+        "size": "20",
+        "margin_currency_short_name": ["USDT", "INR"]
+    }
+
+    orders = []
+    # Fetch Buy side
+    res_b, _ = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders", payload)
+    if res_b and res_b.status_code == 200:
+        try:
+            data = res_b.json()
+            if isinstance(data, list):
+                orders.extend(data)
+        except Exception:
+            pass
+
+    # Fetch Sell side
+    payload["side"] = "sell"
+    res_s, _ = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders", payload)
+    if res_s and res_s.status_code == 200:
+        try:
+            data = res_s.json()
+            if isinstance(data, list):
+                orders.extend(data)
+        except Exception:
+            pass
+
+    return orders
 
 def calculate_trade_costs_and_safe_tp(direction="BUY", entry_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0):
     """

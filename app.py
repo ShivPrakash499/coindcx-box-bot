@@ -15,6 +15,8 @@ from coindcx_engine import (
     calculate_trade_setup_details,
     fetch_futures_funding_rate,
     fetch_coindcx_futures_balance,
+    fetch_coindcx_active_positions,
+    fetch_coindcx_open_orders,
     calculate_trade_costs_and_safe_tp,
     round_asset_price
 )
@@ -63,9 +65,17 @@ def get_cached_ticker(pair):
 def get_cached_funding(pair):
     return fetch_futures_funding_rate(pair)
 
-@st.cache_data(ttl=10)
+@st.cache_data(ttl=5)
 def get_cached_balance():
     return fetch_coindcx_futures_balance()
+
+@st.cache_data(ttl=4)
+def get_cached_positions():
+    return fetch_coindcx_active_positions()
+
+@st.cache_data(ttl=10)
+def get_cached_open_orders():
+    return fetch_coindcx_open_orders()
 
 # ----------------- THEME & STYLING -----------------
 st.sidebar.image("https://img.icons8.com/color/96/000000/bitcoin--v1.png", width=50)
@@ -227,6 +237,35 @@ with top_col2:
 with top_col3:
     @st.fragment(run_every="5s")
     def render_live_pnl_header(pair):
+        live_positions = get_cached_positions()
+        matching_live = next((p for p in live_positions if p["pair"] == pair), None)
+        if not matching_live and len(live_positions) > 0:
+            matching_live = live_positions[0]
+
+        if matching_live:
+            pnl_inr = matching_live["pnl_inr"]
+            pnl_usd = matching_live["pnl_usd"]
+            roe_pct = matching_live["roe_pct"]
+            entry_p = matching_live["entry_price"]
+            dir_str = matching_live["direction"]
+            p_name = matching_live["pair"]
+            pnl_col = "#16a34a" if pnl_inr >= 0 else "#dc2626"
+            pnl_sgn = "+" if pnl_inr >= 0 else ""
+
+            st.html(f"""
+                <div style="background:{card_bg}; border:1px solid {pnl_col}; border-radius:10px; padding:8px 12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-weight:700; color:{pnl_col}; font-size:0.8rem;">● LIVE PnL ({dir_str} {p_name})</span>
+                        <span style="font-size:0.75rem; color:{subtext_color};">Entry: ${entry_p:,.2f}</span>
+                    </div>
+                    <div style="margin-top:4px;">
+                        <span style="font-size:1.5rem; font-weight:800; color:{pnl_col};">{pnl_sgn}₹{pnl_inr:,.2f}</span>
+                        <span style="font-size:0.95rem; font-weight:700; color:{pnl_col}; margin-left:6px;">{pnl_sgn}{roe_pct:.2f}% ROE (${pnl_usd:,.2f})</span>
+                    </div>
+                </div>
+            """)
+            return
+
         pos = st.session_state.active_position
         tick = get_cached_ticker(pair)
         cur_p = tick.get("last_price", 0.0)
@@ -642,16 +681,19 @@ with tabs[1]:
 
         # REQUIREMENT 2: FETCH USER'S FUTURES WALLET BALANCE
         st.markdown("#### 💰 Futures Wallet & Margin Balance")
+        if not wallet["is_live_api"]:
+            st.info("ℹ️ **CoinDCX Live API Notice:** Your `COINDCX_API_SECRET` in `.env` is currently set to placeholder. Enter your real API Secret in `.env` to stream your live CoinDCX Futures wallet and active positions.")
+
         w1, w2, w3, w4 = st.columns(4)
         with w1:
             st.metric("Total Futures Balance", f"₹{wallet['total_inr']:,.2f}")
             st.caption(f"Source: {wallet['source']}")
         with w2:
             st.metric("Available Margin", f"₹{wallet['available_inr']:,.2f}")
-            st.caption("Free for New Positions")
+            usdt_cash = wallet.get('usdt_cash', 0.0)
+            st.caption(f"USDT Balance: ${usdt_cash:,.2f}")
         with w3:
             fund_sign = "+" if fund["is_positive"] else ""
-            fund_color = "normal" if fund["is_positive"] else "inverse"
             st.metric(
                 "8h Funding Rate",
                 f"{fund['funding_rate_str']}",
@@ -659,12 +701,16 @@ with tabs[1]:
             )
             st.caption(fund["sentiment"])
         with w4:
+            live_positions = get_cached_positions()
             active_p = st.session_state.active_position
-            pos_status = f"{active_p['direction']} {active_p['crypto_qty']} {cur_asset}" if active_p else "FLAT (0 Open)"
-            st.metric("Active Position", pos_status)
-            if active_p:
+            if live_positions:
+                pos_status = f"{len(live_positions)} Live Open ({live_positions[0]['pair']})"
+                st.metric("CoinDCX Positions", pos_status)
+                st.caption(f"Unrealized: ₹{sum(p['pnl_inr'] for p in live_positions):,.2f}")
+            elif active_p:
+                pos_status = f"{active_p['direction']} {active_p['crypto_qty']} {cur_asset}"
+                st.metric("Simulated Position", pos_status)
                 if st.button("Close Active Position Now", key=f"btn_close_pos_{pair}"):
-                    # Settle position
                     is_b = active_p["direction"] == "BUY"
                     diff = (cur_price - active_p["entry"]) if is_b else (active_p["entry"] - cur_price)
                     real_inr = diff * active_p["crypto_qty"] * active_p.get("usd_inr", 85.0)
@@ -672,6 +718,31 @@ with tabs[1]:
                     st.session_state.active_position = None
                     st.success(f"Position closed! Realized PnL: ₹{real_inr:,.2f}")
                     st.rerun()
+            else:
+                st.metric("Active Position", "FLAT (0 Open)")
+                st.caption("No open exposure")
+
+        # LIVE COINDCX POSITIONS TABLE
+        live_positions = get_cached_positions()
+        if live_positions:
+            st.markdown("#### 🔥 Active CoinDCX Futures Positions")
+            pos_rows = []
+            for p in live_positions:
+                p_inr = p['pnl_inr']
+                r_pct = p['roe_pct']
+                pos_rows.append({
+                    "Pair": p["pair"],
+                    "Side": p["direction"],
+                    "Quantity": p["quantity"],
+                    "Entry Price": f"${p['entry_price']:,.2f}",
+                    "Mark Price": f"${p['mark_price']:,.2f}",
+                    "Leverage": f"{p['leverage']}x",
+                    "Unrealized PnL (INR)": f"{'+' if p_inr >= 0 else ''}₹{p_inr:,.2f}",
+                    "ROE (%)": f"{'+' if r_pct >= 0 else ''}{r_pct:.2f}%",
+                    "Liquidation": f"${p['liquidation_price']:,.2f}" if p['liquidation_price'] > 0 else "Safe",
+                    "Margin Mode": p.get("margin_type", "crossed").upper()
+                })
+            st.dataframe(pd.DataFrame(pos_rows), use_container_width=True, hide_index=True)
 
         st.markdown("---")
 
