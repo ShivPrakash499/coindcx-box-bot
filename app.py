@@ -32,12 +32,75 @@ from alert_notifier import send_sweep_alert, send_email_notification
 
 load_dotenv()
 
+# Sync Streamlit Cloud secrets into os.environ for backend modules
+try:
+    if hasattr(st, "secrets"):
+        for _sec_k, _sec_v in st.secrets.items():
+            if isinstance(_sec_v, (str, int, float, bool)):
+                os.environ[str(_sec_k)] = str(_sec_v)
+except Exception:
+    pass
+
 st.set_page_config(
     page_title="CoinDCX Box Theory Terminal",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded"
 )
+
+# ----------------- SECURITY & AUTHENTICATION GATE -----------------
+def get_security_pin():
+    try:
+        if hasattr(st, "secrets") and "APP_PIN" in st.secrets:
+            return str(st.secrets["APP_PIN"]).strip()
+    except Exception:
+        pass
+    return os.getenv("APP_PIN", "1234").strip()
+
+def check_authentication():
+    if st.session_state.get("authenticated", False):
+        return True
+
+    required_pin = get_security_pin()
+
+    st.markdown(
+        """
+        <div style="max-width: 440px; margin: 60px auto 20px auto; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); text-align: center; border: 1px solid #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+            <div style="font-size: 46px; margin-bottom: 10px;">🔐</div>
+            <h2 style="margin: 0; color: #0f172a; font-weight: 800; font-size: 24px; letter-spacing: -0.5px;">CoinDCX Terminal</h2>
+            <div style="display: inline-block; background: #eff6ff; color: #2563eb; font-size: 11px; font-weight: 700; padding: 4px 12px; border-radius: 20px; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.5px;">Institutional Security Gate</div>
+            <p style="color: #64748b; font-size: 13px; margin-top: 12px; margin-bottom: 0px; line-height: 1.5;">Enter your secret Access PIN to unlock live balances, analytics, and execution stations.</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    _, col_center, _ = st.columns([1, 1.3, 1])
+    with col_center:
+        with st.form("pin_security_form", clear_on_submit=False):
+            entered_pin = st.text_input(
+                "Access PIN",
+                type="password",
+                placeholder="Enter PIN (Default: 1234)",
+                help="Configure your personal PIN via APP_PIN in .env or Streamlit Secrets"
+            )
+            unlock_clicked = st.form_submit_button("🔓 Unlock Terminal", use_container_width=True)
+            if unlock_clicked:
+                if entered_pin.strip() == required_pin:
+                    st.session_state.authenticated = True
+                    st.success("✅ Access Granted! Opening Terminal...")
+                    st.rerun()
+                else:
+                    st.error("❌ Incorrect PIN. Access Denied.")
+
+        st.markdown(
+            "<p style='text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;'>🔒 Private Session • All live API operations gated behind authentication</p>",
+            unsafe_allow_html=True
+        )
+
+    st.stop()
+
+check_authentication()
 
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -88,6 +151,10 @@ def get_cached_open_orders():
 # ----------------- THEME & STYLING -----------------
 st.sidebar.image("https://img.icons8.com/color/96/000000/bitcoin--v1.png", width=50)
 st.sidebar.title("⚡ Terminal Controls")
+
+if st.sidebar.button("🔒 Lock Terminal Session", use_container_width=True, help="Lock the terminal and require PIN"):
+    st.session_state.authenticated = False
+    st.rerun()
 
 chart_theme = st.sidebar.radio(
     "🎨 Dashboard & Chart Theme",
