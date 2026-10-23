@@ -543,9 +543,9 @@ def exit_coindcx_position(position_id: str) -> tuple[bool, str]:
 
     payload = {"id": str(position_id).strip()}
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/exit", payload)
-    if res and res.status_code == 200:
+    if res is not None and res.status_code == 200:
         return True, f"Successfully executed market exit for position {position_id}"
-    msg = res.text if res else (err or "Exit request failed")
+    msg = res.text if res is not None else (err or "Exit request failed")
     return False, msg
 
 def exit_all_coindcx_positions() -> tuple[int, int, str]:
@@ -617,9 +617,9 @@ def update_coindcx_position_tpsl(position_id: str, tp_price: float = None, sl_pr
         }
 
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/create_tpsl", payload)
-    if res and res.status_code == 200:
+    if res is not None and res.status_code == 200:
         return True, "Take Profit and Stop Loss successfully updated on CoinDCX!"
-    msg = res.text if res else (err or "Failed to update TP/SL on exchange")
+    msg = res.text if res is not None else (err or "Failed to update TP/SL on exchange")
     return False, msg
 
 def place_coindcx_futures_order(
@@ -664,8 +664,8 @@ def place_coindcx_futures_order(
     }
 
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/create", body)
-    if not res:
-        return False, f"Connection error: {err}", {}
+    if res is None:
+        return False, f"Connection error: {err or 'Failed to reach CoinDCX server'}", {}
 
     if res.status_code == 200:
         data = res.json()
@@ -679,7 +679,14 @@ def place_coindcx_futures_order(
 
         return True, f"Successfully placed {order_side.upper()} order for {quantity} {pair} on CoinDCX!", data
     else:
-        return False, f"CoinDCX API Error ({res.status_code}): {res.text}", {}
+        err_msg = res.text
+        try:
+            err_json = res.json()
+            if isinstance(err_json, dict) and "message" in err_json:
+                err_msg = err_json["message"]
+        except Exception:
+            pass
+        return False, f"CoinDCX API Error ({res.status_code}): {err_msg}", {}
 
 def get_current_session_info(dt: datetime = None) -> dict:
     """
