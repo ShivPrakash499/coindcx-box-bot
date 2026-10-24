@@ -1499,48 +1499,90 @@ def run_strategy_backtest(
             exit_reason = None
 
             if pos_dir == "LONG":
-                # Check Stop Loss first (conservative evaluation)
-                if c_low <= sl_p:
-                    exit_triggered = True
-                    exit_price = sl_p
-                    exit_reason = "Stop Loss"
-                elif target_mode == "TP1 Midpoint" and c_high >= tp1_p:
-                    exit_triggered = True
-                    exit_price = tp1_p
-                    exit_reason = "Take Profit (MID)"
-                elif target_mode == "TP2 Full Rotation" and c_high >= tp2_p:
-                    exit_triggered = True
-                    exit_price = tp2_p
-                    exit_reason = "Take Profit (RH)"
-                elif target_mode == "50/50 Split":
-                    if c_high >= tp2_p:
+                mid_to_tp2_half = (tp1_p + tp2_p) / 2.0
+                if target_mode == "50/50 Split":
+                    if not active_trade.get("tp1_hit"):
+                        if c_low <= sl_p:
+                            exit_triggered = True
+                            exit_price = sl_p
+                            exit_reason = "Stop Loss"
+                        elif c_high >= tp1_p:
+                            active_trade["tp1_hit"] = True
+                            active_trade["stop_loss"] = entry_p  # Step 1: Move SL to Breakeven
+                            if c_high >= mid_to_tp2_half:
+                                active_trade["stop_loss"] = tp1_p  # Step 2: Ratchet SL to TP1!
+                            if c_high >= tp2_p:
+                                exit_triggered = True
+                                exit_price = (tp1_p + tp2_p) / 2.0
+                                exit_reason = "TP1 + TP2 Full Rotation"
+                    else:
+                        # TP1 already hit: ratchet trailing SL as price moves toward TP2
+                        if c_high >= mid_to_tp2_half and active_trade["stop_loss"] < tp1_p:
+                            active_trade["stop_loss"] = tp1_p  # Lock in TP1 profit on remainder
+
+                        if c_high >= tp2_p:
+                            exit_triggered = True
+                            exit_price = (tp1_p + tp2_p) / 2.0
+                            exit_reason = "TP1 + TP2 Full Rotation"
+                        elif c_low <= active_trade["stop_loss"]:
+                            exit_triggered = True
+                            exit_price = (tp1_p + active_trade["stop_loss"]) / 2.0
+                            exit_reason = f"TP1 + Trailing SL ({'Locked' if active_trade['stop_loss'] > entry_p else 'Breakeven'})"
+                else:
+                    if c_low <= sl_p:
                         exit_triggered = True
-                        exit_price = (tp1_p + tp2_p) / 2.0
-                        exit_reason = "Take Profit (Scale Out)"
-                    elif c_high >= tp1_p and not active_trade.get("tp1_hit"):
-                        active_trade["tp1_hit"] = True
-                        active_trade["stop_loss"] = entry_p  # Move SL to Breakeven
+                        exit_price = sl_p
+                        exit_reason = "Stop Loss"
+                    elif target_mode == "TP1 Midpoint" and c_high >= tp1_p:
+                        exit_triggered = True
+                        exit_price = tp1_p
+                        exit_reason = "Take Profit (MID)"
+                    elif target_mode == "TP2 Full Rotation" and c_high >= tp2_p:
+                        exit_triggered = True
+                        exit_price = tp2_p
+                        exit_reason = "Take Profit (RH)"
             else:  # SHORT
-                if c_high >= sl_p:
-                    exit_triggered = True
-                    exit_price = sl_p
-                    exit_reason = "Stop Loss"
-                elif target_mode == "TP1 Midpoint" and c_low <= tp1_p:
-                    exit_triggered = True
-                    exit_price = tp1_p
-                    exit_reason = "Take Profit (MID)"
-                elif target_mode == "TP2 Full Rotation" and c_low <= tp2_p:
-                    exit_triggered = True
-                    exit_price = tp2_p
-                    exit_reason = "Take Profit (RL)"
-                elif target_mode == "50/50 Split":
-                    if c_low <= tp2_p:
+                mid_to_tp2_half = (tp1_p + tp2_p) / 2.0
+                if target_mode == "50/50 Split":
+                    if not active_trade.get("tp1_hit"):
+                        if c_high >= sl_p:
+                            exit_triggered = True
+                            exit_price = sl_p
+                            exit_reason = "Stop Loss"
+                        elif c_low <= tp1_p:
+                            active_trade["tp1_hit"] = True
+                            active_trade["stop_loss"] = entry_p  # Step 1: Move SL to Breakeven
+                            if c_low <= mid_to_tp2_half:
+                                active_trade["stop_loss"] = tp1_p  # Step 2: Ratchet SL to TP1!
+                            if c_low <= tp2_p:
+                                exit_triggered = True
+                                exit_price = (tp1_p + tp2_p) / 2.0
+                                exit_reason = "TP1 + TP2 Full Rotation"
+                    else:
+                        if c_low <= mid_to_tp2_half and active_trade["stop_loss"] > tp1_p:
+                            active_trade["stop_loss"] = tp1_p
+
+                        if c_low <= tp2_p:
+                            exit_triggered = True
+                            exit_price = (tp1_p + tp2_p) / 2.0
+                            exit_reason = "TP1 + TP2 Full Rotation"
+                        elif c_high >= active_trade["stop_loss"]:
+                            exit_triggered = True
+                            exit_price = (tp1_p + active_trade["stop_loss"]) / 2.0
+                            exit_reason = f"TP1 + Trailing SL ({'Locked' if active_trade['stop_loss'] < entry_p else 'Breakeven'})"
+                else:
+                    if c_high >= sl_p:
                         exit_triggered = True
-                        exit_price = (tp1_p + tp2_p) / 2.0
-                        exit_reason = "Take Profit (Scale Out)"
-                    elif c_low <= tp1_p and not active_trade.get("tp1_hit"):
-                        active_trade["tp1_hit"] = True
-                        active_trade["stop_loss"] = entry_p  # Move SL to Breakeven
+                        exit_price = sl_p
+                        exit_reason = "Stop Loss"
+                    elif target_mode == "TP1 Midpoint" and c_low <= tp1_p:
+                        exit_triggered = True
+                        exit_price = tp1_p
+                        exit_reason = "Take Profit (MID)"
+                    elif target_mode == "TP2 Full Rotation" and c_low <= tp2_p:
+                        exit_triggered = True
+                        exit_price = tp2_p
+                        exit_reason = "Take Profit (RL)"
 
             if exit_triggered:
                 # Calculate financial metrics with exact CoinDCX fee schedule
@@ -1666,7 +1708,8 @@ def run_strategy_backtest(
                     "tp2": tp2_p,
                     "quantity": qty,
                     "notional_inr": notional_inr,
-                    "session": sess_name
+                    "session": sess_name,
+                    "tp1_hit": False
                 }
 
     # Summary Statistics Calculation
