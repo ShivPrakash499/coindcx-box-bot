@@ -1,5 +1,5 @@
 # ⚡ CoinDCX Box Theory Terminal — Session Handover & Memory
-**Date:** October 23, 2026  
+**Date:** October 24, 2026  
 **Account:** Binni (`38df78ae-38f0-468a-86f2-047ff6113a7f`)  
 **Live URL:** [https://shiv-prakash-crypto-robot.streamlit.app](https://shiv-prakash-crypto-robot.streamlit.app)  
 **GitHub Repository:** [ShivPrakash499/coindcx-box-bot](https://github.com/ShivPrakash499/coindcx-box-bot) (`main` branch)
@@ -8,62 +8,50 @@
 
 ## 1. 🚀 Current Deployment Status
 * **Cloud App:** Live, healthy, and operational on Streamlit Community Cloud.
-* **Security Gate:** App is protected with an **Access PIN** (`7426` or fallback `1234`). No API queries, balances, or trade buttons load until unlocked. A `🔒 Lock Terminal Session` button is available in the sidebar.
-* **Local LAN Access:** Also accessible from home Wi-Fi at `http://192.168.1.8:8501`.
-* **Git Sync:** All local fixes committed and pushed to `origin/main` (latest commit `b91253a`).
+* **Security Gate:** App is protected with an **Access PIN** (`7426` or fallback `1234`).
+* **Live Orders Verified:** Real live orders and order cancellations tested and confirmed 100% operational against CoinDCX Futures API.
+* **Zero Interruption Mode:** Default terminal refresh rate set to **Manual Only (Zero Interruption)** with on-demand manual refresh button.
 
 ---
 
-## 2. 🛠️ Critical Fixes Completed Today
+## 2. 🛠️ Critical Fixes Completed Today (October 24, 2026)
 
 | Issue | Root Cause | Solution Applied |
 | :--- | :--- | :--- |
-| **Setup Levels Not Refreshing** | Streamlit number input widget state locking to initial values | Replaced with setup-specific widget keys (`custom_entry_{pair}_{setup_tag}`) and auto-sync logic on setup switch; added Reset button. |
-| **Mark Price / PnL Stale** | CoinDCX futures position mark price snapshot was frozen/static | Linked real-time mark price to live Binance ticker & CoinDCX live ticker; live PnL and ROE recalculate on every tick. |
-| **`Connection error: None` on Orders** | Python `requests` response object evaluated as falsy (`if not res:`) when CoinDCX returned 400/401 HTTP codes | Fixed to `if res is None:` across `coindcx_engine.py` and added clean JSON error message parsing. |
-| **Paper Trading `KeyError: 'direction'`** | Order record dictionary saved key as `"signal"` while PnL tracker expected `"direction"` | Standardized `order_record` to include both `"signal"` and `"direction"`; updated components to defensively use `.get("direction", "signal")`. |
-| **Public Deployment Misuse Risk** | Public Streamlit URLs are accessible to anyone | Added Institutional Security Gate directly into `app.py` with PIN authentication and sidebar locking. |
+| **CoinDCX Order Placement 400 Bad Request** | CoinDCX Futures strictly enforces instrument step sizes (e.g. `Quantity should be divisible by 0.01` for SOL, `0.001` for ETH/BTC). Code previously rounded all quantities to arbitrary 4 decimals. | Added `FUTURES_PAIR_SPECS` and `format_order_quantity` across all 30 futures pairs to automatically quantize quantities strictly to exchange lot size rules before submission. |
+| **Order Error Disappearing in 1 Second** | The Trade Execution Station in Tab 1 had `@st.fragment(run_every=5)`, which refreshed all inputs and cleared `st.button` click state every 5 seconds. | Removed `run_every=5` from the execution station. Isolated only the 4 wallet metric cards into a self-contained 5s live fragment so trade inputs and messages never reset. |
+| **Order Replacement Error Disappearing** | In `update_coindcx_position_tpsl` (TP/SL trigger adjustment), `st.rerun()` was called unconditionally right after `st.error(...)`, erasing the error message instantly. | Only trigger `st.rerun()` on successful updates (`ok=True`). On errors, maintain error on screen and log to session state. |
+| **Order Leverage Mismatch (422 Error)** | When an active position already exists for a coin on CoinDCX (e.g. SOL 10x), CoinDCX rejects orders with a different leverage (`Order leverage must be equal to position leverage`). | Added automatic position leverage detection in both `place_coindcx_futures_order` and the UI slider, ensuring orders always match active position leverage. |
+| **App Refreshing Every 30s** | Sidebar `chart_refresh_rate` defaulted to `index=2` ("Every 30s"). | Changed default to `index=0` ("Manual Only (Zero Interruption - Recommended)") and added a dedicated `🔄 Refresh Terminal & Market Data` button. |
+| **Maintain Error Log on Streamlit** | User requested persistent error logs on Streamlit. | Implemented a persistent **"📋 CoinDCX Execution & API Error Console"** in `st.session_state.api_error_logs` (with expandable raw JSON technical payloads and Clear Logs button), plus a sticky dismissible alert banner. |
 
 ---
 
 ## 3. 🔑 CoinDCX API & Wallet Verification
 * **API Credentials:** 100% verified working and authenticated against CoinDCX live servers for user **Binni**.
 * **Live Futures Wallet Details:**
-  * **Total Value (INR):** `₹25,748.24`
-  * **Cash Balance (INR):** `₹15,754.90`
-  * **Locked Balance:** `₹9,993.34` (held by an active pending `B-SOL_USDT` limit buy order at `$103.46`)
-  * **Available Margin:** `~₹5,761.56`
-* **Live Order Constraint:** CoinDCX requires a minimum order value of **₹2,448 INR**. When testing live orders, keep trade margin between **₹2,500 and ₹5,000** to stay within available funds and meet the exchange minimum.
+  * **Total Value (INR):** `₹27,537.07`
+  * **Cash Balance (INR):** `₹17,541.56`
+  * **Locked Balance:** `₹9,995.51` (held by active `B-SOL_USDT` long position + TP order)
+  * **Available Margin:** `₹17,541.56`
+* **Live Order Constraints Enforced by Bot:**
+  * Minimum order notional value: **₹2,448 INR** (enforced pre-flight by guard).
+  * Quantity divisibility: Strictly enforced per asset lot size.
+  * Leverage consistency: Auto-locked to active position leverage if an open position exists.
 
 ---
 
-## 4. 📊 1-Year Strategy Backtest Summary (365 Days)
-Tested against completed historical daily box setups across **ETH**, **BTC**, and **SOL** with ₹1,00,000 margin per trade @ 5x leverage:
+## 4. 📋 Summary of Code Changes
+1. [coindcx_engine.py](file:///c:/coindcx_box_bot/coindcx_engine.py):
+   - Added `FUTURES_PAIR_SPECS` and `format_order_quantity` for all 30 pairs.
+   - Updated `place_coindcx_futures_order` with quantity step size formatting, pre-flight ₹2,448 INR value check, position leverage auto-alignment, millisecond timestamps (`int(round(time.time() * 1000))`), and structured JSON error reporting.
+   - Updated `calculate_trade_setup_details` and `evaluate_tri_session_signal` to use `format_order_quantity`.
+   - Updated `update_coindcx_position_tpsl` and `exit_coindcx_position` with clean JSON error parsing.
+2. [app.py](file:///c:/coindcx_box_bot/app.py):
+   - Initialized `api_error_logs` and `last_order_status` in `st.session_state`.
+   - Changed auto-refresh default to "Manual Only" with explicit refresh button.
+   - Removed `run_every=5` from `render_trade_execution_fragment`, isolating wallet metrics in `render_wallet_live_strip`.
+   - Added sticky Notification Banner and dedicated **CoinDCX Execution & API Error Console**.
+   - Auto-locked leverage slider when an active position exists on that pair.
+   - Quantized all user-customized order quantities with `format_order_quantity`.
 
-* **Total Trades Triggered:** 458 trades
-* **Total Wins (TP1 / TP2):** 452 wins
-* **Total Losses (SL):** 6 losses
-* **Portfolio Win Rate:** **98.7%**
-* **Average Win:** +₹7,771.71 | **Average Loss:** -₹268.44
-* **Max Portfolio Drawdown:** -₹529.10 (0.5%)
-* **Total Net Profit (after Taker Fees + 18% GST):** **+₹35,22,040.81 INR**
-* **Intraday 15m Real-Time Validation:** ~62% win rate when using Swing High (SH) and Swing Low (SL) stop loss buffers.
-
----
-
-## 5. 📋 Action Items for Tomorrow
-
-1. **Activate Email Alerts:**
-   * Go to [https://myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords).
-   * Generate a 16-character App Password named `CoinDCX Bot`.
-   * Add to `.env` and Streamlit Cloud Secrets:
-     ```toml
-     SENDER_EMAIL = "jwalashiva@gmail.com"
-     SENDER_APP_PASSWORD = "your_16_character_code"
-     RECEIVER_EMAIL = "jwalashiva@gmail.com"
-     ```
-   * Click **"📩 Send Test Alert Email"** in the sidebar to verify inbox delivery.
-
-2. **Simulated & Live Order Testing:**
-   * Run a **Simulated Paper Trade** on the live web app to observe real-time position tracking and Google Sheets logging.
-   * If testing a **Live CoinDCX Order**, set margin to `₹2,500 - ₹5,000` to fit the available wallet margin (`₹5,761`).

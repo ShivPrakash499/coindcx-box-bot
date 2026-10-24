@@ -25,7 +25,9 @@ from coindcx_engine import (
     place_coindcx_futures_order,
     calculate_trade_costs_and_safe_tp,
     round_asset_price,
-    get_coindcx_live_usdt_inr_rate
+    get_coindcx_live_usdt_inr_rate,
+    format_order_quantity,
+    get_pair_lot_spec
 )
 from sheets_logger import log_trade_to_google_sheet
 from alert_notifier import send_sweep_alert, send_email_notification
@@ -122,6 +124,12 @@ if "selected_pair" not in st.session_state:
 
 if "chart_timeframe" not in st.session_state:
     st.session_state.chart_timeframe = "15m"
+
+if "api_error_logs" not in st.session_state:
+    st.session_state.api_error_logs = []
+
+if "last_order_status" not in st.session_state:
+    st.session_state.last_order_status = None
 
 # ----------------- DATA CACHING -----------------
 @st.cache_data(ttl=300)
@@ -300,10 +308,12 @@ if st.sidebar.button("📩 Send Test Alert Email", key="btn_send_test_email", us
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚡ Live Refresh Settings")
 chart_refresh_rate = st.sidebar.selectbox(
-    "Chart Auto-Update",
-    ["Manual Only (Zero Interruption)", "Every 15s", "Every 30s", "Every 60s"],
-    index=2
+    "Terminal Auto-Update",
+    ["Manual Only (Zero Interruption - Recommended)", "Every 15s", "Every 30s", "Every 60s"],
+    index=0
 )
+if st.sidebar.button("🔄 Refresh Terminal & Market Data", use_container_width=True, help="Force refresh balances, positions, and candlestick charts"):
+    st.rerun()
 
 # ==============================================================================
 # TOP BAR: LIVE PRICE + LIVE PNL + GLOBAL FUTURES DROPDOWN & FAVORITES
@@ -521,8 +531,8 @@ with tabs[0]:
         cur_ticker = get_cached_ticker(pair)
         cur_live_price = cur_ticker.get("last_price", 0.0)
 
-        b_setup = calculate_trade_setup_details("BUY", box_levels, cur_live_price, m_inr, lev, u_inr)
-        s_setup = calculate_trade_setup_details("SELL", box_levels, cur_live_price, m_inr, lev, u_inr)
+        b_setup = calculate_trade_setup_details("BUY", box_levels, cur_live_price, m_inr, lev, u_inr, pair=pair)
+        s_setup = calculate_trade_setup_details("SELL", box_levels, cur_live_price, m_inr, lev, u_inr, pair=pair)
 
         tf_col, overlay_col, slider_col, reload_col = st.columns([1.8, 2.4, 1.8, 1.2])
 
@@ -792,13 +802,33 @@ with tabs[0]:
 # TAB 1: LIVE TRADE EXECUTION, FEES & CAPITAL PRESERVATION (REQUIREMENTS 2, 3, 4, 5)
 # ==============================================================================
 with tabs[1]:
-    @st.fragment(run_every=5)
     def render_trade_execution_fragment(pair, box_levels):
         st.subheader(f"⚡ Live Trade Execution Station — {pair}")
 
+        # Persistent Notification Banner for Orders & API Errors
+        if st.session_state.last_order_status:
+            los = st.session_state.last_order_status
+            los_type = los.get("type", "info")
+            los_msg = los.get("msg", "")
+            los_time = los.get("timestamp", "")
+            los_pair = los.get("pair", "")
+
+            c_banner, c_dismiss = st.columns([0.92, 0.08])
+            with c_banner:
+                banner_title = f"**CoinDCX Order Notice [{los_time}] ({los_pair}):**" if los_pair else f"**CoinDCX Order Notice [{los_time}]:**"
+                if los_type == "error":
+                    st.error(f"{banner_title} {los_msg}")
+                elif los_type == "success":
+                    st.success(f"{banner_title} {los_msg}")
+                else:
+                    st.info(f"{banner_title} {los_msg}")
+            with c_dismiss:
+                if st.button("✕", key="btn_dismiss_banner", help="Dismiss this alert notice"):
+                    st.session_state.last_order_status = None
+                    st.rerun()
+
         cur_ticker = get_cached_ticker(pair)
         cur_price = cur_ticker.get("last_price", 0.0)
-        fund = get_cached_funding(pair)
         wallet = get_cached_balance()
         cur_asset = pair.split('_')[0].replace('B-', '')
 
@@ -807,59 +837,82 @@ with tabs[1]:
                 return "0.00"
             return f"${p:,.4f}" if p < 1.0 else f"${p:,.2f}"
 
-        # REQUIREMENT 2: FETCH USER'S FUTURES WALLET BALANCE
+        # REQUIREMENT 2: FETCH USER'S FUTURES WALLET BALANCE (Isolated Live Fragment)
         st.markdown("#### 💰 Futures Wallet & Margin Balance")
         if not wallet["is_live_api"]:
             st.info("ℹ️ **CoinDCX Live API Notice:** Your `COINDCX_API_SECRET` in `.env` is currently set to placeholder. Enter your real API Secret in `.env` to stream your live CoinDCX Futures wallet and active positions.")
 
-        w1, w2, w3, w4 = st.columns(4)
-        with w1:
-            st.metric("Total Futures Balance", f"₹{wallet['total_inr']:,.2f}")
-            st.caption(f"Locked Margin: ₹{wallet.get('locked_inr', 0.0):,.2f}")
-        with w2:
-            st.metric("Available Free Margin", f"₹{wallet['available_inr']:,.2f}")
-            st.caption(f"Rate: ₹{wallet.get('live_usd_inr', 100.0):,.2f}/USDT")
-        with w3:
-            fund_sign = "+" if fund["is_positive"] else ""
-            st.metric(
-                "8h Funding Rate",
-                f"{fund['funding_rate_str']}",
-                f"{'Positive' if fund['is_positive'] else 'Negative'} ({fund['countdown']})"
-            )
-            st.caption(fund["sentiment"])
-        with w4:
-            live_positions = get_cached_positions()
-            active_p = st.session_state.active_position
-            matching_pos = next((p for p in live_positions if p["pair"] == pair), None) if live_positions else None
+        @st.fragment(run_every="5s")
+        def render_wallet_live_strip(target_pair):
+            cur_ticker_live = get_cached_ticker(target_pair)
+            fund_live = get_cached_funding(target_pair)
+            wallet_live = get_cached_balance()
+            cur_asset_live = target_pair.split('_')[0].replace('B-', '')
 
-            if matching_pos:
-                m_pnl = matching_pos["pnl_inr"]
-                m_roe = matching_pos["roe_pct"]
-                p_sgn = "+" if m_pnl >= 0 else ""
-                st.metric("Live Position", f"{matching_pos['direction']} {matching_pos['quantity']} {cur_asset}")
-                st.caption(f"PnL: {p_sgn}₹{m_pnl:,.2f} ({p_sgn}{m_roe:.2f}% ROE)")
-            elif live_positions:
-                tot_pnl = sum(p['pnl_inr'] for p in live_positions)
-                p_sgn = "+" if tot_pnl >= 0 else ""
-                st.metric("CoinDCX Positions", f"{len(live_positions)} Live Open")
-                st.caption(f"Total Unrealized: {p_sgn}₹{tot_pnl:,.2f}")
-            elif active_p:
-                pos_dir = active_p.get("direction") or active_p.get("signal", "BUY")
-                pos_qty = active_p.get("crypto_qty", 0.0)
-                pos_status = f"{pos_dir} {pos_qty} {cur_asset}"
-                st.metric("Simulated Position", pos_status)
-                if st.button("Close Simulated Position", key=f"btn_close_pos_{pair}"):
-                    is_b = str(pos_dir).upper() in ["BUY", "LONG"]
-                    entry_price = active_p.get("entry", cur_price)
+            w1, w2, w3, w4 = st.columns(4)
+            with w1:
+                st.metric("Total Futures Balance", f"₹{wallet_live['total_inr']:,.2f}")
+                st.caption(f"Locked Margin: ₹{wallet_live.get('locked_inr', 0.0):,.2f}")
+            with w2:
+                st.metric("Available Free Margin", f"₹{wallet_live['available_inr']:,.2f}")
+                st.caption(f"Rate: ₹{wallet_live.get('live_usd_inr', 100.0):,.2f}/USDT")
+            with w3:
+                fund_sign = "+" if fund_live["is_positive"] else ""
+                st.metric(
+                    "8h Funding Rate",
+                    f"{fund_live['funding_rate_str']}",
+                    f"{'Positive' if fund_live['is_positive'] else 'Negative'} ({fund_live['countdown']})"
+                )
+                st.caption(fund_live["sentiment"])
+            with w4:
+                live_pos = get_cached_positions()
+                act_p = st.session_state.active_position
+                m_pos = next((p for p in live_pos if p["pair"] == target_pair), None) if live_pos else None
+
+                if m_pos:
+                    mpnl = m_pos["pnl_inr"]
+                    mroe = m_pos["roe_pct"]
+                    psgn = "+" if mpnl >= 0 else ""
+                    st.metric("Live Position", f"{m_pos['direction']} {m_pos['quantity']} {cur_asset_live}")
+                    st.caption(f"PnL: {psgn}₹{mpnl:,.2f} ({psgn}{mroe:.2f}% ROE)")
+                elif live_pos:
+                    tpnl = sum(p['pnl_inr'] for p in live_pos)
+                    psgn = "+" if tpnl >= 0 else ""
+                    st.metric("CoinDCX Positions", f"{len(live_pos)} Live Open")
+                    st.caption(f"Total Unrealized: {psgn}₹{tpnl:,.2f}")
+                elif act_p:
+                    pdir = act_p.get("direction") or act_p.get("signal", "BUY")
+                    pqty = act_p.get("crypto_qty", 0.0)
+                    st.metric("Simulated Position", f"{pdir} {pqty} {cur_asset_live}")
+                else:
+                    st.metric("Active Position", "FLAT (0 Open)")
+                    st.caption("No open exposure")
+
+        render_wallet_live_strip(pair)
+
+        # Simulated active position close bar
+        if st.session_state.active_position:
+            act_p = st.session_state.active_position
+            pdir = act_p.get("direction") or act_p.get("signal", "BUY")
+            pqty = act_p.get("crypto_qty", 0.0)
+            col_sim1, col_sim2 = st.columns([3, 1])
+            with col_sim1:
+                st.info(f"📝 **Simulated Position Active:** {pdir} {pqty} {cur_asset} (Entry: ${act_p.get('entry', cur_price):,.2f})")
+            with col_sim2:
+                if st.button("Close Simulated Position", key=f"btn_close_pos_{pair}", use_container_width=True):
+                    is_b = str(pdir).upper() in ["BUY", "LONG"]
+                    entry_price = act_p.get("entry", cur_price)
                     diff = (cur_price - entry_price) if is_b else (entry_price - cur_price)
-                    real_inr = diff * pos_qty * active_p.get("usd_inr", 85.0)
+                    real_inr = diff * pqty * act_p.get("usd_inr", 85.0)
                     st.session_state.realized_pnl_inr += real_inr
                     st.session_state.active_position = None
-                    st.success(f"Position closed! Realized PnL: ₹{real_inr:,.2f}")
+                    st.session_state.last_order_status = {
+                        "type": "success",
+                        "msg": f"Simulated position closed! Realized PnL: ₹{real_inr:,.2f}",
+                        "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
+                        "pair": pair
+                    }
                     st.rerun()
-            else:
-                st.metric("Active Position", "FLAT (0 Open)")
-                st.caption("No open exposure")
 
         # LIVE COINDCX POSITIONS
         live_positions = get_cached_positions()
@@ -873,7 +926,21 @@ with tabs[1]:
                 if st.button("🚨 CLOSE ALL POSITIONS & CANCEL ORDERS", key="btn_close_all_positions", type="primary", use_container_width=True):
                     with st.spinner("Executing Emergency Close All on CoinDCX..."):
                         closed, total, msg = exit_all_coindcx_positions()
-                        st.warning(f"🚨 {msg}")
+                        log_entry = {
+                            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                            "pair": "ALL",
+                            "action": "EMERGENCY_CLOSE_ALL",
+                            "status": "SUCCESS" if closed == total else ("WARNING" if closed > 0 else "ERROR"),
+                            "message": msg,
+                            "details": {"closed": closed, "total": total}
+                        }
+                        st.session_state.api_error_logs.insert(0, log_entry)
+                        st.session_state.last_order_status = {
+                            "type": "success" if closed == total else "error",
+                            "msg": msg,
+                            "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
+                            "pair": "ALL"
+                        }
                         st.rerun()
 
             for p in live_positions:
@@ -906,11 +973,31 @@ with tabs[1]:
                         if st.button(f"❌ Close {pair_name}", key=f"btn_close_one_{pos_id}", use_container_width=True):
                             with st.spinner(f"Closing {pair_name} on CoinDCX..."):
                                 ok, msg = exit_coindcx_position(pos_id)
+                                log_entry = {
+                                    "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                                    "pair": pair_name,
+                                    "action": "CLOSE_POSITION",
+                                    "status": "SUCCESS" if ok else "ERROR",
+                                    "message": msg,
+                                    "details": {"pos_id": pos_id}
+                                }
+                                st.session_state.api_error_logs.insert(0, log_entry)
                                 if ok:
-                                    st.success(f"✅ Closed {pair_name} position!")
+                                    st.session_state.last_order_status = {
+                                        "type": "success",
+                                        "msg": f"✅ Closed {pair_name} position!",
+                                        "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
+                                        "pair": pair_name
+                                    }
+                                    st.rerun()
                                 else:
+                                    st.session_state.last_order_status = {
+                                        "type": "error",
+                                        "msg": f"❌ Failed to close {pair_name}: {msg}",
+                                        "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
+                                        "pair": pair_name
+                                    }
                                     st.error(f"❌ {msg}")
-                                st.rerun()
 
                     # In-position adjustment of Take Profit & Stop Loss
                     with st.expander(f"⚙️ Adjust TP / SL for {pair_name}", expanded=False):
@@ -936,11 +1023,31 @@ with tabs[1]:
                             if st.button("💾 Save TP/SL", key=f"btn_update_tpsl_{pos_id}", use_container_width=True):
                                 with st.spinner("Updating triggers on CoinDCX..."):
                                     ok, msg = update_coindcx_position_tpsl(pos_id, new_tp_val, new_sl_val, pair=pair_name)
+                                    log_entry = {
+                                        "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                                        "pair": pair_name,
+                                        "action": "UPDATE_TPSL",
+                                        "status": "SUCCESS" if ok else "ERROR",
+                                        "message": msg,
+                                        "details": {"tp": new_tp_val, "sl": new_sl_val, "pos_id": pos_id}
+                                    }
+                                    st.session_state.api_error_logs.insert(0, log_entry)
                                     if ok:
-                                        st.success("✅ TP and SL updated on CoinDCX!")
+                                        st.session_state.last_order_status = {
+                                            "type": "success",
+                                            "msg": f"✅ TP and SL updated for {pair_name} on CoinDCX!",
+                                            "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
+                                            "pair": pair_name
+                                        }
+                                        st.rerun()
                                     else:
+                                        st.session_state.last_order_status = {
+                                            "type": "error",
+                                            "msg": f"❌ Failed to update TP/SL for {pair_name}: {msg}",
+                                            "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
+                                            "pair": pair_name
+                                        }
                                         st.error(f"❌ {msg}")
-                                    st.rerun()
 
         st.markdown("---")
 
@@ -970,14 +1077,22 @@ with tabs[1]:
                 trade_margin_inr = int(wallet["available_inr"])
 
         with inp_col2:
+            # Check if active position exists for this pair to auto-match leverage
+            matching_active_pos = next((p for p in live_positions if p["pair"] == pair), None) if live_positions else None
+            active_pos_leverage = int(round(float(matching_active_pos["leverage"]))) if matching_active_pos else None
+            default_slider_leverage = active_pos_leverage if active_pos_leverage else 5
+
             trade_leverage = st.slider(
                 "Leverage Multiplier:",
                 min_value=1,
                 max_value=20,
-                value=5,
+                value=default_slider_leverage,
                 key=f"exec_leverage_{pair}"
             )
-            st.caption(f"Position Notional Value: ₹{(trade_margin_inr * trade_leverage):,.0f} (~${(trade_margin_inr * trade_leverage / usd_inr):,.2f} USD)")
+            if active_pos_leverage:
+                st.caption(f"🔒 **Position Leverage Locked:** CoinDCX requires order leverage to match active {pair} position ({active_pos_leverage}x).")
+            else:
+                st.caption(f"Position Notional Value: ₹{(trade_margin_inr * trade_leverage):,.0f} (~${(trade_margin_inr * trade_leverage / usd_inr):,.2f} USD)")
 
         with inp_col3:
             trade_usd_inr = st.number_input(
@@ -988,8 +1103,8 @@ with tabs[1]:
             )
 
         # Compute Setups and Costs based on dynamic margin & leverage
-        b_setup = calculate_trade_setup_details("BUY", box_levels, cur_price, trade_margin_inr, trade_leverage, trade_usd_inr)
-        s_setup = calculate_trade_setup_details("SELL", box_levels, cur_price, trade_margin_inr, trade_leverage, trade_usd_inr)
+        b_setup = calculate_trade_setup_details("BUY", box_levels, cur_price, trade_margin_inr, trade_leverage, trade_usd_inr, pair=pair)
+        s_setup = calculate_trade_setup_details("SELL", box_levels, cur_price, trade_margin_inr, trade_leverage, trade_usd_inr, pair=pair)
         sig_data = evaluate_tri_session_signal(pair, box_levels, trade_margin_inr, trade_leverage, trade_usd_inr, trigger_alert=False)
 
         exec_left, exec_right = st.columns([1.1, 1.1])
@@ -1091,7 +1206,7 @@ with tabs[1]:
 
             # Recalculate metrics dynamically based on custom user inputs
             pos_usd = (trade_margin_inr * trade_leverage) / trade_usd_inr
-            c_qty = round(pos_usd / custom_entry, 4) if custom_entry > 0 else 0
+            c_qty = format_order_quantity(pair, pos_usd / custom_entry) if custom_entry > 0 else 0
             rew_tp1 = abs(custom_tp1 - custom_entry)
             rew_tp2 = abs(custom_tp2 - custom_entry)
             r_sl = abs(custom_entry - custom_sl)
@@ -1169,6 +1284,13 @@ with tabs[1]:
             """
             st.html(ticket_html)
 
+            # Check if order meets CoinDCX minimum required order value (₹2,448 INR)
+            trade_notional_inr = active_trade['crypto_qty'] * active_trade['entry'] * trade_usd_inr
+            is_below_min_val = trade_notional_inr < 2448.0
+
+            if is_below_min_val:
+                st.warning(f"⚠️ **CoinDCX Minimum Order Constraint:** Current order value is **₹{trade_notional_inr:,.0f} INR**. CoinDCX exchange strictly requires a minimum order value of **₹2,448 INR**. Please increase margin or leverage.")
+
             st.write("")
             exec_mode = st.radio(
                 "Execution Target:",
@@ -1182,14 +1304,48 @@ with tabs[1]:
                 exec_time = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
                 live_api_msg = ""
                 order_placed_ok = True
+                api_extra = {}
 
                 if "Live" in exec_mode:
                     if not wallet["is_live_api"]:
-                        st.error("❌ CoinDCX API credentials not configured in .env. Cannot place live exchange order.")
+                        err_text = "CoinDCX API credentials not configured in .env. Cannot place live exchange order."
+                        st.session_state.last_order_status = {
+                            "type": "error",
+                            "msg": err_text,
+                            "timestamp": exec_time,
+                            "pair": pair
+                        }
+                        st.session_state.api_error_logs.insert(0, {
+                            "timestamp": exec_time,
+                            "pair": pair,
+                            "action": f"LIVE_{trade_dir}",
+                            "status": "ERROR",
+                            "message": err_text,
+                            "details": {}
+                        })
+                        st.error(f"❌ {err_text}")
+                        order_placed_ok = False
+                    elif is_below_min_val:
+                        err_text = f"Order value (₹{trade_notional_inr:,.0f} INR) is below CoinDCX exchange minimum of ₹2,448 INR. Increase margin or leverage."
+                        st.session_state.last_order_status = {
+                            "type": "error",
+                            "msg": err_text,
+                            "timestamp": exec_time,
+                            "pair": pair
+                        }
+                        st.session_state.api_error_logs.insert(0, {
+                            "timestamp": exec_time,
+                            "pair": pair,
+                            "action": f"LIVE_{trade_dir}",
+                            "status": "ERROR",
+                            "message": err_text,
+                            "details": {"notional_inr": trade_notional_inr, "min_required_inr": 2448.0}
+                        })
+                        st.error(f"❌ {err_text}")
                         order_placed_ok = False
                     else:
                         with st.spinner("Submitting order to CoinDCX Futures API..."):
-                            ok, api_msg, _ = place_coindcx_futures_order(
+                            ok, api_msg, api_extra = place_coindcx_futures_order(
                                 pair=pair,
                                 side=trade_dir,
                                 quantity=active_trade["crypto_qty"],
@@ -1201,7 +1357,24 @@ with tabs[1]:
                             )
                             order_placed_ok = ok
                             live_api_msg = api_msg
+
+                            log_entry = {
+                                "timestamp": exec_time,
+                                "pair": pair,
+                                "action": f"LIVE_{trade_dir}",
+                                "status": "SUCCESS" if ok else "ERROR",
+                                "message": api_msg,
+                                "details": api_extra or {"quantity": active_trade["crypto_qty"], "entry": active_trade["entry"], "leverage": trade_leverage}
+                            }
+                            st.session_state.api_error_logs.insert(0, log_entry)
+
                             if not ok:
+                                st.session_state.last_order_status = {
+                                    "type": "error",
+                                    "msg": api_msg,
+                                    "timestamp": exec_time,
+                                    "pair": pair
+                                }
                                 st.error(f"❌ CoinDCX Execution Failed: {api_msg}")
 
                 if order_placed_ok:
@@ -1231,13 +1404,23 @@ with tabs[1]:
                     sheet_success, sheet_msg = log_trade_to_google_sheet(order_record, return_details=True)
 
                     status_headline = "LIVE COINDCX ORDER EXECUTED!" if "Live" in exec_mode else "PAPER ORDER RECORDED!"
-                    st.success(f"""
-                    ✅ **{status_headline}**  
-                    • **Order:** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(active_trade['entry'])}  
-                    • **Margin:** ₹{trade_margin_inr:,.0f} at {trade_leverage}x Leverage  
-                    • **CoinDCX Status:** {live_api_msg or 'Paper Simulation Active'}  
-                    • **Google Sheets:** {sheet_msg}
-                    """)
+                    success_text = f"✅ **{status_headline}** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(active_trade['entry'])} | {live_api_msg or 'Paper Simulation Active'} | Google Sheets: {sheet_msg}"
+
+                    st.session_state.last_order_status = {
+                        "type": "success",
+                        "msg": success_text,
+                        "timestamp": exec_time,
+                        "pair": pair
+                    }
+                    if "Live" not in exec_mode:
+                        st.session_state.api_error_logs.insert(0, {
+                            "timestamp": exec_time,
+                            "pair": pair,
+                            "action": f"PAPER_{trade_dir}",
+                            "status": "SUCCESS",
+                            "message": f"Paper trade recorded: {trade_dir} {active_trade['crypto_qty']} {cur_asset}",
+                            "details": order_record
+                        })
                     st.rerun()
 
         # REQUIREMENTS 3 & 5: ROUND-TRIP FEES & ANTI-DECAY SAFE TP SHIELD
@@ -1319,6 +1502,45 @@ with tabs[1]:
                 st.dataframe(history_df, use_container_width=True, hide_index=True)
             else:
                 st.info("No orders executed yet in this session.")
+
+            # Dedicated CoinDCX API & Order Execution Error Console
+            st.markdown("---")
+            st.markdown("#### 📋 CoinDCX Execution & API Error Console")
+            has_error_logs = bool(st.session_state.api_error_logs)
+            with st.expander(f"📡 Real-Time CoinDCX API & Error Logs ({len(st.session_state.api_error_logs)} events recorded)", expanded=has_error_logs):
+                col_clear, col_log_info = st.columns([1.5, 4.0])
+                with col_clear:
+                    if st.button("🗑️ Clear Log History", key=f"btn_clear_logs_{pair}", use_container_width=True):
+                        st.session_state.api_error_logs = []
+                        st.session_state.last_order_status = None
+                        st.rerun()
+                with col_log_info:
+                    st.caption("Maintains persistent history of live order dispatches, bracket adjustments, emergency exits, and exchange error messages. Logs are preserved across reruns.")
+
+                if st.session_state.api_error_logs:
+                    for idx, entry in enumerate(st.session_state.api_error_logs[:20]):
+                        is_err = entry.get("status") == "ERROR"
+                        border_c = "#dc2626" if is_err else "#16a34a"
+                        bg_c = "#fef2f2" if is_light_theme and is_err else ("#3b181a" if is_err else ("#f0fdf4" if is_light_theme else "#132b1e"))
+                        txt_c = "#991b1b" if is_light_theme and is_err else ("#fca5a5" if is_err else ("#166534" if is_light_theme else "#86efac"))
+
+                        st.markdown(
+                            f"""
+                            <div style="background:{bg_c}; border-left:4px solid {border_c}; border-radius:6px; padding:10px 14px; margin-bottom:8px;">
+                                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                                    <span style="font-weight:700; color:{txt_c}; font-size:0.95rem;">{'❌ ' + entry.get('status', 'ERROR') if is_err else '✅ SUCCESS'} — {entry.get('action', 'ORDER')} ({entry.get('pair', '')})</span>
+                                    <span style="font-size:0.8rem; color:{subtext_color};">{entry.get('timestamp', '')}</span>
+                                </div>
+                                <div style="font-size:0.9rem; color:{text_color}; font-weight:500;">{entry.get('message', '')}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
+                        if entry.get("details"):
+                            with st.expander(f"🔍 Raw Technical Details & Request Payload (Log #{idx + 1})", expanded=False):
+                                st.json(entry["details"])
+                else:
+                    st.info("No API execution errors or orders logged yet in this session.")
 
     render_trade_execution_fragment(selected_pair, levels)
 

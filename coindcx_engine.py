@@ -48,6 +48,69 @@ GLOBAL_FUTURES_PAIRS = [
     "B-UNI_USDT"
 ]
 
+# Exact Binance/CoinDCX Futures Contract Specifications & Lot Sizes
+FUTURES_PAIR_SPECS = {
+    "B-BTC_USDT": {"step_size": 0.001, "qty_decimals": 3, "min_qty": 0.001, "tick_size": 0.1, "min_notional_usd": 50.0},
+    "B-ETH_USDT": {"step_size": 0.001, "qty_decimals": 3, "min_qty": 0.001, "tick_size": 0.01, "min_notional_usd": 20.0},
+    "B-SOL_USDT": {"step_size": 0.01, "qty_decimals": 2, "min_qty": 0.01, "tick_size": 0.01, "min_notional_usd": 5.0},
+    "B-XRP_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-BNB_USDT": {"step_size": 0.01, "qty_decimals": 2, "min_qty": 0.01, "tick_size": 0.01, "min_notional_usd": 5.0},
+    "B-DOGE_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 1e-05, "min_notional_usd": 5.0},
+    "B-SUI_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-NEAR_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 0.001, "min_notional_usd": 5.0},
+    "B-PEPE_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 1e-07, "min_notional_usd": 5.0},
+    "B-ADA_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-AVAX_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 0.001, "min_notional_usd": 5.0},
+    "B-LINK_USDT": {"step_size": 0.01, "qty_decimals": 2, "min_qty": 0.01, "tick_size": 0.001, "min_notional_usd": 20.0},
+    "B-APT_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-ARB_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 1e-05, "min_notional_usd": 5.0},
+    "B-OP_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 1e-05, "min_notional_usd": 5.0},
+    "B-INJ_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.001, "min_notional_usd": 5.0},
+    "B-TIA_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-RENDER_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.001, "min_notional_usd": 5.0},
+    "B-FET_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-SHIB_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 1e-06, "min_notional_usd": 5.0},
+    "B-LTC_USDT": {"step_size": 0.001, "qty_decimals": 3, "min_qty": 0.001, "tick_size": 0.01, "min_notional_usd": 20.0},
+    "B-DOT_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-FTM_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-POL_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 1e-05, "min_notional_usd": 5.0},
+    "B-WIF_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-ENA_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 1e-05, "min_notional_usd": 5.0},
+    "B-SEI_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 1e-05, "min_notional_usd": 5.0},
+    "B-TON_USDT": {"step_size": 0.1, "qty_decimals": 1, "min_qty": 0.1, "tick_size": 0.0001, "min_notional_usd": 5.0},
+    "B-KAS_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 1e-05, "min_notional_usd": 5.0},
+    "B-UNI_USDT": {"step_size": 1.0, "qty_decimals": 0, "min_qty": 1.0, "tick_size": 0.001, "min_notional_usd": 5.0}
+}
+
+def get_pair_lot_spec(pair: str) -> dict:
+    """Returns the lot size and step precision specifications for a futures pair."""
+    return FUTURES_PAIR_SPECS.get(pair, {
+        "step_size": 0.001,
+        "qty_decimals": 3,
+        "min_qty": 0.001,
+        "tick_size": 0.01,
+        "min_notional_usd": 5.0
+    })
+
+def format_order_quantity(pair: str, raw_qty: float) -> float:
+    """
+    Quantizes order quantity strictly to the exchange step size and decimal precision.
+    Prevents HTTP 400 'Quantity should be divisible by X' errors on CoinDCX Futures.
+    """
+    if raw_qty is None or raw_qty <= 0:
+        return 0.0
+
+    spec = get_pair_lot_spec(pair)
+    step = spec["step_size"]
+    decimals = spec["qty_decimals"]
+
+    steps = int(round(raw_qty / step, 8))
+    quantized = steps * step
+
+    if decimals == 0:
+        return float(int(quantized))
+    return round(quantized, decimals)
+
 def round_asset_price(val, ref_price=None):
     """
     Rounds price dynamically based on asset magnitude (handles low-cost tokens like DOGE/PEPE).
@@ -541,12 +604,19 @@ def exit_coindcx_position(position_id: str) -> tuple[bool, str]:
     if not position_id:
         return False, "Invalid position ID"
 
-    payload = {"id": str(position_id).strip()}
+    payload = {"id": str(position_id).strip(), "timestamp": int(round(time.time() * 1000))}
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/exit", payload)
     if res is not None and res.status_code == 200:
         return True, f"Successfully executed market exit for position {position_id}"
     msg = res.text if res is not None else (err or "Exit request failed")
-    return False, msg
+    try:
+        if res is not None:
+            err_json = res.json()
+            if isinstance(err_json, dict) and "message" in err_json:
+                msg = err_json["message"]
+    except Exception:
+        pass
+    return False, f"CoinDCX Exit Error: {msg}"
 
 def exit_all_coindcx_positions() -> tuple[int, int, str]:
     """
@@ -594,15 +664,15 @@ def update_coindcx_position_tpsl(position_id: str, tp_price: float = None, sl_pr
             o_id = o.get("id")
             if o_id and (not pair or o_pair == pair) and o_stage == "tpsl_exit":
                 if tp_price is not None and "take_profit" in o_type:
-                    _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(time.time())})
+                    _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(round(time.time() * 1000))})
                 if sl_price is not None and "stop" in o_type:
-                    _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(time.time())})
+                    _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(round(time.time() * 1000))})
     except Exception as e:
         print(f"[TP/SL Pre-Cancel Notice]: {e}")
 
     # Step 2: Create new TP/SL triggers
     payload = {
-        "timestamp": int(time.time()),
+        "timestamp": int(round(time.time() * 1000)),
         "id": str(position_id).strip()
     }
     if tp_price is not None and tp_price > 0:
@@ -619,8 +689,16 @@ def update_coindcx_position_tpsl(position_id: str, tp_price: float = None, sl_pr
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/create_tpsl", payload)
     if res is not None and res.status_code == 200:
         return True, "Take Profit and Stop Loss successfully updated on CoinDCX!"
+
     msg = res.text if res is not None else (err or "Failed to update TP/SL on exchange")
-    return False, msg
+    try:
+        if res is not None:
+            err_json = res.json()
+            if isinstance(err_json, dict) and "message" in err_json:
+                msg = err_json["message"]
+    except Exception:
+        pass
+    return False, f"CoinDCX TP/SL Error: {msg}"
 
 def place_coindcx_futures_order(
     pair: str,
@@ -636,15 +714,62 @@ def place_coindcx_futures_order(
     """
     Executes a real futures order directly on CoinDCX exchange via API.
     Supports market_order or limit_order, leverage multiplier, and optional auto TP/SL attachments.
+    Enforces exchange quantity divisibility, minimum order value, and position leverage matching.
     """
     side_lower = side.lower()
     order_side = "buy" if side_lower in ["buy", "long"] else "sell"
+
+    # Step 1: Format quantity strictly to pair's step size and precision
+    formatted_qty = format_order_quantity(pair, float(quantity))
+    if formatted_qty <= 0:
+        return False, f"Calculated quantity ({quantity}) is too small for {pair} minimum lot size.", {
+            "error_type": "LOT_SIZE_UNDERFLOW",
+            "pair": pair,
+            "raw_quantity": quantity
+        }
+
+    # Step 2: Auto-sync leverage if an active position already exists for this pair
+    try:
+        active_positions = fetch_coindcx_active_positions()
+        matched_pos = next((p for p in active_positions if p["pair"] == pair), None)
+        if matched_pos and matched_pos.get("leverage"):
+            pos_lev = int(round(float(matched_pos["leverage"])))
+            if int(leverage) != pos_lev:
+                print(f"[Leverage Auto-Sync]: Aligning order leverage from {leverage}x to {pos_lev}x for active position in {pair}")
+                leverage = pos_lev
+    except Exception as e:
+        print(f"[Leverage Check Notice]: {e}")
+
+    # Step 3: Check CoinDCX minimum order value (strictly 2,448 INR)
+    usd_inr = get_coindcx_live_usdt_inr_rate()
+    ref_p = float(price) if (price and price > 0) else 0.0
+    if ref_p <= 0:
+        try:
+            t = fetch_live_ticker(pair)
+            ref_p = float(t.get("last_price", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    if ref_p > 0:
+        notional_inr = formatted_qty * ref_p * usd_inr
+        if notional_inr < 2448.0:
+            min_margin_needed = int(round(2500.0 / max(1, leverage))) + 50
+            return False, (
+                f"Minimum order value on CoinDCX is ₹2,448 INR (current: ₹{notional_inr:,.0f}). "
+                f"Please increase trade margin to at least ₹{min_margin_needed:,} or increase leverage."
+            ), {
+                "error_type": "MIN_ORDER_VALUE_NOT_MET",
+                "notional_inr": notional_inr,
+                "min_required_inr": 2448.0,
+                "formatted_qty": formatted_qty,
+                "ref_price": ref_p
+            }
 
     order_payload = {
         "side": order_side,
         "pair": pair,
         "order_type": order_type,
-        "total_quantity": float(quantity),
+        "total_quantity": formatted_qty,
         "leverage": int(leverage),
         "margin_currency_short_name": margin_currency.upper(),
         "notification": "email_notification",
@@ -659,34 +784,54 @@ def place_coindcx_futures_order(
         order_payload["time_in_force"] = "good_till_cancel"
 
     body = {
-        "timestamp": int(time.time()),
+        "timestamp": int(round(time.time() * 1000)),
         "order": order_payload
     }
 
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/create", body)
     if res is None:
-        return False, f"Connection error: {err or 'Failed to reach CoinDCX server'}", {}
+        return False, f"Connection error: {err or 'Failed to reach CoinDCX server'}", {
+            "error_type": "CONNECTION_ERROR",
+            "details": err,
+            "body": body
+        }
 
     if res.status_code == 200:
         data = res.json()
+        order_info = data[0] if (isinstance(data, list) and len(data) > 0) else (data if isinstance(data, dict) else {})
+        order_id = order_info.get("id", "CONFIRMED")
+
         # If TP or SL specified, attach them once order is registered
         if tp_price or sl_price:
             time.sleep(1.0)
-            positions = fetch_coindcx_active_positions()
-            matched_pos = next((p for p in positions if p["pair"] == pair), None)
-            if matched_pos and matched_pos.get("id"):
-                update_coindcx_position_tpsl(matched_pos["id"], tp_price=tp_price, sl_price=sl_price, pair=pair)
+            try:
+                positions = fetch_coindcx_active_positions()
+                matched_pos = next((p for p in positions if p["pair"] == pair), None)
+                if matched_pos and matched_pos.get("id"):
+                    update_coindcx_position_tpsl(matched_pos["id"], tp_price=tp_price, sl_price=sl_price, pair=pair)
+            except Exception as e:
+                print(f"[Auto TP/SL Notice]: {e}")
 
-        return True, f"Successfully placed {order_side.upper()} order for {quantity} {pair} on CoinDCX!", data
+        return True, f"Successfully placed {order_side.upper()} order for {formatted_qty} {pair} on CoinDCX! (Order ID: {order_id})", {
+            "order_id": order_id,
+            "raw_response": data,
+            "request_payload": order_payload
+        }
     else:
         err_msg = res.text
+        raw_json = {}
         try:
-            err_json = res.json()
-            if isinstance(err_json, dict) and "message" in err_json:
-                err_msg = err_json["message"]
+            raw_json = res.json()
+            if isinstance(raw_json, dict) and "message" in raw_json:
+                err_msg = raw_json["message"]
         except Exception:
             pass
-        return False, f"CoinDCX API Error ({res.status_code}): {err_msg}", {}
+        return False, f"CoinDCX API Error ({res.status_code}): {err_msg}", {
+            "status_code": res.status_code,
+            "error_message": err_msg,
+            "raw_response": raw_json or res.text,
+            "request_payload": order_payload
+        }
 
 def get_current_session_info(dt: datetime = None) -> dict:
     """
@@ -932,10 +1077,11 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
         "prev_day_date": datetime.fromtimestamp(prev_day['timestamp'] / 1000, tz=IST).strftime("%Y-%m-%d")
     }
 
-def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0):
+def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0, pair="B-ETH_USDT"):
     """
     Calculates specific BUY (Long at Range Low) or SELL (Short at Range High)
     trade setup parameters including targets, stops, and financial projections.
+    Quantizes order quantity to the pair's exchange lot size rules.
     """
     if not levels:
         return None
@@ -961,7 +1107,8 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
 
     margin_usd = margin_inr / usd_inr
     position_usd = margin_usd * leverage
-    crypto_qty = round(position_usd / entry, 4) if entry > 0 else 0
+    raw_qty = position_usd / entry if entry > 0 else 0
+    crypto_qty = format_order_quantity(pair, raw_qty)
 
     risk_per_unit = abs(entry - stop_loss) if stop_loss > 0 else 0
     reward_tp1 = abs(entry - tp1)
@@ -1074,7 +1221,8 @@ def evaluate_tri_session_signal(pair="B-ETH_USDT", levels=None, margin_inr=10000
 
     margin_usd = margin_inr / usd_inr
     position_usd = margin_usd * leverage
-    crypto_qty = round(position_usd / entry, 4) if entry > 0 else 0
+    raw_qty = position_usd / entry if entry > 0 else 0
+    crypto_qty = format_order_quantity(pair, raw_qty)
 
     risk_per_unit = abs(entry - stop_loss) if stop_loss > 0 else 0
     reward_tp1 = abs(entry - tp1)
