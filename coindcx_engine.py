@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import time
 import json
@@ -5,7 +6,6 @@ import hmac
 import hashlib
 import requests
 import pandas as pd
-import numpy as np
 import pytz
 from datetime import datetime, timezone
 from dotenv import load_dotenv

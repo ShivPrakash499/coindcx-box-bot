@@ -1,40 +1,17 @@
+from __future__ import annotations
 import os
+import sys
+import importlib
+import traceback
+
+# Guarantee repository root directory is in sys.path
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
 import streamlit as st
-import pandas as pd
-import pytz
-from datetime import datetime
-import plotly.graph_objects as go
-from dotenv import load_dotenv
 
-from coindcx_engine import (
-    GLOBAL_FUTURES_PAIRS,
-    calculate_daily_box_levels,
-    evaluate_715_pm_signal,
-    evaluate_tri_session_signal,
-    get_current_session_info,
-    fetch_coindcx_candles,
-    fetch_live_ticker,
-    calculate_trade_setup_details,
-    fetch_futures_funding_rate,
-    fetch_coindcx_futures_balance,
-    fetch_coindcx_active_positions,
-    fetch_coindcx_open_orders,
-    exit_coindcx_position,
-    exit_all_coindcx_positions,
-    update_coindcx_position_tpsl,
-    place_coindcx_futures_order,
-    calculate_trade_costs_and_safe_tp,
-    round_asset_price,
-    get_coindcx_live_usdt_inr_rate,
-    format_order_quantity,
-    get_pair_lot_spec
-)
-from sheets_logger import log_trade_to_google_sheet
-from alert_notifier import send_sweep_alert, send_email_notification
-
-load_dotenv()
-
-# Sync Streamlit Cloud secrets into os.environ for backend modules
+# Sync Streamlit Cloud secrets into os.environ BEFORE backend modules initialize
 try:
     if hasattr(st, "secrets"):
         for _sec_k, _sec_v in st.secrets.items():
@@ -42,6 +19,73 @@ try:
                 os.environ[str(_sec_k)] = str(_sec_v)
 except Exception:
     pass
+
+import pandas as pd
+import pytz
+from datetime import datetime
+import plotly.graph_objects as go
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Safe, hot-reloadable module imports with graceful fallbacks
+try:
+    import coindcx_engine
+    try:
+        importlib.reload(coindcx_engine)
+    except Exception:
+        pass
+
+    GLOBAL_FUTURES_PAIRS = coindcx_engine.GLOBAL_FUTURES_PAIRS
+    calculate_daily_box_levels = coindcx_engine.calculate_daily_box_levels
+    evaluate_715_pm_signal = coindcx_engine.evaluate_715_pm_signal
+    evaluate_tri_session_signal = coindcx_engine.evaluate_tri_session_signal
+    get_current_session_info = coindcx_engine.get_current_session_info
+    fetch_coindcx_candles = coindcx_engine.fetch_coindcx_candles
+    fetch_live_ticker = coindcx_engine.fetch_live_ticker
+    calculate_trade_setup_details = coindcx_engine.calculate_trade_setup_details
+    fetch_futures_funding_rate = coindcx_engine.fetch_futures_funding_rate
+    fetch_coindcx_futures_balance = coindcx_engine.fetch_coindcx_futures_balance
+    fetch_coindcx_active_positions = coindcx_engine.fetch_coindcx_active_positions
+    fetch_coindcx_open_orders = coindcx_engine.fetch_coindcx_open_orders
+    exit_coindcx_position = coindcx_engine.exit_coindcx_position
+    exit_all_coindcx_positions = coindcx_engine.exit_all_coindcx_positions
+    update_coindcx_position_tpsl = coindcx_engine.update_coindcx_position_tpsl
+    place_coindcx_futures_order = coindcx_engine.place_coindcx_futures_order
+    calculate_trade_costs_and_safe_tp = coindcx_engine.calculate_trade_costs_and_safe_tp
+    round_asset_price = coindcx_engine.round_asset_price
+    get_coindcx_live_usdt_inr_rate = coindcx_engine.get_coindcx_live_usdt_inr_rate
+    format_order_quantity = getattr(coindcx_engine, "format_order_quantity", lambda pair, qty: round(float(qty), 4))
+    get_pair_lot_spec = getattr(coindcx_engine, "get_pair_lot_spec", lambda pair: {})
+except Exception as _mod_err:
+    st.error(f"❌ Backend Engine Initialization Error: {_mod_err}")
+    st.code(traceback.format_exc())
+    st.stop()
+
+try:
+    import sheets_logger
+    try:
+        importlib.reload(sheets_logger)
+    except Exception:
+        pass
+    log_trade_to_google_sheet = sheets_logger.log_trade_to_google_sheet
+except Exception as _sheet_err:
+    def log_trade_to_google_sheet(*args, **kwargs):
+        return (False, f"Google Sheets integration offline: {_sheet_err}") if kwargs.get("return_details") else False
+
+try:
+    import alert_notifier
+    try:
+        importlib.reload(alert_notifier)
+    except Exception:
+        pass
+    send_sweep_alert = alert_notifier.send_sweep_alert
+    send_email_notification = alert_notifier.send_email_notification
+except Exception as _alert_err:
+    def send_sweep_alert(*args, **kwargs):
+        pass
+    def send_email_notification(*args, **kwargs):
+        return False, f"Email notifier offline: {_alert_err}"
 
 st.set_page_config(
     page_title="CoinDCX Box Theory Terminal",

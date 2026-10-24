@@ -1,7 +1,9 @@
 # ⚡ CoinDCX Box Theory Terminal — Session Handover & Memory
 **Date:** October 24, 2026  
 **Account:** Binni (`38df78ae-38f0-468a-86f2-047ff6113a7f`)  
-**Live URL:** [https://shiv-prakash-crypto-robot.streamlit.app](https://shiv-prakash-crypto-robot.streamlit.app)  
+**Live URLs:**  
+* Primary Assistant: [https://shiv-prakash-trade-assistant.streamlit.app](https://shiv-prakash-trade-assistant.streamlit.app)  
+* Alternative Mirror: [https://shiv-prakash-crypto-robot.streamlit.app](https://shiv-prakash-crypto-robot.streamlit.app)  
 **GitHub Repository:** [ShivPrakash499/coindcx-box-bot](https://github.com/ShivPrakash499/coindcx-box-bot) (`main` branch)
 
 ---
@@ -18,6 +20,7 @@
 
 | Issue | Root Cause | Solution Applied |
 | :--- | :--- | :--- |
+| **Streamlit Cloud Redacted `ImportError` on line 9** | On Streamlit Community Cloud, active containers cache loaded modules in `sys.modules`. When new functions (`format_order_quantity`, `get_pair_lot_spec`) were added and imported via multi-line `from coindcx_engine import (...)`, Python evaluated against the cached module in memory without reloading, raising an unhandled `ImportError` that Streamlit Cloud redacted for data leak protection. | 1. Added explicit `sys.path.insert(0, CURRENT_DIR)` at the very top of `app.py`.<br>2. Synced Streamlit Cloud `st.secrets` into `os.environ` *before* backend modules load.<br>3. Switched to `import coindcx_engine` with `importlib.reload(coindcx_engine)` and graceful `getattr` fallbacks.<br>4. Added `from __future__ import annotations` across all 4 modules (`app.py`, `coindcx_engine.py`, `alert_notifier.py`, `sheets_logger.py`) for complete cross-version Python compatibility (3.8-3.13+).<br>5. Removed unused `import numpy as np` in `coindcx_engine.py` to prevent potential Linux C-extension ABI conflicts.<br>6. Added `.streamlit/config.toml` with `showErrorDetails = "full"` and `headless = true`. |
 | **CoinDCX Order Placement 400 Bad Request** | CoinDCX Futures strictly enforces instrument step sizes (e.g. `Quantity should be divisible by 0.01` for SOL, `0.001` for ETH/BTC). Code previously rounded all quantities to arbitrary 4 decimals. | Added `FUTURES_PAIR_SPECS` and `format_order_quantity` across all 30 futures pairs to automatically quantize quantities strictly to exchange lot size rules before submission. |
 | **Order Error Disappearing in 1 Second** | The Trade Execution Station in Tab 1 had `@st.fragment(run_every=5)`, which refreshed all inputs and cleared `st.button` click state every 5 seconds. | Removed `run_every=5` from the execution station. Isolated only the 4 wallet metric cards into a self-contained 5s live fragment so trade inputs and messages never reset. |
 | **Order Replacement Error Disappearing** | In `update_coindcx_position_tpsl` (TP/SL trigger adjustment), `st.rerun()` was called unconditionally right after `st.error(...)`, erasing the error message instantly. | Only trigger `st.rerun()` on successful updates (`ok=True`). On errors, maintain error on screen and log to session state. |
@@ -43,15 +46,24 @@
 
 ## 4. 📋 Summary of Code Changes
 1. [coindcx_engine.py](file:///c:/coindcx_box_bot/coindcx_engine.py):
+   - Added `from __future__ import annotations`.
+   - Removed unused `import numpy as np`.
    - Added `FUTURES_PAIR_SPECS` and `format_order_quantity` for all 30 pairs.
    - Updated `place_coindcx_futures_order` with quantity step size formatting, pre-flight ₹2,448 INR value check, position leverage auto-alignment, millisecond timestamps (`int(round(time.time() * 1000))`), and structured JSON error reporting.
    - Updated `calculate_trade_setup_details` and `evaluate_tri_session_signal` to use `format_order_quantity`.
    - Updated `update_coindcx_position_tpsl` and `exit_coindcx_position` with clean JSON error parsing.
 2. [app.py](file:///c:/coindcx_box_bot/app.py):
+   - Added `from __future__ import annotations`.
+   - Added `sys.path.insert(0, CURRENT_DIR)` to guarantee module resolution on Streamlit Cloud.
+   - Synced `st.secrets` before backend modules load.
+   - Robust `importlib.reload(coindcx_engine)` loading with fallback `getattr` implementations.
    - Initialized `api_error_logs` and `last_order_status` in `st.session_state`.
    - Changed auto-refresh default to "Manual Only" with explicit refresh button.
-   - Removed `run_every=5` from `render_trade_execution_fragment`, isolating wallet metrics in `render_wallet_live_strip`.
+   - Removed `run_every=5` from `render_trade_execution_fragment`.
    - Added sticky Notification Banner and dedicated **CoinDCX Execution & API Error Console**.
    - Auto-locked leverage slider when an active position exists on that pair.
    - Quantized all user-customized order quantities with `format_order_quantity`.
-
+3. [.streamlit/config.toml](file:///c:/coindcx_box_bot/.streamlit/config.toml):
+   - Configured `[client] showErrorDetails = "full"` and `[server] headless = true`.
+4. [.gitignore](file:///c:/coindcx_box_bot/.gitignore):
+   - Track `.streamlit/config.toml` while keeping `.streamlit/secrets.toml` ignored.

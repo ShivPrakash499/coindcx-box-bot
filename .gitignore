@@ -3,5 +3,5 @@ credentials.json
 __pycache__/
 *.pyc
 .venv/
-.streamlit/
+.streamlit/secrets.toml
 *.log
