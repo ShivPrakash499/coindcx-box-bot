@@ -57,6 +57,7 @@ try:
     get_coindcx_live_usdt_inr_rate = coindcx_engine.get_coindcx_live_usdt_inr_rate
     format_order_quantity = getattr(coindcx_engine, "format_order_quantity", lambda pair, qty: round(float(qty), 4))
     get_pair_lot_spec = getattr(coindcx_engine, "get_pair_lot_spec", lambda pair: {})
+    run_strategy_backtest = getattr(coindcx_engine, "run_strategy_backtest", None)
 except Exception as _mod_err:
     st.error(f"❌ Backend Engine Initialization Error: {_mod_err}")
     st.code(traceback.format_exc())
@@ -1695,26 +1696,281 @@ with tabs[3]:
         """)
 
 # ==============================================================================
-# TAB 4: STRATEGY BACKTEST & ANALYTICS
+# TAB 4: REAL-TIME STRATEGY BACKTEST & PERFORMANCE ANALYTICS
 # ==============================================================================
 with tabs[4]:
-    st.subheader("📊 6-Month Historical Performance Preview")
-    st.write(f"Box Liquidity Sweeps on 15m Candles ({leverage}x Leverage, ₹{margin_inr:,.0f} Margin)")
+    st.subheader("📊 Real-Time Strategy Backtest & Execution Simulator")
+    st.caption("Simulate the institutional Box Theory & Liquidity Sweep strategy on real historical exchange candles with exact CoinDCX Futures fee schedules, leverage, and Indian GST accounting.")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Win Rate", "64.8%", "+4.2% vs Benchmark")
-    m2.metric("Profit Factor", "2.14", "Gross Profit / Gross Loss")
-    m3.metric("Max Drawdown", "6.2%", "Strict Risk Boundary")
-    m4.metric("Avg Trade Duration", "1h 45m", "15m candle execution")
+    # 1. Backtest Configuration Controls
+    with st.container():
+        st.markdown(f"""
+            <div style="background:{card_bg}; border:1px solid {card_border}; border-radius:10px; padding:14px 18px; margin-bottom:15px;">
+                <span style="font-weight:700; color:{text_color}; font-size:1.05rem;">⚙️ Backtest Simulation Parameters</span>
+            </div>
+        """, unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown("#### Monthly Performance Breakdown")
-    backtest_data = pd.DataFrame([
-        {"Month": "May 2026", "Trades": 22, "Win Rate": "68.2%", "Net Profit (INR)": "₹1,18,400", "Profit Factor": 2.42},
-        {"Month": "Jun 2026", "Trades": 19, "Win Rate": "63.1%", "Net Profit (INR)": "₹86,500", "Profit Factor": 1.95},
-        {"Month": "Jul 2026", "Trades": 24, "Win Rate": "66.7%", "Net Profit (INR)": "₹1,42,100", "Profit Factor": 2.30},
-        {"Month": "Aug 2026", "Trades": 20, "Win Rate": "60.0%", "Net Profit (INR)": "₹71,200", "Profit Factor": 1.78},
-        {"Month": "Sep 2026", "Trades": 25, "Win Rate": "68.0%", "Net Profit (INR)": "₹1,56,800", "Profit Factor": 2.51},
-        {"Month": "Oct 2026", "Trades": 18, "Win Rate": "61.1%", "Net Profit (INR)": "₹94,300", "Profit Factor": 2.05},
-    ])
-    st.dataframe(backtest_data, use_container_width=True, hide_index=True)
+        c_pair, c_dur, c_margin, c_lev, c_target = st.columns([1.6, 1.6, 1.4, 1.2, 1.6])
+
+        # Current pair default index
+        cur_pair = st.session_state.selected_pair
+        default_pair_idx = GLOBAL_FUTURES_PAIRS.index(cur_pair) if cur_pair in GLOBAL_FUTURES_PAIRS else 0
+
+        with c_pair:
+            bt_pair = st.selectbox("Futures Asset", GLOBAL_FUTURES_PAIRS, index=default_pair_idx, key="bt_pair_select")
+
+        with c_dur:
+            duration_options = {
+                "Last 7 Days (15m Candles)": 7,
+                "Last 14 Days (15m Candles)": 14,
+                "Last 30 Days (1h Candles - Recommended)": 30,
+                "Last 60 Days (1h Candles)": 60,
+                "Last 90 Days (4h Candles)": 90,
+                "Last 180 Days (4h Candles)": 180
+            }
+            bt_dur_label = st.selectbox("Backtest Duration", list(duration_options.keys()), index=2, key="bt_dur_select")
+            bt_days = duration_options[bt_dur_label]
+
+        with c_margin:
+            bt_margin = st.number_input(
+                "Trade Margin (₹ INR)",
+                min_value=2500,
+                max_value=2000000,
+                value=int(margin_inr) if margin_inr >= 2500 else 50000,
+                step=5000,
+                key="bt_margin_input",
+                help="Margin allocation per simulated trade in Indian Rupees."
+            )
+
+        with c_lev:
+            bt_leverage = st.slider("Leverage", min_value=1, max_value=25, value=int(leverage), key="bt_lev_slider")
+
+        with c_target:
+            bt_target_mode = st.selectbox(
+                "Take Profit Rule",
+                ["TP1 Midpoint", "TP2 Full Rotation", "50/50 Split"],
+                index=0,
+                key="bt_target_select",
+                help="TP1 Midpoint: 50% retracement. TP2 Full Rotation: opposite range boundary. 50/50: scale out half at TP1 & move SL to breakeven."
+            )
+
+        col_run, col_info = st.columns([1.5, 4.5])
+        with col_run:
+            run_btn = st.button("🚀 Run Real-Time Backtest", use_container_width=True, type="primary", key="btn_run_backtest")
+        with col_info:
+            st.caption("Pulls live candlestick candles directly from CoinDCX / Binance public data APIs, establishes rolling daily boxes, and simulates entry/stop/target executions.")
+
+    # Manage backtest session execution
+    if "backtest_result" not in st.session_state:
+        st.session_state.backtest_result = None
+
+    if run_btn or st.session_state.backtest_result is None:
+        if run_strategy_backtest:
+            with st.spinner(f"⏳ Simulating Box Theory sweeps for {bt_pair} across historical candles ({bt_days} days)..."):
+                try:
+                    bt_res = run_strategy_backtest(
+                        pair=bt_pair,
+                        duration_days=bt_days,
+                        margin_inr=float(bt_margin),
+                        leverage=int(bt_leverage),
+                        target_mode=bt_target_mode,
+                        usd_inr=usd_inr
+                    )
+                    st.session_state.backtest_result = bt_res
+                except Exception as _bt_err:
+                    st.error(f"❌ Backtest simulation failed: {_bt_err}")
+                    st.session_state.backtest_result = {"error": str(_bt_err)}
+
+    bt_res = st.session_state.backtest_result
+
+    if bt_res:
+        if bt_res.get("error"):
+            st.warning(f"⚠️ {bt_res['error']}")
+        else:
+            # 2. Performance Summary Headline
+            roi_color = "#16a34a" if bt_res['net_profit_inr'] >= 0 else "#dc2626"
+            roi_sign = "+" if bt_res['net_profit_inr'] >= 0 else ""
+
+            st.markdown(f"""
+                <div style="background:{card_bg}; border:1px solid {card_border}; border-left:4px solid {roi_color}; border-radius:8px; padding:12px 16px; margin: 12px 0 16px 0;">
+                    <span style="font-weight:700; color:{text_color}; font-size:1.05rem;">
+                        Backtest Results: {bt_res['pair']} | {bt_res['duration_days']} Days ({bt_res['candle_interval']} Candles) | ₹{bt_res['margin_inr']:,.0f} Margin @ {bt_res['leverage']}x Leverage
+                    </span><br>
+                    <span style="font-size:0.85rem; color:{subtext_color};">
+                        Strategy: Daily Box Liquidity Sweeps • Exit Target: {bt_res['target_mode']} • Fee Model: 0.05% Taker + 18% GST
+                    </span>
+                </div>
+            """, unsafe_allow_html=True)
+
+            # 3. Key Performance Metric Cards (Row 1)
+            k1, k2, k3, k4, k5 = st.columns(5)
+            with k1:
+                st.metric(
+                    "Net Profit (INR)",
+                    f"₹{bt_res['net_profit_inr']:,.2f}",
+                    f"{roi_sign}{bt_res['total_roi_pct']:.1f}% ROI",
+                    delta_color="normal"
+                )
+            with k2:
+                st.metric(
+                    "Win Rate",
+                    f"{bt_res['win_rate_pct']:.1f}%",
+                    f"{bt_res['win_count']}W / {bt_res['loss_count']}L"
+                )
+            with k3:
+                pf_str = f"{bt_res['profit_factor']:.2f}" if bt_res['profit_factor'] < 90 else "∞"
+                st.metric(
+                    "Profit Factor",
+                    pf_str,
+                    f"Gross: ₹{bt_res['total_gross_profit']:,.0f}"
+                )
+            with k4:
+                st.metric(
+                    "Max Drawdown",
+                    f"-{bt_res['max_drawdown_pct']:.1f}%",
+                    "Equity peak-to-trough"
+                )
+            with k5:
+                st.metric(
+                    "Total Trades",
+                    f"{bt_res['total_trades']}",
+                    f"Avg: {bt_res['avg_duration_candles']} candles"
+                )
+
+            # 4. Secondary Edge & Execution Statistics (Row 2)
+            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+            e1, e2, e3, e4 = st.columns(4)
+            with e1:
+                st.metric(
+                    "Long Win Rate",
+                    f"{bt_res['long_win_rate_pct']:.1f}%",
+                    f"{bt_res['long_trades']} Long Trades"
+                )
+            with e2:
+                st.metric(
+                    "Short Win Rate",
+                    f"{bt_res['short_win_rate_pct']:.1f}%",
+                    f"{bt_res['short_trades']} Short Trades"
+                )
+            with e3:
+                st.metric(
+                    "CoinDCX Fees Paid",
+                    f"₹{bt_res['total_fees_paid_inr']:,.2f}",
+                    "Taker + 18% GST"
+                )
+            with e4:
+                st.metric(
+                    "Avg Win vs Avg Loss",
+                    f"₹{bt_res['avg_win_inr']:,.0f}",
+                    f"Avg Loss: ₹{bt_res['avg_loss_inr']:,.0f}"
+                )
+
+            # 5. Interactive Cumulative Equity Growth Curve (Plotly Chart)
+            st.markdown("---")
+            st.markdown("#### 📈 Cumulative Portfolio Equity Curve (₹ INR)")
+
+            eq_data = bt_res.get("equity_curve", [])
+            if eq_data and len(eq_data) > 1:
+                eq_df = pd.DataFrame(eq_data)
+                fig_eq = go.Figure()
+
+                is_profitable = bt_res['net_profit_inr'] >= 0
+                line_col = "#10b981" if is_profitable else "#ef4444"
+                fill_col = "rgba(16, 185, 129, 0.12)" if is_profitable else "rgba(239, 68, 68, 0.12)"
+
+                fig_eq.add_trace(go.Scatter(
+                    x=eq_df['timestamp'],
+                    y=eq_df['equity_inr'],
+                    mode='lines+markers',
+                    line=dict(color=line_col, width=2.5),
+                    marker=dict(size=4, color=line_col),
+                    fill='tozeroy',
+                    fillcolor=fill_col,
+                    name='Account Equity',
+                    hovertemplate="<b>Date:</b> %{x}<br><b>Portfolio Equity:</b> ₹%{y:,.2f}<extra></extra>"
+                ))
+
+                fig_eq.add_hline(
+                    y=bt_res['margin_inr'],
+                    line_dash="dash",
+                    line_color="#94a3b8",
+                    annotation_text=f"Starting Margin: ₹{bt_res['margin_inr']:,.0f}",
+                    annotation_position="bottom right"
+                )
+
+                fig_eq.update_layout(
+                    xaxis_title="Trade Timeline",
+                    yaxis_title="Equity (₹ INR)",
+                    template="plotly_white" if is_light_theme else "plotly_dark",
+                    margin=dict(l=20, r=20, t=30, b=20),
+                    height=340,
+                    hovermode="x unified"
+                )
+                st.plotly_chart(fig_eq, use_container_width=True)
+
+            # 6. Dynamic Performance Breakdowns
+            st.markdown("---")
+            col_tbl_m, col_tbl_s = st.columns([1.1, 1.0])
+
+            with col_tbl_m:
+                st.markdown("#### 📅 Monthly Performance Breakdown")
+                monthly_df = bt_res.get("monthly_df", pd.DataFrame())
+                if not monthly_df.empty:
+                    st.dataframe(monthly_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No completed monthly intervals in this duration window.")
+
+            with col_tbl_s:
+                st.markdown("#### 🏛️ Institutional Session Breakdown")
+                session_df = bt_res.get("session_df", pd.DataFrame())
+                if not session_df.empty:
+                    st.dataframe(session_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("Session analytics will appear here once trades are executed.")
+
+            # 7. Detailed Trade-by-Trade Execution Log & CSV Export
+            st.markdown("---")
+            st.markdown(f"#### 📋 Complete Simulated Trade Log ({bt_res['total_trades']} Trades)")
+
+            trades_df = bt_res.get("trades_df", pd.DataFrame())
+            if not trades_df.empty:
+                display_cols = [
+                    "trade_id", "entry_time", "exit_time", "direction", "session",
+                    "entry_price", "exit_price", "exit_reason", "gross_pnl_inr",
+                    "fees_inr", "net_pnl_inr", "roe_pct"
+                ]
+                avail_cols = [c for c in display_cols if c in trades_df.columns]
+
+                # Download CSV button
+                csv_bytes = trades_df.to_csv(index=False).encode('utf-8')
+                col_btn, col_exp_info = st.columns([1.5, 4.5])
+                with col_btn:
+                    st.download_button(
+                        label="📥 Export Trade Log (CSV)",
+                        data=csv_bytes,
+                        file_name=f"box_backtest_{bt_res['pair']}_{bt_res['duration_days']}d.csv",
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+                with col_exp_info:
+                    st.caption(f"Download complete trade-by-trade audit logs with exact entries, stops, take profits, and fee deductions.")
+
+                rename_map = {
+                    "trade_id": "Trade #",
+                    "entry_time": "Entry Time",
+                    "exit_time": "Exit Time",
+                    "direction": "Side",
+                    "session": "Session",
+                    "entry_price": "Entry ($)",
+                    "exit_price": "Exit ($)",
+                    "exit_reason": "Outcome",
+                    "gross_pnl_inr": "Gross (₹)",
+                    "fees_inr": "Fees (₹)",
+                    "net_pnl_inr": "Net PnL (₹)",
+                    "roe_pct": "ROE %"
+                }
+
+                pretty_df = trades_df[avail_cols].rename(columns=rename_map)
+                st.dataframe(pretty_df, use_container_width=True, hide_index=True)
+            else:
+                st.info(f"No liquidity sweep trade setups were triggered for {bt_res['pair']} during the selected {bt_res['duration_days']}-day period.")

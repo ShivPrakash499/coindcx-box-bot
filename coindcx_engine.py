@@ -1293,3 +1293,391 @@ def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, le
     """
     return evaluate_tri_session_signal(pair, levels, margin_inr, leverage, usd_inr)
 
+def run_strategy_backtest(
+    pair: str = "B-BTC_USDT",
+    duration_days: int = 30,
+    margin_inr: float = 50000.0,
+    leverage: int = 5,
+    target_mode: str = "TP1 Midpoint",
+    usd_inr: float = None
+) -> dict:
+    """
+    Executes a real-time historical simulation of the Box Liquidity Sweep strategy.
+    Fetches real candles from CoinDCX / Binance public APIs, establishes rolling daily boxes,
+    identifies institutional liquidity sweeps, simulates order executions with fee accounting,
+    and returns comprehensive performance analytics, monthly breakdowns, and trade logs.
+    """
+    if not usd_inr or usd_inr <= 0:
+        usd_inr = get_coindcx_live_usdt_inr_rate()
+
+    # 1. Determine execution candle timeframe and limits based on duration
+    if duration_days <= 14:
+        interval = "15m"
+        limit = min(1000, duration_days * 24 * 4 + 20)
+    elif duration_days <= 45:
+        interval = "1h"
+        limit = min(1000, duration_days * 24 + 20)
+    else:
+        interval = "4h"
+        limit = min(1000, duration_days * 6 + 20)
+
+    # 2. Fetch execution candles
+    df = fetch_coindcx_candles(pair=pair, interval=interval, limit=limit, sync_live_price=False)
+    if df.empty or len(df) < 30:
+        return {"error": f"Insufficient historical candle data available for {pair}."}
+
+    # 3. Fetch daily candles for daily box establishment
+    daily_limit = min(120, max(duration_days + 25, 40))
+    df_daily = fetch_coindcx_candles(pair=pair, interval="1d", limit=daily_limit, sync_live_price=False)
+    if df_daily.empty or len(df_daily) < 5:
+        return {"error": f"Insufficient daily candle data for {pair}."}
+
+    df['dt_ist'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
+    df['date_str'] = df['dt_ist'].dt.strftime('%Y-%m-%d')
+
+    df_daily['dt_ist'] = pd.to_datetime(df_daily['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
+    df_daily['date_str'] = df_daily['dt_ist'].dt.strftime('%Y-%m-%d')
+
+    # Pre-build daily box levels for each day
+    daily_boxes = {}
+    daily_records = df_daily.to_dict('records')
+    for i in range(1, len(daily_records)):
+        curr_day_str = daily_records[i]['date_str']
+        prev_day = daily_records[i-1]
+        rh = float(prev_day['high'])
+        rl = float(prev_day['low'])
+        mid = (rh + rl) / 2.0
+
+        lookback_start = max(0, i - 15)
+        prior_slice = daily_records[lookback_start:i-1]
+        prior_highs = [float(d['high']) for d in prior_slice] if prior_slice else []
+        prior_lows = [float(d['low']) for d in prior_slice] if prior_slice else []
+
+        sh_c = [h for h in prior_highs if h > rh]
+        sh = min(sh_c) if sh_c else rh * 1.015
+        sl_c = [l for l in prior_lows if l < rl]
+        sl = max(sl_c) if sl_c else rl * 0.985
+
+        daily_boxes[curr_day_str] = {
+            "RH": rh,
+            "RL": rl,
+            "MID": mid,
+            "SH": sh,
+            "SL": sl
+        }
+
+    # 4. Sequential Candle Simulation
+    trades = []
+    active_trade = None
+    initial_capital = margin_inr
+    current_equity = initial_capital
+    equity_curve = [{"timestamp": df['dt_ist'].iloc[0].strftime("%Y-%m-%d %H:%M"), "equity_inr": initial_capital, "pnl_inr": 0.0}]
+
+    taker_fee_rate = 0.0005 * 1.18  # 0.05% + 18% GST
+
+    for idx in range(len(df)):
+        candle = df.iloc[idx]
+        c_date = candle['date_str']
+        c_time = candle['dt_ist']
+        c_high = float(candle['high'])
+        c_low = float(candle['low'])
+        c_close = float(candle['close'])
+
+        box = daily_boxes.get(c_date)
+        if not box:
+            continue
+
+        rh, rl, mid = box["RH"], box["RL"], box["MID"]
+        sh, sl = box["SH"], box["SL"]
+
+        # Check active trade exit conditions first
+        if active_trade:
+            pos_dir = active_trade["direction"]
+            entry_p = active_trade["entry_price"]
+            sl_p = active_trade["stop_loss"]
+            tp1_p = active_trade["tp1"]
+            tp2_p = active_trade["tp2"]
+            qty = active_trade["quantity"]
+            notional_inr = active_trade["notional_inr"]
+
+            exit_triggered = False
+            exit_price = None
+            exit_reason = None
+
+            if pos_dir == "LONG":
+                # Check Stop Loss first (conservative evaluation)
+                if c_low <= sl_p:
+                    exit_triggered = True
+                    exit_price = sl_p
+                    exit_reason = "Stop Loss"
+                elif target_mode == "TP1 Midpoint" and c_high >= tp1_p:
+                    exit_triggered = True
+                    exit_price = tp1_p
+                    exit_reason = "Take Profit (MID)"
+                elif target_mode == "TP2 Full Rotation" and c_high >= tp2_p:
+                    exit_triggered = True
+                    exit_price = tp2_p
+                    exit_reason = "Take Profit (RH)"
+                elif target_mode == "50/50 Split":
+                    if c_high >= tp2_p:
+                        exit_triggered = True
+                        exit_price = (tp1_p + tp2_p) / 2.0
+                        exit_reason = "Take Profit (Scale Out)"
+                    elif c_high >= tp1_p and not active_trade.get("tp1_hit"):
+                        active_trade["tp1_hit"] = True
+                        active_trade["stop_loss"] = entry_p  # Move SL to Breakeven
+            else:  # SHORT
+                if c_high >= sl_p:
+                    exit_triggered = True
+                    exit_price = sl_p
+                    exit_reason = "Stop Loss"
+                elif target_mode == "TP1 Midpoint" and c_low <= tp1_p:
+                    exit_triggered = True
+                    exit_price = tp1_p
+                    exit_reason = "Take Profit (MID)"
+                elif target_mode == "TP2 Full Rotation" and c_low <= tp2_p:
+                    exit_triggered = True
+                    exit_price = tp2_p
+                    exit_reason = "Take Profit (RL)"
+                elif target_mode == "50/50 Split":
+                    if c_low <= tp2_p:
+                        exit_triggered = True
+                        exit_price = (tp1_p + tp2_p) / 2.0
+                        exit_reason = "Take Profit (Scale Out)"
+                    elif c_low <= tp1_p and not active_trade.get("tp1_hit"):
+                        active_trade["tp1_hit"] = True
+                        active_trade["stop_loss"] = entry_p  # Move SL to Breakeven
+
+            if exit_triggered:
+                # Calculate financial metrics with exact CoinDCX fee schedule
+                if pos_dir == "LONG":
+                    gross_pnl_usd = (exit_price - entry_p) * qty
+                else:
+                    gross_pnl_usd = (entry_p - exit_price) * qty
+
+                gross_pnl_inr = gross_pnl_usd * usd_inr
+                entry_fee_inr = notional_inr * taker_fee_rate
+                exit_notional_inr = (qty * exit_price) * usd_inr
+                exit_fee_inr = exit_notional_inr * taker_fee_rate
+                total_fees_inr = entry_fee_inr + exit_fee_inr
+                net_pnl_inr = gross_pnl_inr - total_fees_inr
+                roe_pct = (net_pnl_inr / margin_inr) * 100.0
+
+                current_equity += net_pnl_inr
+
+                trades.append({
+                    "trade_id": len(trades) + 1,
+                    "entry_time": active_trade["entry_time"],
+                    "exit_time": c_time.strftime("%Y-%m-%d %H:%M"),
+                    "pair": pair,
+                    "direction": pos_dir,
+                    "session": active_trade["session"],
+                    "entry_price": round_asset_price(entry_p, entry_p),
+                    "exit_price": round_asset_price(exit_price, entry_p),
+                    "stop_loss": round_asset_price(sl_p, entry_p),
+                    "target_tp": round_asset_price(tp1_p if "MID" in exit_reason else tp2_p, entry_p),
+                    "exit_reason": exit_reason,
+                    "quantity": qty,
+                    "gross_pnl_inr": round(gross_pnl_inr, 2),
+                    "fees_inr": round(total_fees_inr, 2),
+                    "net_pnl_inr": round(net_pnl_inr, 2),
+                    "roe_pct": round(roe_pct, 2),
+                    "is_win": net_pnl_inr > 0,
+                    "duration_candles": idx - active_trade["entry_idx"]
+                })
+
+                equity_curve.append({
+                    "timestamp": c_time.strftime("%Y-%m-%d %H:%M"),
+                    "equity_inr": round(current_equity, 2),
+                    "pnl_inr": round(net_pnl_inr, 2)
+                })
+
+                active_trade = None
+
+        # If no active trade, evaluate signal for new entry
+        if not active_trade:
+            is_long_sweep = (c_low <= rl) and (c_close > rl)
+            is_short_sweep = (c_high >= rh) and (c_close < rh)
+
+            if is_long_sweep or is_short_sweep:
+                trade_dir = "LONG" if is_long_sweep else "SHORT"
+                entry_p = c_close
+                if trade_dir == "LONG":
+                    sl_p = min(c_low, sl) * 0.998
+                    tp1_p = mid
+                    tp2_p = rh
+                else:
+                    sl_p = max(c_high, sh) * 1.002
+                    tp1_p = mid
+                    tp2_p = rl
+
+                margin_usd = margin_inr / usd_inr
+                pos_usd = margin_usd * leverage
+                raw_qty = pos_usd / entry_p if entry_p > 0 else 0
+                qty = format_order_quantity(pair, raw_qty)
+                notional_inr = margin_inr * leverage
+
+                # Categorize institutional session
+                h = c_time.hour
+                m = c_time.minute
+                if (h == 7) or (h == 8 and m <= 30):
+                    sess_name = "🌅 Asia Open"
+                elif (h == 13) or (h == 14 and m <= 30):
+                    sess_name = "🏛️ London Open"
+                elif (h == 18 and m >= 45) or (h == 19) or (h == 20 and m <= 15):
+                    sess_name = "⚡ New York Open"
+                else:
+                    sess_name = "🌐 Intraday Monitor"
+
+                active_trade = {
+                    "direction": trade_dir,
+                    "entry_time": c_time.strftime("%Y-%m-%d %H:%M"),
+                    "entry_idx": idx,
+                    "entry_price": entry_p,
+                    "stop_loss": sl_p,
+                    "tp1": tp1_p,
+                    "tp2": tp2_p,
+                    "quantity": qty,
+                    "notional_inr": notional_inr,
+                    "session": sess_name
+                }
+
+    # Summary Statistics Calculation
+    total_trades = len(trades)
+    if total_trades == 0:
+        return {
+            "total_trades": 0,
+            "win_count": 0,
+            "loss_count": 0,
+            "win_rate_pct": 0.0,
+            "net_profit_inr": 0.0,
+            "total_roi_pct": 0.0,
+            "profit_factor": 0.0,
+            "max_drawdown_pct": 0.0,
+            "total_gross_profit": 0.0,
+            "total_gross_loss": 0.0,
+            "avg_win_inr": 0.0,
+            "avg_loss_inr": 0.0,
+            "avg_duration_candles": 0.0,
+            "candle_interval": interval,
+            "trades_df": pd.DataFrame(),
+            "monthly_df": pd.DataFrame(),
+            "session_df": pd.DataFrame(),
+            "equity_curve": equity_curve,
+            "pair": pair,
+            "duration_days": duration_days,
+            "margin_inr": margin_inr,
+            "leverage": leverage
+        }
+
+    wins = [t for t in trades if t["is_win"]]
+    losses = [t for t in trades if not t["is_win"]]
+    longs = [t for t in trades if t["direction"] == "LONG"]
+    shorts = [t for t in trades if t["direction"] == "SHORT"]
+
+    win_count = len(wins)
+    loss_count = len(losses)
+    win_rate = round((win_count / total_trades) * 100.0, 1)
+
+    long_wins = [t for t in longs if t["is_win"]]
+    short_wins = [t for t in shorts if t["is_win"]]
+    long_win_rate = round((len(long_wins) / len(longs) * 100.0), 1) if longs else 0.0
+    short_win_rate = round((len(short_wins) / len(shorts) * 100.0), 1) if shorts else 0.0
+
+    total_gross_profit = sum(t["net_pnl_inr"] for t in wins)
+    total_gross_loss = abs(sum(t["net_pnl_inr"] for t in losses))
+    net_profit = round(sum(t["net_pnl_inr"] for t in trades), 2)
+    total_roi = round((net_profit / initial_capital) * 100.0, 2)
+
+    profit_factor = round(total_gross_profit / total_gross_loss, 2) if total_gross_loss > 0 else (99.0 if total_gross_profit > 0 else 0.0)
+
+    # Max Drawdown calculation from equity curve
+    equity_series = [e["equity_inr"] for e in equity_curve]
+    peak = equity_series[0]
+    max_dd = 0.0
+    for eq in equity_series:
+        if eq > peak:
+            peak = eq
+        dd = ((peak - eq) / peak) * 100.0 if peak > 0 else 0.0
+        if dd > max_dd:
+            max_dd = dd
+
+    avg_win = round(total_gross_profit / win_count, 2) if win_count > 0 else 0.0
+    avg_loss = round(total_gross_loss / loss_count, 2) if loss_count > 0 else 0.0
+    avg_duration_candles = round(sum(t["duration_candles"] for t in trades) / total_trades, 1)
+    total_fees_paid = round(sum(t["fees_inr"] for t in trades), 2)
+
+    trades_df = pd.DataFrame(trades)
+
+    # Compute Monthly Breakdown
+    monthly_rows = []
+    if not trades_df.empty:
+        trades_df['month'] = pd.to_datetime(trades_df['entry_time']).dt.strftime('%b %Y')
+        for month_name, m_group in trades_df.groupby('month', sort=False):
+            m_trades = len(m_group)
+            m_wins = len(m_group[m_group['is_win']])
+            m_losses = m_trades - m_wins
+            m_wr = round((m_wins / m_trades) * 100.0, 1) if m_trades > 0 else 0.0
+            m_pnl = round(m_group['net_pnl_inr'].sum(), 2)
+            m_gross_p = m_group[m_group['is_win']]['net_pnl_inr'].sum()
+            m_gross_l = abs(m_group[~m_group['is_win']]['net_pnl_inr'].sum())
+            m_pf = round(m_gross_p / m_gross_l, 2) if m_gross_l > 0 else (99.0 if m_gross_p > 0 else 0.0)
+            monthly_rows.append({
+                "Month": month_name,
+                "Trades": m_trades,
+                "Wins": m_wins,
+                "Losses": m_losses,
+                "Win Rate": f"{m_wr:.1f}%",
+                "Net Profit (INR)": f"₹{m_pnl:,.2f}",
+                "Profit Factor": m_pf
+            })
+    monthly_df = pd.DataFrame(monthly_rows)
+
+    # Compute Session Breakdown
+    session_rows = []
+    if not trades_df.empty:
+        for sess_name, s_group in trades_df.groupby('session', sort=False):
+            s_trades = len(s_group)
+            s_wins = len(s_group[s_group['is_win']])
+            s_wr = round((s_wins / s_trades) * 100.0, 1) if s_trades > 0 else 0.0
+            s_pnl = round(s_group['net_pnl_inr'].sum(), 2)
+            session_rows.append({
+                "Institutional Session": sess_name,
+                "Trades": s_trades,
+                "Wins": s_wins,
+                "Win Rate": f"{s_wr:.1f}%",
+                "Net Profit (INR)": f"₹{s_pnl:,.2f}"
+            })
+    session_df = pd.DataFrame(session_rows)
+
+    return {
+        "pair": pair,
+        "duration_days": duration_days,
+        "margin_inr": margin_inr,
+        "leverage": leverage,
+        "target_mode": target_mode,
+        "total_trades": total_trades,
+        "win_count": win_count,
+        "loss_count": loss_count,
+        "win_rate_pct": win_rate,
+        "long_trades": len(longs),
+        "long_win_rate_pct": long_win_rate,
+        "short_trades": len(shorts),
+        "short_win_rate_pct": short_win_rate,
+        "net_profit_inr": net_profit,
+        "total_roi_pct": total_roi,
+        "profit_factor": profit_factor,
+        "max_drawdown_pct": round(max_dd, 2),
+        "total_gross_profit": round(total_gross_profit, 2),
+        "total_gross_loss": round(total_gross_loss, 2),
+        "total_fees_paid_inr": total_fees_paid,
+        "avg_win_inr": avg_win,
+        "avg_loss_inr": avg_loss,
+        "avg_duration_candles": avg_duration_candles,
+        "candle_interval": interval,
+        "trades_df": trades_df,
+        "monthly_df": monthly_df,
+        "session_df": session_df,
+        "equity_curve": equity_curve
+    }
+

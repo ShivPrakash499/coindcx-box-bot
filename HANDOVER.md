@@ -28,6 +28,8 @@
 | **App Refreshing Every 30s** | Sidebar `chart_refresh_rate` defaulted to `index=2` ("Every 30s"). | Changed default to `index=0` ("Manual Only (Zero Interruption - Recommended)") and added a dedicated `🔄 Refresh Terminal & Market Data` button. |
 | **Maintain Error Log on Streamlit** | User requested persistent error logs on Streamlit. | Implemented a persistent **"📋 CoinDCX Execution & API Error Console"** in `st.session_state.api_error_logs` (with expandable raw JSON technical payloads and Clear Logs button), plus a sticky dismissible alert banner. |
 
+| **Static Backtest Section with Old Mock Data** | Backtest Tab 4 previously rendered static hardcoded metrics and dummy tables from early 2026 without any user controls or live calculation. | Implemented dynamic `run_strategy_backtest` engine with live candle fetching from CoinDCX / Binance public APIs. Added UI controls for selecting futures pair, backtest duration (7d to 180d), trade margin (INR), leverage, and TP rule (TP1 Midpoint, TP2 Full Rotation, 50/50 Split). Generates live KPI cards, interactive Plotly cumulative equity curve, dynamic monthly and institutional session breakdowns, and downloadable trade log CSV. |
+
 ---
 
 ## 3. 🔑 CoinDCX API & Wallet Verification
@@ -49,6 +51,7 @@
    - Added `from __future__ import annotations`.
    - Removed unused `import numpy as np`.
    - Added `FUTURES_PAIR_SPECS` and `format_order_quantity` for all 30 pairs.
+   - Added `run_strategy_backtest` function to simulate the Box Liquidity Sweep strategy across historical candles with exact CoinDCX fee schedules (0.05% Taker + 18% GST), daily box establishment, and session tracking.
    - Updated `place_coindcx_futures_order` with quantity step size formatting, pre-flight ₹2,448 INR value check, position leverage auto-alignment, millisecond timestamps (`int(round(time.time() * 1000))`), and structured JSON error reporting.
    - Updated `calculate_trade_setup_details` and `evaluate_tri_session_signal` to use `format_order_quantity`.
    - Updated `update_coindcx_position_tpsl` and `exit_coindcx_position` with clean JSON error parsing.
@@ -57,6 +60,17 @@
    - Added `sys.path.insert(0, CURRENT_DIR)` to guarantee module resolution on Streamlit Cloud.
    - Synced `st.secrets` before backend modules load.
    - Robust `importlib.reload(coindcx_engine)` loading with fallback `getattr` implementations.
+   - Replaced static Tab 4 with an interactive **Real-Time Strategy Backtest & Execution Simulator** featuring:
+     - Futures Pair selector (all 30 pairs, defaulting to active pair)
+     - Duration selector (7, 14, 30, 60, 90, 180 days with auto timeframe resolution)
+     - INR Margin per trade and leverage inputs
+     - Take Profit target mode (TP1 Midpoint, TP2 Full Rotation, 50/50 Split)
+     - Key Performance Metric Cards (Net Profit ₹, ROI %, Win Rate, Profit Factor, Max Drawdown, Total Trades)
+     - Secondary Edge Statistics (Long vs Short Win Rate, Total Fees Paid, Avg Win vs Avg Loss)
+     - Interactive Cumulative Equity Growth Curve (Plotly Chart)
+     - Dynamic Monthly Performance Breakdown table
+     - Institutional Session Breakdown table (Asia, London, NY, Intraday)
+     - Detailed Trade-by-Trade Execution Log with CSV download button
    - Initialized `api_error_logs` and `last_order_status` in `st.session_state`.
    - Changed auto-refresh default to "Manual Only" with explicit refresh button.
    - Removed `run_every=5` from `render_trade_execution_fragment`.
