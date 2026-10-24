@@ -1462,6 +1462,7 @@ def run_strategy_backtest(
     df_records = df.to_dict('records')
     trades = []
     active_trade = None
+    last_exit_idx = -999
     initial_capital = margin_inr
     current_equity = initial_capital
     first_candle_time = df['dt_ist'].iloc[0].strftime("%Y-%m-%d %H:%M")
@@ -1586,14 +1587,47 @@ def run_strategy_backtest(
                 })
 
                 active_trade = None
+                last_exit_idx = idx
 
-        # If no active trade, evaluate signal for new entry
-        if not active_trade:
-            is_long_sweep = (c_low <= rl) and (c_close > rl)
-            is_short_sweep = (c_high >= rh) and (c_close < rh)
+        # If no active trade, evaluate signal for new entry in Buy or Sell Zone
+        if not active_trade and (idx - last_exit_idx >= 1):
+            c_open = float(candle.get('open', c_close))
+            candle_range = c_high - c_low
 
-            if is_long_sweep or is_short_sweep:
-                trade_dir = "LONG" if is_long_sweep else "SHORT"
+            # 1. Buy Zone Rejection Trigger (Long Setup):
+            # Price swept down into Buy Zone (<= RL), rejected, and closed back above RL (> RL)
+            swept_buy_zone = (c_low <= rl)
+            closed_above_rl = (c_close > rl)
+            lower_wick = min(c_open, c_close) - c_low
+            is_bullish_rejection = (
+                swept_buy_zone and 
+                closed_above_rl and 
+                (c_low >= sl * 0.995) and 
+                (
+                    (candle_range > 0 and (lower_wick / candle_range) >= 0.15) or 
+                    (c_close >= c_open) or 
+                    (candle_range > 0 and (c_close - c_low) / candle_range >= 0.45)
+                )
+            )
+
+            # 2. Sell Zone Rejection Trigger (Short Setup):
+            # Price swept up into Sell Zone (>= RH), rejected, and closed back below RH (< RH)
+            swept_sell_zone = (c_high >= rh)
+            closed_below_rh = (c_close < rh)
+            upper_wick = c_high - max(c_open, c_close)
+            is_bearish_rejection = (
+                swept_sell_zone and 
+                closed_below_rh and 
+                (c_high <= sh * 1.005) and 
+                (
+                    (candle_range > 0 and (upper_wick / candle_range) >= 0.15) or 
+                    (c_close <= c_open) or 
+                    (candle_range > 0 and (c_high - c_close) / candle_range >= 0.45)
+                )
+            )
+
+            if is_bullish_rejection or is_bearish_rejection:
+                trade_dir = "LONG" if is_bullish_rejection else "SHORT"
                 entry_p = c_close
                 if trade_dir == "LONG":
                     sl_p = min(c_low, sl) * 0.998
@@ -1702,28 +1736,48 @@ def run_strategy_backtest(
 
     trades_df = pd.DataFrame(trades)
 
-    # Compute Monthly Breakdown
+    # Compute Monthly Breakdown with requested columns:
+    # Month, Number of Trades, Margin Used, Fees Paid, Profit or Loss, Win Rate, Overall Net Profit
     monthly_rows = []
     if not trades_df.empty:
-        trades_df['month'] = pd.to_datetime(trades_df['entry_time']).dt.strftime('%b %Y')
-        for month_name, m_group in trades_df.groupby('month', sort=False):
+        trades_df['ym'] = pd.to_datetime(trades_df['entry_time']).dt.strftime('%Y-%m')
+        cum_net_pnl = 0.0
+
+        for ym_str in sorted(trades_df['ym'].unique()):
+            m_group = trades_df[trades_df['ym'] == ym_str]
+            m_dt = pd.to_datetime(ym_str + "-01")
+            month_label = m_dt.strftime('%b %Y')
+
             m_trades = len(m_group)
             m_wins = len(m_group[m_group['is_win']])
             m_losses = m_trades - m_wins
             m_wr = round((m_wins / m_trades) * 100.0, 1) if m_trades > 0 else 0.0
-            m_pnl = round(m_group['net_pnl_inr'].sum(), 2)
-            m_gross_p = m_group[m_group['is_win']]['net_pnl_inr'].sum()
-            m_gross_l = abs(m_group[~m_group['is_win']]['net_pnl_inr'].sum())
-            m_pf = round(m_gross_p / m_gross_l, 2) if m_gross_l > 0 else (99.0 if m_gross_p > 0 else 0.0)
+
+            m_margin_used = m_trades * margin_inr
+            m_fees = round(m_group['fees_inr'].sum(), 2)
+            m_net_pnl = round(m_group['net_pnl_inr'].sum(), 2)
+            cum_net_pnl = round(cum_net_pnl + m_net_pnl, 2)
+
             monthly_rows.append({
-                "Month": month_name,
-                "Trades": m_trades,
-                "Wins": m_wins,
-                "Losses": m_losses,
+                "Month": month_label,
+                "Number of Trades": m_trades,
+                "Margin Used": f"₹{m_margin_used:,.0f}",
+                "Fees Paid": f"₹{m_fees:,.2f}",
+                "Profit or Loss": f"{'+' if m_net_pnl >= 0 else ''}₹{m_net_pnl:,.2f}",
                 "Win Rate": f"{m_wr:.1f}%",
-                "Net Profit (INR)": f"₹{m_pnl:,.2f}",
-                "Profit Factor": m_pf
+                "Overall Net Profit": f"{'+' if cum_net_pnl >= 0 else ''}₹{cum_net_pnl:,.2f}"
             })
+
+        # Summary total row
+        monthly_rows.append({
+            "Month": "🔥 TOTAL / SUMMARY",
+            "Number of Trades": total_trades,
+            "Margin Used": f"₹{(total_trades * margin_inr):,.0f}",
+            "Fees Paid": f"₹{total_fees_paid:,.2f}",
+            "Profit or Loss": f"{'+' if net_profit >= 0 else ''}₹{net_profit:,.2f}",
+            "Win Rate": f"{win_rate:.1f}%",
+            "Overall Net Profit": f"{'+' if net_profit >= 0 else ''}₹{net_profit:,.2f}"
+        })
     monthly_df = pd.DataFrame(monthly_rows)
 
     # Compute Session Breakdown

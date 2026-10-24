@@ -1727,7 +1727,8 @@ with tabs[4]:
                 "6 Months (180 Days)": 180,
                 "12 Months / 1 Year (365 Days)": 365
             }
-            bt_dur_label = st.selectbox("Duration", list(duration_options.keys()), index=4, key="bt_dur_select", help="Simulation lookback period")
+            # Default to 6 Months (180 Days) as selected by user
+            bt_dur_label = st.selectbox("Duration", list(duration_options.keys()), index=3, key="bt_dur_select", help="Simulation lookback period")
             bt_days = duration_options[bt_dur_label]
 
         with c_tf:
@@ -1735,12 +1736,13 @@ with tabs[4]:
             bt_interval = st.selectbox("Timeframe", timeframe_options, index=0, key="bt_interval_select", help="Standard candlestick intervals: 15m (Institutional sweep), 1h (Hourly swing), 4h (Macro trend), 1d (Daily swing)")
 
         with c_margin:
+            # Default to ₹100,000 margin allocation as requested
             bt_margin = st.number_input(
                 "Trade Margin (₹ INR)",
                 min_value=2500,
                 max_value=2000000,
-                value=int(margin_inr) if margin_inr >= 2500 else 50000,
-                step=5000,
+                value=100000,
+                step=10000,
                 key="bt_margin_input",
                 help="Margin allocation per simulated trade in Indian Rupees."
             )
@@ -1766,13 +1768,26 @@ with tabs[4]:
             else:
                 st.caption(f"Pulls live {bt_interval} candles for {bt_days} days directly from CoinDCX / Binance public data APIs, establishes rolling daily boxes, and simulates execution.")
 
-    # Manage backtest session execution
-    if "backtest_result" not in st.session_state:
-        st.session_state.backtest_result = None
+    # Manage backtest session execution with dynamic change detection
+    current_sim_params = {
+        "pair": bt_pair,
+        "duration_days": int(bt_days),
+        "interval": str(bt_interval),
+        "margin_inr": float(bt_margin),
+        "leverage": int(bt_leverage),
+        "target_mode": str(bt_target_mode)
+    }
 
-    if run_btn or st.session_state.backtest_result is None:
+    # Automatically re-run whenever any parameter changes OR button clicked OR first load
+    should_run = (
+        run_btn or 
+        st.session_state.get("backtest_result") is None or 
+        st.session_state.get("backtest_active_params") != current_sim_params
+    )
+
+    if should_run:
         if run_strategy_backtest:
-            with st.spinner(f"⏳ Simulating Box Theory sweeps for {bt_pair} across historical candles ({bt_days} days on {bt_interval})..."):
+            with st.spinner(f"⏳ Simulating Box Theory sweeps for {bt_pair} ({bt_days} days on {bt_interval} with ₹{bt_margin:,.0f} margin)..."):
                 try:
                     bt_res = run_strategy_backtest(
                         pair=bt_pair,
@@ -1784,11 +1799,12 @@ with tabs[4]:
                         usd_inr=usd_inr
                     )
                     st.session_state.backtest_result = bt_res
+                    st.session_state.backtest_active_params = current_sim_params
                 except Exception as _bt_err:
                     st.error(f"❌ Backtest simulation failed: {_bt_err}")
                     st.session_state.backtest_result = {"error": str(_bt_err)}
 
-    bt_res = st.session_state.backtest_result
+    bt_res = st.session_state.get("backtest_result")
 
     if bt_res:
         if bt_res.get("error"):
@@ -1917,23 +1933,20 @@ with tabs[4]:
 
             # 6. Dynamic Performance Breakdowns
             st.markdown("---")
-            col_tbl_m, col_tbl_s = st.columns([1.1, 1.0])
+            st.markdown("#### 📅 Monthly Performance & Financial Audit")
+            st.caption("Detailed month-by-month financial audit showing total trades taken, margin deployed, exchange fees deducted, profit/loss amount, win rate, and cumulative net earnings.")
+            monthly_df = bt_res.get("monthly_df", pd.DataFrame())
+            if not monthly_df.empty:
+                st.dataframe(monthly_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("No completed monthly intervals in this duration window.")
 
-            with col_tbl_m:
-                st.markdown("#### 📅 Monthly Performance Breakdown")
-                monthly_df = bt_res.get("monthly_df", pd.DataFrame())
-                if not monthly_df.empty:
-                    st.dataframe(monthly_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("No completed monthly intervals in this duration window.")
-
-            with col_tbl_s:
-                st.markdown("#### 🏛️ Institutional Session Breakdown")
-                session_df = bt_res.get("session_df", pd.DataFrame())
-                if not session_df.empty:
-                    st.dataframe(session_df, use_container_width=True, hide_index=True)
-                else:
-                    st.info("Session analytics will appear here once trades are executed.")
+            st.markdown("#### 🏛️ Institutional Session Breakdown")
+            session_df = bt_res.get("session_df", pd.DataFrame())
+            if not session_df.empty:
+                st.dataframe(session_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Session analytics will appear here once trades are executed.")
 
             # 7. Detailed Trade-by-Trade Execution Log & CSV Export
             st.markdown("---")

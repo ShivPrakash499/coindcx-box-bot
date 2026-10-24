@@ -62,16 +62,18 @@
    - Robust `importlib.reload(coindcx_engine)` loading with fallback `getattr` implementations.
    - Replaced static Tab 4 with an interactive **Real-Time Strategy Backtest & Execution Simulator** featuring:
      - Futures Pair selector (all 30 pairs, defaulting to active pair)
-     - Separated Duration selector: `1 Week (7 Days)`, `1 Month (30 Days)`, `3 Months (90 Days)`, `6 Months (180 Days)`, `12 Months / 1 Year (365 Days)`
+     - Separated Duration selector: `1 Week (7 Days)`, `1 Month (30 Days)`, `3 Months (90 Days)`, `6 Months (180 Days)`, `12 Months / 1 Year (365 Days)` (defaulting to 6 Months)
      - Separated Standard Timeframe selector: `15m`, `1h`, `4h`, `1d`
+     - Dynamic Parameter Change Detection: Changing Duration, Margin, Timeframe, Asset, or Leverage immediately triggers recalculation, preventing stale 1-month or 10,000 margin results.
+     - Exact Buy/Sell Zone Rejection Candle Strategy: Long only on liquidity sweeps into Buy Zone (<= RL) with bullish rejection candle close above RL; Short only on liquidity sweeps into Sell Zone (>= RH) with bearish rejection candle close below RH.
      - Multi-batch paginated candle fetching (`fetch_historical_candles_paginated`) supporting up to 35,000+ continuous candles (~1 Year on 15m)
      - High-speed in-memory candle caching (`_HISTORICAL_CANDLES_CACHE`) providing instantaneous (<0.4s) simulation reruns across different margins, leverages, and TP rules
-     - INR Margin per trade and leverage inputs
+     - Trade Margin input defaulting to ₹100,000 INR
      - Take Profit target mode (TP1 Midpoint, TP2 Full Rotation, 50/50 Split)
      - Key Performance Metric Cards (Net Profit ₹, ROI %, Win Rate, Profit Factor, Max Drawdown, Total Trades)
      - Secondary Edge Statistics (Long vs Short Win Rate, Total Fees Paid, Avg Win vs Avg Loss)
      - Interactive Cumulative Equity Growth Curve (Plotly Chart)
-     - Dynamic Monthly Performance Breakdown table
+     - Dynamic Monthly Performance & Financial Audit table with columns: `Month`, `Number of Trades`, `Margin Used`, `Fees Paid`, `Profit or Loss`, `Win Rate`, `Overall Net Profit`, plus `🔥 TOTAL / SUMMARY` row
      - Institutional Session Breakdown table (Asia, London, NY, Intraday)
      - Detailed Trade-by-Trade Execution Log with CSV download button (naming includes pair, duration, and timeframe)
    - Initialized `api_error_logs` and `last_order_status` in `st.session_state`.
