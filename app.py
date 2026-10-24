@@ -1710,7 +1710,7 @@ with tabs[4]:
             </div>
         """, unsafe_allow_html=True)
 
-        c_pair, c_dur, c_margin, c_lev, c_target = st.columns([1.6, 1.6, 1.4, 1.2, 1.6])
+        c_pair, c_dur, c_tf, c_margin, c_lev, c_target = st.columns([1.5, 1.4, 1.0, 1.4, 1.0, 1.5])
 
         # Current pair default index
         cur_pair = st.session_state.selected_pair
@@ -1721,15 +1721,18 @@ with tabs[4]:
 
         with c_dur:
             duration_options = {
-                "Last 7 Days (15m Candles)": 7,
-                "Last 14 Days (15m Candles)": 14,
-                "Last 30 Days (1h Candles - Recommended)": 30,
-                "Last 60 Days (1h Candles)": 60,
-                "Last 90 Days (4h Candles)": 90,
-                "Last 180 Days (4h Candles)": 180
+                "1 Week (7 Days)": 7,
+                "1 Month (30 Days)": 30,
+                "3 Months (90 Days)": 90,
+                "6 Months (180 Days)": 180,
+                "12 Months / 1 Year (365 Days)": 365
             }
-            bt_dur_label = st.selectbox("Backtest Duration", list(duration_options.keys()), index=2, key="bt_dur_select")
+            bt_dur_label = st.selectbox("Duration", list(duration_options.keys()), index=4, key="bt_dur_select", help="Simulation lookback period")
             bt_days = duration_options[bt_dur_label]
+
+        with c_tf:
+            timeframe_options = ["15m", "1h", "4h", "1d"]
+            bt_interval = st.selectbox("Timeframe", timeframe_options, index=0, key="bt_interval_select", help="Standard candlestick intervals: 15m (Institutional sweep), 1h (Hourly swing), 4h (Macro trend), 1d (Daily swing)")
 
         with c_margin:
             bt_margin = st.number_input(
@@ -1758,7 +1761,10 @@ with tabs[4]:
         with col_run:
             run_btn = st.button("🚀 Run Real-Time Backtest", use_container_width=True, type="primary", key="btn_run_backtest")
         with col_info:
-            st.caption("Pulls live candlestick candles directly from CoinDCX / Binance public data APIs, establishes rolling daily boxes, and simulates entry/stop/target executions.")
+            if bt_days >= 365 and bt_interval == "15m":
+                st.caption("⚡ **1 Year on 15m Candles:** Simulating ~35,000 candles with multi-batch pagination and instant in-memory caching.")
+            else:
+                st.caption(f"Pulls live {bt_interval} candles for {bt_days} days directly from CoinDCX / Binance public data APIs, establishes rolling daily boxes, and simulates execution.")
 
     # Manage backtest session execution
     if "backtest_result" not in st.session_state:
@@ -1766,11 +1772,12 @@ with tabs[4]:
 
     if run_btn or st.session_state.backtest_result is None:
         if run_strategy_backtest:
-            with st.spinner(f"⏳ Simulating Box Theory sweeps for {bt_pair} across historical candles ({bt_days} days)..."):
+            with st.spinner(f"⏳ Simulating Box Theory sweeps for {bt_pair} across historical candles ({bt_days} days on {bt_interval})..."):
                 try:
                     bt_res = run_strategy_backtest(
                         pair=bt_pair,
                         duration_days=bt_days,
+                        interval=bt_interval,
                         margin_inr=float(bt_margin),
                         leverage=int(bt_leverage),
                         target_mode=bt_target_mode,
@@ -1948,7 +1955,7 @@ with tabs[4]:
                     st.download_button(
                         label="📥 Export Trade Log (CSV)",
                         data=csv_bytes,
-                        file_name=f"box_backtest_{bt_res['pair']}_{bt_res['duration_days']}d.csv",
+                        file_name=f"box_backtest_{bt_res['pair']}_{bt_res['duration_days']}d_{bt_res.get('candle_interval', '15m')}.csv",
                         mime="text/csv",
                         use_container_width=True
                     )

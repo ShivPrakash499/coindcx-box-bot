@@ -1043,6 +1043,99 @@ def fetch_coindcx_candles(pair="B-ETH_USDT", interval="15m", limit=100, sync_liv
 
     return df
 
+_HISTORICAL_CANDLES_CACHE = {}
+
+def fetch_historical_candles_paginated(
+    pair: str = "B-BTC_USDT",
+    interval: str = "15m",
+    duration_days: int = 365,
+    progress_callback = None
+) -> pd.DataFrame:
+    """
+    Fetches full historical candlestick data across extended durations (e.g. 1 Year on 15m = ~35,000 candles)
+    using multi-batch pagination from Binance / CoinDCX public APIs.
+    Maintains an in-memory cache to make repeated simulations (e.g. changing margin or leverage) instant.
+    """
+    clean_pair = pair.replace("B-", "").replace("I-", "").replace("_", "").upper()
+    cache_key = f"{clean_pair}_{interval.lower()}_{duration_days}"
+    now_ts = time.time()
+
+    if cache_key in _HISTORICAL_CANDLES_CACHE:
+        cached_entry = _HISTORICAL_CANDLES_CACHE[cache_key]
+        if (now_ts - cached_entry["timestamp"]) < 1800:  # 30-minute cache TTL
+            return cached_entry["df"].copy()
+
+    intv_minutes = {
+        "1m": 1,
+        "5m": 5,
+        "15m": 15,
+        "30m": 30,
+        "1h": 60,
+        "2h": 120,
+        "4h": 240,
+        "6h": 360,
+        "12h": 720,
+        "1d": 1440
+    }
+    m = intv_minutes.get(interval.lower(), 15)
+    total_candles_needed = int((duration_days * 24 * 60) / m) + 50
+    # Safety cap: up to 40,000 candles
+    total_candles_needed = min(total_candles_needed, 40000)
+
+    all_candles = []
+    end_time = None
+    batch_size = 1000
+    batches_needed = (total_candles_needed + batch_size - 1) // batch_size
+
+    # Multi-batch fetching loop
+    for b_idx in range(batches_needed):
+        url = f"https://api.binance.com/api/v3/klines?symbol={clean_pair}&interval={interval}&limit={batch_size}"
+        if end_time:
+            url += f"&endTime={end_time}"
+
+        try:
+            r = requests.get(url, timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                if not data or not isinstance(data, list):
+                    break
+                # Binance returns ascending: data[0] is oldest, data[-1] is newest in this batch
+                all_candles.extend(data)
+                # Next batch fetches candles prior to the oldest one in current batch
+                end_time = data[0][0] - 1
+                if progress_callback:
+                    try:
+                        progress_callback(b_idx + 1, batches_needed, len(all_candles))
+                    except Exception:
+                        pass
+            else:
+                break
+        except Exception as e:
+            print(f"[Historical Candles Notice]: {e}")
+            break
+
+        if len(all_candles) >= total_candles_needed:
+            break
+
+    if not all_candles:
+        # Fallback to single fetch
+        return fetch_coindcx_candles(pair=pair, interval=interval, limit=min(1000, total_candles_needed), sync_live_price=False)
+
+    # Convert to standardized DataFrame
+    b_df = pd.DataFrame(all_candles, columns=[
+        'timestamp', 'open', 'high', 'low', 'close', 'volume',
+        'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+    ])
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        b_df[col] = b_df[col].astype(float)
+    b_df['timestamp'] = pd.to_numeric(b_df['timestamp'], errors='coerce')
+
+    df = b_df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+
+    _HISTORICAL_CANDLES_CACHE[cache_key] = {"df": df, "timestamp": now_ts}
+    return df
+
 def calculate_daily_box_levels(pair="B-ETH_USDT"):
     """
     Calculates Previous Day High (RH), Low (RL), Swing High (SH), Swing Low (SL),
@@ -1296,39 +1389,38 @@ def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, le
 def run_strategy_backtest(
     pair: str = "B-BTC_USDT",
     duration_days: int = 30,
+    interval: str = "15m",
     margin_inr: float = 50000.0,
     leverage: int = 5,
     target_mode: str = "TP1 Midpoint",
-    usd_inr: float = None
+    usd_inr: float = None,
+    progress_callback = None
 ) -> dict:
     """
     Executes a real-time historical simulation of the Box Liquidity Sweep strategy.
-    Fetches real candles from CoinDCX / Binance public APIs, establishes rolling daily boxes,
-    identifies institutional liquidity sweeps, simulates order executions with fee accounting,
-    and returns comprehensive performance analytics, monthly breakdowns, and trade logs.
+    Fetches real candles from CoinDCX / Binance public APIs with multi-batch pagination,
+    establishes rolling daily boxes, identifies institutional liquidity sweeps, simulates
+    order executions with fee accounting, and returns comprehensive performance analytics.
     """
     if not usd_inr or usd_inr <= 0:
         usd_inr = get_coindcx_live_usdt_inr_rate()
 
-    # 1. Determine execution candle timeframe and limits based on duration
-    if duration_days <= 14:
-        interval = "15m"
-        limit = min(1000, duration_days * 24 * 4 + 20)
-    elif duration_days <= 45:
-        interval = "1h"
-        limit = min(1000, duration_days * 24 + 20)
-    else:
-        interval = "4h"
-        limit = min(1000, duration_days * 6 + 20)
+    # 1. Fetch execution candles using multi-batch pagination
+    df = fetch_historical_candles_paginated(
+        pair=pair,
+        interval=interval,
+        duration_days=duration_days,
+        progress_callback=progress_callback
+    )
+    if df.empty or len(df) < 20:
+        return {"error": f"Insufficient historical candle data available for {pair} on {interval}."}
 
-    # 2. Fetch execution candles
-    df = fetch_coindcx_candles(pair=pair, interval=interval, limit=limit, sync_live_price=False)
-    if df.empty or len(df) < 30:
-        return {"error": f"Insufficient historical candle data available for {pair}."}
-
-    # 3. Fetch daily candles for daily box establishment
-    daily_limit = min(120, max(duration_days + 25, 40))
-    df_daily = fetch_coindcx_candles(pair=pair, interval="1d", limit=daily_limit, sync_live_price=False)
+    # 2. Fetch daily candles for daily box establishment
+    df_daily = fetch_historical_candles_paginated(
+        pair=pair,
+        interval="1d",
+        duration_days=duration_days + 40
+    )
     if df_daily.empty or len(df_daily) < 5:
         return {"error": f"Insufficient daily candle data for {pair}."}
 
@@ -1366,17 +1458,18 @@ def run_strategy_backtest(
             "SL": sl
         }
 
-    # 4. Sequential Candle Simulation
+    # 3. High-speed Sequential Candle Simulation using dictionary records
+    df_records = df.to_dict('records')
     trades = []
     active_trade = None
     initial_capital = margin_inr
     current_equity = initial_capital
-    equity_curve = [{"timestamp": df['dt_ist'].iloc[0].strftime("%Y-%m-%d %H:%M"), "equity_inr": initial_capital, "pnl_inr": 0.0}]
+    first_candle_time = df['dt_ist'].iloc[0].strftime("%Y-%m-%d %H:%M")
+    equity_curve = [{"timestamp": first_candle_time, "equity_inr": initial_capital, "pnl_inr": 0.0}]
 
     taker_fee_rate = 0.0005 * 1.18  # 0.05% + 18% GST
 
-    for idx in range(len(df)):
-        candle = df.iloc[idx]
+    for idx, candle in enumerate(df_records):
         c_date = candle['date_str']
         c_time = candle['dt_ist']
         c_high = float(candle['high'])

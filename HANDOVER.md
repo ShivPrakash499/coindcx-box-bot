@@ -62,7 +62,10 @@
    - Robust `importlib.reload(coindcx_engine)` loading with fallback `getattr` implementations.
    - Replaced static Tab 4 with an interactive **Real-Time Strategy Backtest & Execution Simulator** featuring:
      - Futures Pair selector (all 30 pairs, defaulting to active pair)
-     - Duration selector (7, 14, 30, 60, 90, 180 days with auto timeframe resolution)
+     - Separated Duration selector: `1 Week (7 Days)`, `1 Month (30 Days)`, `3 Months (90 Days)`, `6 Months (180 Days)`, `12 Months / 1 Year (365 Days)`
+     - Separated Standard Timeframe selector: `15m`, `1h`, `4h`, `1d`
+     - Multi-batch paginated candle fetching (`fetch_historical_candles_paginated`) supporting up to 35,000+ continuous candles (~1 Year on 15m)
+     - High-speed in-memory candle caching (`_HISTORICAL_CANDLES_CACHE`) providing instantaneous (<0.4s) simulation reruns across different margins, leverages, and TP rules
      - INR Margin per trade and leverage inputs
      - Take Profit target mode (TP1 Midpoint, TP2 Full Rotation, 50/50 Split)
      - Key Performance Metric Cards (Net Profit ₹, ROI %, Win Rate, Profit Factor, Max Drawdown, Total Trades)
@@ -70,7 +73,7 @@
      - Interactive Cumulative Equity Growth Curve (Plotly Chart)
      - Dynamic Monthly Performance Breakdown table
      - Institutional Session Breakdown table (Asia, London, NY, Intraday)
-     - Detailed Trade-by-Trade Execution Log with CSV download button
+     - Detailed Trade-by-Trade Execution Log with CSV download button (naming includes pair, duration, and timeframe)
    - Initialized `api_error_logs` and `last_order_status` in `st.session_state`.
    - Changed auto-refresh default to "Manual Only" with explicit refresh button.
    - Removed `run_every=5` from `render_trade_execution_fragment`.
