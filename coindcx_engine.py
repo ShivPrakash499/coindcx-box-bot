@@ -1141,26 +1141,61 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
     """
     Calculates Previous Day High (RH), Low (RL), Swing High (SH), Swing Low (SL),
     and Equilibrium Midpoint (MID) using completed daily candles.
+    Strictly caps lookback to 30 completed daily candles. When SH is too far from RH or
+    SL is back from 30 days or more, calculates the average daily price rise and average
+    daily price drop and places SH and SL accordingly.
     """
-    df_daily = fetch_coindcx_candles(pair=pair, interval="1d", limit=30, sync_live_price=False)
+    df_daily = fetch_coindcx_candles(pair=pair, interval="1d", limit=32, sync_live_price=False)
     if df_daily.empty or len(df_daily) < 2:
         return None
 
-    # Completed yesterday candle is iloc[-2]
-    prev_day = df_daily.iloc[-2]
+    # Limit search strictly to maximum 30 completed daily candles (never go beyond 30 days)
+    df_completed = df_daily.iloc[:-1].tail(30)
+    prev_day = df_completed.iloc[-1]
     rh = float(prev_day['high'])
     rl = float(prev_day['low'])
     mid = (rh + rl) / 2.0
 
-    # Look back over last 15-28 days for swing peaks/troughs beyond RH/RL
-    historical_highs = df_daily['high'].iloc[:-2].tolist()
-    historical_lows = df_daily['low'].iloc[:-2].tolist()
+    # Historical completed candles before yesterday within the 30-day window
+    df_hist = df_completed.iloc[:-1]
 
-    sh_candidates = [h for h in historical_highs if h > rh]
-    sh = min(sh_candidates) if sh_candidates else rh * 1.015
+    # Calculate average daily price rise (for green days) and average daily price drop (for red days)
+    up_days = df_completed[df_completed['close'] >= df_completed['open']]
+    down_days = df_completed[df_completed['close'] < df_completed['open']]
 
-    sl_candidates = [l for l in historical_lows if l < rl]
-    sl = max(sl_candidates) if sl_candidates else rl * 0.985
+    avg_daily_rise = float((up_days['close'] - up_days['open']).mean()) if len(up_days) > 0 else (rh - rl) * 0.25
+    avg_daily_drop = float((down_days['open'] - down_days['close']).mean()) if len(down_days) > 0 else (rh - rl) * 0.25
+
+    if avg_daily_rise <= 0:
+        avg_daily_rise = (rh - rl) * 0.25
+    if avg_daily_drop <= 0:
+        avg_daily_drop = (rh - rl) * 0.25
+
+    # Look for swing peaks beyond RH strictly within the 30-day window
+    historical_highs = df_hist['high'].tolist() if not df_hist.empty else []
+    sh_candidates = [float(h) for h in historical_highs if float(h) > rh]
+    if sh_candidates:
+        nearest_sh = min(sh_candidates)
+        # If candidate is within average daily rise distance from RH, use it; otherwise place at RH + avg_daily_rise
+        if (nearest_sh - rh) <= avg_daily_rise:
+            sh = nearest_sh
+        else:
+            sh = rh + avg_daily_rise
+    else:
+        sh = rh + avg_daily_rise
+
+    # Look for swing troughs beyond RL strictly within the 30-day window
+    historical_lows = df_hist['low'].tolist() if not df_hist.empty else []
+    sl_candidates = [float(l) for l in historical_lows if float(l) < rl]
+    if sl_candidates:
+        nearest_sl = max(sl_candidates)
+        # If candidate is within average daily drop distance from RL, use it; otherwise place at RL - avg_daily_drop
+        if (rl - nearest_sl) <= avg_daily_drop:
+            sl = nearest_sl
+        else:
+            sl = rl - avg_daily_drop
+    else:
+        sl = rl - avg_daily_drop
 
     return {
         "RH": round_asset_price(rh),
@@ -1168,7 +1203,9 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
         "SH": round_asset_price(sh, rh),
         "SL": round_asset_price(sl, rl),
         "MID": round_asset_price(mid, rh),
-        "prev_day_date": datetime.fromtimestamp(prev_day['timestamp'] / 1000, tz=IST).strftime("%Y-%m-%d")
+        "prev_day_date": datetime.fromtimestamp(prev_day['timestamp'] / 1000, tz=IST).strftime("%Y-%m-%d"),
+        "avg_daily_rise": round(avg_daily_rise, 2),
+        "avg_daily_drop": round(avg_daily_drop, 2)
     }
 
 def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0, pair="B-ETH_USDT"):

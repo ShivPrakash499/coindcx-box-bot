@@ -38,8 +38,10 @@ def scan_pair(pair: str, margin_inr: float, leverage: int, usd_inr: float):
     return eng.evaluate_tri_session_signal(pair, levels, margin_inr, leverage, usd_inr, trigger_alert=False)
 
 
-def scan_and_alert(pairs, margin_inr: float, leverage: int, usd_inr: float, send: bool = True) -> list:
+def scan_and_alert(pairs=None, margin_inr: float = 100000.0, leverage: int = 5, usd_inr: float = 85.0, send: bool = True) -> list:
     """Returns one dict per pair: {pair, signal(dict|None), emailed(bool), message}."""
+    if pairs is None:
+        pairs = DEFAULT_WATCHLIST
     state = _load()
     results = []
     for pair in pairs:

@@ -1,9 +1,10 @@
 """
-Gmail trade notifications (SSL, smtp.gmail.com:465).
+Gmail trade notifications (smtp.gmail.com:587 STARTTLS / 465 SSL).
 
-Config is read from environment / .env / Streamlit secrets - nothing is hard-coded:
+Config is read from environment / .env / Streamlit secrets:
     GMAIL_SENDER, GMAIL_APP_PASSWORD, GMAIL_RECEIVER
-Subject format:  "<SYMBOL> - trade notification"   e.g.  "SOL - trade notification"
+Subject format:  "<SYMBOL> - trade notification"   e.g.  "ETH - trade notification"
+Direct Action Link: <APP_URL>/?tab=execute&pair=<PAIR>&direction=<DIR>&entry=<ENTRY>&sl=<SL>&tp1=<TP1>&tp2=<TP2>&margin=<MARGIN>&lev=<LEV>
 """
 from __future__ import annotations
 
@@ -40,64 +41,133 @@ def get_email_config() -> dict:
     sender = _cfg("GMAIL_SENDER") or _cfg("SENDER_EMAIL")
     password = _cfg("GMAIL_APP_PASSWORD") or _cfg("SENDER_APP_PASSWORD")
     receiver = _cfg("GMAIL_RECEIVER") or _cfg("RECEIVER_EMAIL") or sender
-    return {"sender": sender, "password": password.replace(" ", ""), "receiver": receiver,
-            "configured": bool(sender and password and receiver)}
+    clean_pwd = password.replace(" ", "").strip()
+    # 16-character check for standard Google App Passwords
+    is_app_password = len(clean_pwd) == 16
+    return {
+        "sender": sender,
+        "password": clean_pwd,
+        "receiver": receiver,
+        "is_app_password": is_app_password,
+        "configured": bool(sender and clean_pwd and receiver)
+    }
 
 
 def _send(subject: str, html: str, text: str) -> tuple[bool, str]:
     cfg = get_email_config()
     if not cfg["configured"]:
         return False, "Email not configured: set GMAIL_SENDER, GMAIL_APP_PASSWORD and GMAIL_RECEIVER in .env / Streamlit secrets."
+
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = f"CoinDCX Box Bot <{cfg['sender']}>"
+    msg["From"] = f"Crypto Trade Assistant <{cfg['sender']}>"
     msg["To"] = cfg["receiver"]
     msg.attach(MIMEText(text, "plain"))
     msg.attach(MIMEText(html, "html"))
+
+    app_pwd_hint = (
+        "\n\n👉 Google requires a 16-character App Password (not your standard account password). "
+        "Create one in 30 seconds at: https://myaccount.google.com/apppasswords "
+        "and paste it into .env under GMAIL_APP_PASSWORD."
+    )
+
+    # Attempt 1: Port 587 with STARTTLS (standard modern Gmail submission)
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=15) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587, timeout=12) as server:
+            server.ehlo()
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
             server.login(cfg["sender"], cfg["password"])
             server.sendmail(cfg["sender"], [cfg["receiver"]], msg.as_string())
-        return True, f"Email sent to {cfg['receiver']}"
-    except smtplib.SMTPAuthenticationError:
-        return False, "Gmail rejected the login. Use a 16-character App Password (2-Step Verification must be on)."
-    except Exception as e:  # network, DNS, timeout ...
-        return False, f"Failed to send email: {e}"
+        return True, f"Email alert sent successfully to {cfg['receiver']}"
+    except (smtplib.SMTPAuthenticationError, smtplib.SMTPResponseException) as e:
+        err_msg = str(e)
+        if "534" in err_msg or "Application-specific" in err_msg or "InvalidSecondFactor" in err_msg or not cfg["is_app_password"]:
+            return False, f"Gmail rejected login: {app_pwd_hint}"
+        return False, f"Gmail authentication error: {err_msg} {app_pwd_hint}"
+    except smtplib.SMTPServerDisconnected:
+        # Fallback to Port 465 SSL
+        try:
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=12) as server:
+                server.login(cfg["sender"], cfg["password"])
+                server.sendmail(cfg["sender"], [cfg["receiver"]], msg.as_string())
+            return True, f"Email alert sent successfully to {cfg['receiver']} via SSL"
+        except Exception as e_ssl:
+            return False, f"Gmail connection closed. If using normal account password, Google blocks it: {app_pwd_hint}"
+    except Exception as e:
+        return False, f"Failed to send email ({type(e).__name__}): {e}"
 
 
 def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2: float,
                      margin_inr: float, leverage: int = 5, zone: str = "", kind: str = "SIGNAL",
                      note: str = "", app_url: str = "") -> tuple[bool, str]:
-    """kind: SIGNAL (alert), EXECUTED (order placed) or CLOSED."""
+    """
+    Sends structured trade email notification with a 1-click action link
+    that opens the Trade Execution tab with all values pre-filled.
+    """
     direction = direction.upper()
     is_long = direction in ("LONG", "BUY")
     direction = "LONG" if is_long else "SHORT"
     zone = zone or ("Buy Zone RL-SL" if is_long else "Sell Zone RH-SH")
     sym = short_name(pair)
     now = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p IST")
-    url = app_url or _cfg("APP_WEB_URL", "http://localhost:8501")
+    base_url = app_url or _cfg("APP_WEB_URL", "http://localhost:8501")
+    
+    # Action URL with pre-filled parameters to open execution tab
+    action_url = (
+        f"{base_url}/?tab=execute&pair={pair}&direction={direction}&entry={entry:.4f}"
+        f"&sl={stop_loss:.4f}&tp1={tp1:.4f}&tp2={tp2:.4f}&margin={int(margin_inr)}&lev={leverage}"
+    )
+
     colour = "#16a34a" if is_long else "#dc2626"
-    heading = {"SIGNAL": "Trade signal", "EXECUTED": "Order executed", "CLOSED": "Position closed"}.get(kind, kind)
+    heading = {"SIGNAL": "Trade Signal Alert", "EXECUTED": "Order Executed", "CLOSED": "Position Closed"}.get(kind, kind)
 
     rows = [
-        ("Direction", direction), ("Trigger Zone", zone), ("Entry Price", f"${entry:,.4f}"),
-        ("Structural Stop Loss", f"${stop_loss:,.4f}"), ("TP1 (MID)", f"${tp1:,.4f}"), ("TP2", f"${tp2:,.4f}"),
-        ("Allocated Rotational Margin", f"₹{margin_inr:,.0f}"), ("Leverage", f"{leverage}x"), ("Timestamp (IST)", now),
+        ("Asset / Pair", pair),
+        ("Trade Direction", direction),
+        ("Trigger Zone", zone),
+        ("Planned Entry Price", f"${entry:,.4f}"),
+        ("Structural Stop Loss", f"${stop_loss:,.4f}"),
+        ("Take Profit 1 (MID)", f"${tp1:,.4f}"),
+        ("Take Profit 2 (Extreme)", f"${tp2:,.4f}"),
+        ("Allocated Margin", f"₹{margin_inr:,.0f} INR"),
+        ("Leverage", f"{leverage}x"),
+        ("Timestamp (IST)", now),
     ]
-    tr = "".join(f"<tr><td style='padding:6px 10px;color:#475569'>{k}</td>"
-                 f"<td style='padding:6px 10px;font-weight:700;text-align:right'>{v}</td></tr>" for k, v in rows)
-    html = f"""<html><body style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f1f5f9;padding:16px">
-      <div style="max-width:520px;margin:auto;background:#fff;border-radius:12px;border:1px solid #e2e8f0;overflow:hidden">
-        <div style="background:#0f172a;color:#fff;padding:16px;text-align:center">
-          <div style="font-size:13px;opacity:.8">{heading} &bull; {pair}</div>
-          <div style="margin-top:6px;display:inline-block;padding:4px 14px;border-radius:16px;background:{colour};font-weight:800">{direction}</div>
+    tr = "".join(f"<tr style='border-bottom:1px solid #f1f5f9'><td style='padding:8px 12px;color:#64748b'>{k}</td>"
+                 f"<td style='padding:8px 12px;font-weight:700;text-align:right;color:#0f172a'>{v}</td></tr>" for k, v in rows)
+
+    html = f"""<html><body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#f8fafc;padding:20px;color:#1e293b;">
+      <div style="max-width:540px;margin:auto;background:#ffffff;border-radius:14px;border:1px solid #e2e8f0;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.06);">
+        <div style="background:#0f172a;color:#ffffff;padding:20px;text-align:center">
+          <div style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#94a3b8;font-weight:700">{heading}</div>
+          <div style="font-size:22px;font-weight:800;margin-top:4px;">{pair}</div>
+          <div style="margin-top:10px;display:inline-block;padding:5px 18px;border-radius:20px;background:{colour};font-weight:800;font-size:14px;color:#fff;">
+            {direction} SETUP
+          </div>
         </div>
-        <table style="width:100%;border-collapse:collapse;font-size:14px">{tr}</table>
-        {f'<p style="padding:0 14px;color:#334155;font-size:13px">{note}</p>' if note else ''}
-        <p style="text-align:center;padding:10px"><a href="{url}" style="background:#2563eb;color:#fff;padding:12px 18px;border-radius:8px;text-decoration:none;font-weight:700">Open terminal &amp; review</a></p>
-      </div></body></html>"""
-    text = (f"{heading}: {direction} {pair}\n" + "\n".join(f"{k}: {v}" for k, v in rows)
-            + (f"\n{note}" if note else "") + f"\n{url}")
+        <div style="padding:16px;">
+          <table style="width:100%;border-collapse:collapse;font-size:14px;">{tr}</table>
+          {f'<div style="margin-top:14px;padding:10px 14px;background:#f1f5f9;border-left:4px solid {colour};border-radius:4px;color:#334155;font-size:13px;"><strong>Note:</strong> {note}</div>' if note else ''}
+          <div style="text-align:center;margin-top:24px;margin-bottom:8px;">
+            <a href="{action_url}" style="background:#2563eb;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:800;font-size:15px;display:inline-block;box-shadow:0 4px 12px rgba(37,99,235,0.3);">
+              🚀 Review &amp; Execute Trade in Assistant
+            </a>
+          </div>
+          <p style="text-align:center;color:#64748b;font-size:12px;margin-top:10px;line-height:1.4;">
+            Clicking opens the <strong>Crypto Trade Assistant</strong> with prefilled entry (${entry:,.2f}), SL, and TPs ready for manual review.
+          </p>
+        </div>
+      </div>
+    </body></html>"""
+
+    text = (
+        f"⚡ {heading}: {direction} {pair}\n"
+        + "=" * 40 + "\n"
+        + "\n".join(f"{k}: {v}" for k, v in rows)
+        + (f"\nNote: {note}\n" if note else "\n")
+        + f"\nOpen & Execute in Assistant (Pre-filled):\n{action_url}\n"
+    )
     return _send(f"{sym} - trade notification", html, text)
 
 
@@ -105,4 +175,5 @@ def send_test_trade_email(pair: str = "B-SOL_USDT", live_price: float = 100.0, m
     return send_trade_email(
         pair=pair, direction="LONG", entry=live_price, stop_loss=round(live_price * 0.985, 4),
         tp1=round(live_price * 1.02, 4), tp2=round(live_price * 1.04, 4), margin_inr=margin_inr, leverage=5,
-        zone="Buy Zone RL-SL", kind="SIGNAL", note="This is a TEST alert - no trade was placed.")
+        zone="Buy Zone RL-SL", kind="SIGNAL", note="This is a TEST alert - opens prefilled Trade Execution tab."
+    )

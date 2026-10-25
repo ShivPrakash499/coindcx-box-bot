@@ -113,7 +113,7 @@ except Exception:
         return False
 
 st.set_page_config(
-    page_title="CoinDCX Box Theory Terminal",
+    page_title="Crypto Trade Assistant",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -138,7 +138,7 @@ def check_authentication():
         """
         <div style="max-width: 440px; margin: 60px auto 20px auto; padding: 32px; background: #ffffff; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.08); text-align: center; border: 1px solid #e2e8f0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
             <div style="font-size: 46px; margin-bottom: 10px;">🔐</div>
-            <h2 style="margin: 0; color: #0f172a; font-weight: 800; font-size: 24px; letter-spacing: -0.5px;">CoinDCX Terminal</h2>
+            <h2 style="margin: 0; color: #0f172a; font-weight: 800; font-size: 24px; letter-spacing: -0.5px;">Crypto Trade Assistant</h2>
             <div style="display: inline-block; background: #eff6ff; color: #2563eb; font-size: 11px; font-weight: 700; padding: 4px 12px; border-radius: 20px; margin-top: 8px; text-transform: uppercase; letter-spacing: 0.5px;">Institutional Security Gate</div>
             <p style="color: #64748b; font-size: 13px; margin-top: 12px; margin-bottom: 0px; line-height: 1.5;">Enter your secret Access PIN to unlock live balances, analytics, and execution stations.</p>
         </div>
@@ -155,11 +155,11 @@ def check_authentication():
                 placeholder="Enter PIN (Default: 1234)",
                 help="Configure your personal PIN via APP_PIN in .env or Streamlit Secrets"
             )
-            unlock_clicked = st.form_submit_button("🔓 Unlock Terminal", use_container_width=True)
+            unlock_clicked = st.form_submit_button("🔓 Unlock Assistant", use_container_width=True)
             if unlock_clicked:
                 if entered_pin.strip() == required_pin:
                     st.session_state.authenticated = True
-                    st.success("✅ Access Granted! Opening Terminal...")
+                    st.success("✅ Access Granted! Opening Assistant...")
                     st.rerun()
                 else:
                     st.error("❌ Incorrect PIN. Access Denied.")
@@ -175,12 +175,49 @@ check_authentication()
 
 IST = pytz.timezone('Asia/Kolkata')
 
-# ----------------- SESSION STATE INITIALIZATION -----------------
+# ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON -----------------
+import threading
+import time
+
+def _ensure_background_monitor():
+    """Starts 24/7 background monitor daemon once per Streamlit server process."""
+    if getattr(_ensure_background_monitor, "_running", False):
+        return
+    _ensure_background_monitor._running = True
+
+    def _monitor_worker():
+        while True:
+            try:
+                if signal_monitor:
+                    rot = coindcx_engine.get_rotational_margin_inr()
+                    m_inr = float(rot.get("margin_inr", 100000.0))
+                    lev = int(os.getenv("LEVERAGE", 5))
+                    u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
+                    signal_monitor.scan_and_alert(
+                        pairs=["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"],
+                        margin_inr=m_inr,
+                        leverage=lev,
+                        usd_inr=u_inr,
+                        send=True
+                    )
+            except Exception as e:
+                print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
+            time.sleep(60)
+
+    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
+    th.start()
+
+_ensure_background_monitor()
+
+# ----------------- SESSION STATE & QUERY PARAMS INITIALIZATION -----------------
 if "executed_trades" not in st.session_state:
     st.session_state.executed_trades = []
 
 if "active_position" not in st.session_state:
     st.session_state.active_position = None
+
+if "paper_pending_orders" not in st.session_state:
+    st.session_state.paper_pending_orders = []
 
 if "realized_pnl_inr" not in st.session_state:
     st.session_state.realized_pnl_inr = 0.0
@@ -199,6 +236,85 @@ if "api_error_logs" not in st.session_state:
 
 if "last_order_status" not in st.session_state:
     st.session_state.last_order_status = None
+
+# Process URL query parameters (e.g. from trade alert email action button)
+_qp = st.query_params
+_url_pair = _qp.get("pair")
+if _url_pair and _url_pair in GLOBAL_FUTURES_PAIRS:
+    st.session_state.selected_pair = _url_pair
+
+_url_tab = _qp.get("tab", "").lower()
+is_execution_link = _url_tab in ("execute", "execution", "trade")
+
+if is_execution_link:
+    _p = st.session_state.selected_pair
+    if "margin" in _qp:
+        try: st.session_state[f"exec_margin_inr_{_p}"] = int(float(_qp["margin"]))
+        except Exception: pass
+    if "lev" in _qp:
+        try: st.session_state[f"exec_leverage_{_p}"] = int(_qp["lev"])
+        except Exception: pass
+    for _tag in ["BUY", "SELL", "SIGNAL"]:
+        if "entry" in _qp:
+            try: st.session_state[f"custom_entry_{_p}_{_tag}"] = float(_qp["entry"])
+            except Exception: pass
+        if "sl" in _qp:
+            try: st.session_state[f"custom_sl_{_p}_{_tag}"] = float(_qp["sl"])
+            except Exception: pass
+        if "tp1" in _qp:
+            try: st.session_state[f"custom_tp1_{_p}_{_tag}"] = float(_qp["tp1"])
+            except Exception: pass
+        if "tp2" in _qp:
+            try: st.session_state[f"custom_tp2_{_p}_{_tag}"] = float(_qp["tp2"])
+            except Exception: pass
+
+def check_and_update_paper_orders():
+    """
+    Checks resting paper limit orders. Fills them only when live market price
+    touches or crosses the limit entry price:
+      - BUY limit: fills when last_price <= entry
+      - SELL limit: fills when last_price >= entry
+    """
+    pending = st.session_state.get("paper_pending_orders", [])
+    if not pending:
+        return
+    still_pending = []
+    for ord_item in pending:
+        p_pair = ord_item.get("pair")
+        tick = fetch_live_ticker(p_pair)
+        px = float(tick.get("last_price", 0.0))
+        if px <= 0:
+            still_pending.append(ord_item)
+            continue
+
+        p_dir = str(ord_item.get("direction", "BUY")).upper()
+        is_buy = p_dir in ("BUY", "LONG")
+        entry_lvl = float(ord_item.get("entry", 0.0))
+
+        # Check limit order fill condition
+        is_filled = (px <= entry_lvl) if is_buy else (px >= entry_lvl)
+        if is_filled:
+            ord_item["status"] = "PAPER_FILLED"
+            ord_item["fill_price"] = px
+            ord_item["filled_at"] = datetime.now(IST).strftime("%H:%M:%S IST")
+            st.session_state.active_position = ord_item
+            st.session_state.executed_trades.insert(0, ord_item)
+            # Log to Google Sheets & send filled email notification
+            log_trade_to_google_sheet(ord_item, return_details=False)
+            send_trade_email(
+                pair=p_pair, direction=p_dir, entry=entry_lvl,
+                stop_loss=ord_item.get("stop_loss", 0), tp1=ord_item.get("tp1", 0), tp2=ord_item.get("tp2", 0),
+                margin_inr=ord_item.get("margin_inr", 10000), leverage=ord_item.get("leverage", 5),
+                kind="EXECUTED", note=f"Resting Paper Limit order filled at ${entry_lvl:,.2f}."
+            )
+            st.toast(f"🎯 Paper Limit Order Filled! {p_dir} {p_pair} @ ${entry_lvl:,.2f}", icon="✅")
+        else:
+            still_pending.append(ord_item)
+
+    st.session_state.paper_pending_orders = still_pending
+
+# Execute fill checks for pending paper orders
+check_and_update_paper_orders()
 
 # ----------------- DATA CACHING -----------------
 @st.cache_data(ttl=300)
@@ -368,15 +484,16 @@ st.sidebar.caption(f"🟢 CoinDCX Live Spot USDT: **₹{live_crypto_rate:,.2f} I
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📧 Gmail Trade Alerts")
 _mail_cfg = get_email_config()
-st.sidebar.caption(f"Status: **{'🟢 Configured' if _mail_cfg['configured'] else '🔴 Not configured'}** | Subject: `<SYMBOL> - trade notification`")
-if _mail_cfg["configured"]:
-    st.sidebar.caption(f"Receiver: `{_mail_cfg['receiver']}`")
-else:
-    st.sidebar.caption("Set `GMAIL_SENDER`, `GMAIL_APP_PASSWORD`, `GMAIL_RECEIVER` in `.env` / Streamlit secrets.")
-cfg_app_url = os.getenv("APP_WEB_URL", "http://localhost:8501")
-custom_url = st.sidebar.text_input("Server Web App URL (Included in Alerts):", value=cfg_app_url, key="input_app_web_url")
-if custom_url != os.getenv("APP_WEB_URL", ""):
-    os.environ["APP_WEB_URL"] = custom_url
+st.sidebar.markdown("**Mail Server:** `smtp.gmail.com:587` (Default)")
+st.sidebar.caption(f"Status: **{'🟢 Configured' if _mail_cfg['configured'] else '🔴 Incomplete'}** | Receiver: `{_mail_cfg['receiver'] or 'Not set'}`")
+if not _mail_cfg.get("is_app_password", False):
+    st.sidebar.warning(
+        "⚠️ **Google App Password Required:**\n\n"
+        "Google requires a 16-character **Google App Password** (not your regular account password):\n"
+        "1. Open [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords)\n"
+        "2. Create a 16-char password for 'Mail'\n"
+        "3. Paste into `GMAIL_APP_PASSWORD` in `.env`"
+    )
 
 if st.sidebar.button("📧 Send Test Trade Alert Email", key="btn_send_test_email", use_container_width=True):
     with st.sidebar:
@@ -385,13 +502,14 @@ if st.sidebar.button("📧 Send Test Trade Alert Email", key="btn_send_test_emai
             ok, msg = send_test_trade_email(st.session_state.selected_pair, test_ticker.get("last_price", 100.0), margin_inr)
             (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
 
-st.sidebar.markdown("### 📡 Signal Monitor")
-monitor_on = st.sidebar.toggle("Scan & e-mail signals while this app is open", value=True, key="monitor_on")
+st.sidebar.markdown("### 📡 24/7 Signal Monitor")
+st.sidebar.caption("🟢 Background Daemon Active: Scans 15m candles 24/7 and sends emails even if this tab is closed.")
+monitor_on = st.sidebar.toggle("Auto-Email Alert Notifications", value=True, key="monitor_on")
 _default_watch = ["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"]
 monitor_pairs = st.sidebar.multiselect(
     "Watchlist", GLOBAL_FUTURES_PAIRS,
     default=[p for p in _default_watch if p in GLOBAL_FUTURES_PAIRS], key="monitor_pairs")
-st.sidebar.caption("Standalone alternative: `python signal_scanner.py` (no UI needed).")
+st.sidebar.caption("Standalone terminal scanner: `python signal_scanner.py`.")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚡ Live Refresh Settings")
@@ -410,7 +528,7 @@ top_col1, top_col2, top_col3, top_col4 = st.columns([1.8, 1.4, 1.6, 2.0])
 
 with top_col1:
     cur_session = get_current_session_info()
-    st.title("⚡ CoinDCX Box Terminal")
+    st.title("⚡ Crypto Trade Assistant")
     st.caption(f"Asset: **`{st.session_state.selected_pair}`** | **{cur_session['emoji']} {cur_session['name']}** ({cur_session['window']})")
 
 # REQUIREMENT 1: LIVE PRICE + FUNDING RATE
@@ -495,7 +613,11 @@ with top_col3:
         tick = get_cached_ticker(pair)
         cur_p = tick.get("last_price", 0.0)
 
-        if pos and pos.get("pair") == pair and cur_p > 0:
+        # Check if there is a pending resting limit order for this pair
+        pending_list = st.session_state.get("paper_pending_orders", [])
+        pair_pending = next((o for o in pending_list if o.get("pair") == pair), None)
+
+        if pos and pos.get("pair") == pair and cur_p > 0 and pos.get("status") in ("LIVE_FILLED", "PAPER_FILLED"):
             entry_p = pos.get("entry", 0.0)
             qty = pos.get("crypto_qty", 0.0)
             pos_dir = pos.get("direction") or pos.get("signal", "BUY")
@@ -520,6 +642,22 @@ with top_col3:
                     <div style="margin-top:4px;">
                         <span style="font-size:1.5rem; font-weight:800; color:{pnl_col};">{pnl_sgn}₹{pnl_inr:,.2f}</span>
                         <span style="font-size:0.95rem; font-weight:700; color:{pnl_col}; margin-left:6px;">{pnl_sgn}{roe_pct:.2f}% ROE</span>
+                    </div>
+                </div>
+            """)
+        elif pair_pending:
+            p_dir = pair_pending.get("direction", "ORDER")
+            p_entry = pair_pending.get("entry", 0.0)
+            dist_pct = abs(cur_p - p_entry) / p_entry * 100 if p_entry > 0 else 0.0
+            st.html(f"""
+                <div style="background:{card_bg}; border:1px solid #3b82f6; border-radius:10px; padding:8px 12px;">
+                    <div style="display:flex; justify-content:space-between; align-items:center;">
+                        <span style="font-weight:700; color:#3b82f6; font-size:0.8rem;">⏳ PENDING LIMIT ({p_dir})</span>
+                        <span style="font-size:0.75rem; color:{subtext_color};">Target: ${p_entry:,.2f}</span>
+                    </div>
+                    <div style="margin-top:4px;">
+                        <span style="font-size:1.5rem; font-weight:800; color:#94a3b8;">₹0.00</span>
+                        <span style="font-size:0.85rem; font-weight:600; color:#3b82f6; margin-left:6px;">Waiting for fill ({dist_pct:.2f}% away)</span>
                     </div>
                 </div>
             """)
@@ -602,19 +740,30 @@ elif "60" in chart_refresh_rate:
     chart_sec = 60
 
 # Main Tabs
-tabs = st.tabs([
-    "🎯 Signals",
-    "🛡️ Trade Execution",
-    "📊 Live Trades",
-    "📐 Key Levels & Predefined Setup",
-    "📋 Google Sheet Logger",
-    "📊 Multi-Derivative Backtest"
-])
+if is_execution_link:
+    t_exec, t_signals, t_live, t_levels, t_sheets, t_backtest = st.tabs([
+        "🛡️ Trade Execution",
+        "🎯 Signals",
+        "📊 Live Trades",
+        "📐 Key Levels & Predefined Setup",
+        "📋 Google Sheet Logger",
+        "📊 Multi-Derivative Backtest"
+    ])
+    st.info(f"⚡ **Alert Action Link Loaded:** Trade Execution station prefilled for **{selected_pair}**. Review levels below and click Execute.")
+else:
+    t_signals, t_exec, t_live, t_levels, t_sheets, t_backtest = st.tabs([
+        "🎯 Signals",
+        "🛡️ Trade Execution",
+        "📊 Live Trades",
+        "📐 Key Levels & Predefined Setup",
+        "📋 Google Sheet Logger",
+        "📊 Multi-Derivative Backtest"
+    ])
 
 # ==============================================================================
 # TAB 0: INTERACTIVE CHART (DARK/LIGHT + TIMEFRAME + BOLD HIGHLIGHTS)
 # ==============================================================================
-with tabs[0]:
+with t_signals:
     @st.fragment(run_every=chart_sec)
     def render_chart_fragment(pair, box_levels, is_light, m_inr, lev, u_inr):
         cur_ticker = get_cached_ticker(pair)
@@ -944,7 +1093,7 @@ with tabs[0]:
 # ==============================================================================
 # TAB 1: LIVE TRADE EXECUTION, FEES & CAPITAL PRESERVATION (REQUIREMENTS 2, 3, 4, 5)
 # ==============================================================================
-with tabs[1]:
+with t_exec:
     def render_trade_execution_fragment(pair, box_levels):
         st.subheader(f"⚡ Live Trade Execution Station — {pair}")
 
@@ -1068,24 +1217,27 @@ with tabs[1]:
 
         with inp_col1:
             avail_margin_int = max(1000, int(wallet["available_inr"]))
+            margin_key = f"exec_margin_inr_{pair}"
+            if margin_key not in st.session_state:
+                st.session_state[margin_key] = int(max(500, min(coindcx_engine.get_rotational_margin_inr()["margin_inr"], avail_margin_int if wallet["is_live_api"] else 10**9)))
+
+            def _apply_margin_pct(pct_ratio):
+                calc_val = max(500, int(wallet["available_inr"] * pct_ratio))
+                st.session_state[margin_key] = min(calc_val, max(avail_margin_int, 500000))
+
             trade_margin_inr = st.number_input(
                 "Margin Allocation for this Trade (INR):",
                 min_value=500,
                 max_value=max(avail_margin_int, 500000),
-                value=int(max(500, min(coindcx_engine.get_rotational_margin_inr()["margin_inr"], avail_margin_int if wallet["is_live_api"] else 10**9))),
                 step=1000,
-                key=f"exec_margin_inr_{pair}"
+                key=margin_key
             )
-            # Preset percentage chips
+            # Preset percentage chips with on_click callbacks that update the input widget before rerun
             c1, c2, c3, c4 = st.columns(4)
-            if c1.button("25%", key=f"pct_25_{pair}"):
-                trade_margin_inr = int(wallet["available_inr"] * 0.25)
-            if c2.button("50%", key=f"pct_50_{pair}"):
-                trade_margin_inr = int(wallet["available_inr"] * 0.50)
-            if c3.button("75%", key=f"pct_75_{pair}"):
-                trade_margin_inr = int(wallet["available_inr"] * 0.75)
-            if c4.button("100%", key=f"pct_100_{pair}"):
-                trade_margin_inr = int(wallet["available_inr"])
+            c1.button("25%", key=f"pct_25_{pair}", on_click=_apply_margin_pct, args=(0.25,), use_container_width=True)
+            c2.button("50%", key=f"pct_50_{pair}", on_click=_apply_margin_pct, args=(0.50,), use_container_width=True)
+            c3.button("75%", key=f"pct_75_{pair}", on_click=_apply_margin_pct, args=(0.75,), use_container_width=True)
+            c4.button("100%", key=f"pct_100_{pair}", on_click=_apply_margin_pct, args=(1.00,), use_container_width=True)
 
         with inp_col2:
             # Check if active position exists for this pair to auto-match leverage
@@ -1421,13 +1573,25 @@ with tabs[1]:
                                 st.error(f"❌ CoinDCX Execution Failed: {api_msg}")
 
                 if order_placed_ok:
+                    is_live = "Live" in exec_mode
+                    cur_market_px = float(get_cached_ticker(pair).get("last_price", 0.0))
+                    is_buy_dir = (trade_dir == "BUY")
+                    limit_entry_px = float(active_trade["entry"])
+
+                    # For paper trades: check if market price has already reached the limit level
+                    # A BUY limit order fills only when price <= entry
+                    # A SELL limit order fills only when price >= entry
+                    already_reached = (cur_market_px <= limit_entry_px) if is_buy_dir else (cur_market_px >= limit_entry_px) if cur_market_px > 0 else True
+
+                    order_status = "LIVE_FILLED" if is_live else ("PAPER_FILLED" if already_reached else "PAPER_PENDING")
+
                     order_record = {
                         "timestamp": exec_time,
                         "pair": pair,
                         "signal": trade_dir,
                         "direction": trade_dir,
                         "setup": active_trade.get("setup", "Box Setup"),
-                        "entry": active_trade["entry"],
+                        "entry": limit_entry_px,
                         "stop_loss": active_trade["stop_loss"],
                         "tp1": active_trade["tp1"],
                         "tp2": active_trade["tp2"],
@@ -1437,40 +1601,56 @@ with tabs[1]:
                         "usd_inr": trade_usd_inr,
                         "profit_tp1_inr": active_trade["profit_tp1_inr"],
                         "loss_sl_inr": active_trade["loss_sl_inr"],
-                        "status": "LIVE_FILLED" if "Live" in exec_mode else "PAPER_EXECUTED"
+                        "status": order_status
                     }
 
-                    # Save active position for tracking
-                    st.session_state.active_position = order_record
-                    st.session_state.executed_trades.insert(0, order_record)
+                    if is_live:
+                        st.session_state.active_position = order_record
+                        st.session_state.executed_trades.insert(0, order_record)
+                        sheet_success, sheet_msg = log_trade_to_google_sheet(order_record, return_details=True)
+                        mail_ok, mail_msg = send_trade_email(
+                            pair=pair, direction=trade_dir, entry=limit_entry_px, stop_loss=active_trade["stop_loss"],
+                            tp1=active_trade["tp1"], tp2=active_trade["tp2"], margin_inr=trade_margin_inr, leverage=trade_leverage,
+                            kind="EXECUTED", note="Live Limit Maker order submitted.")
+                        status_headline = "LIVE COINDCX ORDER EXECUTED!"
+                        success_text = f"✅ **{status_headline}** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(limit_entry_px)} | {live_api_msg} | Google Sheets: {sheet_msg} | Email: {mail_msg}"
+                    elif already_reached:
+                        # Paper order filled immediately because price already reached entry
+                        st.session_state.active_position = order_record
+                        st.session_state.executed_trades.insert(0, order_record)
+                        sheet_success, sheet_msg = log_trade_to_google_sheet(order_record, return_details=True)
+                        mail_ok, mail_msg = send_trade_email(
+                            pair=pair, direction=trade_dir, entry=limit_entry_px, stop_loss=active_trade["stop_loss"],
+                            tp1=active_trade["tp1"], tp2=active_trade["tp2"], margin_inr=trade_margin_inr, leverage=trade_leverage,
+                            kind="EXECUTED", note="Paper trade filled at limit price.")
+                        status_headline = "PAPER ORDER FILLED!"
+                        success_text = f"✅ **{status_headline}** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(limit_entry_px)} | Paper Position Active | Google Sheets: {sheet_msg} | Email: {mail_msg}"
+                    else:
+                        # Paper limit order resting - NOT FILLED YET
+                        st.session_state.setdefault("paper_pending_orders", []).insert(0, order_record)
+                        status_headline = "PAPER LIMIT ORDER PLACED (PENDING FILL)!"
+                        dist_val = abs(cur_market_px - limit_entry_px)
+                        dist_pct = (dist_val / limit_entry_px * 100.0) if limit_entry_px > 0 else 0.0
+                        success_text = f"⏳ **{status_headline}** {trade_dir} limit @ {fmt(limit_entry_px)}. Live price is {fmt(cur_market_px)} ({dist_pct:.2f}% away). Order will fill automatically when price reaches entry!"
 
-                    sheet_success, sheet_msg = log_trade_to_google_sheet(order_record, return_details=True)
-                    mail_ok, mail_msg = send_trade_email(
-                        pair=pair, direction=trade_dir, entry=active_trade["entry"], stop_loss=active_trade["stop_loss"],
-                        tp1=active_trade["tp1"], tp2=active_trade["tp2"], margin_inr=trade_margin_inr, leverage=trade_leverage,
-                        kind="EXECUTED", note=("Live Limit Maker order submitted." if "Live" in exec_mode else "Paper trade recorded."))
-                    # Remember the plan so Live Trades can apply SL/TP once a resting limit order fills
                     st.session_state.setdefault("trade_plans", {})[pair] = {
-                        "direction": "LONG" if trade_dir == "BUY" else "SHORT", "entry": active_trade["entry"],
+                        "direction": "LONG" if trade_dir == "BUY" else "SHORT", "entry": limit_entry_px,
                         "sl": active_trade["stop_loss"], "tp1": active_trade["tp1"], "tp2": active_trade["tp2"],
                         "applied": False, "margin_inr": trade_margin_inr, "leverage": trade_leverage}
 
-                    status_headline = "LIVE COINDCX ORDER EXECUTED!" if "Live" in exec_mode else "PAPER ORDER RECORDED!"
-                    success_text = f"✅ **{status_headline}** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(active_trade['entry'])} | {live_api_msg or 'Paper Simulation Active'} | Google Sheets: {sheet_msg} | Email: {mail_msg}"
-
                     st.session_state.last_order_status = {
-                        "type": "success",
+                        "type": "success" if already_reached or is_live else "info",
                         "msg": success_text,
                         "timestamp": exec_time,
                         "pair": pair
                     }
-                    if "Live" not in exec_mode:
+                    if not is_live:
                         st.session_state.api_error_logs.insert(0, {
                             "timestamp": exec_time,
                             "pair": pair,
                             "action": f"PAPER_{trade_dir}",
                             "status": "SUCCESS",
-                            "message": f"Paper trade recorded: {trade_dir} {active_trade['crypto_qty']} {cur_asset}",
+                            "message": f"Paper trade: {trade_dir} {active_trade['crypto_qty']} {cur_asset} ({order_status})",
                             "details": order_record
                         })
                     st.rerun()
@@ -1599,7 +1779,9 @@ with tabs[1]:
 # ==============================================================================
 # TAB 2: LIVE TRADES & POSITION MANAGER
 # ==============================================================================
-with tabs[2]:
+# TAB 2: LIVE TRADES & POSITION MANAGER
+# ==============================================================================
+with t_live:
     def _lt_fmt(p):
         return f"${p:,.4f}" if p < 1.0 else f"${p:,.2f}"
 
@@ -1625,10 +1807,46 @@ with tabs[2]:
 
     @st.fragment(run_every="10s")
     def render_live_trades_manager():
+        # Check resting paper orders on each fragment cycle
+        check_and_update_paper_orders()
+
         st.subheader("📊 Live Trades & Position Manager")
         live_positions = get_cached_positions() or []
         paper = st.session_state.active_position
         plans = st.session_state.get("trade_plans", {})
+        pending_paper = st.session_state.get("paper_pending_orders", [])
+
+        # Display Pending Paper Limit Orders (Resting)
+        if pending_paper:
+            st.markdown("#### ⏳ Pending Paper Limit Orders (Resting / Unfilled)")
+            for idx, p_ord in enumerate(list(pending_paper)):
+                p_pair = p_ord.get("pair", "")
+                p_tick = get_cached_ticker(p_pair)
+                p_cur_px = float(p_tick.get("last_price", 0.0))
+                p_dir = p_ord.get("direction", "BUY")
+                p_entry = float(p_ord.get("entry", 0.0))
+                p_dist = abs(p_cur_px - p_entry) if p_cur_px else 0.0
+                p_dist_pct = (p_dist / p_entry * 100.0) if p_entry > 0 else 0.0
+                is_p_buy = p_dir == "BUY"
+
+                with st.container(border=True):
+                    badge_cls = "badge-buy" if is_p_buy else "badge-sell"
+                    st.markdown(f"<span class='{badge_cls}'>{p_dir} LIMIT {p_pair}</span> &nbsp; **{p_ord['crypto_qty']}** @ {_lt_fmt(p_entry)} ({p_ord.get('leverage', 5)}x)", unsafe_allow_html=True)
+                    c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+                    c_m1.metric("Planned Entry", _lt_fmt(p_entry))
+                    c_m2.metric("Live Mark", _lt_fmt(p_cur_px))
+                    c_m3.metric("Distance to Fill", f"{p_dist_pct:.2f}%", f"{'-' if (is_p_buy and p_cur_px > p_entry) else '+'}{_lt_fmt(p_dist)}")
+                    c_m4.metric("Allocated Margin", f"₹{p_ord.get('margin_inr', 0):,.0f}")
+                    st.caption(f"Status: ⏳ Resting Limit Order • Waiting for live price ({_lt_fmt(p_cur_px)}) to {'drop to' if is_p_buy else 'rise to'} {_lt_fmt(p_entry)}")
+                    if st.button(f"❌ Cancel Pending Order ({p_pair})", key=f"lt_cancel_pending_{idx}", use_container_width=True):
+                        st.session_state.paper_pending_orders.remove(p_ord)
+                        st.session_state.last_order_status = {
+                            "type": "info",
+                            "msg": f"Cancelled pending paper {p_dir} limit order for {p_pair}.",
+                            "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
+                            "pair": p_pair
+                        }
+                        st.rerun()
 
         total_margin = sum(float(p.get("locked_margin_inr", 0) or 0) for p in live_positions)
         total_unreal = sum(float(p.get("pnl_inr", 0) or 0) for p in live_positions)
@@ -1750,7 +1968,7 @@ with tabs[2]:
 # ==============================================================================
 # TAB 2: KEY BOX LEVELS BREAKDOWN
 # ==============================================================================
-with tabs[3]:
+with t_levels:
     st.subheader(f"📐 Key Levels & Predefined Setup — {selected_pair}")
     st.caption("Derived from the completed Previous Day candle and multi-day swing extrema. The chart lives only in this tab to keep other tabs fast on mobile.")
 
@@ -1850,7 +2068,7 @@ with tabs[3]:
 # ==============================================================================
 # TAB 3: GOOGLE SHEET TRADE LOGGER
 # ==============================================================================
-with tabs[4]:
+with t_sheets:
     st.subheader("📋 Google Sheet Automated Trade Logger")
     sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
     st.markdown(f"**Target Spreadsheet:** `{sheet_name}`")
@@ -1892,7 +2110,7 @@ with tabs[4]:
 # ==============================================================================
 # TAB 5: MULTI-DERIVATIVE BACKTEST (max 4 derivatives)
 # ==============================================================================
-with tabs[5]:
+with t_backtest:
     st.subheader("📊 Multi-Derivative Backtest")
     st.caption("Runs the restored baseline strategy (24/7 RH–SH / RL–SL zone rejection, structural SL, 50/50 ratchet or 100% at MID) "
                "on up to 4 derivatives with 1/3 rotational margin per trade.")
