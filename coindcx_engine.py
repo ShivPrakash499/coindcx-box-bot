@@ -1488,14 +1488,20 @@ def run_strategy_backtest(
     leverage: int = 5,
     target_mode: str = "TP1 Midpoint",
     usd_inr: float = None,
-    progress_callback = None
+    progress_callback = None,
+    strategy_id: str = "box_theory"
 ) -> dict:
     """
-    Executes a real-time historical simulation of the Box Liquidity Sweep strategy.
-    Fetches real candles from CoinDCX / Binance public APIs with multi-batch pagination,
-    establishes rolling daily boxes, identifies institutional liquidity sweeps, simulates
-    order executions with fee accounting, and returns comprehensive performance analytics.
+    Executes a real-time historical simulation of any registered strategy (see strategies.py).
+    Fetches real candles from CoinDCX / Binance public APIs with multi-batch pagination, lets the
+    strategy build its daily context and detect entries, then simulates exits with the shared
+    TP1 / TP2 / 50-50 ratchet engine and CoinDCX fee accounting.
+    target_mode: "TP1 Midpoint" = 100% exit at TP1, "TP2 Full Rotation" = 100% at TP2,
+                 "50/50 Split" = half at TP1, ratchet trailing SL on the rest toward TP2.
     """
+    import strategies as _strategies
+    strat = _strategies.get_strategy(strategy_id)
+
     if not usd_inr or usd_inr <= 0:
         usd_inr = get_coindcx_live_usdt_inr_rate()
 
@@ -1513,7 +1519,7 @@ def run_strategy_backtest(
     df_daily = fetch_historical_candles_paginated(
         pair=pair,
         interval="1d",
-        duration_days=duration_days + 40
+        duration_days=duration_days + strat.daily_warmup_days
     )
     if df_daily.empty or len(df_daily) < 5:
         return {"error": f"Insufficient daily candle data for {pair}."}
@@ -1524,33 +1530,8 @@ def run_strategy_backtest(
     df_daily['dt_ist'] = pd.to_datetime(df_daily['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
     df_daily['date_str'] = df_daily['dt_ist'].dt.strftime('%Y-%m-%d')
 
-    # Pre-build daily box levels for each day
-    daily_boxes = {}
-    daily_records = df_daily.to_dict('records')
-    for i in range(1, len(daily_records)):
-        curr_day_str = daily_records[i]['date_str']
-        prev_day = daily_records[i-1]
-        rh = float(prev_day['high'])
-        rl = float(prev_day['low'])
-        mid = (rh + rl) / 2.0
-
-        lookback_start = max(0, i - 15)
-        prior_slice = daily_records[lookback_start:i-1]
-        prior_highs = [float(d['high']) for d in prior_slice] if prior_slice else []
-        prior_lows = [float(d['low']) for d in prior_slice] if prior_slice else []
-
-        sh_c = [h for h in prior_highs if h > rh]
-        sh = min(sh_c) if sh_c else rh * 1.015
-        sl_c = [l for l in prior_lows if l < rl]
-        sl = max(sl_c) if sl_c else rl * 0.985
-
-        daily_boxes[curr_day_str] = {
-            "RH": rh,
-            "RL": rl,
-            "MID": mid,
-            "SH": sh,
-            "SL": sl
-        }
+    # Strategy-specific daily context (Box: rolling daily boxes; ATR Reversal: 50-SMA + ATR14)
+    strat_ctx = strat.prepare_backtest(df, df_daily)
 
     # 3. High-speed Sequential Candle Simulation using dictionary records
     df_records = df.to_dict('records')
@@ -1571,12 +1552,8 @@ def run_strategy_backtest(
         c_low = float(candle['low'])
         c_close = float(candle['close'])
 
-        box = daily_boxes.get(c_date)
-        if not box:
+        if not strat.backtest_has_context(candle, strat_ctx):
             continue
-
-        rh, rl, mid = box["RH"], box["RL"], box["MID"]
-        sh, sl = box["SH"], box["SL"]
 
         # Check active trade exit conditions first
         if active_trade:
@@ -1630,11 +1607,11 @@ def run_strategy_backtest(
                     elif target_mode == "TP1 Midpoint" and c_high >= tp1_p:
                         exit_triggered = True
                         exit_price = tp1_p
-                        exit_reason = "Take Profit (MID)"
+                        exit_reason = f"Take Profit ({active_trade['tp1_label']})"
                     elif target_mode == "TP2 Full Rotation" and c_high >= tp2_p:
                         exit_triggered = True
                         exit_price = tp2_p
-                        exit_reason = "Take Profit (RH)"
+                        exit_reason = f"Take Profit ({active_trade['tp2_label']})"
             else:  # SHORT
                 mid_to_tp2_half = (tp1_p + tp2_p) / 2.0
                 if target_mode == "50/50 Split":
@@ -1672,11 +1649,11 @@ def run_strategy_backtest(
                     elif target_mode == "TP1 Midpoint" and c_low <= tp1_p:
                         exit_triggered = True
                         exit_price = tp1_p
-                        exit_reason = "Take Profit (MID)"
+                        exit_reason = f"Take Profit ({active_trade['tp1_label']})"
                     elif target_mode == "TP2 Full Rotation" and c_low <= tp2_p:
                         exit_triggered = True
                         exit_price = tp2_p
-                        exit_reason = "Take Profit (RL)"
+                        exit_reason = f"Take Profit ({active_trade['tp2_label']})"
 
             if exit_triggered:
                 # Calculate financial metrics with exact CoinDCX fee schedule
@@ -1705,7 +1682,7 @@ def run_strategy_backtest(
                     "entry_price": round_asset_price(entry_p, entry_p),
                     "exit_price": round_asset_price(exit_price, entry_p),
                     "stop_loss": round_asset_price(sl_p, entry_p),
-                    "target_tp": round_asset_price(tp1_p if "MID" in exit_reason else tp2_p, entry_p),
+                    "target_tp": round_asset_price(tp1_p if exit_reason == f"Take Profit ({active_trade['tp1_label']})" else tp2_p, entry_p),
                     "exit_reason": exit_reason,
                     "quantity": qty,
                     "gross_pnl_inr": round(gross_pnl_inr, 2),
@@ -1713,7 +1690,9 @@ def run_strategy_backtest(
                     "net_pnl_inr": round(net_pnl_inr, 2),
                     "roe_pct": round(roe_pct, 2),
                     "is_win": net_pnl_inr > 0,
-                    "duration_candles": idx - active_trade["entry_idx"]
+                    "duration_candles": idx - active_trade["entry_idx"],
+                    "strategy": strat.name,
+                    "trigger": active_trade.get("reason", "")
                 })
 
                 equity_curve.append({
@@ -1725,54 +1704,15 @@ def run_strategy_backtest(
                 active_trade = None
                 last_exit_idx = idx
 
-        # If no active trade, evaluate signal for new entry in Buy or Sell Zone
+        # If no active trade, ask the strategy whether this closed candle is an entry
         if not active_trade and (idx - last_exit_idx >= 1):
-            c_open = float(candle.get('open', c_close))
-            candle_range = c_high - c_low
-
-            # 1. Buy Zone Rejection Trigger (Long Setup):
-            # Price swept down into Buy Zone (<= RL), rejected, and closed back above RL (> RL)
-            swept_buy_zone = (c_low <= rl)
-            closed_above_rl = (c_close > rl)
-            lower_wick = min(c_open, c_close) - c_low
-            is_bullish_rejection = (
-                swept_buy_zone and 
-                closed_above_rl and 
-                (c_low >= sl * 0.995) and 
-                (
-                    (candle_range > 0 and (lower_wick / candle_range) >= 0.15) or 
-                    (c_close >= c_open) or 
-                    (candle_range > 0 and (c_close - c_low) / candle_range >= 0.45)
-                )
-            )
-
-            # 2. Sell Zone Rejection Trigger (Short Setup):
-            # Price swept up into Sell Zone (>= RH), rejected, and closed back below RH (< RH)
-            swept_sell_zone = (c_high >= rh)
-            closed_below_rh = (c_close < rh)
-            upper_wick = c_high - max(c_open, c_close)
-            is_bearish_rejection = (
-                swept_sell_zone and 
-                closed_below_rh and 
-                (c_high <= sh * 1.005) and 
-                (
-                    (candle_range > 0 and (upper_wick / candle_range) >= 0.15) or 
-                    (c_close <= c_open) or 
-                    (candle_range > 0 and (c_high - c_close) / candle_range >= 0.45)
-                )
-            )
-
-            if is_bullish_rejection or is_bearish_rejection:
-                trade_dir = "LONG" if is_bullish_rejection else "SHORT"
-                entry_p = c_close
-                if trade_dir == "LONG":
-                    sl_p = min(c_low, sl) * 0.998
-                    tp1_p = mid
-                    tp2_p = rh
-                else:
-                    sl_p = max(c_high, sh) * 1.002
-                    tp1_p = mid
-                    tp2_p = rl
+            entry_sig = strat.backtest_entry(idx, candle, strat_ctx, df_records)
+            if entry_sig:
+                trade_dir = entry_sig["direction"]
+                entry_p = entry_sig["entry"]
+                sl_p = entry_sig["stop"]
+                tp1_p = entry_sig["tp1"]
+                tp2_p = entry_sig["tp2"]
 
                 margin_usd = margin_inr / usd_inr
                 pos_usd = margin_usd * leverage
@@ -1780,17 +1720,7 @@ def run_strategy_backtest(
                 qty = format_order_quantity(pair, raw_qty)
                 notional_inr = margin_inr * leverage
 
-                # Categorize institutional session
-                h = c_time.hour
-                m = c_time.minute
-                if (h == 7) or (h == 8 and m <= 30):
-                    sess_name = "🌅 Asia Open"
-                elif (h == 13) or (h == 14 and m <= 30):
-                    sess_name = "🏛️ London Open"
-                elif (h == 18 and m >= 45) or (h == 19) or (h == 20 and m <= 15):
-                    sess_name = "⚡ New York Open"
-                else:
-                    sess_name = "🌐 Intraday Monitor"
+                sess_name = _strategies.backtest_session_name(c_time)
 
                 active_trade = {
                     "direction": trade_dir,
@@ -1803,7 +1733,10 @@ def run_strategy_backtest(
                     "quantity": qty,
                     "notional_inr": notional_inr,
                     "session": sess_name,
-                    "tp1_hit": False
+                    "tp1_hit": False,
+                    "tp1_label": entry_sig.get("tp1_label", "TP1"),
+                    "tp2_label": entry_sig.get("tp2_label", "TP2"),
+                    "reason": entry_sig.get("reason", "")
                 }
 
     # Summary Statistics Calculation
@@ -1831,7 +1764,10 @@ def run_strategy_backtest(
             "pair": pair,
             "duration_days": duration_days,
             "margin_inr": margin_inr,
-            "leverage": leverage
+            "leverage": leverage,
+            "total_fees_paid_inr": 0.0,
+            "strategy_id": strat.id,
+            "strategy_name": strat.name
         }
 
     wins = [t for t in trades if t["is_win"]]
@@ -1935,6 +1871,8 @@ def run_strategy_backtest(
     session_df = pd.DataFrame(session_rows)
 
     return {
+        "strategy_id": strat.id,
+        "strategy_name": strat.name,
         "pair": pair,
         "duration_days": duration_days,
         "margin_inr": margin_inr,

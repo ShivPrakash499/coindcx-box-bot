@@ -72,15 +72,19 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
         client = gspread.authorize(creds)
         sheet = _get_ws(client.open(sheet_name), "Live_Trades")
 
-        # Check if headers exist; if empty, insert them
+        # Check if headers exist; if empty, insert them (older sheets get the new columns appended)
         records = sheet.get_all_values()
+        headers = [
+            "Timestamp (IST)", "Pair", "Direction", "Entry ($)", 
+            "Stop Loss ($)", "TP1 Mid ($)", "TP2 Target ($)", "Qty", 
+            "Margin (INR)", "Leverage", "Proj Profit TP1 (INR)", "Proj Loss SL (INR)", "Status",
+            "Strategy", "Trigger Reason"
+        ]
         if len(records) == 0:
-            headers = [
-                "Timestamp (IST)", "Pair", "Direction", "Entry ($)", 
-                "Stop Loss ($)", "TP1 Mid ($)", "TP2 Target ($)", "Qty", 
-                "Margin (INR)", "Leverage", "Proj Profit TP1 (INR)", "Proj Loss SL (INR)", "Status"
-            ]
             sheet.append_row(headers)
+        elif len(records[0]) < len(headers):
+            for col in range(len(records[0]) + 1, len(headers) + 1):
+                sheet.update_cell(1, col, headers[col - 1])
 
         margin_val = trade_data.get("margin_inr", 100000)
         leverage_val = f"{trade_data.get('leverage', 5)}x"
@@ -98,7 +102,9 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
             leverage_val,
             trade_data["profit_tp1_inr"],
             trade_data["loss_sl_inr"],
-            "LOGGED_PENDING"
+            "LOGGED_PENDING",
+            trade_data.get("strategy_name", "Box Theory Sweep"),
+            trade_data.get("trigger_reason", "")
         ]
         sheet.append_row(row)
         success_msg = f"[✓] Trade successfully logged to Google Sheet '{sheet_name}': {trade_data['signal']} on {trade_data['pair']}"

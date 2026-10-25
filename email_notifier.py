@@ -3,8 +3,9 @@ Gmail trade notifications (smtp.gmail.com:587 STARTTLS / 465 SSL).
 
 Config is read from environment / .env / Streamlit secrets:
     GMAIL_SENDER, GMAIL_APP_PASSWORD, GMAIL_RECEIVER
-Subject format:  "<SYMBOL> - trade notification"   e.g.  "ETH - trade notification"
-Direct Action Link: <APP_URL>/?tab=execute&pair=<PAIR>&direction=<DIR>&entry=<ENTRY>&sl=<SL>&tp1=<TP1>&tp2=<TP2>&margin=<MARGIN>&lev=<LEV>
+Subject format:  "<SYMBOL> - <STRATEGY> - trade notification"   e.g.  "ETH - Box Theory Sweep - trade notification"
+                 (falls back to "<SYMBOL> - trade notification" when no strategy is given)
+Direct Action Link: <APP_URL>/?tab=execute&strategy=<ID>&pair=<PAIR>&direction=<DIR>&entry=<ENTRY>&sl=<SL>&tp1=<TP1>&tp2=<TP2>&margin=<MARGIN>&lev=<LEV>
 """
 from __future__ import annotations
 
@@ -100,7 +101,8 @@ def _send(subject: str, html: str, text: str) -> tuple[bool, str]:
 
 def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2: float,
                      margin_inr: float, leverage: int = 5, zone: str = "", kind: str = "SIGNAL",
-                     note: str = "", app_url: str = "") -> tuple[bool, str]:
+                     note: str = "", app_url: str = "", strategy_name: str = "", trigger_reason: str = "",
+                     strategy_id: str = "") -> tuple[bool, str]:
     """
     Sends structured trade email notification with a 1-click action link
     that opens the Trade Execution tab with all values pre-filled.
@@ -111,11 +113,11 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     zone = zone or ("Buy Zone RL-SL" if is_long else "Sell Zone RH-SH")
     sym = short_name(pair)
     now = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p IST")
-    base_url = app_url or _cfg("APP_WEB_URL", "http://localhost:8501")
+    base_url = (app_url or _cfg("APP_WEB_URL", "https://shiv-prakash-trade-assistant.streamlit.app")).rstrip("/")
     
     # Action URL with pre-filled parameters to open execution tab
     action_url = (
-        f"{base_url}/?tab=execute&pair={pair}&direction={direction}&entry={entry:.4f}"
+        f"{base_url}/?tab=execute{f'&strategy={strategy_id}' if strategy_id else ''}&pair={pair}&direction={direction}&entry={entry:.4f}"
         f"&sl={stop_loss:.4f}&tp1={tp1:.4f}&tp2={tp2:.4f}&margin={int(margin_inr)}&lev={leverage}"
     )
 
@@ -123,14 +125,19 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     heading = {"SIGNAL": "Trade Signal Alert", "EXECUTED": "Order Executed", "CLOSED": "Position Closed"}.get(kind, kind)
 
     rows = [
+        ("Strategy", strategy_name or "Box Theory Sweep"),
         ("Asset / Pair", pair),
         ("Trade Direction", direction),
         ("Trigger Zone", zone),
+    ]
+    if trigger_reason:
+        rows.append(("Trigger Reason", trigger_reason))
+    rows += [
         ("Planned Entry Price", f"${entry:,.4f}"),
         ("Structural Stop Loss", f"${stop_loss:,.4f}"),
-        ("Take Profit 1 (MID)", f"${tp1:,.4f}"),
-        ("Take Profit 2 (Extreme)", f"${tp2:,.4f}"),
-        ("Allocated Margin", f"₹{margin_inr:,.0f} INR"),
+        ("Take Profit 1", f"${tp1:,.4f}"),
+        ("Take Profit 2", f"${tp2:,.4f}"),
+        ("1/3 Rotational Margin" if kind == "SIGNAL" else "Allocated Margin", f"₹{margin_inr:,.0f} INR"),
         ("Leverage", f"{leverage}x"),
         ("Timestamp (IST)", now),
     ]
@@ -140,7 +147,7 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     html = f"""<html><body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#f8fafc;padding:20px;color:#1e293b;">
       <div style="max-width:540px;margin:auto;background:#ffffff;border-radius:14px;border:1px solid #e2e8f0;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.06);">
         <div style="background:#0f172a;color:#ffffff;padding:20px;text-align:center">
-          <div style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#94a3b8;font-weight:700">{heading}</div>
+          <div style="font-size:12px;text-transform:uppercase;letter-spacing:1px;color:#94a3b8;font-weight:700">{heading}{f' &middot; {strategy_name}' if strategy_name else ''}</div>
           <div style="font-size:22px;font-weight:800;margin-top:4px;">{pair}</div>
           <div style="margin-top:10px;display:inline-block;padding:5px 18px;border-radius:20px;background:{colour};font-weight:800;font-size:14px;color:#fff;">
             {direction} SETUP
@@ -162,18 +169,21 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     </body></html>"""
 
     text = (
-        f"⚡ {heading}: {direction} {pair}\n"
+        f"⚡ {heading}: {direction} {pair}{f' [{strategy_name}]' if strategy_name else ''}\n"
         + "=" * 40 + "\n"
         + "\n".join(f"{k}: {v}" for k, v in rows)
         + (f"\nNote: {note}\n" if note else "\n")
         + f"\nOpen & Execute in Assistant (Pre-filled):\n{action_url}\n"
     )
-    return _send(f"{sym} - trade notification", html, text)
+    subject = f"{sym} - {strategy_name} - trade notification" if strategy_name else f"{sym} - trade notification"
+    return _send(subject, html, text)
 
 
-def send_test_trade_email(pair: str = "B-SOL_USDT", live_price: float = 100.0, margin_inr: float = 10000.0) -> tuple[bool, str]:
+def send_test_trade_email(pair: str = "B-SOL_USDT", live_price: float = 100.0, margin_inr: float = 10000.0,
+                          strategy_name: str = "Box Theory Sweep", strategy_id: str = "box_theory") -> tuple[bool, str]:
     return send_trade_email(
         pair=pair, direction="LONG", entry=live_price, stop_loss=round(live_price * 0.985, 4),
         tp1=round(live_price * 1.02, 4), tp2=round(live_price * 1.04, 4), margin_inr=margin_inr, leverage=5,
-        zone="Buy Zone RL-SL", kind="SIGNAL", note="This is a TEST alert - opens prefilled Trade Execution tab."
+        zone="Buy Zone RL-SL", kind="SIGNAL", note="This is a TEST alert - opens prefilled Trade Execution tab.",
+        strategy_name=strategy_name, strategy_id=strategy_id, trigger_reason="TEST - no real trigger"
     )

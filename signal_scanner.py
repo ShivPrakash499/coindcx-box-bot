@@ -1,6 +1,6 @@
 """
 Standalone signal scanner (no orders, no UI):  python signal_scanner.py [--interval 60] [--once]
-E-mails a trade notification for every new zone-reversal / tower-continuation confirmation.
+E-mails a strategy-tagged trade notification for every new signal from any registered strategy.
 """
 import argparse
 import time
@@ -23,7 +23,7 @@ def main():
         for r in sm.scan_and_alert(args.pairs, rot["margin_inr"], 5, usd_inr):
             sig = r["signal"]
             tag = f"{sig['signal']} {sig['signal_kind']}" if sig and sig["signal"] != "NEUTRAL" else "-"
-            print(f"[{datetime.now():%H:%M:%S}] {r['pair']:11s} {tag:24s} emailed={r['emailed']} ({r['message']})", flush=True)
+            print(f"[{datetime.now():%H:%M:%S}] {r['pair']:11s} {r['strategy_name'][:26]:26s} {tag:24s} emailed={r['emailed']} ({r['message']})", flush=True)
         if args.once:
             break
         time.sleep(args.interval)

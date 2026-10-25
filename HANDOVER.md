@@ -1,7 +1,7 @@
 # ⚡ CoinDCX Box Theory Terminal — Session Handover & Memory
 **Latest Update:** October 25, 2026 (00:30 IST)  
 **Account:** Binni  
-**Live URL:** [https://shiv-prakash-crypto-robot.streamlit.app](https://shiv-prakash-crypto-robot.streamlit.app)  
+**Live URL:** [https://shiv-prakash-trade-assistant.streamlit.app](https://shiv-prakash-trade-assistant.streamlit.app)  
 **GitHub Repository:** [ShivPrakash499/coindcx-box-bot](https://github.com/ShivPrakash499/coindcx-box-bot) (`main` branch)
 
 ---
@@ -15,6 +15,17 @@
 * **Live Wallet Verification:**
   * **Total Equity (INR):** `~₹28,790.90` (Cash + active margin).
   * **Live Order Guard:** Minimum order value enforced at **₹2,448 INR**.
+
+---
+
+## 1b. 🧠 Oct 25, 2026 (evening) — Modular Multi-Strategy Upgrade
+* New [`strategies.py`](strategies.py) with `STRATEGY_REGISTRY`: **Box Theory Sweep** (`box_theory`, math unchanged — regression byte-identical on SOL/ETH/BTC 1y) and **1-Candle 25% ATR Reversal** (`atr_reversal`).
+* `coindcx_engine.run_strategy_backtest(..., strategy_id=...)` delegates entries to the strategy; exit/fee engine unchanged.
+* E-mail subject: `"{SYM} - {Strategy Name} - trade notification"`; Strategy + Trigger Reason in e-mail body and `Live_Trades` sheet.
+* UI: strategy selector on Key Levels, strategy arming on Execution ("All Active Strategies (Auto-Detect Triggers)" / "<name> Only"), strategy + "Compare All Strategies Side-by-Side" on Backtest.
+* Fixed: background monitor thread was started on every rerun (now `st.cache_resource`).
+* Optional env `ENABLED_STRATEGIES` (comma-separated ids). Streamlit Secrets need `GMAIL_*` + `APP_WEB_URL`.
+* 1-year result: ATR Reversal is net negative on SOL/ETH/BTC as specified (see README table) — paper-trade only until refined.
 
 ---
 

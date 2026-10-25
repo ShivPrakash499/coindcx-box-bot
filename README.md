@@ -12,7 +12,10 @@ coindcx_box_bot/
 ├── .gitignore            # Protects keys, credentials, and virtual environment
 ├── credentials.json      # Google Service Account Key for Sheets API
 ├── app.py                # Live Streamlit Web Terminal & Real-Time Dashboard
-├── coindcx_engine.py     # Live API Data Fetcher (RH, RL, SH, SL + 7:15 PM Signal Engine)
+├── coindcx_engine.py     # Live API Data Fetcher (RH, RL, SH, SL + 7:15 PM Signal Engine) & backtester
+├── strategies.py         # Pluggable STRATEGY_REGISTRY (Box Theory Sweep, 1-Candle 25% ATR Reversal, ...)
+├── signal_monitor.py     # 24/7 multi-strategy scanner + strategy-tagged e-mail alerts
+├── email_notifier.py     # Gmail SMTP trade notifications
 ├── sheets_logger.py      # Google Sheets Automated Trade Logger (gspread)
 ├── requirements.txt      # Python Dependencies
 └── README.md             # Documentation and Execution Guide
@@ -36,6 +39,35 @@ coindcx_box_bot/
   - **Default Margin:** ₹1,00,000 INR per trade.
   - **Leverage:** 5x multiplier (enforced).
   - **Target ROE:** Minimum 5% ROE on TP1 (Midpoint).
+
+---
+
+## 🧠 Modular Multi-Strategy Architecture (`strategies.py`)
+
+All strategies live in [`strategies.py`](strategies.py) and are registered in `STRATEGY_REGISTRY`.
+The Signals, Execution, Key Levels and Backtest tabs, the 24/7 e-mail monitor and the backtester all iterate over the registry, so **a new strategy needs no UI changes**.
+
+| ID | Name | Bias / Trigger | SL | TP1 | TP2 |
+|---|---|---|---|---|---|
+| `box_theory` | **Box Theory Sweep** (baseline, math unchanged) | Sweep of RH / RL closing back inside | `max(high,SH)*1.002` / `min(low,SL)*0.998` | MID | RL / RH |
+| `atr_reversal` | **1-Candle 25% ATR Reversal** | Daily close vs SMA50 → 1–3 candle 15m flush/spike ≥ 25% of Daily ATR14 → close beyond previous opposite candle's high/low | `flush_low*0.9985` / `spike_high*1.0015` | 50% retrace | Origin of move |
+
+Both use the 50/50 ratchet exit in the backtester. ATR guards: one trade per flush, flush must be within the last 8 candles, entry must sit between SL and TP1.
+
+**Adding a strategy:** subclass `Strategy`, set `id`, `name`, `tp1_name`, `tp2_name`, implement `compute_levels`, `evaluate_signal`, `plan_setups`, `prepare_backtest`, `backtest_has_context`, `backtest_entry` (optionally `chart_lines`, `chart_markers`, `metric_badges`, `level_rows`), then add it to `STRATEGY_REGISTRY`.
+
+**Alerts:** e-mail subject is `"{SYM} - {Strategy Name} - trade notification"`; body and the `Live_Trades` sheet include Strategy and Trigger Reason. Restrict the background monitor with `ENABLED_STRATEGIES=box_theory,atr_reversal` (default: all).
+
+**1-year comparison (₹10,000 margin, 5x, 50/50 ratchet, USD/INR 88):**
+
+| Strategy | Pair | Trades | Fees (₹) | Win % | Net (₹) |
+|---|---|---|---|---|---|
+| Box Theory Sweep | SOL | 369 | 21,763 | 49.6 | **+40,317** |
+| Box Theory Sweep | ETH | 330 | 19,450 | 47.3 | **+2,359** |
+| Box Theory Sweep | BTC | 312 | 17,804 | 48.7 | **−13,227** |
+| 1-Candle 25% ATR Reversal | SOL | 152 | 8,960 | 45.4 | **−5,037** |
+| 1-Candle 25% ATR Reversal | ETH | 135 | 7,956 | 36.3 | **−9,172** |
+| 1-Candle 25% ATR Reversal | BTC | 152 | 8,656 | 28.9 | **−9,415** |
 
 ---
 

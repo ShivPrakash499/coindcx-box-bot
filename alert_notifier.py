@@ -34,14 +34,14 @@ def send_email_notification(subject: str, html_content: str, text_content: str =
     if not enabled:
         return False, "Email alerts are disabled in .env (ALERT_EMAIL_ENABLED=False)"
 
-    sender = os.getenv("SENDER_EMAIL", "").strip()
-    password = os.getenv("SENDER_APP_PASSWORD", "").strip()
-    receiver = os.getenv("RECEIVER_EMAIL", "").strip() or sender
+    sender = (os.getenv("SENDER_EMAIL") or os.getenv("GMAIL_SENDER") or "").strip()
+    password = (os.getenv("SENDER_APP_PASSWORD") or os.getenv("GMAIL_APP_PASSWORD") or "").replace(" ", "").strip()
+    receiver = (os.getenv("RECEIVER_EMAIL") or os.getenv("GMAIL_RECEIVER") or "").strip() or sender
     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com").strip()
     smtp_port = int(os.getenv("SMTP_PORT", 587))
 
     if not sender or not password:
-        return False, "SENDER_EMAIL or SENDER_APP_PASSWORD missing in .env"
+        return False, "SENDER_EMAIL / GMAIL_SENDER or SENDER_APP_PASSWORD / GMAIL_APP_PASSWORD missing in .env"
 
     try:
         msg = MIMEMultipart("alternative")
@@ -73,7 +73,7 @@ def send_sweep_alert(pair: str, signal_type: str, session_name: str, live_price:
     if not force and is_alert_on_cooldown(pair, signal_type):
         return False, f"Alert for {pair} {signal_type} suppressed by 15-min cooldown."
 
-    app_url = os.getenv("APP_WEB_URL", "http://localhost:8501").strip()
+    app_url = os.getenv("APP_WEB_URL", "https://shiv-prakash-trade-assistant.streamlit.app").strip().rstrip("/")
     now_str = datetime.now(IST).strftime("%I:%M %p IST (%d %b %Y)")
 
     is_buy = signal_type.upper() in ["BUY", "LONG"]
