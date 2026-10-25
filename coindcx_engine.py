@@ -709,7 +709,8 @@ def place_coindcx_futures_order(
     price: float = None,
     margin_currency: str = "INR",
     tp_price: float = None,
-    sl_price: float = None
+    sl_price: float = None,
+    post_only: bool = False
 ) -> tuple[bool, str, dict]:
     """
     Executes a real futures order directly on CoinDCX exchange via API.
@@ -774,7 +775,7 @@ def place_coindcx_futures_order(
         "margin_currency_short_name": margin_currency.upper(),
         "notification": "email_notification",
         "hidden": False,
-        "post_only": False
+        "post_only": bool(post_only)
     }
 
     if order_type == "limit_order":
@@ -1236,7 +1237,76 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
         "target_roe_met": roe_tp1 >= 5.0
     }
 
-def evaluate_tri_session_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, leverage=5, usd_inr=85.0, trigger_alert: bool = True):
+def detect_zone_signal(levels: dict, o: float, h: float, l: float, c: float):
+    """
+    Classifies ONE CLOSED candle against the daily box zones.
+      REVERSAL     : sweep into the zone and close back inside (baseline rule, unchanged)
+                       Sell Zone RH-SH: high >= RH and close < RH  -> SHORT
+                       Buy  Zone RL-SL: low  <= RL and close > RL  -> LONG
+      CONTINUATION : a solid "tower" candle (body >= 70% of range) closing beyond RH / RL
+                       close > RH (bullish tower) -> LONG toward SH ; close < RL (bearish tower) -> SHORT toward SL
+                     Alert-only idea: it has NOT been backtested.
+    """
+    rh, rl, sh, sl, mid = levels["RH"], levels["RL"], levels["SH"], levels["SL"], levels["MID"]
+    rng = h - l
+    solid = rng > 0 and abs(c - o) / rng >= 0.70
+
+    if h >= rh and c < rh:
+        return {"kind": "REVERSAL", "direction": "SHORT", "zone": "Sell Zone RH-SH",
+                "stop": round(max(h, sh) * 1.002, 4), "tp1": mid, "tp2": rl}
+    if l <= rl and c > rl:
+        return {"kind": "REVERSAL", "direction": "LONG", "zone": "Buy Zone RL-SL",
+                "stop": round(min(l, sl) * 0.998, 4), "tp1": mid, "tp2": rh}
+    if solid and c > o and rh < c < sh:
+        return {"kind": "CONTINUATION", "direction": "LONG", "zone": "Sell Zone RH-SH (breakout)",
+                "stop": round(rh * 0.998, 4), "tp1": sh, "tp2": round(sh + (sh - rh), 4)}
+    if solid and c < o and sl < c < rl:
+        return {"kind": "CONTINUATION", "direction": "SHORT", "zone": "Buy Zone RL-SL (breakdown)",
+                "stop": round(rl * 1.002, 4), "tp1": sl, "tp2": round(sl - (rl - sl), 4)}
+    return None
+
+
+def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> dict:
+    """
+    Higher-timeframe bias from Daily + 4H structure (no indicators):
+      +1/-1  Daily slope over the last 5 completed days (needs |move| > 0.5%)
+      +1/-1  4H slope over the last 12 bars (needs |move| > 0.3%)
+      +1/-1  live price above / below the previous day's close
+    score >= 2 BULLISH, <= -2 BEARISH, otherwise NEUTRAL / RANGE.
+    """
+    out = {"bias": "NEUTRAL / RANGE", "score": 0, "reasons": []}
+    try:
+        d = fetch_coindcx_candles(pair=pair, interval="1d", limit=15, sync_live_price=False)
+        h4 = fetch_coindcx_candles(pair=pair, interval="4h", limit=30, sync_live_price=False)
+        score = 0
+        if len(d) >= 8:
+            c_now, c_old = float(d["close"].iloc[-2]), float(d["close"].iloc[-7])
+            mv = (c_now - c_old) / c_old * 100
+            if mv > 0.5:
+                score += 1
+            elif mv < -0.5:
+                score -= 1
+            out["reasons"].append(f"Daily 5-day slope {mv:+.2f}%")
+            prev_close = float(d["close"].iloc[-2])
+            lp = live_price or float(d["close"].iloc[-1])
+            score += 1 if lp > prev_close else -1
+            out["reasons"].append(f"Price {'above' if lp > prev_close else 'below'} previous close ({prev_close:,.4f})")
+        if len(h4) >= 14:
+            c_now, c_old = float(h4["close"].iloc[-1]), float(h4["close"].iloc[-13])
+            mv = (c_now - c_old) / c_old * 100
+            if mv > 0.3:
+                score += 1
+            elif mv < -0.3:
+                score -= 1
+            out["reasons"].append(f"4H 12-bar slope {mv:+.2f}%")
+        out["score"] = score
+        out["bias"] = "BULLISH" if score >= 2 else ("BEARISH" if score <= -2 else "NEUTRAL / RANGE")
+    except Exception as e:
+        out["reasons"].append(f"Bias unavailable: {e}")
+    return out
+
+
+def evaluate_tri_session_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, leverage=5, usd_inr=85.0, trigger_alert: bool = False):
     """
     Evaluates 15-minute candles and real-time prices across the Three Institutional Opens:
     - 🌅 Asia Open (07:00 - 08:30 IST)
@@ -1250,7 +1320,7 @@ def evaluate_tri_session_signal(pair="B-ETH_USDT", levels=None, margin_inr=10000
     if not levels:
         return None
 
-    df_15m = fetch_coindcx_candles(pair=pair, interval="15m", limit=30, sync_live_price=True)
+    df_15m = fetch_coindcx_candles(pair=pair, interval="15m", limit=40, sync_live_price=False)
     if df_15m.empty:
         return None
 
@@ -1258,59 +1328,43 @@ def evaluate_tri_session_signal(pair="B-ETH_USDT", levels=None, margin_inr=10000
     now_ist = datetime.now(IST)
     session = get_current_session_info(now_ist)
 
-    today_date = now_ist.date()
+    # Confirmation requires a CLOSED candle: drop the still-forming 15m bar
+    now_ms = int(time.time() * 1000)
+    closed_df = df_15m[df_15m['timestamp'] + 900000 <= now_ms]
+    eval_candle = closed_df.iloc[-1] if not closed_df.empty else df_15m.iloc[-2 if len(df_15m) > 1 else -1]
+    candle_time_str = eval_candle['ist_dt'].strftime('%H:%M IST')
+    candle_label = f"Last closed 15m candle ({candle_time_str}) [{session['emoji']} {session['name']}]"
 
-    # Determine whether we are evaluating an institutional session candle or latest active bar
-    target_candle_df = df_15m[
-        (df_15m['ist_dt'].dt.date == today_date) & 
-        (
-            ((df_15m['ist_dt'].dt.hour == 7) & (df_15m['ist_dt'].dt.minute >= 15) & (df_15m['ist_dt'].dt.minute <= 45)) |
-            ((df_15m['ist_dt'].dt.hour == 13) & (df_15m['ist_dt'].dt.minute >= 15) & (df_15m['ist_dt'].dt.minute <= 45)) |
-            ((df_15m['ist_dt'].dt.hour == 19) & (df_15m['ist_dt'].dt.minute == 0))
-        )
-    ]
-
-    is_prime_session_candle = False
-    if not target_candle_df.empty and session["is_prime"]:
-        eval_candle = target_candle_df.iloc[-1]
-        candle_time_str = eval_candle['ist_dt'].strftime('%H:%M IST')
-        candle_label = f"{session['emoji']} {session['name']} Candle ({candle_time_str})"
-        is_prime_session_candle = True
-    else:
-        eval_candle = df_15m.iloc[-1]
-        candle_time_str = eval_candle['ist_dt'].strftime('%H:%M IST')
-        candle_label = f"Latest Candle ({candle_time_str}) [{session['emoji']} {session['name']}]"
-
+    open_price = float(eval_candle['open'])
     close_price = float(eval_candle['close'])
     high_price = float(eval_candle['high'])
     low_price = float(eval_candle['low'])
+    candle_ts = int(eval_candle['timestamp'])
 
     rh, rl = levels["RH"], levels["RL"]
     sh, sl = levels["SH"], levels["SL"]
     mid = levels["MID"]
 
-    setup = "WAIT / NO TRADE (Price oscillating within Equilibrium)"
+    setup = "WAIT / NO TRADE (No zone rejection or tower confirmation on the last closed candle)"
     entry = close_price
     stop_loss = 0.0
     tp1 = mid
     tp2 = rl
     signal_type = "NEUTRAL"
+    signal_kind = None
+    trigger_zone = None
 
-    # Top Liquidity Sweep: Swept RH/SH and closed back below RH
-    if high_price >= rh and close_price < rh:
-        signal_type = "SHORT"
-        setup = f"SELL (Short): Liquidity Sweep Rejection at Range High ({session['name']})"
-        stop_loss = round_asset_price(max(high_price, sh) * 1.002, rh)
-        tp1 = mid
-        tp2 = rl
-
-    # Bottom Liquidity Sweep: Swept RL/SL and closed back above RL
-    elif low_price <= rl and close_price > rl:
-        signal_type = "LONG"
-        setup = f"BUY (Long): Liquidity Sweep Rejection at Range Low ({session['name']})"
-        stop_loss = round_asset_price(min(low_price, sl) * 0.998, rh)
-        tp1 = mid
-        tp2 = rh
+    zs = detect_zone_signal(levels, open_price, high_price, low_price, close_price)
+    if zs:
+        signal_type = zs["direction"]
+        signal_kind = zs["kind"]
+        trigger_zone = zs["zone"]
+        stop_loss = round_asset_price(zs["stop"], rh)
+        tp1 = round_asset_price(zs["tp1"], rh)
+        tp2 = round_asset_price(zs["tp2"], rh)
+        word = "BUY (Long)" if signal_type == "LONG" else "SELL (Short)"
+        label = "Rejection Reversal" if signal_kind == "REVERSAL" else "Tower Continuation (alert-only, untested)"
+        setup = f"{word}: {label} - {trigger_zone} ({session['name']})"
 
     margin_usd = margin_inr / usd_inr
     position_usd = margin_usd * leverage
@@ -1377,7 +1431,10 @@ def evaluate_tri_session_signal(pair="B-ETH_USDT", levels=None, margin_inr=10000
         "profit_tp1_inr": profit_tp1_inr,
         "profit_tp2_inr": profit_tp2_inr,
         "loss_sl_inr": loss_sl_inr,
-        "levels": levels
+        "levels": levels,
+        "signal_kind": signal_kind,
+        "trigger_zone": trigger_zone,
+        "candle_ts": candle_ts
     }
 
 def evaluate_715_pm_signal(pair="B-ETH_USDT", levels=None, margin_inr=100000, leverage=5, usd_inr=85.0):

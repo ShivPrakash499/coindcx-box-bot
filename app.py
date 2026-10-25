@@ -58,6 +58,8 @@ try:
     format_order_quantity = getattr(coindcx_engine, "format_order_quantity", lambda pair, qty: round(float(qty), 4))
     get_pair_lot_spec = getattr(coindcx_engine, "get_pair_lot_spec", lambda pair: {})
     run_strategy_backtest = getattr(coindcx_engine, "run_strategy_backtest", None)
+    compute_market_bias = coindcx_engine.compute_market_bias
+    get_rotational_margin_inr = coindcx_engine.get_rotational_margin_inr
 except Exception as _mod_err:
     st.error(f"❌ Backend Engine Initialization Error: {_mod_err}")
     st.code(traceback.format_exc())
@@ -88,11 +90,33 @@ except Exception as _alert_err:
     def send_email_notification(*args, **kwargs):
         return False, f"Email notifier offline: {_alert_err}"
 
+try:
+    import email_notifier
+    import signal_monitor
+    from email_notifier import send_trade_email, send_test_trade_email, get_email_config
+except Exception as _em_err:
+    _EMAIL_ERR = str(_em_err)
+    email_notifier = signal_monitor = None
+    def send_trade_email(*args, **kwargs):
+        return False, f"Email module offline: {_EMAIL_ERR}"
+    def send_test_trade_email(*args, **kwargs):
+        return False, f"Email module offline: {_EMAIL_ERR}"
+    def get_email_config():
+        return {"sender": "", "receiver": "", "configured": False}
+
+try:
+    from sheets_logger import log_trade_closed, log_failed_trade_diagnostic
+except Exception:
+    def log_trade_closed(*args, **kwargs):
+        return False
+    def log_failed_trade_diagnostic(*args, **kwargs):
+        return False
+
 st.set_page_config(
     page_title="CoinDCX Box Theory Terminal",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
@@ -201,6 +225,10 @@ def get_cached_positions():
 def get_cached_open_orders():
     return fetch_coindcx_open_orders()
 
+@st.cache_data(ttl=300)
+def get_cached_bias(pair):
+    return compute_market_bias(pair)
+
 # ----------------- THEME & STYLING -----------------
 st.sidebar.image("https://img.icons8.com/color/96/000000/bitcoin--v1.png", width=50)
 st.sidebar.title("⚡ Terminal Controls")
@@ -299,6 +327,24 @@ st.markdown(f"""
         border-radius: 6px;
         font-size: 0.95rem;
     }}
+    /* ---------- iPad / iPhone responsive layer ---------- */
+    @media only screen and (max-width: 1024px) {{
+        .block-container {{ padding: 1rem 1rem 3rem 1rem !important; }}
+        div[data-testid="stTabs"] [role="tablist"] {{ overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; scrollbar-width: none; }}
+        div[data-testid="stTabs"] button[role="tab"] {{ white-space: nowrap; min-height: 48px; }}
+    }}
+    @media only screen and (max-width: 768px) {{
+        .block-container {{ padding: 0.6rem 0.6rem 3rem 0.6rem !important; }}
+        .stButton > button, .stDownloadButton > button, div[data-testid="stFormSubmitButton"] button {{ min-height: 48px; font-size: 1rem; }}
+        div[data-testid="stHorizontalBlock"] {{ flex-wrap: wrap !important; gap: 0.5rem !important; }}
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"],
+        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {{ min-width: calc(50% - 0.5rem) !important; flex: 1 1 calc(50% - 0.5rem) !important; }}
+        div[data-testid="stMetric"] {{ background: {card_bg}; border: 1px solid {card_border}; border-radius: 10px; padding: 10px; }}
+        h1 {{ font-size: 1.5rem !important; }}
+        h2, h3 {{ font-size: 1.2rem !important; }}
+        div[data-testid="stDataFrame"], div[data-testid="stTable"] {{ overflow-x: auto; }}
+        input, select, textarea {{ font-size: 16px !important; }}
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -307,8 +353,10 @@ st.sidebar.markdown("### 💰 Account Margin Overview")
 wallet_data = get_cached_balance()
 st.sidebar.metric("Futures Balance", f"₹{wallet_data['total_inr']:,.2f}", wallet_data["source"])
 
-default_margin = float(os.getenv("MARGIN_PER_TRADE_INR", 100000))
-margin_inr = st.sidebar.number_input("Margin per Trade (INR)", value=int(default_margin), step=10000)
+_rot = get_rotational_margin_inr()
+default_margin = float(_rot["margin_inr"])
+margin_inr = st.sidebar.number_input("Margin per Trade (INR)", value=int(default_margin), step=500)
+st.sidebar.caption(f"Rotational sizing: 1/3 of {'live' if _rot['is_live_api'] else 'configured'} wallet ₹{_rot['wallet_equity_inr']:,.0f} = ₹{_rot['margin_inr']:,.0f}")
 
 default_lev = int(os.getenv("LEVERAGE", 5))
 leverage = st.sidebar.slider("Leverage Multiplier", min_value=1, max_value=20, value=default_lev)
@@ -318,37 +366,32 @@ usd_inr = st.sidebar.number_input("USDT / INR Rate (Live CoinDCX)", value=float(
 st.sidebar.caption(f"🟢 CoinDCX Live Spot USDT: **₹{live_crypto_rate:,.2f} INR**")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 📧 Email Alerts & Server Link")
-alert_enabled = os.getenv("ALERT_EMAIL_ENABLED", "True").lower() in ["true", "1", "yes"]
-st.sidebar.caption(f"Status: **{'🟢 Active' if alert_enabled else '🔴 Disabled'}** | Cooldown: 15 mins")
-cfg_receiver = os.getenv("RECEIVER_EMAIL", "your_email@example.com")
+st.sidebar.markdown("### 📧 Gmail Trade Alerts")
+_mail_cfg = get_email_config()
+st.sidebar.caption(f"Status: **{'🟢 Configured' if _mail_cfg['configured'] else '🔴 Not configured'}** | Subject: `<SYMBOL> - trade notification`")
+if _mail_cfg["configured"]:
+    st.sidebar.caption(f"Receiver: `{_mail_cfg['receiver']}`")
+else:
+    st.sidebar.caption("Set `GMAIL_SENDER`, `GMAIL_APP_PASSWORD`, `GMAIL_RECEIVER` in `.env` / Streamlit secrets.")
 cfg_app_url = os.getenv("APP_WEB_URL", "http://localhost:8501")
 custom_url = st.sidebar.text_input("Server Web App URL (Included in Alerts):", value=cfg_app_url, key="input_app_web_url")
 if custom_url != os.getenv("APP_WEB_URL", ""):
     os.environ["APP_WEB_URL"] = custom_url
-st.sidebar.caption(f"Receiver: `{cfg_receiver}`")
 
-if st.sidebar.button("📩 Send Test Alert Email", key="btn_send_test_email", use_container_width=True):
+if st.sidebar.button("📧 Send Test Trade Alert Email", key="btn_send_test_email", use_container_width=True):
     with st.sidebar:
-        with st.spinner("Dispatching test alert email..."):
+        with st.spinner("Dispatching test trade alert..."):
             test_ticker = get_cached_ticker(st.session_state.selected_pair)
-            test_lp = test_ticker.get("last_price", 100.0)
-            ok, msg = send_sweep_alert(
-                pair=st.session_state.selected_pair,
-                signal_type="BUY",
-                session_name="🏛️ London Open (01:30 PM IST)",
-                live_price=test_lp,
-                entry=test_lp,
-                stop_loss=round(test_lp * 0.985, 2),
-                tp1=round(test_lp * 1.025, 2),
-                tp2=round(test_lp * 1.045, 2),
-                roe_tp1=12.5,
-                force=True
-            )
-            if ok:
-                st.success(f"✅ {msg}")
-            else:
-                st.error(f"❌ {msg}")
+            ok, msg = send_test_trade_email(st.session_state.selected_pair, test_ticker.get("last_price", 100.0), margin_inr)
+            (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
+
+st.sidebar.markdown("### 📡 Signal Monitor")
+monitor_on = st.sidebar.toggle("Scan & e-mail signals while this app is open", value=True, key="monitor_on")
+_default_watch = ["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"]
+monitor_pairs = st.sidebar.multiselect(
+    "Watchlist", GLOBAL_FUTURES_PAIRS,
+    default=[p for p in _default_watch if p in GLOBAL_FUTURES_PAIRS], key="monitor_pairs")
+st.sidebar.caption("Standalone alternative: `python signal_scanner.py` (no UI needed).")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### ⚡ Live Refresh Settings")
@@ -560,11 +603,12 @@ elif "60" in chart_refresh_rate:
 
 # Main Tabs
 tabs = st.tabs([
-    "📈 Live Chart & Trade Setups",
-    "⚡ Live Trade Execution & Risk",
-    "📐 Key Box Levels Breakdown",
+    "🎯 Signals",
+    "🛡️ Trade Execution",
+    "📊 Live Trades",
+    "📐 Key Levels & Predefined Setup",
     "📋 Google Sheet Logger",
-    "📊 Strategy Backtest"
+    "📊 Multi-Derivative Backtest"
 ])
 
 # ==============================================================================
@@ -628,6 +672,11 @@ with tabs[0]:
             ts_series = pd.to_datetime(df_chart['timestamp'], unit='ms')
 
             fig = go.Figure()
+
+            fig.add_hrect(y0=box_levels['RH'], y1=box_levels['SH'], fillcolor="rgba(220,38,38,0.10)", line_width=0,
+                          layer="below", annotation_text="Sell Zone (RH → SH)", annotation_position="top left")
+            fig.add_hrect(y0=box_levels['SL'], y1=box_levels['RL'], fillcolor="rgba(22,163,74,0.10)", line_width=0,
+                          layer="below", annotation_text="Buy Zone (RL → SL)", annotation_position="bottom left")
 
             fig.add_trace(go.Candlestick(
                 x=ts_series,
@@ -841,7 +890,56 @@ with tabs[0]:
         else:
             st.error(f"Could not load {active_tf} candles for {pair}.")
 
-    render_chart_fragment(selected_pair, levels, is_light_theme, margin_inr, leverage, usd_inr)
+    @st.fragment(run_every="60s")
+    def render_signals_panel(watch, auto_send, m_inr, lev, u_inr):
+        st.subheader("🎯 Zone Signals — rejection reversal & solid-tower continuation")
+        st.caption("Evaluated on the last CLOSED 15m candle. Each new confirmation is e-mailed once (60-min cooldown per pair/direction). "
+                   "Open the **🛡️ Trade Execution** tab to review the pre-filled Entry / SL / TPs and press Execute.")
+        if not watch:
+            st.info("Pick at least one derivative in the sidebar **Signal Monitor** watchlist.")
+            return
+        results = signal_monitor.scan_and_alert(watch, m_inr, lev, u_inr, send=auto_send) if signal_monitor else []
+        st.caption(f"Last scan: {datetime.now(IST).strftime('%I:%M:%S %p IST')} • auto e-mail {'ON' if auto_send else 'OFF'}")
+
+        for r in results:
+            sig, pair_r = r["signal"], r["pair"]
+            name_r = pair_r.replace("B-", "").replace("_USDT", "")
+            lv = (sig or {}).get("levels") or get_cached_box_levels(pair_r)
+            px = get_cached_ticker(pair_r).get("last_price", 0.0)
+            if lv and px:
+                if px >= lv["RH"]:
+                    zone_txt = "🔴 Inside **Sell Zone** (RH–SH)" if px <= lv["SH"] else "🔴 Above Swing High"
+                elif px <= lv["RL"]:
+                    zone_txt = "🟢 Inside **Buy Zone** (RL–SL)" if px >= lv["SL"] else "🟢 Below Swing Low"
+                else:
+                    zone_txt = "⚪ Mid-range (no zone touched)"
+            else:
+                zone_txt = "levels unavailable"
+
+            with st.container(border=True):
+                h1, h2 = st.columns([2, 3])
+                h1.markdown(f"### {name_r}  \n`${px:,.4f}`" if px < 1 else f"### {name_r}  \n`${px:,.2f}`")
+                h2.markdown(zone_txt)
+                if sig and sig["signal"] != "NEUTRAL":
+                    is_l = sig["signal"] == "LONG"
+                    badge = "badge-buy" if is_l else "badge-sell"
+                    st.markdown(f"<span class='{badge}'>{sig['signal']} — {sig['signal_kind']}</span> &nbsp; {sig['trigger_zone']}", unsafe_allow_html=True)
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Entry", f"${sig['entry']:,.4f}")
+                    m2.metric("Structural SL", f"${sig['stop_loss']:,.4f}")
+                    m3.metric("TP1", f"${sig['tp1']:,.4f}")
+                    m4.metric("TP2", f"${sig['tp2']:,.4f}")
+                    st.caption(f"Margin ₹{sig['margin_inr']:,.0f} @ {sig['leverage']}x • TP1 ≈ +₹{sig['profit_tp1_inr']:,.0f} • SL ≈ -₹{sig['loss_sl_inr']:,.0f} • "
+                               f"📧 {'sent' if r['emailed'] else r['message']}")
+                    if sig["signal_kind"] == "CONTINUATION":
+                        st.caption("⚠️ Continuation (tower) signals are alert-only ideas and have not been backtested.")
+                    if st.button(f"➡️ Load {name_r} into Execution tab", key=f"btn_load_sig_{pair_r}", use_container_width=True):
+                        st.session_state.selected_pair = pair_r
+                        st.rerun()
+                else:
+                    st.caption(f"No confirmation on the last closed 15m candle • {r['message']}")
+
+    render_signals_panel(monitor_pairs, monitor_on, margin_inr, leverage, usd_inr)
 
 # ==============================================================================
 # TAB 1: LIVE TRADE EXECUTION, FEES & CAPITAL PRESERVATION (REQUIREMENTS 2, 3, 4, 5)
@@ -959,140 +1057,8 @@ with tabs[1]:
                     }
                     st.rerun()
 
-        # LIVE COINDCX POSITIONS
         live_positions = get_cached_positions()
-        if live_positions:
-            col_pos_head, col_pos_close_all = st.columns([2.2, 1.8])
-            with col_pos_head:
-                st.markdown("#### 🔥 Active CoinDCX Futures Positions")
-                st.caption(f"{len(live_positions)} active position(s) streaming live from CoinDCX")
-            with col_pos_close_all:
-                st.write("")
-                if st.button("🚨 CLOSE ALL POSITIONS & CANCEL ORDERS", key="btn_close_all_positions", type="primary", use_container_width=True):
-                    with st.spinner("Executing Emergency Close All on CoinDCX..."):
-                        closed, total, msg = exit_all_coindcx_positions()
-                        log_entry = {
-                            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                            "pair": "ALL",
-                            "action": "EMERGENCY_CLOSE_ALL",
-                            "status": "SUCCESS" if closed == total else ("WARNING" if closed > 0 else "ERROR"),
-                            "message": msg,
-                            "details": {"closed": closed, "total": total}
-                        }
-                        st.session_state.api_error_logs.insert(0, log_entry)
-                        st.session_state.last_order_status = {
-                            "type": "success" if closed == total else "error",
-                            "msg": msg,
-                            "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
-                            "pair": "ALL"
-                        }
-                        st.rerun()
-
-            for p in live_positions:
-                pos_id = p["id"]
-                pair_name = p["pair"]
-                direction = p["direction"]
-                qty = p["quantity"]
-                entry_p = p["entry_price"]
-                mark_p = p["mark_price"]
-                pnl_inr = p["pnl_inr"]
-                pnl_usd = p["pnl_usd"]
-                roe_pct = p["roe_pct"]
-                liq_p = p["liquidation_price"]
-                lev = p["leverage"]
-                cur_tp = p.get("take_profit")
-                cur_sl = p.get("stop_loss")
-                pnl_col = "#16a34a" if pnl_inr >= 0 else "#dc2626"
-                pnl_sgn = "+" if pnl_inr >= 0 else ""
-
-                with st.container(border=True):
-                    c_title, c_metrics, c_actions = st.columns([1.5, 2.0, 1.5])
-                    with c_title:
-                        dir_badge = f"<span class='badge-buy'>{direction} {pair_name}</span>" if direction == "LONG" else f"<span class='badge-sell'>{direction} {pair_name}</span>"
-                        st.markdown(f"{dir_badge} **{qty}** @ ${entry_p:,.2f} ({lev}x)", unsafe_allow_html=True)
-                        st.caption(f"Mark: ${mark_p:,.2f} | Liq: ${liq_p:,.2f} | Mode: {p.get('margin_type', 'isolated').upper()}")
-                    with c_metrics:
-                        st.markdown(f"<div style='font-size:1.15rem; font-weight:800; color:{pnl_col};'>{pnl_sgn}₹{pnl_inr:,.2f} ({pnl_sgn}{roe_pct:.2f}% ROE)</div>", unsafe_allow_html=True)
-                        st.caption(f"Margin: ₹{p.get('locked_margin_inr', 0.0):,.2f} | Size: ₹{p.get('notional_inr', 0.0):,.2f} | Rate: ₹{p.get('settlement_rate', 100.0):.2f}/USDT")
-                    with c_actions:
-                        if st.button(f"❌ Close {pair_name}", key=f"btn_close_one_{pos_id}", use_container_width=True):
-                            with st.spinner(f"Closing {pair_name} on CoinDCX..."):
-                                ok, msg = exit_coindcx_position(pos_id)
-                                log_entry = {
-                                    "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                                    "pair": pair_name,
-                                    "action": "CLOSE_POSITION",
-                                    "status": "SUCCESS" if ok else "ERROR",
-                                    "message": msg,
-                                    "details": {"pos_id": pos_id}
-                                }
-                                st.session_state.api_error_logs.insert(0, log_entry)
-                                if ok:
-                                    st.session_state.last_order_status = {
-                                        "type": "success",
-                                        "msg": f"✅ Closed {pair_name} position!",
-                                        "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
-                                        "pair": pair_name
-                                    }
-                                    st.rerun()
-                                else:
-                                    st.session_state.last_order_status = {
-                                        "type": "error",
-                                        "msg": f"❌ Failed to close {pair_name}: {msg}",
-                                        "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
-                                        "pair": pair_name
-                                    }
-                                    st.error(f"❌ {msg}")
-
-                    # In-position adjustment of Take Profit & Stop Loss
-                    with st.expander(f"⚙️ Adjust TP / SL for {pair_name}", expanded=False):
-                        t_col1, t_col2, t_col3 = st.columns([1.5, 1.5, 1.2])
-                        with t_col1:
-                            new_tp_val = st.number_input(
-                                "New Take Profit ($):",
-                                value=float(cur_tp) if cur_tp else float(round_asset_price(mark_p * (1.02 if direction == "LONG" else 0.98), mark_p)),
-                                step=0.5 if mark_p > 1.0 else 0.0001,
-                                format="%.4f" if mark_p < 1.0 else "%.2f",
-                                key=f"input_tp_{pos_id}"
-                            )
-                        with t_col2:
-                            new_sl_val = st.number_input(
-                                "New Stop Loss ($):",
-                                value=float(cur_sl) if cur_sl else float(round_asset_price(mark_p * (0.98 if direction == "LONG" else 1.02), mark_p)),
-                                step=0.5 if mark_p > 1.0 else 0.0001,
-                                format="%.4f" if mark_p < 1.0 else "%.2f",
-                                key=f"input_sl_{pos_id}"
-                            )
-                        with t_col3:
-                            st.write("")
-                            if st.button("💾 Save TP/SL", key=f"btn_update_tpsl_{pos_id}", use_container_width=True):
-                                with st.spinner("Updating triggers on CoinDCX..."):
-                                    ok, msg = update_coindcx_position_tpsl(pos_id, new_tp_val, new_sl_val, pair=pair_name)
-                                    log_entry = {
-                                        "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                                        "pair": pair_name,
-                                        "action": "UPDATE_TPSL",
-                                        "status": "SUCCESS" if ok else "ERROR",
-                                        "message": msg,
-                                        "details": {"tp": new_tp_val, "sl": new_sl_val, "pos_id": pos_id}
-                                    }
-                                    st.session_state.api_error_logs.insert(0, log_entry)
-                                    if ok:
-                                        st.session_state.last_order_status = {
-                                            "type": "success",
-                                            "msg": f"✅ TP and SL updated for {pair_name} on CoinDCX!",
-                                            "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
-                                            "pair": pair_name
-                                        }
-                                        st.rerun()
-                                    else:
-                                        st.session_state.last_order_status = {
-                                            "type": "error",
-                                            "msg": f"❌ Failed to update TP/SL for {pair_name}: {msg}",
-                                            "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"),
-                                            "pair": pair_name
-                                        }
-                                        st.error(f"❌ {msg}")
+        st.caption("📊 Open positions, TP/SL edits and Close / Close-All live in the **Live Trades** tab.")
 
         st.markdown("---")
 
@@ -1163,7 +1129,7 @@ with tabs[1]:
                     f"🔴 SELL / SHORT Setup (Entry at Range High: {fmt(s_setup['entry'])})",
                     f"⚡ {sig_data['session_name']} Signal ({sig_data['signal']}: {sig_data['setup']})"
                 ],
-                index=0,
+                index=2 if sig_data.get("signal") in ("LONG", "SHORT") else 0,
                 key=f"trade_choice_exec_{pair}"
             )
 
@@ -1180,6 +1146,10 @@ with tabs[1]:
             else:
                 trade_dir = "BUY" if sig_data["signal"] in ["BUY", "LONG"] else ("SELL" if sig_data["signal"] in ["SELL", "SHORT"] else "BUY")
                 active_trade = b_setup if trade_dir == "BUY" else s_setup
+                if sig_data.get("signal") in ("LONG", "SHORT"):
+                    # Live zone signal: exact entry / structural SL / TPs on the last closed candle
+                    active_trade = {**active_trade, "entry": sig_data["entry"], "stop_loss": sig_data["stop_loss"],
+                                    "tp1": sig_data["tp1"], "tp2": sig_data["tp2"], "setup": sig_data["setup"]}
                 setup_tag = "SIGNAL"
                 color_class = "badge-buy" if trade_dir == "BUY" else "badge-sell"
 
@@ -1337,6 +1307,12 @@ with tabs[1]:
                 st.warning(f"⚠️ **CoinDCX Minimum Order Constraint:** Current order value is **₹{trade_notional_inr:,.0f} INR**. CoinDCX exchange strictly requires a minimum order value of **₹2,448 INR**. Please increase margin or leverage.")
 
             st.write("")
+            price_shield_pct = st.slider(
+                "🛡️ Price Shield — max deviation of live price from entry (%)",
+                min_value=0.05, max_value=1.0, value=0.15, step=0.05, key=f"price_shield_{pair}",
+                help="Live orders are blocked if the live price has moved further than this from the planned entry."
+            )
+            st.caption("Live orders are sent as **Limit Maker (post_only)** so they can never pay taker slippage.")
             exec_mode = st.radio(
                 "Execution Target:",
                 ["⚡ Live CoinDCX Exchange Order (Real Funds API)", "📝 Simulated Paper Trade (Track in App & Google Sheet)"],
@@ -1350,6 +1326,13 @@ with tabs[1]:
                 live_api_msg = ""
                 order_placed_ok = True
                 api_extra = {}
+
+                shield_blocked, shield_live_px, shield_dev = False, 0.0, 0.0
+                if "Live" in exec_mode and wallet["is_live_api"]:
+                    shield_live_px = float(fetch_live_ticker(pair).get("last_price", 0.0) or 0.0)
+                    _ent = float(active_trade["entry"])
+                    shield_dev = abs(shield_live_px - _ent) / _ent * 100.0 if (_ent > 0 and shield_live_px > 0) else 999.0
+                    shield_blocked = shield_dev > price_shield_pct
 
                 if "Live" in exec_mode:
                     if not wallet["is_live_api"]:
@@ -1388,14 +1371,29 @@ with tabs[1]:
                         })
                         st.error(f"❌ {err_text}")
                         order_placed_ok = False
+                    elif shield_blocked:
+                        err_text = (f"🛡️ Price Shield blocked the order: live price {fmt(shield_live_px)} is {shield_dev:.2f}% away from "
+                                    f"planned entry {fmt(active_trade['entry'])} (limit {price_shield_pct:.2f}%). Refresh the setup and retry.")
+                        st.session_state.last_order_status = {"type": "error", "msg": err_text, "timestamp": exec_time, "pair": pair}
+                        st.session_state.api_error_logs.insert(0, {
+                            "timestamp": exec_time, "pair": pair, "action": f"LIVE_{trade_dir}", "status": "ERROR",
+                            "message": err_text, "details": {"live_price": shield_live_px, "entry": active_trade["entry"], "deviation_pct": round(shield_dev, 3)}
+                        })
+                        st.error(err_text)
+                        order_placed_ok = False
                     else:
-                        with st.spinner("Submitting order to CoinDCX Futures API..."):
+                        _maker_px = round_asset_price(
+                            min(float(active_trade["entry"]), shield_live_px) if trade_dir == "BUY" else max(float(active_trade["entry"]), shield_live_px),
+                            float(active_trade["entry"]))
+                        with st.spinner("Submitting Limit Maker (post_only) order to CoinDCX Futures API..."):
                             ok, api_msg, api_extra = place_coindcx_futures_order(
                                 pair=pair,
                                 side=trade_dir,
                                 quantity=active_trade["crypto_qty"],
                                 leverage=trade_leverage,
-                                order_type="market_order",
+                                order_type="limit_order",
+                                price=_maker_px,
+                                post_only=True,
                                 margin_currency="INR",
                                 tp_price=active_trade["tp1"],
                                 sl_price=active_trade["stop_loss"]
@@ -1447,9 +1445,18 @@ with tabs[1]:
                     st.session_state.executed_trades.insert(0, order_record)
 
                     sheet_success, sheet_msg = log_trade_to_google_sheet(order_record, return_details=True)
+                    mail_ok, mail_msg = send_trade_email(
+                        pair=pair, direction=trade_dir, entry=active_trade["entry"], stop_loss=active_trade["stop_loss"],
+                        tp1=active_trade["tp1"], tp2=active_trade["tp2"], margin_inr=trade_margin_inr, leverage=trade_leverage,
+                        kind="EXECUTED", note=("Live Limit Maker order submitted." if "Live" in exec_mode else "Paper trade recorded."))
+                    # Remember the plan so Live Trades can apply SL/TP once a resting limit order fills
+                    st.session_state.setdefault("trade_plans", {})[pair] = {
+                        "direction": "LONG" if trade_dir == "BUY" else "SHORT", "entry": active_trade["entry"],
+                        "sl": active_trade["stop_loss"], "tp1": active_trade["tp1"], "tp2": active_trade["tp2"],
+                        "applied": False, "margin_inr": trade_margin_inr, "leverage": trade_leverage}
 
                     status_headline = "LIVE COINDCX ORDER EXECUTED!" if "Live" in exec_mode else "PAPER ORDER RECORDED!"
-                    success_text = f"✅ **{status_headline}** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(active_trade['entry'])} | {live_api_msg or 'Paper Simulation Active'} | Google Sheets: {sheet_msg}"
+                    success_text = f"✅ **{status_headline}** {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt(active_trade['entry'])} | {live_api_msg or 'Paper Simulation Active'} | Google Sheets: {sheet_msg} | Email: {mail_msg}"
 
                     st.session_state.last_order_status = {
                         "type": "success",
@@ -1590,11 +1597,198 @@ with tabs[1]:
     render_trade_execution_fragment(selected_pair, levels)
 
 # ==============================================================================
-# TAB 2: KEY BOX LEVELS BREAKDOWN
+# TAB 2: LIVE TRADES & POSITION MANAGER
 # ==============================================================================
 with tabs[2]:
-    st.subheader(f"📐 Calculated Key Box Levels for {selected_pair}")
-    st.caption("Derived from completed Previous Day Daily (1D) Candle and Multi-Day Swing Extrema")
+    def _lt_fmt(p):
+        return f"${p:,.4f}" if p < 1.0 else f"${p:,.2f}"
+
+    def _lt_finish_close(pos, pnl_inr, reason_label):
+        """Book realised PnL, log the final result to Google Sheets and e-mail the close."""
+        st.session_state.realized_pnl_inr += pnl_inr
+        plan = st.session_state.get("trade_plans", {}).get(pos["pair"], {})
+        record = {
+            "entry_time": plan.get("opened", ""), "exit_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S"),
+            "pair": pos["pair"], "direction": pos["direction"], "session": "",
+            "entry_price": pos["entry_price"], "stop_loss": plan.get("sl", pos.get("stop_loss") or ""),
+            "exit_price": pos["mark_price"], "exit_reason": reason_label, "net_pnl_inr": round(pnl_inr, 2),
+            "duration_candles": "",
+        }
+        log_trade_closed(record)
+        if pnl_inr < 0:
+            log_failed_trade_diagnostic(record)
+        send_trade_email(
+            pair=pos["pair"], direction=pos["direction"], entry=pos["entry_price"],
+            stop_loss=float(plan.get("sl") or pos.get("stop_loss") or 0), tp1=float(plan.get("tp1") or pos.get("take_profit") or 0),
+            tp2=float(plan.get("tp2") or 0), margin_inr=float(pos.get("locked_margin_inr", 0)), leverage=int(pos.get("leverage", 5) or 5),
+            kind="CLOSED", note=f"Closed at ~{_lt_fmt(pos['mark_price'])} | Final PnL: {'+' if pnl_inr >= 0 else ''}₹{pnl_inr:,.2f} ({reason_label})")
+
+    @st.fragment(run_every="10s")
+    def render_live_trades_manager():
+        st.subheader("📊 Live Trades & Position Manager")
+        live_positions = get_cached_positions() or []
+        paper = st.session_state.active_position
+        plans = st.session_state.get("trade_plans", {})
+
+        total_margin = sum(float(p.get("locked_margin_inr", 0) or 0) for p in live_positions)
+        total_unreal = sum(float(p.get("pnl_inr", 0) or 0) for p in live_positions)
+        unreal_pct = (total_unreal / total_margin * 100.0) if total_margin > 0 else 0.0
+        realized = st.session_state.realized_pnl_inr
+        n_open = len(live_positions) + (1 if paper else 0)
+
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Total Open Positions", n_open)
+        s2.metric("Margin Deployed", f"₹{total_margin:,.0f}")
+        s3.metric("Unrealized PnL", f"{'+' if total_unreal >= 0 else ''}₹{total_unreal:,.2f}", f"{unreal_pct:+.2f}%")
+        s4.metric("Realized Session PnL", f"{'+' if realized >= 0 else ''}₹{realized:,.2f}")
+
+        if live_positions and st.button("🚨 Close All Positions", key="lt_close_all", type="primary", use_container_width=True):
+            snapshot = list(live_positions)
+            with st.spinner("Closing all positions on CoinDCX..."):
+                closed, total, msg = exit_all_coindcx_positions()
+            if closed:
+                for pos in snapshot:
+                    _lt_finish_close(pos, float(pos.get("pnl_inr", 0) or 0), "Manual close (Close All)")
+            st.session_state.last_order_status = {"type": "success" if closed == total else "error", "msg": msg,
+                                                  "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"), "pair": "ALL"}
+            st.rerun()
+
+        if not live_positions and not paper:
+            st.info("No open positions. Executed trades appear here with live mark price, SL/TPs and PnL.")
+
+        for p in live_positions:
+            pid, pr = p["id"], p["pair"]
+            is_long = p["direction"] == "LONG"
+            entry_p, mark_p = float(p["entry_price"]), float(p["mark_price"])
+            plan = plans.get(pr, {})
+            cur_sl, cur_tp = p.get("stop_loss"), p.get("take_profit")
+            tp1 = float(plan.get("tp1") or cur_tp or 0)
+            tp2 = float(plan.get("tp2") or 0)
+
+            # Apply the planned SL/TP once, if the resting limit order has filled and no bracket exists yet
+            if plan and not plan.get("applied") and not cur_sl:
+                ok, m = update_coindcx_position_tpsl(pid, plan.get("tp1"), plan.get("sl"), pair=pr)
+                plan["applied"] = True
+                plan["apply_msg"] = ("✅ Planned SL/TP applied on fill" if ok else f"⚠️ Could not apply planned SL/TP: {m}")
+                cur_sl, cur_tp = plan.get("sl"), plan.get("tp1")
+
+            # Ratchet trailing status (advisory: exchange holds one TP, so SL moves are applied by button)
+            ratchet, target_sl = "—", None
+            if tp1 and tp2:
+                half = (tp1 + tp2) / 2.0
+                reached = (lambda lvl: mark_p >= lvl) if is_long else (lambda lvl: mark_p <= lvl)
+                if reached(half):
+                    ratchet, target_sl = "🔒 ≥50% of TP1→TP2: ratchet SL to TP1 (MID)", tp1
+                elif reached(tp1):
+                    ratchet, target_sl = "✅ TP1 (MID) reached: take 50%, SL to breakeven", entry_p
+                else:
+                    ratchet = "⏳ Waiting for TP1 (MID)"
+
+            pnl_inr, roe = float(p["pnl_inr"]), float(p["roe_pct"])
+            col = "#16a34a" if pnl_inr >= 0 else "#dc2626"
+            with st.container(border=True):
+                badge = "badge-buy" if is_long else "badge-sell"
+                st.markdown(f"<span class='{badge}'>{p['direction']} {pr}</span> &nbsp; **{p['quantity']}** @ {_lt_fmt(entry_p)} ({p['leverage']}x)", unsafe_allow_html=True)
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Entry", _lt_fmt(entry_p))
+                m2.metric("Live Mark", _lt_fmt(mark_p))
+                m3.metric("Structural SL", _lt_fmt(float(cur_sl)) if cur_sl else "not set")
+                m4.metric("TP1 / TP2", f"{_lt_fmt(tp1) if tp1 else '—'} / {_lt_fmt(tp2) if tp2 else '—'}")
+                st.markdown(f"<div style='font-size:1.15rem;font-weight:800;color:{col}'>{'+' if pnl_inr >= 0 else ''}₹{pnl_inr:,.2f} ({roe:+.2f}% ROE)</div>", unsafe_allow_html=True)
+                st.caption(f"Ratchet: {ratchet} • Liq {_lt_fmt(float(p.get('liquidation_price', 0) or 0))} • Margin ₹{float(p.get('locked_margin_inr', 0) or 0):,.0f}")
+                if plan.get("apply_msg"):
+                    st.caption(plan["apply_msg"])
+
+                b1, b2 = st.columns(2)
+                if target_sl is not None:
+                    better = (cur_sl is None) or ((target_sl > float(cur_sl)) if is_long else (target_sl < float(cur_sl)))
+                    if better and b1.button("🔒 Apply ratchet SL", key=f"lt_ratchet_{pid}", use_container_width=True):
+                        ok, m = update_coindcx_position_tpsl(pid, cur_tp, target_sl, pair=pr)
+                        (st.success if ok else st.error)(("✅ " if ok else "❌ ") + m)
+                if b2.button(f"❌ Close Position ({pr})", key=f"lt_close_{pid}", use_container_width=True):
+                    with st.spinner(f"Closing {pr}..."):
+                        ok, m = exit_coindcx_position(pid)
+                    if ok:
+                        _lt_finish_close(p, pnl_inr, "Manual close")
+                        st.session_state.last_order_status = {"type": "success", "msg": f"✅ Closed {pr}. Final PnL {'+' if pnl_inr >= 0 else ''}₹{pnl_inr:,.2f}",
+                                                              "timestamp": datetime.now(IST).strftime("%H:%M:%S IST"), "pair": pr}
+                        st.rerun()
+                    else:
+                        st.error(f"❌ {m}")
+
+                with st.expander(f"⚙️ Adjust TP / SL — {pr}"):
+                    step = 0.5 if mark_p > 1.0 else 0.0001
+                    fmt_s = "%.2f" if mark_p > 1.0 else "%.4f"
+                    e1, e2, e3 = st.columns([1.5, 1.5, 1])
+                    new_tp = e1.number_input("Take Profit ($)", value=float(cur_tp) if cur_tp else float(tp1 or mark_p), step=step, format=fmt_s, key=f"lt_tp_{pid}")
+                    new_sl = e2.number_input("Stop Loss ($)", value=float(cur_sl) if cur_sl else float(mark_p), step=step, format=fmt_s, key=f"lt_sl_{pid}")
+                    if e3.button("💾 Save", key=f"lt_save_{pid}", use_container_width=True):
+                        ok, m = update_coindcx_position_tpsl(pid, new_tp, new_sl, pair=pr)
+                        (st.success if ok else st.error)(("✅ " if ok else "❌ ") + m)
+
+        if paper:
+            pr = paper.get("pair", "")
+            px = get_cached_ticker(pr).get("last_price", 0.0) if pr else 0.0
+            is_b = str(paper.get("direction") or paper.get("signal", "BUY")).upper() in ("BUY", "LONG")
+            e_px, qty = float(paper.get("entry", 0)), float(paper.get("crypto_qty", 0))
+            diff = (px - e_px) if is_b else (e_px - px)
+            p_inr = diff * qty * float(paper.get("usd_inr", 85.0)) if px else 0.0
+            with st.container(border=True):
+                st.markdown(f"📝 **Paper position** — {'LONG' if is_b else 'SHORT'} {pr} {qty} @ {_lt_fmt(e_px)}")
+                q1, q2, q3 = st.columns(3)
+                q1.metric("Live Mark", _lt_fmt(px) if px else "—")
+                q2.metric("SL / TP1", f"{_lt_fmt(float(paper.get('stop_loss', 0)))} / {_lt_fmt(float(paper.get('tp1', 0)))}")
+                q3.metric("Unrealized PnL", f"{'+' if p_inr >= 0 else ''}₹{p_inr:,.2f}")
+                if st.button("❌ Close Paper Position", key="lt_close_paper", use_container_width=True):
+                    st.session_state.realized_pnl_inr += p_inr
+                    st.session_state.active_position = None
+                    st.rerun()
+
+    render_live_trades_manager()
+
+
+# ==============================================================================
+# TAB 2: KEY BOX LEVELS BREAKDOWN
+# ==============================================================================
+with tabs[3]:
+    st.subheader(f"📐 Key Levels & Predefined Setup — {selected_pair}")
+    st.caption("Derived from the completed Previous Day candle and multi-day swing extrema. The chart lives only in this tab to keep other tabs fast on mobile.")
+
+    # ---------------- Overall market bias + predefined plan ----------------
+    if levels:
+        _bias = get_cached_bias(selected_pair)
+        _bias_name = _bias["bias"]
+        _bias_icon = "🟢" if _bias_name == "BULLISH" else ("🔴" if _bias_name == "BEARISH" else "⚪")
+        _buy = calculate_trade_setup_details("BUY", levels, 0.0, margin_inr, leverage, usd_inr, pair=selected_pair)
+        _sell = calculate_trade_setup_details("SELL", levels, 0.0, margin_inr, leverage, usd_inr, pair=selected_pair)
+
+        def _plan_card(title, setup, tag):
+            with st.container(border=True):
+                st.markdown(f"**{title}**")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Entry", f"${setup['entry']:,.4f}")
+                c2.metric("Structural SL", f"${setup['stop_loss']:,.4f}", f"-{setup['roe_sl']}% ROE")
+                c3.metric("TP1 (MID)", f"${setup['tp1']:,.4f}", f"+{setup['roe_tp1']}% ROE")
+                c4.metric("TP2", f"${setup['tp2']:,.4f}", f"+{setup['roe_tp2']}% ROE")
+                st.caption(f"{tag} • Margin ₹{margin_inr:,.0f} @ {leverage}x • Projected TP1 profit ≈ +₹{setup['profit_tp1_inr']:,.0f} • TP2 ≈ +₹{setup['profit_tp2_inr']:,.0f} • SL loss ≈ -₹{setup['loss_sl_inr']:,.0f}")
+
+        st.markdown("#### 🎯 Predefined Trade Plan (Based on Market Bias)")
+        st.markdown(f"**Overall Bias: {_bias_icon} {_bias_name}**  \n" + " • ".join(_bias["reasons"]))
+        if _bias_name == "BULLISH":
+            _plan_card("🟢 LONG in Buy Zone (RL → SL)", _buy, "Primary plan")
+            with st.expander("Counter-zone plan if price sweeps the upper boundary first"):
+                _plan_card("🔴 SHORT in Sell Zone (RH → SH)", _sell, "Secondary plan")
+        elif _bias_name == "BEARISH":
+            _plan_card("🔴 SHORT in Sell Zone (RH → SH)", _sell, "Primary plan")
+            with st.expander("Counter-zone plan if price sweeps the lower boundary first"):
+                _plan_card("🟢 LONG in Buy Zone (RL → SL)", _buy, "Secondary plan")
+        else:
+            st.info("Neutral / range bias: both boundaries are valid — trade whichever zone gets swept and rejected first.")
+            _plan_card("🔴 SHORT in Sell Zone (RH → SH)", _sell, "Upper boundary")
+            _plan_card("🟢 LONG in Buy Zone (RL → SL)", _buy, "Lower boundary")
+
+        render_chart_fragment(selected_pair, levels, is_light_theme, margin_inr, leverage, usd_inr)
+        st.markdown("---")
 
     cur_ticker = get_cached_ticker(selected_pair)
     cur_live = cur_ticker.get("last_price", 0.0)
@@ -1656,7 +1850,7 @@ with tabs[2]:
 # ==============================================================================
 # TAB 3: GOOGLE SHEET TRADE LOGGER
 # ==============================================================================
-with tabs[3]:
+with tabs[4]:
     st.subheader("📋 Google Sheet Automated Trade Logger")
     sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
     st.markdown(f"**Target Spreadsheet:** `{sheet_name}`")
@@ -1696,301 +1890,76 @@ with tabs[3]:
         """)
 
 # ==============================================================================
-# TAB 4: REAL-TIME STRATEGY BACKTEST & PERFORMANCE ANALYTICS
+# TAB 5: MULTI-DERIVATIVE BACKTEST (max 4 derivatives)
 # ==============================================================================
-with tabs[4]:
-    st.subheader("📊 Real-Time Strategy Backtest & Execution Simulator")
-    st.caption("Simulate the institutional Box Theory & Liquidity Sweep strategy on real historical exchange candles with exact CoinDCX Futures fee schedules, leverage, and Indian GST accounting.")
+with tabs[5]:
+    st.subheader("📊 Multi-Derivative Backtest")
+    st.caption("Runs the restored baseline strategy (24/7 RH–SH / RL–SL zone rejection, structural SL, 50/50 ratchet or 100% at MID) "
+               "on up to 4 derivatives with 1/3 rotational margin per trade.")
 
-    # 1. Backtest Configuration Controls
-    with st.container():
-        st.markdown(f"""
-            <div style="background:{card_bg}; border:1px solid {card_border}; border-radius:10px; padding:14px 18px; margin-bottom:15px;">
-                <span style="font-weight:700; color:{text_color}; font-size:1.05rem;">⚙️ Backtest Simulation Parameters</span>
-            </div>
-        """, unsafe_allow_html=True)
+    BT_OPTIONS = ["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT", "B-BNB_USDT", "B-XRP_USDT", "B-DOGE_USDT"]
+    bt_pairs = st.multiselect("Derivatives (max 4)", BT_OPTIONS, default=["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"],
+                              max_selections=4, key="bt_multi_pairs")
+    bc1, bc2, bc3 = st.columns(3)
+    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days"], index=4, key="bt_multi_dur")
+    bt_capital = bc2.number_input("Starting Capital (₹)", min_value=5000, value=30000, step=5000, key="bt_multi_cap")
+    bt_lev = bc3.slider("Leverage", 1, 10, 5, key="bt_multi_lev")
 
-        c_pair, c_dur, c_tf, c_margin, c_lev, c_target = st.columns([1.5, 1.4, 1.0, 1.4, 1.0, 1.5])
+    bt_margin_mode = st.radio("Margin per trade", ["1/3 of capital (rotational)", "Custom margin"], horizontal=True, key="bt_multi_mm")
+    if bt_margin_mode.startswith("Custom"):
+        bt_margin = st.number_input("Custom margin per trade (₹)", min_value=500, value=int(bt_capital / 3), step=500, key="bt_multi_custom")
+    else:
+        bt_margin = bt_capital / 3.0
+        st.caption(f"Margin per trade = ₹{bt_margin:,.0f}")
+    if len(bt_pairs) == 4 and not bt_margin_mode.startswith("Custom"):
+        st.warning("4 derivatives with 1/3 margin each can deploy up to 133% of capital if all trade at once. Treat the combined figure as an upper bound.")
 
-        # Current pair default index
-        cur_pair = st.session_state.selected_pair
-        default_pair_idx = GLOBAL_FUTURES_PAIRS.index(cur_pair) if cur_pair in GLOBAL_FUTURES_PAIRS else 0
+    st.markdown("**Exit mode per derivative**")
+    bt_modes = {}
+    mode_cols = st.columns(max(1, len(bt_pairs)))
+    for col, pr in zip(mode_cols, bt_pairs):
+        default_idx = 1 if pr == "B-ETH_USDT" else 0
+        bt_modes[pr] = col.selectbox(pr.replace("B-", "").replace("_USDT", ""), ["50/50 Split", "TP1 Midpoint"], index=default_idx, key=f"bt_mode_{pr}")
 
-        with c_pair:
-            bt_pair = st.selectbox("Futures Asset", GLOBAL_FUTURES_PAIRS, index=default_pair_idx, key="bt_pair_select")
+    if st.button("▶️ Run Backtest", key="btn_run_multi_bt", type="primary", use_container_width=True, disabled=not bt_pairs):
+        days = int(bt_dur_label.split()[0])
+        rows, details, prog = [], {}, st.progress(0.0, text="Starting...")
+        for n, pr in enumerate(bt_pairs):
+            prog.progress(n / len(bt_pairs), text=f"Backtesting {pr} ({bt_dur_label})...")
+            res = run_strategy_backtest(pair=pr, duration_days=days, interval="15m", margin_inr=bt_margin, leverage=bt_lev,
+                                        target_mode=bt_modes[pr], usd_inr=usd_inr)
+            details[pr] = res
+        prog.progress(1.0, text="Done")
+        st.session_state.bt_multi = {"details": details, "capital": bt_capital, "duration": bt_dur_label, "modes": dict(bt_modes)}
 
-        with c_dur:
-            duration_options = {
-                "1 Week (7 Days)": 7,
-                "1 Month (30 Days)": 30,
-                "3 Months (90 Days)": 90,
-                "6 Months (180 Days)": 180,
-                "12 Months / 1 Year (365 Days)": 365
-            }
-            # Default to 6 Months (180 Days) as selected by user
-            bt_dur_label = st.selectbox("Duration", list(duration_options.keys()), index=3, key="bt_dur_select", help="Simulation lookback period")
-            bt_days = duration_options[bt_dur_label]
+    out = st.session_state.get("bt_multi")
+    if out:
+        rows, tot = [], {"trades": 0, "wins": 0, "fees": 0.0, "net": 0.0, "gp": 0.0, "gl": 0.0}
+        for pr, res in out["details"].items():
+            name = pr.replace("B-", "").replace("_USDT", "")
+            if not res or res.get("error"):
+                rows.append({"Derivative": name, "Duration": out["duration"], "Trades": 0, "Fees Taken (₹)": "—", "Net P/L (₹)": res.get("error", "error") if res else "error",
+                             "ROI %": "—", "Win Rate %": "—", "Profit Factor": "—"})
+                continue
+            n_tr, net, fees = res["total_trades"], res["net_profit_inr"], res.get("total_fees_paid_inr", 0.0)
+            tot["trades"] += n_tr; tot["wins"] += res.get("win_count", 0); tot["fees"] += fees; tot["net"] += net
+            tot["gp"] += res.get("total_gross_profit", 0.0); tot["gl"] += res.get("total_gross_loss", 0.0)
+            rows.append({"Derivative": name, "Duration": out["duration"], "Trades": n_tr, "Fees Taken (₹)": round(fees, 2),
+                         "Net P/L (₹)": round(net, 2), "ROI %": round(net / out["capital"] * 100, 2),
+                         "Win Rate %": res["win_rate_pct"], "Profit Factor": res["profit_factor"]})
+        pf = round(tot["gp"] / tot["gl"], 2) if tot["gl"] > 0 else 0.0
+        rows.append({"Derivative": "🔥 COMBINED", "Duration": out["duration"], "Trades": tot["trades"], "Fees Taken (₹)": round(tot["fees"], 2),
+                     "Net P/L (₹)": round(tot["net"], 2), "ROI %": round(tot["net"] / out["capital"] * 100, 2),
+                     "Win Rate %": round(tot["wins"] / tot["trades"] * 100, 1) if tot["trades"] else 0.0, "Profit Factor": pf})
 
-        with c_tf:
-            timeframe_options = ["15m", "1h", "4h", "1d"]
-            bt_interval = st.selectbox("Timeframe", timeframe_options, index=0, key="bt_interval_select", help="Standard candlestick intervals: 15m (Institutional sweep), 1h (Hourly swing), 4h (Macro trend), 1d (Daily swing)")
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Combined Net P/L", f"{'+' if tot['net'] >= 0 else ''}₹{tot['net']:,.0f}", f"{tot['net'] / out['capital'] * 100:+.1f}% ROI")
+        k2.metric("Trades Executed", tot["trades"])
+        k3.metric("Fees Taken", f"₹{tot['fees']:,.0f}")
+        k4.metric("Win Rate / PF", f"{rows[-1]['Win Rate %']}% / {pf}")
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-        with c_margin:
-            # Default to ₹100,000 margin allocation as requested
-            bt_margin = st.number_input(
-                "Trade Margin (₹ INR)",
-                min_value=2500,
-                max_value=2000000,
-                value=100000,
-                step=10000,
-                key="bt_margin_input",
-                help="Margin allocation per simulated trade in Indian Rupees."
-            )
-
-        with c_lev:
-            bt_leverage = st.slider("Leverage", min_value=1, max_value=25, value=int(leverage), key="bt_lev_slider")
-
-        with c_target:
-            bt_target_mode = st.selectbox(
-                "Take Profit Rule",
-                ["TP1 Midpoint", "TP2 Full Rotation", "50/50 Split"],
-                index=0,
-                key="bt_target_select",
-                help="TP1 Midpoint: 50% retracement. TP2 Full Rotation: opposite range boundary. 50/50: scale out half at TP1 & move SL to breakeven."
-            )
-
-        col_run, col_info = st.columns([1.5, 4.5])
-        with col_run:
-            run_btn = st.button("🚀 Run Real-Time Backtest", use_container_width=True, type="primary", key="btn_run_backtest")
-        with col_info:
-            if bt_days >= 365 and bt_interval == "15m":
-                st.caption("⚡ **1 Year on 15m Candles:** Simulating ~35,000 candles with multi-batch pagination and instant in-memory caching.")
-            else:
-                st.caption(f"Pulls live {bt_interval} candles for {bt_days} days directly from CoinDCX / Binance public data APIs, establishes rolling daily boxes, and simulates execution.")
-
-    # Manage backtest session execution with dynamic change detection
-    current_sim_params = {
-        "pair": bt_pair,
-        "duration_days": int(bt_days),
-        "interval": str(bt_interval),
-        "margin_inr": float(bt_margin),
-        "leverage": int(bt_leverage),
-        "target_mode": str(bt_target_mode)
-    }
-
-    # Automatically re-run whenever any parameter changes OR button clicked OR first load
-    should_run = (
-        run_btn or 
-        st.session_state.get("backtest_result") is None or 
-        st.session_state.get("backtest_active_params") != current_sim_params
-    )
-
-    if should_run:
-        if run_strategy_backtest:
-            with st.spinner(f"⏳ Simulating Box Theory sweeps for {bt_pair} ({bt_days} days on {bt_interval} with ₹{bt_margin:,.0f} margin)..."):
-                try:
-                    bt_res = run_strategy_backtest(
-                        pair=bt_pair,
-                        duration_days=bt_days,
-                        interval=bt_interval,
-                        margin_inr=float(bt_margin),
-                        leverage=int(bt_leverage),
-                        target_mode=bt_target_mode,
-                        usd_inr=usd_inr
-                    )
-                    st.session_state.backtest_result = bt_res
-                    st.session_state.backtest_active_params = current_sim_params
-                except Exception as _bt_err:
-                    st.error(f"❌ Backtest simulation failed: {_bt_err}")
-                    st.session_state.backtest_result = {"error": str(_bt_err)}
-
-    bt_res = st.session_state.get("backtest_result")
-
-    if bt_res:
-        if bt_res.get("error"):
-            st.warning(f"⚠️ {bt_res['error']}")
-        else:
-            # 2. Performance Summary Headline
-            roi_color = "#16a34a" if bt_res['net_profit_inr'] >= 0 else "#dc2626"
-            roi_sign = "+" if bt_res['net_profit_inr'] >= 0 else ""
-
-            st.markdown(f"""
-                <div style="background:{card_bg}; border:1px solid {card_border}; border-left:4px solid {roi_color}; border-radius:8px; padding:12px 16px; margin: 12px 0 16px 0;">
-                    <span style="font-weight:700; color:{text_color}; font-size:1.05rem;">
-                        Backtest Results: {bt_res['pair']} | {bt_res['duration_days']} Days ({bt_res['candle_interval']} Candles) | ₹{bt_res['margin_inr']:,.0f} Margin @ {bt_res['leverage']}x Leverage
-                    </span><br>
-                    <span style="font-size:0.85rem; color:{subtext_color};">
-                        Strategy: Daily Box Liquidity Sweeps • Exit Target: {bt_res['target_mode']} • Fee Model: 0.05% Taker + 18% GST
-                    </span>
-                </div>
-            """, unsafe_allow_html=True)
-
-            # 3. Key Performance Metric Cards (Row 1)
-            k1, k2, k3, k4, k5 = st.columns(5)
-            with k1:
-                st.metric(
-                    "Net Profit (INR)",
-                    f"₹{bt_res['net_profit_inr']:,.2f}",
-                    f"{roi_sign}{bt_res['total_roi_pct']:.1f}% ROI",
-                    delta_color="normal"
-                )
-            with k2:
-                st.metric(
-                    "Win Rate",
-                    f"{bt_res['win_rate_pct']:.1f}%",
-                    f"{bt_res['win_count']}W / {bt_res['loss_count']}L"
-                )
-            with k3:
-                pf_str = f"{bt_res['profit_factor']:.2f}" if bt_res['profit_factor'] < 90 else "∞"
-                st.metric(
-                    "Profit Factor",
-                    pf_str,
-                    f"Gross: ₹{bt_res['total_gross_profit']:,.0f}"
-                )
-            with k4:
-                st.metric(
-                    "Max Drawdown",
-                    f"-{bt_res['max_drawdown_pct']:.1f}%",
-                    "Equity peak-to-trough"
-                )
-            with k5:
-                st.metric(
-                    "Total Trades",
-                    f"{bt_res['total_trades']}",
-                    f"Avg: {bt_res['avg_duration_candles']} candles"
-                )
-
-            # 4. Secondary Edge & Execution Statistics (Row 2)
-            st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
-            e1, e2, e3, e4 = st.columns(4)
-            with e1:
-                st.metric(
-                    "Long Win Rate",
-                    f"{bt_res['long_win_rate_pct']:.1f}%",
-                    f"{bt_res['long_trades']} Long Trades"
-                )
-            with e2:
-                st.metric(
-                    "Short Win Rate",
-                    f"{bt_res['short_win_rate_pct']:.1f}%",
-                    f"{bt_res['short_trades']} Short Trades"
-                )
-            with e3:
-                st.metric(
-                    "CoinDCX Fees Paid",
-                    f"₹{bt_res['total_fees_paid_inr']:,.2f}",
-                    "Taker + 18% GST"
-                )
-            with e4:
-                st.metric(
-                    "Avg Win vs Avg Loss",
-                    f"₹{bt_res['avg_win_inr']:,.0f}",
-                    f"Avg Loss: ₹{bt_res['avg_loss_inr']:,.0f}"
-                )
-
-            # 5. Interactive Cumulative Equity Growth Curve (Plotly Chart)
-            st.markdown("---")
-            st.markdown("#### 📈 Cumulative Portfolio Equity Curve (₹ INR)")
-
-            eq_data = bt_res.get("equity_curve", [])
-            if eq_data and len(eq_data) > 1:
-                eq_df = pd.DataFrame(eq_data)
-                fig_eq = go.Figure()
-
-                is_profitable = bt_res['net_profit_inr'] >= 0
-                line_col = "#10b981" if is_profitable else "#ef4444"
-                fill_col = "rgba(16, 185, 129, 0.12)" if is_profitable else "rgba(239, 68, 68, 0.12)"
-
-                fig_eq.add_trace(go.Scatter(
-                    x=eq_df['timestamp'],
-                    y=eq_df['equity_inr'],
-                    mode='lines+markers',
-                    line=dict(color=line_col, width=2.5),
-                    marker=dict(size=4, color=line_col),
-                    fill='tozeroy',
-                    fillcolor=fill_col,
-                    name='Account Equity',
-                    hovertemplate="<b>Date:</b> %{x}<br><b>Portfolio Equity:</b> ₹%{y:,.2f}<extra></extra>"
-                ))
-
-                fig_eq.add_hline(
-                    y=bt_res['margin_inr'],
-                    line_dash="dash",
-                    line_color="#94a3b8",
-                    annotation_text=f"Starting Margin: ₹{bt_res['margin_inr']:,.0f}",
-                    annotation_position="bottom right"
-                )
-
-                fig_eq.update_layout(
-                    xaxis_title="Trade Timeline",
-                    yaxis_title="Equity (₹ INR)",
-                    template="plotly_white" if is_light_theme else "plotly_dark",
-                    margin=dict(l=20, r=20, t=30, b=20),
-                    height=340,
-                    hovermode="x unified"
-                )
-                st.plotly_chart(fig_eq, use_container_width=True)
-
-            # 6. Dynamic Performance Breakdowns
-            st.markdown("---")
-            st.markdown("#### 📅 Monthly Performance & Financial Audit")
-            st.caption("Detailed month-by-month financial audit showing total trades taken, margin deployed, exchange fees deducted, profit/loss amount, win rate, and cumulative net earnings.")
-            monthly_df = bt_res.get("monthly_df", pd.DataFrame())
-            if not monthly_df.empty:
-                st.dataframe(monthly_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No completed monthly intervals in this duration window.")
-
-            st.markdown("#### 🏛️ Institutional Session Breakdown")
-            session_df = bt_res.get("session_df", pd.DataFrame())
-            if not session_df.empty:
-                st.dataframe(session_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("Session analytics will appear here once trades are executed.")
-
-            # 7. Detailed Trade-by-Trade Execution Log & CSV Export
-            st.markdown("---")
-            st.markdown(f"#### 📋 Complete Simulated Trade Log ({bt_res['total_trades']} Trades)")
-
-            trades_df = bt_res.get("trades_df", pd.DataFrame())
-            if not trades_df.empty:
-                display_cols = [
-                    "trade_id", "entry_time", "exit_time", "direction", "session",
-                    "entry_price", "exit_price", "exit_reason", "gross_pnl_inr",
-                    "fees_inr", "net_pnl_inr", "roe_pct"
-                ]
-                avail_cols = [c for c in display_cols if c in trades_df.columns]
-
-                # Download CSV button
-                csv_bytes = trades_df.to_csv(index=False).encode('utf-8')
-                col_btn, col_exp_info = st.columns([1.5, 4.5])
-                with col_btn:
-                    st.download_button(
-                        label="📥 Export Trade Log (CSV)",
-                        data=csv_bytes,
-                        file_name=f"box_backtest_{bt_res['pair']}_{bt_res['duration_days']}d_{bt_res.get('candle_interval', '15m')}.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                with col_exp_info:
-                    st.caption(f"Download complete trade-by-trade audit logs with exact entries, stops, take profits, and fee deductions.")
-
-                rename_map = {
-                    "trade_id": "Trade #",
-                    "entry_time": "Entry Time",
-                    "exit_time": "Exit Time",
-                    "direction": "Side",
-                    "session": "Session",
-                    "entry_price": "Entry ($)",
-                    "exit_price": "Exit ($)",
-                    "exit_reason": "Outcome",
-                    "gross_pnl_inr": "Gross (₹)",
-                    "fees_inr": "Fees (₹)",
-                    "net_pnl_inr": "Net PnL (₹)",
-                    "roe_pct": "ROE %"
-                }
-
-                pretty_df = trades_df[avail_cols].rename(columns=rename_map)
-                st.dataframe(pretty_df, use_container_width=True, hide_index=True)
-            else:
-                st.info(f"No liquidity sweep trade setups were triggered for {bt_res['pair']} during the selected {bt_res['duration_days']}-day period.")
+        for pr, res in out["details"].items():
+            if res and not res.get("error") and res.get("total_trades", 0) > 0:
+                with st.expander(f"📅 Monthly audit — {pr.replace('B-', '').replace('_USDT', '')} ({out['modes'].get(pr, '')})"):
+                    st.dataframe(res["monthly_df"], use_container_width=True, hide_index=True)

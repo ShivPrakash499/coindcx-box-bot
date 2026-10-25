@@ -112,3 +112,17 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
         msg = f"[!] Error logging to Google Sheets: {e}"
         print(msg)
         return (False, msg) if return_details else False
+
+def log_trade_closed(trade: dict, return_details: bool = False):
+    """Logs the final result of a closed position to the 'Closed_Trades' worksheet."""
+    try:
+        book = _client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
+        ws = _get_ws(book, "Closed_Trades")
+        if len(ws.get_all_values()) == 0:
+            ws.append_row(["Exit Time", "Pair", "Direction", "Entry", "Stop Loss", "Exit", "Exit Reason", "Net PnL (INR)"])
+        ws.append_row([trade.get(k, "") for k in ("exit_time", "pair", "direction", "entry_price", "stop_loss",
+                                                  "exit_price", "exit_reason", "net_pnl_inr")])
+        return (True, "logged") if return_details else True
+    except Exception as e:
+        print(f"[!] Closed-trade log error: {e}")
+        return (False, str(e)) if return_details else False
