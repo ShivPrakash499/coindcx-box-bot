@@ -321,7 +321,7 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### 📧 Email Alerts & Server Link")
 alert_enabled = os.getenv("ALERT_EMAIL_ENABLED", "True").lower() in ["true", "1", "yes"]
 st.sidebar.caption(f"Status: **{'🟢 Active' if alert_enabled else '🔴 Disabled'}** | Cooldown: 15 mins")
-cfg_receiver = os.getenv("RECEIVER_EMAIL", "jwalashiva@gmail.com")
+cfg_receiver = os.getenv("RECEIVER_EMAIL", "your_email@example.com")
 cfg_app_url = os.getenv("APP_WEB_URL", "http://localhost:8501")
 custom_url = st.sidebar.text_input("Server Web App URL (Included in Alerts):", value=cfg_app_url, key="input_app_web_url")
 if custom_url != os.getenv("APP_WEB_URL", ""):
@@ -1106,7 +1106,7 @@ with tabs[1]:
                 "Margin Allocation for this Trade (INR):",
                 min_value=500,
                 max_value=max(avail_margin_int, 500000),
-                value=min(100000, avail_margin_int),
+                value=int(max(500, min(coindcx_engine.get_rotational_margin_inr()["margin_inr"], avail_margin_int if wallet["is_live_api"] else 10**9))),
                 step=1000,
                 key=f"exec_margin_inr_{pair}"
             )

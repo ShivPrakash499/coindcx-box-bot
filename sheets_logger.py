@@ -7,6 +7,36 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+def _get_ws(book, title):
+    try:
+        return book.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return book.add_worksheet(title=title, rows=1000, cols=20)
+
+
+def _client():
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+    return gspread.authorize(creds)
+
+
+def log_failed_trade_diagnostic(trade: dict, return_details: bool = False):
+    """Logs any trade that hit its structural SL to 'Failed_Trade_Diagnostics' for the 15-day review."""
+    try:
+        book = _client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
+        ws = _get_ws(book, "Failed_Trade_Diagnostics")
+        if len(ws.get_all_values()) == 0:
+            ws.append_row(["Entry Time", "Exit Time", "Pair", "Direction", "Session", "Entry", "Stop Loss",
+                           "Exit", "Exit Reason", "Net PnL (INR)", "Duration (candles)"])
+        keys = ("entry_time", "exit_time", "pair", "direction", "session", "entry_price", "stop_loss",
+                "exit_price", "exit_reason", "net_pnl_inr", "duration_candles")
+        ws.append_row([trade.get(k, "") for k in keys])
+        return (True, "logged") if return_details else True
+    except Exception as e:
+        print(f"[!] Failed-trade log error: {e}")
+        return (False, str(e)) if return_details else False
+
+
 def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
     """
     Logs executed signals or trade plans to Google Sheets.
@@ -40,7 +70,7 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
         ]
         creds = ServiceAccountCredentials.from_json_keyfile_name(creds_file, scope)
         client = gspread.authorize(creds)
-        sheet = client.open(sheet_name).sheet1
+        sheet = _get_ws(client.open(sheet_name), "Live_Trades")
 
         # Check if headers exist; if empty, insert them
         records = sheet.get_all_values()

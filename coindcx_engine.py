@@ -1871,3 +1871,25 @@ def run_strategy_backtest(
         "equity_curve": equity_curve
     }
 
+
+
+DEFAULT_WALLET_INR = float(os.getenv("DEFAULT_WALLET_INR", 30000))
+TRADE_ALLOCATION_FRACTION = 1.0 / 3.0
+
+
+def get_rotational_margin_inr(leverage: int = 5) -> dict:
+    """
+    Rotational capital sizing: 1/3rd of live CoinDCX Futures wallet equity per trade.
+    Falls back to configurable DEFAULT_WALLET_INR (Rs 30,000) when the live API is unavailable.
+    Strategy math is untouched; this only decides the margin fed into it.
+    """
+    equity, live = DEFAULT_WALLET_INR, False
+    try:
+        bal = fetch_coindcx_futures_balance()
+        if bal and bal.get("is_live_api") and float(bal.get("total_inr", 0)) > 0:
+            equity, live = float(bal["total_inr"]), True
+    except Exception as e:
+        print(f"[Wallet Sizing Fallback]: {e}")
+    margin = round(equity * TRADE_ALLOCATION_FRACTION, 2)
+    return {"wallet_equity_inr": equity, "margin_inr": margin, "leverage": leverage,
+            "notional_inr": margin * leverage, "is_live_api": live}

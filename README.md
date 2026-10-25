@@ -70,7 +70,7 @@ pip install -r requirements.txt
 The `.env` file contains your CoinDCX API keys and trade sizing configuration:
 
 ```ini
-COINDCX_API_KEY=97eb9df80b90446f94f4d9b103a58b921e714d1b95e90b48cc2fe071f1cad827
+COINDCX_API_KEY=your_coindcx_api_key_here
 COINDCX_API_SECRET=your_coindcx_secret_key_here
 GOOGLE_SHEET_NAME=Crypto_Trades_Journal
 TOTAL_WALLET_INR=250000
