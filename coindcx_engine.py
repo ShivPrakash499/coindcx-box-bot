@@ -1140,21 +1140,33 @@ def fetch_historical_candles_paginated(
 def calculate_daily_box_levels(pair="B-ETH_USDT"):
     """
     Calculates Previous Day High (RH), Low (RL), Swing High (SH), Swing Low (SL),
-    and Equilibrium Midpoint (MID) using completed daily candles.
-    Strictly caps lookback to 30 completed daily candles. When SH is too far from RH or
-    SL is back from 30 days or more, calculates the average daily price rise and average
-    daily price drop and places SH and SL accordingly.
+    Equilibrium Midpoint (MID), and Daily 50 EMA & 200 EMA Trend Bias.
+    Strictly caps SH/SL lookback to 30 completed daily candles, while using 1000 daily candles
+    so the 200-day EMA matches TradingView / CoinDCX exactly.
     """
-    df_daily = fetch_coindcx_candles(pair=pair, interval="1d", limit=32, sync_live_price=False)
+    df_daily = fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
     if df_daily.empty or len(df_daily) < 2:
         return None
 
+    ema50_val = float(df_daily['close'].ewm(span=50, adjust=False).mean().iloc[-1])
+    ema200_val = float(df_daily['close'].ewm(span=200, adjust=False).mean().iloc[-1])
+    current_daily_close = float(df_daily['close'].iloc[-1])
+
+    df_all_completed = df_daily.iloc[:-1].reset_index(drop=True)
     # Limit search strictly to maximum 30 completed daily candles (never go beyond 30 days)
-    df_completed = df_daily.iloc[:-1].tail(30)
+    df_completed = df_all_completed.tail(30)
     prev_day = df_completed.iloc[-1]
     rh = float(prev_day['high'])
     rl = float(prev_day['low'])
+    daily_close = current_daily_close
     mid = (rh + rl) / 2.0
+
+    if daily_close < ema50_val and daily_close < ema200_val:
+        trend_bias = "BEARISH"
+    elif daily_close > ema50_val and daily_close > ema200_val:
+        trend_bias = "BULLISH"
+    else:
+        trend_bias = "NEUTRAL"
 
     # Historical completed candles before yesterday within the 30-day window
     df_hist = df_completed.iloc[:-1]
@@ -1203,6 +1215,10 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
         "SH": round_asset_price(sh, rh),
         "SL": round_asset_price(sl, rl),
         "MID": round_asset_price(mid, rh),
+        "EMA50": round_asset_price(ema50_val, rh),
+        "EMA200": round_asset_price(ema200_val, rh),
+        "daily_close": round_asset_price(daily_close, rh),
+        "trend_bias": trend_bias,
         "prev_day_date": datetime.fromtimestamp(prev_day['timestamp'] / 1000, tz=IST).strftime("%Y-%m-%d"),
         "avg_daily_rise": round(avg_daily_rise, 2),
         "avg_daily_drop": round(avg_daily_drop, 2)
@@ -1224,17 +1240,27 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
     if direction.upper() in ["BUY", "LONG"]:
         dir_name = "BUY"
         entry = round_asset_price(live_price if live_price > 0 and live_price <= rl else rl, rh)
-        stop_loss = round_asset_price(min(rl, sl) * 0.998, rh)
-        tp1 = mid
-        tp2 = rh
-        setup_desc = "BUY (Long): Liquidity Sweep Rejection at Range Low (RL)"
+        struct_sl = min(rl, sl) * 0.998
+        max_sl_dist = entry * (5.0 / 100.0 / max(1, leverage))
+        sl_dist = min(abs(entry - struct_sl), max_sl_dist)
+        stop_loss = round_asset_price(entry - sl_dist, rh)
+        max_tp_dist = entry * (20.0 / 100.0 / max(1, leverage))
+        tp_dist = min(abs(mid - entry), max_tp_dist)
+        tp1 = round_asset_price(entry + tp_dist, rh)
+        tp2 = tp1
+        setup_desc = "BUY (Long): Liquidity Sweep Rejection at Range Low (RL) [Single TP <=20% ROE, Strict SL <=5% ROE]"
     else:
         dir_name = "SELL"
         entry = round_asset_price(live_price if live_price > 0 and live_price >= rh else rh, rh)
-        stop_loss = round_asset_price(max(rh, sh) * 1.002, rh)
-        tp1 = mid
-        tp2 = rl
-        setup_desc = "SELL (Short): Liquidity Sweep Rejection at Range High (RH)"
+        struct_sl = max(rh, sh) * 1.002
+        max_sl_dist = entry * (5.0 / 100.0 / max(1, leverage))
+        sl_dist = min(abs(struct_sl - entry), max_sl_dist)
+        stop_loss = round_asset_price(entry + sl_dist, rh)
+        max_tp_dist = entry * (20.0 / 100.0 / max(1, leverage))
+        tp_dist = min(abs(entry - mid), max_tp_dist)
+        tp1 = round_asset_price(entry - tp_dist, rh)
+        tp2 = tp1
+        setup_desc = "SELL (Short): Liquidity Sweep Rejection at Range High (RH) [Single TP <=20% ROE, Strict SL <=5% ROE]"
 
     margin_usd = margin_inr / usd_inr
     position_usd = margin_usd * leverage
@@ -1276,68 +1302,67 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
 
 def detect_zone_signal(levels: dict, o: float, h: float, l: float, c: float):
     """
-    Classifies ONE CLOSED candle against the daily box zones.
-      REVERSAL     : sweep into the zone and close back inside (baseline rule, unchanged)
-                       Sell Zone RH-SH: high >= RH and close < RH  -> SHORT
-                       Buy  Zone RL-SL: low  <= RL and close > RL  -> LONG
-      CONTINUATION : a solid "tower" candle (body >= 70% of range) closing beyond RH / RL
-                       close > RH (bullish tower) -> LONG toward SH ; close < RL (bearish tower) -> SHORT toward SL
-                     Alert-only idea: it has NOT been backtested.
+    Classifies ONE CLOSED candle against the daily box zones, strictly gated by Daily 50 & 200 EMA trend bias:
+      - BEARISH (Daily Close < 50 EMA & < 200 EMA): Sell Zone RH-SH sweep & rejection -> SHORT only
+      - BULLISH (Daily Close > 50 EMA & > 200 EMA): Buy Zone RL-SL sweep & rejection -> LONG only
+      - NEUTRAL (Between 50 EMA & 200 EMA): No trade signal
+    Enforces Single TP = min(20% ROE [4% price], MID) (must be >= 5% ROE [1% price])
+    and Strict SL = min(5% ROE [1% price], Structural Sweep SL).
     """
     rh, rl, sh, sl, mid = levels["RH"], levels["RL"], levels["SH"], levels["SL"], levels["MID"]
-    rng = h - l
-    solid = rng > 0 and abs(c - o) / rng >= 0.70
+    bias = levels.get("trend_bias", "NEUTRAL")
 
-    if h >= rh and c < rh:
+    if bias == "BEARISH" and h >= rh and c < rh:
+        struct_stop = max(h, sh) * 1.002
+        tp_dist = min(abs(c - mid), c * 0.04)
+        if tp_dist < c * 0.0098:
+            return None
+        sl_dist = min(abs(struct_stop - c), c * 0.01)
+        tp_p = round(c - tp_dist, 4)
         return {"kind": "REVERSAL", "direction": "SHORT", "zone": "Sell Zone RH-SH",
-                "stop": round(max(h, sh) * 1.002, 4), "tp1": mid, "tp2": rl}
-    if l <= rl and c > rl:
+                "stop": round(c + sl_dist, 4), "tp1": tp_p, "tp2": tp_p}
+    if bias == "BULLISH" and l <= rl and c > rl:
+        struct_stop = min(l, sl) * 0.998
+        tp_dist = min(abs(mid - c), c * 0.04)
+        if tp_dist < c * 0.0098:
+            return None
+        sl_dist = min(abs(c - struct_stop), c * 0.01)
+        tp_p = round(c + tp_dist, 4)
         return {"kind": "REVERSAL", "direction": "LONG", "zone": "Buy Zone RL-SL",
-                "stop": round(min(l, sl) * 0.998, 4), "tp1": mid, "tp2": rh}
-    if solid and c > o and rh < c < sh:
-        return {"kind": "CONTINUATION", "direction": "LONG", "zone": "Sell Zone RH-SH (breakout)",
-                "stop": round(rh * 0.998, 4), "tp1": sh, "tp2": round(sh + (sh - rh), 4)}
-    if solid and c < o and sl < c < rl:
-        return {"kind": "CONTINUATION", "direction": "SHORT", "zone": "Buy Zone RL-SL (breakdown)",
-                "stop": round(rl * 1.002, 4), "tp1": sl, "tp2": round(sl - (rl - sl), 4)}
+                "stop": round(c - sl_dist, 4), "tp1": tp_p, "tp2": tp_p}
     return None
 
 
 def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> dict:
     """
-    Higher-timeframe bias from Daily + 4H structure (no indicators):
-      +1/-1  Daily slope over the last 5 completed days (needs |move| > 0.5%)
-      +1/-1  4H slope over the last 12 bars (needs |move| > 0.3%)
-      +1/-1  live price above / below the previous day's close
-    score >= 2 BULLISH, <= -2 BEARISH, otherwise NEUTRAL / RANGE.
+    Daily 50 EMA & 200 EMA Trend Bias Filter:
+      - BEARISH: Daily Price < 50 EMA AND Daily Price < 200 EMA (SHORT setups only)
+      - BULLISH: Daily Price > 50 EMA AND Daily Price > 200 EMA (LONG setups only)
+      - NEUTRAL / RANGE: Daily Price is between 50 EMA and 200 EMA (NO TRADE)
     """
     out = {"bias": "NEUTRAL / RANGE", "score": 0, "reasons": []}
     try:
-        d = fetch_coindcx_candles(pair=pair, interval="1d", limit=15, sync_live_price=False)
-        h4 = fetch_coindcx_candles(pair=pair, interval="4h", limit=30, sync_live_price=False)
-        score = 0
-        if len(d) >= 8:
-            c_now, c_old = float(d["close"].iloc[-2]), float(d["close"].iloc[-7])
-            mv = (c_now - c_old) / c_old * 100
-            if mv > 0.5:
-                score += 1
-            elif mv < -0.5:
-                score -= 1
-            out["reasons"].append(f"Daily 5-day slope {mv:+.2f}%")
-            prev_close = float(d["close"].iloc[-2])
-            lp = live_price or float(d["close"].iloc[-1])
-            score += 1 if lp > prev_close else -1
-            out["reasons"].append(f"Price {'above' if lp > prev_close else 'below'} previous close ({prev_close:,.4f})")
-        if len(h4) >= 14:
-            c_now, c_old = float(h4["close"].iloc[-1]), float(h4["close"].iloc[-13])
-            mv = (c_now - c_old) / c_old * 100
-            if mv > 0.3:
-                score += 1
-            elif mv < -0.3:
-                score -= 1
-            out["reasons"].append(f"4H 12-bar slope {mv:+.2f}%")
-        out["score"] = score
-        out["bias"] = "BULLISH" if score >= 2 else ("BEARISH" if score <= -2 else "NEUTRAL / RANGE")
+        d = fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
+        if len(d) >= 52:
+            ema50 = float(d["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            ema200 = float(d["close"].ewm(span=200, adjust=False).mean().iloc[-1])
+            d_close = float(live_price) if (live_price and live_price > 0) else float(d["close"].iloc[-1])
+            out["ema50"] = round_asset_price(ema50, d_close)
+            out["ema200"] = round_asset_price(ema200, d_close)
+            out["daily_close"] = round_asset_price(d_close, d_close)
+
+            if d_close < ema50 and d_close < ema200:
+                out["bias"] = "BEARISH"
+                out["score"] = -2
+                out["reasons"].append(f"Daily Price (${d_close:,.2f}) < 50 EMA (${ema50:,.2f}) & < 200 EMA (${ema200:,.2f}) → SHORT setups only")
+            elif d_close > ema50 and d_close > ema200:
+                out["bias"] = "BULLISH"
+                out["score"] = 2
+                out["reasons"].append(f"Daily Price (${d_close:,.2f}) > 50 EMA (${ema50:,.2f}) & > 200 EMA (${ema200:,.2f}) → LONG setups only")
+            else:
+                out["bias"] = "NEUTRAL / RANGE"
+                out["score"] = 0
+                out["reasons"].append(f"Daily Price (${d_close:,.2f}) is between 50 EMA (${ema50:,.2f}) & 200 EMA (${ema200:,.2f}) → Wait for trend alignment")
     except Exception as e:
         out["reasons"].append(f"Bias unavailable: {e}")
     return out
@@ -1544,6 +1569,9 @@ def run_strategy_backtest(
     equity_curve = [{"timestamp": first_candle_time, "equity_inr": initial_capital, "pnl_inr": 0.0}]
 
     taker_fee_rate = 0.0005 * 1.18  # 0.05% + 18% GST
+    day_trade_count = {}
+    day_realized_pnl = {}
+    day_locked = set()
 
     for idx, candle in enumerate(df_records):
         c_date = candle['date_str']
@@ -1555,7 +1583,7 @@ def run_strategy_backtest(
         if not strat.backtest_has_context(candle, strat_ctx):
             continue
 
-        # Check active trade exit conditions first
+        # Check active trade exit conditions first (Single 100% Exit at TP or Strict SL)
         if active_trade:
             pos_dir = active_trade["direction"]
             entry_p = active_trade["entry_price"]
@@ -1570,90 +1598,23 @@ def run_strategy_backtest(
             exit_reason = None
 
             if pos_dir == "LONG":
-                mid_to_tp2_half = (tp1_p + tp2_p) / 2.0
-                if target_mode == "50/50 Split":
-                    if not active_trade.get("tp1_hit"):
-                        if c_low <= sl_p:
-                            exit_triggered = True
-                            exit_price = sl_p
-                            exit_reason = "Stop Loss"
-                        elif c_high >= tp1_p:
-                            active_trade["tp1_hit"] = True
-                            active_trade["stop_loss"] = entry_p  # Step 1: Move SL to Breakeven
-                            if c_high >= mid_to_tp2_half:
-                                active_trade["stop_loss"] = tp1_p  # Step 2: Ratchet SL to TP1!
-                            if c_high >= tp2_p:
-                                exit_triggered = True
-                                exit_price = (tp1_p + tp2_p) / 2.0
-                                exit_reason = "TP1 + TP2 Full Rotation"
-                    else:
-                        # TP1 already hit: ratchet trailing SL as price moves toward TP2
-                        if c_high >= mid_to_tp2_half and active_trade["stop_loss"] < tp1_p:
-                            active_trade["stop_loss"] = tp1_p  # Lock in TP1 profit on remainder
-
-                        if c_high >= tp2_p:
-                            exit_triggered = True
-                            exit_price = (tp1_p + tp2_p) / 2.0
-                            exit_reason = "TP1 + TP2 Full Rotation"
-                        elif c_low <= active_trade["stop_loss"]:
-                            exit_triggered = True
-                            exit_price = (tp1_p + active_trade["stop_loss"]) / 2.0
-                            exit_reason = f"TP1 + Trailing SL ({'Locked' if active_trade['stop_loss'] > entry_p else 'Breakeven'})"
-                else:
-                    if c_low <= sl_p:
-                        exit_triggered = True
-                        exit_price = sl_p
-                        exit_reason = "Stop Loss"
-                    elif target_mode == "TP1 Midpoint" and c_high >= tp1_p:
-                        exit_triggered = True
-                        exit_price = tp1_p
-                        exit_reason = f"Take Profit ({active_trade['tp1_label']})"
-                    elif target_mode == "TP2 Full Rotation" and c_high >= tp2_p:
-                        exit_triggered = True
-                        exit_price = tp2_p
-                        exit_reason = f"Take Profit ({active_trade['tp2_label']})"
+                if c_low <= sl_p:
+                    exit_triggered = True
+                    exit_price = sl_p
+                    exit_reason = "Stop Loss (<=5% ROE / Sweep)"
+                elif c_high >= tp1_p:
+                    exit_triggered = True
+                    exit_price = tp1_p
+                    exit_reason = f"Take Profit ({active_trade['tp1_label']})"
             else:  # SHORT
-                mid_to_tp2_half = (tp1_p + tp2_p) / 2.0
-                if target_mode == "50/50 Split":
-                    if not active_trade.get("tp1_hit"):
-                        if c_high >= sl_p:
-                            exit_triggered = True
-                            exit_price = sl_p
-                            exit_reason = "Stop Loss"
-                        elif c_low <= tp1_p:
-                            active_trade["tp1_hit"] = True
-                            active_trade["stop_loss"] = entry_p  # Step 1: Move SL to Breakeven
-                            if c_low <= mid_to_tp2_half:
-                                active_trade["stop_loss"] = tp1_p  # Step 2: Ratchet SL to TP1!
-                            if c_low <= tp2_p:
-                                exit_triggered = True
-                                exit_price = (tp1_p + tp2_p) / 2.0
-                                exit_reason = "TP1 + TP2 Full Rotation"
-                    else:
-                        if c_low <= mid_to_tp2_half and active_trade["stop_loss"] > tp1_p:
-                            active_trade["stop_loss"] = tp1_p
-
-                        if c_low <= tp2_p:
-                            exit_triggered = True
-                            exit_price = (tp1_p + tp2_p) / 2.0
-                            exit_reason = "TP1 + TP2 Full Rotation"
-                        elif c_high >= active_trade["stop_loss"]:
-                            exit_triggered = True
-                            exit_price = (tp1_p + active_trade["stop_loss"]) / 2.0
-                            exit_reason = f"TP1 + Trailing SL ({'Locked' if active_trade['stop_loss'] < entry_p else 'Breakeven'})"
-                else:
-                    if c_high >= sl_p:
-                        exit_triggered = True
-                        exit_price = sl_p
-                        exit_reason = "Stop Loss"
-                    elif target_mode == "TP1 Midpoint" and c_low <= tp1_p:
-                        exit_triggered = True
-                        exit_price = tp1_p
-                        exit_reason = f"Take Profit ({active_trade['tp1_label']})"
-                    elif target_mode == "TP2 Full Rotation" and c_low <= tp2_p:
-                        exit_triggered = True
-                        exit_price = tp2_p
-                        exit_reason = f"Take Profit ({active_trade['tp2_label']})"
+                if c_high >= sl_p:
+                    exit_triggered = True
+                    exit_price = sl_p
+                    exit_reason = "Stop Loss (<=5% ROE / Sweep)"
+                elif c_low <= tp1_p:
+                    exit_triggered = True
+                    exit_price = tp1_p
+                    exit_reason = f"Take Profit ({active_trade['tp1_label']})"
 
             if exit_triggered:
                 # Calculate financial metrics with exact CoinDCX fee schedule
@@ -1669,8 +1630,16 @@ def run_strategy_backtest(
                 total_fees_inr = entry_fee_inr + exit_fee_inr
                 net_pnl_inr = gross_pnl_inr - total_fees_inr
                 roe_pct = (net_pnl_inr / margin_inr) * 100.0
+                gross_roe_pct = (gross_pnl_inr / margin_inr) * 100.0
 
                 current_equity += net_pnl_inr
+
+                entry_day = active_trade.get("entry_date", c_date)
+                day_realized_pnl[entry_day] = day_realized_pnl.get(entry_day, 0.0) + net_pnl_inr
+                # Done for the Day Rule: if single trade achieves >=10% ROE (gross >=9.5% or net daily >=9% of margin), lock day
+                if gross_roe_pct >= 9.5 or day_realized_pnl[entry_day] >= (margin_inr * 0.09):
+                    day_locked.add(entry_day)
+                    day_locked.add(c_date)
 
                 trades.append({
                     "trade_id": len(trades) + 1,
@@ -1682,7 +1651,7 @@ def run_strategy_backtest(
                     "entry_price": round_asset_price(entry_p, entry_p),
                     "exit_price": round_asset_price(exit_price, entry_p),
                     "stop_loss": round_asset_price(sl_p, entry_p),
-                    "target_tp": round_asset_price(tp1_p if exit_reason == f"Take Profit ({active_trade['tp1_label']})" else tp2_p, entry_p),
+                    "target_tp": round_asset_price(tp1_p, entry_p),
                     "exit_reason": exit_reason,
                     "quantity": qty,
                     "gross_pnl_inr": round(gross_pnl_inr, 2),
@@ -1703,6 +1672,10 @@ def run_strategy_backtest(
 
                 active_trade = None
                 last_exit_idx = idx
+
+        # Daily Discipline Gate: Max 2 trades/day + Done for the day after >=10% ROE win
+        if c_date in day_locked or day_trade_count.get(c_date, 0) >= 2:
+            continue
 
         # If no active trade, ask the strategy whether this closed candle is an entry
         if not active_trade and (idx - last_exit_idx >= 1):
@@ -1725,6 +1698,7 @@ def run_strategy_backtest(
                 active_trade = {
                     "direction": trade_dir,
                     "entry_time": c_time.strftime("%Y-%m-%d %H:%M"),
+                    "entry_date": c_date,
                     "entry_idx": idx,
                     "entry_price": entry_p,
                     "stop_loss": sl_p,
@@ -1734,10 +1708,11 @@ def run_strategy_backtest(
                     "notional_inr": notional_inr,
                     "session": sess_name,
                     "tp1_hit": False,
-                    "tp1_label": entry_sig.get("tp1_label", "TP1"),
-                    "tp2_label": entry_sig.get("tp2_label", "TP2"),
+                    "tp1_label": entry_sig.get("tp1_label", "Single TP"),
+                    "tp2_label": entry_sig.get("tp2_label", "Single TP"),
                     "reason": entry_sig.get("reason", "")
                 }
+                day_trade_count[c_date] = day_trade_count.get(c_date, 0) + 1
 
     # Summary Statistics Calculation
     total_trades = len(trades)

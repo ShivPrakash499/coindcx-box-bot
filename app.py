@@ -878,6 +878,20 @@ with t_signals:
                 decreasing_fillcolor=candle_down
             ))
 
+            # Overlay 50 EMA and 200 EMA curves on the active timeframe
+            ema50_curve = df_chart['close'].ewm(span=50, adjust=False).mean()
+            ema200_curve = df_chart['close'].ewm(span=200, adjust=False).mean()
+            fig.add_trace(go.Scatter(
+                x=ts_series, y=ema50_curve, mode="lines",
+                name=f"50 EMA ({active_tf})",
+                line=dict(color="#8b5cf6", width=2)
+            ))
+            fig.add_trace(go.Scatter(
+                x=ts_series, y=ema200_curve, mode="lines",
+                name=f"200 EMA ({active_tf})",
+                line=dict(color="#f59e0b", width=2, dash="dot")
+            ))
+
             def fmt(p):
                 if p is None:
                     return "0.00"
@@ -2176,20 +2190,14 @@ with t_levels:
                     c4.metric("TP2", f"${setup['tp2']:,.4f}", f"+{setup['roe_tp2']}% ROE")
                     st.caption(f"{tag} • Margin ₹{margin_inr:,.0f} @ {leverage}x • Projected TP1 profit ≈ +₹{setup['profit_tp1_inr']:,.0f} • TP2 ≈ +₹{setup['profit_tp2_inr']:,.0f} • SL loss ≈ -₹{setup['loss_sl_inr']:,.0f}")
 
-            st.markdown("#### 🎯 Predefined Trade Plan (Based on Market Bias)")
+            st.markdown("#### 🎯 Predefined Trade Plan (Based on Daily 50 & 200 EMA Trend Bias)")
             st.markdown(f"**Overall Bias: {_bias_icon} {_bias_name}**  \n" + " • ".join(_bias["reasons"]))
             if _bias_name == "BULLISH":
-                _plan_card("🟢 LONG in Buy Zone (RL → SL)", _buy, "Primary plan")
-                with st.expander("Counter-zone plan if price sweeps the upper boundary first"):
-                    _plan_card("🔴 SHORT in Sell Zone (RH → SH)", _sell, "Secondary plan")
+                _plan_card("🟢 LONG in Buy Zone (RL → SL) or 50 EMA Support", _buy, "Primary plan (Daily > 50 & 200 EMA — Short alerts disabled)")
             elif _bias_name == "BEARISH":
-                _plan_card("🔴 SHORT in Sell Zone (RH → SH)", _sell, "Primary plan")
-                with st.expander("Counter-zone plan if price sweeps the lower boundary first"):
-                    _plan_card("🟢 LONG in Buy Zone (RL → SL)", _buy, "Secondary plan")
+                _plan_card("🔴 SHORT in Sell Zone (RH → SH) or 50 EMA Resistance", _sell, "Primary plan (Daily < 50 & 200 EMA — Long alerts disabled)")
             else:
-                st.info("Neutral / range bias: both boundaries are valid — trade whichever zone gets swept and rejected first.")
-                _plan_card("🔴 SHORT in Sell Zone (RH → SH)", _sell, "Upper boundary")
-                _plan_card("🟢 LONG in Buy Zone (RL → SL)", _buy, "Lower boundary")
+                st.info("⚪ Neutral / Mixed EMA Bias: Daily close is between the 50 EMA and 200 EMA. Trade notifications are paused until price aligns cleanly above or below both EMAs.")
 
             render_chart_fragment(selected_pair, levels, is_light_theme, margin_inr, leverage, usd_inr)
             st.markdown("---")

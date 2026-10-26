@@ -18,14 +18,24 @@
 
 ---
 
-## 1b. 🧠 Oct 25, 2026 (evening) — Modular Multi-Strategy Upgrade
-* New [`strategies.py`](strategies.py) with `STRATEGY_REGISTRY`: **Box Theory Sweep** (`box_theory`, math unchanged — regression byte-identical on SOL/ETH/BTC 1y) and **1-Candle 25% ATR Reversal** (`atr_reversal`).
+## 1b. 🧠 Oct 25–26, 2026 — Modular Multi-Strategy, Daily 50 & 200 EMA Bias & Dual-Timeframe Engine Upgrade
+* New [`strategies.py`](strategies.py) with `STRATEGY_REGISTRY`: **Box Theory Sweep** (`box_theory`) and **1-Candle 25% ATR Reversal** (`atr_reversal`).
+* **Daily 50 EMA & 200 EMA Trend Bias Gate (Oct 26 Refinement):**
+  * Computed on 1,000 daily candles (`limit=1000`) for exact TradingView/CoinDCX alignment while keeping `SH`/`SL` lookback strictly capped to 30 completed daily candles.
+  * **SHORT Only (`BEARISH`):** `Daily Close < 50 EMA AND Daily Close < 200 EMA`
+  * **LONG Only (`BULLISH`):** `Daily Close > 50 EMA AND Daily Close > 200 EMA`
+  * **NEUTRAL (No Trade):** Price sits between the Daily 50 EMA and Daily 200 EMA.
+* **Dual-Timeframe Confirmation Engine (15m Trigger → 5m Confirmation):**
+  * **Box Theory Sweep:** 15m candle monitors liquidity sweep into $RH$/$RL$ OR Daily 50 EMA touch; switches to 5m timeframe for rejection confirmation (`close < RH/EMA50` & `< prev_close` for Short, `close > RL/EMA50` & `> prev_close` for Long) with tighter structural stop loss.
+  * **1-Candle 25% ATR Reversal:** 15m candle monitors $\ge 25\%$ Daily ATR manipulation flush/spike aligned with Daily 50 & 200 EMA bias; switches to 5m timeframe for 1-candle reversal crossover (`close > prev_5m_red_high` for Long, `close < prev_5m_green_low` for Short).
+* **Email Alert Hardening (`signal_monitor.py` & `coindcx_engine.py`):**
+  * Removed untested `CONTINUATION` breakdown/breakout alerts from `detect_zone_signal`.
+  * Added `_SCAN_LOCK` thread synchronization and per-pair 45m cooldown (`PAIR_LOCK|{pair}`) in `signal_monitor.py` to prevent simultaneous duplicate/conflicting alerts.
 * `coindcx_engine.run_strategy_backtest(..., strategy_id=...)` delegates entries to the strategy; exit/fee engine unchanged.
 * E-mail subject: `"{SYM} - {Strategy Name} - trade notification"`; Strategy + Trigger Reason in e-mail body and `Live_Trades` sheet.
 * UI: strategy selector on Key Levels, strategy arming on Execution ("All Active Strategies (Auto-Detect Triggers)" / "<name> Only"), strategy + "Compare All Strategies Side-by-Side" on Backtest.
 * Fixed: background monitor thread was started on every rerun (now `st.cache_resource`).
 * Optional env `ENABLED_STRATEGIES` (comma-separated ids). Streamlit Secrets need `GMAIL_*` + `APP_WEB_URL`.
-* 1-year result: ATR Reversal is net negative on SOL/ETH/BTC as specified (see README table) — paper-trade only until refined.
 
 ---
 

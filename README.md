@@ -47,27 +47,34 @@ coindcx_box_bot/
 All strategies live in [`strategies.py`](strategies.py) and are registered in `STRATEGY_REGISTRY`.
 The Signals, Execution, Key Levels and Backtest tabs, the 24/7 e-mail monitor and the backtester all iterate over the registry, so **a new strategy needs no UI changes**.
 
-| ID | Name | Bias / Trigger | SL | TP1 | TP2 |
+| ID | Name | Timeframe Engine | Trigger & Confirmation | Strict SL | Single Complete-Exit TP |
 |---|---|---|---|---|---|
-| `box_theory` | **Box Theory Sweep** (baseline, math unchanged) | Sweep of RH / RL closing back inside | `max(high,SH)*1.002` / `min(low,SL)*0.998` | MID | RL / RH |
-| `atr_reversal` | **1-Candle 25% ATR Reversal** | Daily close vs SMA50 → 1–3 candle 15m flush/spike ≥ 25% of Daily ATR14 → close beyond previous opposite candle's high/low | `flush_low*0.9985` / `spike_high*1.0015` | 50% retrace | Origin of move |
+| `box_theory` | **Box Theory Sweep** | Daily 50 & 200 EMA Bias → 15m Trigger → 5m Confirmation | Requires Daily Close `< 50 EMA & < 200 EMA` for Short (`> 50 EMA & > 200 EMA` for Long; between EMAs = Neutral/No Trade). 15m candle sweeps Box Zone ($RH$/$RL$) or touches Daily 50 EMA; switches to 5m timeframe for rejection confirmation candle | `min(5% ROE [1% price], Structural Sweep SL)` | `min(20% ROE [4% price], MID)` (100% exit, requires $\ge 5\%$ ROE) |
+| `atr_reversal` | **1-Candle 25% ATR Reversal** | Daily 50 & 200 EMA Bias → 15m Flush → 5m Crossover | Requires Daily Close `< 50 EMA & < 200 EMA` for Short (`> 50 EMA & > 200 EMA` for Long); 15m candle watches for $\ge 25\%$ Daily ATR manipulation flush/spike; switches to 5m timeframe for 1-candle reversal crossover | `min(5% ROE [1% price], Flush Extreme SL)` | `min(20% ROE [4% price], 50% Retrace)` (100% exit, requires $\ge 5\%$ ROE) |
 
-Both use the 50/50 ratchet exit in the backtester. ATR guards: one trade per flush, flush must be within the last 8 candles, entry must sit between SL and TP1.
+Both strategies enforce **100% Single Complete Exit at TP** (no partial split), **Strict SL $\le 5\%$ ROE**, **Minimum TP $\ge 5\%$ ROE**, and **Daily Trade Discipline** (max 2 trades/day per coin; "Done for the Day" lock once a trade hits $\ge 10\%$ ROE).
+
+**Multi-Timeframe Architecture:**
+- **Daily Trend Bias Gate (50 EMA & 200 EMA):** Computed on 1,000 daily candles (`BEARISH` = Short only when `Close < 50 EMA & < 200 EMA`; `BULLISH` = Long only when `Close > 50 EMA & > 200 EMA`; `NEUTRAL` = No trade when between EMAs).
+- **15m Higher-Timeframe Watch:** Monitors institutional liquidity sweeps / Daily 50 EMA touches (Box Theory) and $\ge 25\%$ ATR manipulation flushes/spikes (ATR Reversal) on 15-minute candles to avoid false noise.
+- **5m Execution & Confirmation:** Once the 15m trigger occurs, the bot drops down to 5-minute candles for the precise rejection or crossover candle, providing earlier entries, tighter structural stops, and higher Risk-to-Reward.
 
 **Adding a strategy:** subclass `Strategy`, set `id`, `name`, `tp1_name`, `tp2_name`, implement `compute_levels`, `evaluate_signal`, `plan_setups`, `prepare_backtest`, `backtest_has_context`, `backtest_entry` (optionally `chart_lines`, `chart_markers`, `metric_badges`, `level_rows`), then add it to `STRATEGY_REGISTRY`.
 
 **Alerts:** e-mail subject is `"{SYM} - {Strategy Name} - trade notification"`; body and the `Live_Trades` sheet include Strategy and Trigger Reason. Restrict the background monitor with `ENABLED_STRATEGIES=box_theory,atr_reversal` (default: all).
 
-**1-year comparison (₹10,000 margin, 5x, 50/50 ratchet, USD/INR 88):**
+**1-year verified comparison with Daily 50 & 200 EMA Bias + Single TP ($\le 20\%$ ROE / MID, $\ge 5\%$ ROE) + Strict SL ($\le 5\%$ ROE / Sweep) + Max 2 Trades/Day ("Done on 10% ROE Win") (₹10,000 margin, 5x, USD/INR 88):**
 
-| Strategy | Pair | Trades | Fees (₹) | Win % | Net (₹) |
-|---|---|---|---|---|---|
-| Box Theory Sweep | SOL | 369 | 21,763 | 49.6 | **+40,317** |
-| Box Theory Sweep | ETH | 330 | 19,450 | 47.3 | **+2,359** |
-| Box Theory Sweep | BTC | 312 | 17,804 | 48.7 | **−13,227** |
-| 1-Candle 25% ATR Reversal | SOL | 152 | 8,960 | 45.4 | **−5,037** |
-| 1-Candle 25% ATR Reversal | ETH | 135 | 7,956 | 36.3 | **−9,172** |
-| 1-Candle 25% ATR Reversal | BTC | 152 | 8,656 | 28.9 | **−9,415** |
+| Strategy | Pair | Trades | Fees (₹) | Win % | Profit Factor | Max DD % | Net (₹) |
+|---|---|---|---|---|---|---|---|
+| Box Theory Sweep | SOL | 169 | 9,950 | 44.4 | 1.64 | 13.7% | **+28,966** |
+| Box Theory Sweep | ETH | 121 | 7,131 | 38.0 | 1.23 | 30.8% | **+8,080** |
+| Box Theory Sweep | BTC | 100 | 5,716 | 33.0 | 0.93 | 47.7% | **−1,957** |
+| **Box Theory Portfolio Total** | **All 3** | **390** | **22,797** | **39.5** | **1.36** | — | **+35,088** |
+| 1-Candle 25% ATR Reversal | SOL | 3 | 176 | 100.0 | 99.00 | 0.0% | **+1,426** |
+| 1-Candle 25% ATR Reversal | ETH | 3 | 177 | 33.3 | 0.57 | 4.5% | **−372** |
+| 1-Candle 25% ATR Reversal | BTC | 0 | 0 | — | — | 0.0% | **0** |
+| **ATR Reversal Portfolio Total** | **All 3** | **6** | **353** | **66.7** | **2.21** | — | **+1,053** |
 
 ---
 
