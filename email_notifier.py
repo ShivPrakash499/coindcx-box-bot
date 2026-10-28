@@ -102,10 +102,10 @@ def _send(subject: str, html: str, text: str) -> tuple[bool, str]:
 def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2: float,
                      margin_inr: float, leverage: int = 5, zone: str = "", kind: str = "SIGNAL",
                      note: str = "", app_url: str = "", strategy_name: str = "", trigger_reason: str = "",
-                     strategy_id: str = "") -> tuple[bool, str]:
+                     strategy_id: str = "", levels: dict | None = None) -> tuple[bool, str]:
     """
     Sends structured trade email notification with a 1-click action link
-    that opens the Trade Execution tab with all values pre-filled.
+    that opens the Trade Execution tab with all values pre-filled, plus a visual Daily Trend Bias card.
     """
     direction = direction.upper()
     is_long = direction in ("LONG", "BUY")
@@ -124,19 +124,66 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     colour = "#16a34a" if is_long else "#dc2626"
     heading = {"SIGNAL": "Trade Signal Alert", "EXECUTED": "Order Executed", "CLOSED": "Position Closed"}.get(kind, kind)
 
+    tp_roe = round((abs(tp1 - entry) / entry) * leverage * 100.0, 2) if entry > 0 else 0.0
+    sl_roe = round((abs(stop_loss - entry) / entry) * leverage * 100.0, 2) if (entry > 0 and stop_loss > 0) else 0.0
+
+    # Build Daily Trend Bias visual banner if levels are provided
+    lv = levels or {}
+    t_bias = lv.get("trend_bias") or lv.get("bias") or ""
+    ema50 = lv.get("EMA50")
+    ema200 = lv.get("EMA200")
+    d_close = lv.get("daily_close") or entry
+    rh_val, mid_val, rl_val = lv.get("RH"), lv.get("MID"), lv.get("RL")
+
+    if t_bias == "BEARISH":
+        trend_badge = "🔴 BEARISH TREND (< 50 & 200 EMA — Short Bias)"
+        trend_bg, trend_border, trend_fg = "#fef2f2", "#ef4444", "#991b1b"
+    elif t_bias == "BULLISH":
+        trend_badge = "🟢 BULLISH TREND (> 50 & 200 EMA — Long Bias)"
+        trend_bg, trend_border, trend_fg = "#f0fdf4", "#22c55e", "#166534"
+    elif t_bias == "NEUTRAL":
+        trend_badge = "🟡 RANGE MODE (Between 50 & 200 EMA — Both Box Edges Active)"
+        trend_bg, trend_border, trend_fg = "#fefce8", "#eab308", "#854d0e"
+    else:
+        trend_badge = ""
+        trend_bg, trend_border, trend_fg = "#f8fafc", "#cbd5e1", "#334155"
+
+    trend_visual_html = ""
+    if trend_badge and ema50 is not None and ema200 is not None:
+        box_strip = (
+            f"<div style='margin-top:6px;font-size:12px;color:#475569;'>"
+            f"📦 <strong>Daily Box:</strong> RH (Sell): <strong>${float(rh_val):,.2f}</strong> &middot; "
+            f"MID (50%): <strong>${float(mid_val):,.2f}</strong> &middot; "
+            f"RL (Buy): <strong>${float(rl_val):,.2f}</strong></div>"
+        ) if (rh_val and mid_val and rl_val) else ""
+        trend_visual_html = f"""
+        <div style="margin-bottom:14px;padding:12px 14px;background:{trend_bg};border:1px solid {trend_border};border-left:5px solid {trend_border};border-radius:8px;">
+          <div style="font-weight:800;font-size:13px;color:{trend_fg};letter-spacing:0.3px;">{trend_badge}</div>
+          <div style="margin-top:6px;font-size:12px;color:#1e293b;">
+            📊 <strong>Daily Close:</strong> ${float(d_close):,.2f} &nbsp;|&nbsp;
+            <strong>50 EMA:</strong> ${float(ema50):,.2f} &nbsp;|&nbsp;
+            <strong>200 EMA:</strong> ${float(ema200):,.2f}
+          </div>
+          {box_strip}
+        </div>
+        """
+
     rows = [
         ("Strategy", strategy_name or "Box Theory Sweep"),
         ("Asset / Pair", pair),
         ("Trade Direction", direction),
         ("Trigger Zone", zone),
     ]
+    if trend_badge:
+        rows.append(("Daily Trend Bias", trend_badge))
+    if ema50 is not None and ema200 is not None:
+        rows.append(("Daily 50 EMA / 200 EMA", f"${float(ema50):,.2f}  /  ${float(ema200):,.2f}"))
     if trigger_reason:
         rows.append(("Trigger Reason", trigger_reason))
     rows += [
         ("Planned Entry Price", f"${entry:,.4f}"),
-        ("Structural Stop Loss", f"${stop_loss:,.4f}"),
-        ("Take Profit 1", f"${tp1:,.4f}"),
-        ("Take Profit 2", f"${tp2:,.4f}"),
+        ("Strict Stop Loss (<=5% ROE / Sweep)", f"${stop_loss:,.4f}  (-{sl_roe:.2f}% ROE)"),
+        ("Single Complete-Exit TP (100% Exit)", f"${tp1:,.4f}  (+{tp_roe:.2f}% ROE)"),
         ("1/3 Rotational Margin" if kind == "SIGNAL" else "Allocated Margin", f"₹{margin_inr:,.0f} INR"),
         ("Leverage", f"{leverage}x"),
         ("Timestamp (IST)", now),
@@ -154,6 +201,7 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
           </div>
         </div>
         <div style="padding:16px;">
+          {trend_visual_html}
           <table style="width:100%;border-collapse:collapse;font-size:14px;">{tr}</table>
           {f'<div style="margin-top:14px;padding:10px 14px;background:#f1f5f9;border-left:4px solid {colour};border-radius:4px;color:#334155;font-size:13px;"><strong>Note:</strong> {note}</div>' if note else ''}
           <div style="text-align:center;margin-top:24px;margin-bottom:8px;">
@@ -162,7 +210,7 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
             </a>
           </div>
           <p style="text-align:center;color:#64748b;font-size:12px;margin-top:10px;line-height:1.4;">
-            Clicking opens the <strong>Crypto Trade Assistant</strong> with prefilled entry (${entry:,.2f}), SL, and TPs ready for manual review.
+            Clicking opens the <strong>Crypto Trade Assistant</strong> with prefilled entry (${entry:,.2f}), SL, and Single TP ready for manual review.
           </p>
         </div>
       </div>

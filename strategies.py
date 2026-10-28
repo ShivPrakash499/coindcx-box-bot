@@ -105,7 +105,7 @@ def classify_daily_ema_bias(close_val: float, ema50_val: float, ema200_val: floa
 
 # Dynamic Single-TP & Strict-SL Constants (at 5x default leverage)
 MAX_TP_ROE_PCT = 20.0         # Max TP = 20% ROE (4.0% price move at 5x) or MID whichever is lower/closer
-MIN_TP_ROE_PCT = 5.0          # Skip trade if TP distance is < 5% ROE (1.0% price move at 5x)
+MIN_TP_ROE_PCT = 3.0          # Skip trade if TP distance is < 3% ROE (0.6% price move at 5x)
 MAX_SL_ROE_PCT = 5.0          # Strict SL = 5% ROE (1.0% price move at 5x) or Sweep SL whichever is lower/closer
 MAX_TRADES_PER_DAY = 2        # Max 2 trades per coin per day
 DAILY_WIN_ROE_LOCK_PCT = 10.0 # Done for the day once a trade hits >= 10% ROE
@@ -287,18 +287,18 @@ class BoxTheorySweep(Strategy):
         }
         out.update(position_metrics(pair, c5_close, 0.0, mid, out["tp2"], margin_inr, leverage, usd_inr))
 
-        # 1. Strict Daily Trend Bias Gate: Do not alert if price is trapped between Daily 50 EMA & 200 EMA
-        if trend_bias == "NEUTRAL":
-            out["setup"] = (
-                f"WAIT / NO TRADE — Daily Close (${daily_close:,.2f}) is between Daily 50 EMA (${daily_ema50:,.2f}) "
-                f"& 200 EMA (${daily_ema200:,.2f}). Trend bias is neutral."
+        bias_label = (
+            f"Daily Bearish (<50 EMA ${daily_ema50:,.2f} & <200 EMA ${daily_ema200:,.2f})" if trend_bias == "BEARISH"
+            else (
+                f"Daily Bullish (>50 EMA ${daily_ema50:,.2f} & >200 EMA ${daily_ema200:,.2f})" if trend_bias == "BULLISH"
+                else f"Daily Range Mode (Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f})"
             )
-            out["trigger_reason"] = "Daily price between 50 EMA and 200 EMA (no directional bias)"
-            return self._stamp(out)
+        )
+        out["daily_trend_summary"] = bias_label
 
-        # 2. BEARISH BIAS (Daily below 50 EMA & 200 EMA) -> SHORT SIGNALS ONLY
-        if trend_bias == "BEARISH":
-            recent_15m = recs_15m[-3:-1]
+        # 1. SHORT SETUPS: Allowed in BEARISH (Short-only) AND NEUTRAL (Range Mode — Both Box Edges Active)
+        if trend_bias in ("BEARISH", "NEUTRAL"):
+            recent_15m = recs_15m[-3:]
             # Condition A: Price swept Box Sell Zone (RH-SH) and rejects back below RH
             swept_rh_prior = any(float(r["high"]) >= rh or float(r["open"]) >= rh for r in recent_15m)
             swept_rh_curr15 = (c15_high >= rh) or (float(prev_c15["high"]) >= rh)
@@ -306,10 +306,11 @@ class BoxTheorySweep(Strategy):
             rejected_rh_5m = swept_rh_prior and (c5_close < rh) and (c5_close <= c5_open or c5_close < prev_c5_close)
             rejected_rh_15m = swept_rh_curr15 and (c15_close < rh) and (c15_close <= c15_open or c15_close < prev_c15_close)
 
-            # Condition B: Price reached Daily 50 EMA resistance and next candle rejects lower
+            # Condition B: Price reached Daily 50 EMA resistance and next candle rejects lower (Bearish trend or from below 50 EMA)
             min_short_zone = rl + 0.35 * (rh - rl)
             touched_daily_ema50 = (
-                any(float(r["high"]) >= daily_ema50 * 0.999 and float(r["low"]) <= daily_ema50 * 1.005 for r in recs_15m[-3:])
+                (daily_close < daily_ema50)
+                and any(float(r["high"]) >= daily_ema50 * 0.999 and float(r["low"]) <= daily_ema50 * 1.005 for r in recs_15m[-3:])
                 and c5_close >= min_short_zone
             )
             rejected_d_ema50 = (
@@ -333,7 +334,7 @@ class BoxTheorySweep(Strategy):
                     tp2 = tp1
                     tf_lbl = "5m" if rejected_rh_5m else "15m"
                     reason = (
-                        f"Daily Bearish (<50 & 200 EMA) | Swept RH (${rh:,.2f}) + {tf_lbl} rejection "
+                        f"{bias_label} | Swept RH (${rh:,.2f}) + {tf_lbl} rejection "
                         f"(close ${entry:,.2f} < RH | {tp_lbl}, Strict SL <=5% ROE)"
                     )
                     out.update({
@@ -359,7 +360,7 @@ class BoxTheorySweep(Strategy):
                     tp2 = tp1
                     if stop > entry > tp1:
                         reason = (
-                            f"Daily Bearish (<50 & 200 EMA) | Touched Daily 50 EMA (${daily_ema50:,.2f}) + next-candle "
+                            f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + next-candle "
                             f"bearish rejection (close ${entry:,.2f} < Daily 50 EMA | {tp_lbl}, Strict SL <=5% ROE)"
                         )
                         out.update({
@@ -372,16 +373,17 @@ class BoxTheorySweep(Strategy):
                         out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr))
                         return self._stamp(out)
 
-            out["setup"] = (
-                f"WAIT / SHORT ONLY (Daily < 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f} — "
-                f"watching for price to reach RH ${rh:,.2f} or Daily 50 EMA ${daily_ema50:,.2f} and reject)"
-            )
-            out["trigger_reason"] = "Daily Bearish (<50 & 200 EMA): Long signals blocked; watching RH / Daily 50 EMA for Short rejection"
-            return self._stamp(out)
+            if trend_bias == "BEARISH":
+                out["setup"] = (
+                    f"WAIT / SHORT ONLY (Daily < 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f} — "
+                    f"watching for price to reach RH ${rh:,.2f} or Daily 50 EMA ${daily_ema50:,.2f} and reject)"
+                )
+                out["trigger_reason"] = "Daily Bearish (<50 & 200 EMA): Long signals blocked; watching RH / Daily 50 EMA for Short rejection"
+                return self._stamp(out)
 
-        # 3. BULLISH BIAS (Daily above 50 EMA & 200 EMA) -> LONG SIGNALS ONLY
-        if trend_bias == "BULLISH":
-            recent_15m = recs_15m[-3:-1]
+        # 2. LONG SETUPS: Allowed in BULLISH (Long-only) AND NEUTRAL (Range Mode — Both Box Edges Active)
+        if trend_bias in ("BULLISH", "NEUTRAL"):
+            recent_15m = recs_15m[-3:]
             swept_rl_prior = any(float(r["low"]) <= rl or float(r["open"]) <= rl for r in recent_15m)
             swept_rl_curr15 = (c15_low <= rl) or (float(prev_c15["low"]) <= rl)
 
@@ -390,7 +392,8 @@ class BoxTheorySweep(Strategy):
 
             max_long_zone = rh - 0.35 * (rh - rl)
             touched_daily_ema50 = (
-                any(float(r["low"]) <= daily_ema50 * 1.001 and float(r["high"]) >= daily_ema50 * 0.995 for r in recs_15m[-3:])
+                (daily_close > daily_ema50)
+                and any(float(r["low"]) <= daily_ema50 * 1.001 and float(r["high"]) >= daily_ema50 * 0.995 for r in recs_15m[-3:])
                 and c5_close <= max_long_zone
             )
             rejected_d_ema50 = (
@@ -414,7 +417,7 @@ class BoxTheorySweep(Strategy):
                     tp2 = tp1
                     tf_lbl = "5m" if rejected_rl_5m else "15m"
                     reason = (
-                        f"Daily Bullish (>50 & 200 EMA) | Swept RL (${rl:,.2f}) + {tf_lbl} rejection "
+                        f"{bias_label} | Swept RL (${rl:,.2f}) + {tf_lbl} rejection "
                         f"(close ${entry:,.2f} > RL | {tp_lbl}, Strict SL <=5% ROE)"
                     )
                     out.update({
@@ -440,7 +443,7 @@ class BoxTheorySweep(Strategy):
                     tp2 = tp1
                     if stop < entry < tp1:
                         reason = (
-                            f"Daily Bullish (>50 & 200 EMA) | Touched Daily 50 EMA (${daily_ema50:,.2f}) + next-candle "
+                            f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + next-candle "
                             f"bullish rejection (close ${entry:,.2f} > Daily 50 EMA | {tp_lbl}, Strict SL <=5% ROE)"
                         )
                         out.update({
@@ -453,13 +456,19 @@ class BoxTheorySweep(Strategy):
                         out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr))
                         return self._stamp(out)
 
-            out["setup"] = (
-                f"WAIT / LONG ONLY (Daily > 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f} — "
-                f"watching for price to reach RL ${rl:,.2f} or Daily 50 EMA ${daily_ema50:,.2f} and reject)"
-            )
-            out["trigger_reason"] = "Daily Bullish (>50 & 200 EMA): Short signals blocked; watching RL / Daily 50 EMA for Long rejection"
-            return self._stamp(out)
+            if trend_bias == "BULLISH":
+                out["setup"] = (
+                    f"WAIT / LONG ONLY (Daily > 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f} — "
+                    f"watching for price to reach RL ${rl:,.2f} or Daily 50 EMA ${daily_ema50:,.2f} and reject)"
+                )
+                out["trigger_reason"] = "Daily Bullish (>50 & 200 EMA): Short signals blocked; watching RL / Daily 50 EMA for Long rejection"
+                return self._stamp(out)
 
+        out["setup"] = (
+            f"WAIT / RANGE MODE (Daily ${daily_close:,.2f} is between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f} — "
+            f"watching BOTH Buy Zone RL ${rl:,.2f} & Sell Zone RH ${rh:,.2f} for rejection)"
+        )
+        out["trigger_reason"] = "Daily Range Mode (Between 50 & 200 EMA): Watching both RL Buy Zone and RH Sell Zone"
         return self._stamp(out)
 
     def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
@@ -474,9 +483,9 @@ class BoxTheorySweep(Strategy):
         b = eng.calculate_trade_setup_details("BUY", levels, live_price, margin_inr, leverage, usd_inr, pair=pair)
         s = eng.calculate_trade_setup_details("SELL", levels, live_price, margin_inr, leverage, usd_inr, pair=pair)
         if b:
-            b["trigger_reason"] = "Planned (Daily Bullish > 50 & 200 EMA): RL Buy Zone or 50 EMA touch + next-candle rejection"
+            b["trigger_reason"] = f"Planned ({trend_bias}): RL Buy Zone or 50 EMA touch + next-candle rejection"
         if s:
-            s["trigger_reason"] = "Planned (Daily Bearish < 50 & 200 EMA): RH Sell Zone or 50 EMA touch + next-candle rejection"
+            s["trigger_reason"] = f"Planned ({trend_bias}): RH Sell Zone or 50 EMA touch + next-candle rejection"
 
         if sig and sig.get("signal") == "LONG":
             return {"BUY": self._stamp({**sig, "direction": "BUY"}), "SELL": None,
@@ -498,9 +507,9 @@ class BoxTheorySweep(Strategy):
                 "note": f"🟢 Daily Trend Bias is BULLISH (above 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — LONG setups only."
             }
         return {
-            "BUY": None,
-            "SELL": None,
-            "note": f"⚪ Daily Close is between 50 EMA (${levels.get('EMA50', 0):,.2f}) and 200 EMA (${levels.get('EMA200', 0):,.2f}) — No trade until trend aligns."
+            "BUY": self._stamp(b),
+            "SELL": self._stamp(s),
+            "note": f"🟡 Daily Range Mode: Price (${levels.get('daily_close', 0):,.2f}) is between 50 EMA (${levels.get('EMA50', 0):,.2f}) and 200 EMA (${levels.get('EMA200', 0):,.2f}) — BOTH Buy Zone (RL) & Sell Zone (RH) sweep setups are active."
         }
 
     def chart_lines(self, levels, plan=None):
@@ -565,8 +574,6 @@ class BoxTheorySweep(Strategy):
             return None
         box = ctx["boxes"][candle["date_str"]]
         bias = box["bias"]
-        if bias == "NEUTRAL":
-            return None
 
         rh, rl, mid = box["RH"], box["RL"], box["MID"]
         sh, sl = box["SH"], box["SL"]
@@ -583,8 +590,8 @@ class BoxTheorySweep(Strategy):
         p_low = float(prev["low"])
         p_close = float(prev["close"])
 
-        # BEARISH BIAS (Daily Close < 50 EMA & < 200 EMA) -> SHORT ONLY
-        if bias == "BEARISH":
+        # SHORT SETUPS: Allowed in BEARISH (<50 & 200 EMA) and NEUTRAL (Between 50 & 200 EMA Range Mode)
+        if bias in ("BEARISH", "NEUTRAL"):
             upper_wick = c_high - max(c_open, c_close)
             is_bearish_rejection = (
                 (c_high >= rh) and (c_close < rh) and (c_high <= sh * 1.005) and (
@@ -598,31 +605,31 @@ class BoxTheorySweep(Strategy):
                 dyn = apply_dynamic_roe_tp_sl("SHORT", c_close, struct_stop, mid, leverage=5)
                 if dyn:
                     stop_p, tp_p, tp_lbl = dyn
+                    tag = "Daily <50/200 EMA" if bias == "BEARISH" else "Daily Range (Between 50/200 EMA)"
                     return {
                         "direction": "SHORT", "entry": c_close, "stop": stop_p,
                         "tp1": tp_p, "tp2": tp_p, "tp1_label": tp_lbl, "tp2_label": tp_lbl,
-                        "reason": "Daily <50/200 EMA + Swept RH Sell Zone"
+                        "reason": f"{tag} + Swept RH Sell Zone"
                     }
 
-            # Daily 50 EMA Touch + Next-Candle Rejection
-            min_short_zone = rl + 0.35 * (rh - rl)
-            touched_d_ema50 = (p_high >= daily_ema50 * 0.9995) and (p_low <= daily_ema50 * 1.005)
-            if touched_d_ema50 and (c_close < daily_ema50) and (c_close < c_open) and (c_close < p_close) and (c_close >= min_short_zone):
-                struct_stop = max(p_high, c_high, daily_ema50) * 1.0025
-                struct_tp1 = mid if c_close > mid else rl
-                if struct_stop > c_close > struct_tp1:
-                    dyn = apply_dynamic_roe_tp_sl("SHORT", c_close, struct_stop, struct_tp1, leverage=5)
-                    if dyn:
-                        stop_p, tp_p, tp_lbl = dyn
-                        return {
-                            "direction": "SHORT", "entry": c_close, "stop": stop_p,
-                            "tp1": tp_p, "tp2": tp_p, "tp1_label": tp_lbl, "tp2_label": tp_lbl,
-                            "reason": "Daily <50/200 EMA + Daily 50 EMA Rejection"
-                        }
-            return None
+            if bias == "BEARISH":
+                min_short_zone = rl + 0.35 * (rh - rl)
+                touched_d_ema50 = (p_high >= daily_ema50 * 0.9995) and (p_low <= daily_ema50 * 1.005)
+                if touched_d_ema50 and (c_close < daily_ema50) and (c_close < c_open) and (c_close < p_close) and (c_close >= min_short_zone):
+                    struct_stop = max(p_high, c_high, daily_ema50) * 1.0025
+                    struct_tp1 = mid if c_close > mid else rl
+                    if struct_stop > c_close > struct_tp1:
+                        dyn = apply_dynamic_roe_tp_sl("SHORT", c_close, struct_stop, struct_tp1, leverage=5)
+                        if dyn:
+                            stop_p, tp_p, tp_lbl = dyn
+                            return {
+                                "direction": "SHORT", "entry": c_close, "stop": stop_p,
+                                "tp1": tp_p, "tp2": tp_p, "tp1_label": tp_lbl, "tp2_label": tp_lbl,
+                                "reason": "Daily <50/200 EMA + Daily 50 EMA Rejection"
+                            }
 
-        # BULLISH BIAS (Daily Close > 50 EMA & > 200 EMA) -> LONG ONLY
-        if bias == "BULLISH":
+        # LONG SETUPS: Allowed in BULLISH (>50 & 200 EMA) and NEUTRAL (Between 50 & 200 EMA Range Mode)
+        if bias in ("BULLISH", "NEUTRAL"):
             lower_wick = min(c_open, c_close) - c_low
             is_bullish_rejection = (
                 (c_low <= rl) and (c_close > rl) and (c_low >= sl * 0.995) and (
@@ -636,28 +643,28 @@ class BoxTheorySweep(Strategy):
                 dyn = apply_dynamic_roe_tp_sl("LONG", c_close, struct_stop, mid, leverage=5)
                 if dyn:
                     stop_p, tp_p, tp_lbl = dyn
+                    tag = "Daily >50/200 EMA" if bias == "BULLISH" else "Daily Range (Between 50/200 EMA)"
                     return {
                         "direction": "LONG", "entry": c_close, "stop": stop_p,
                         "tp1": tp_p, "tp2": tp_p, "tp1_label": tp_lbl, "tp2_label": tp_lbl,
-                        "reason": "Daily >50/200 EMA + Swept RL Buy Zone"
+                        "reason": f"{tag} + Swept RL Buy Zone"
                     }
 
-            # Daily 50 EMA Touch + Next-Candle Rejection
-            max_long_zone = rh - 0.35 * (rh - rl)
-            touched_d_ema50 = (p_low <= daily_ema50 * 1.0005) and (p_high >= daily_ema50 * 0.995)
-            if touched_d_ema50 and (c_close > daily_ema50) and (c_close > c_open) and (c_close > p_close) and (c_close <= max_long_zone):
-                struct_stop = min(p_low, c_low, daily_ema50) * 0.9975
-                struct_tp1 = mid if c_close < mid else rh
-                if struct_stop < c_close < struct_tp1:
-                    dyn = apply_dynamic_roe_tp_sl("LONG", c_close, struct_stop, struct_tp1, leverage=5)
-                    if dyn:
-                        stop_p, tp_p, tp_lbl = dyn
-                        return {
-                            "direction": "LONG", "entry": c_close, "stop": stop_p,
-                            "tp1": tp_p, "tp2": tp_p, "tp1_label": tp_lbl, "tp2_label": tp_lbl,
-                            "reason": "Daily >50/200 EMA + Daily 50 EMA Rejection"
-                        }
-            return None
+            if bias == "BULLISH":
+                max_long_zone = rh - 0.35 * (rh - rl)
+                touched_d_ema50 = (p_low <= daily_ema50 * 1.0005) and (p_high >= daily_ema50 * 0.995)
+                if touched_d_ema50 and (c_close > daily_ema50) and (c_close > c_open) and (c_close > p_close) and (c_close <= max_long_zone):
+                    struct_stop = min(p_low, c_low, daily_ema50) * 0.9975
+                    struct_tp1 = mid if c_close < mid else rh
+                    if struct_stop < c_close < struct_tp1:
+                        dyn = apply_dynamic_roe_tp_sl("LONG", c_close, struct_stop, struct_tp1, leverage=5)
+                        if dyn:
+                            stop_p, tp_p, tp_lbl = dyn
+                            return {
+                                "direction": "LONG", "entry": c_close, "stop": stop_p,
+                                "tp1": tp_p, "tp2": tp_p, "tp1_label": tp_lbl, "tp2_label": tp_lbl,
+                                "reason": "Daily >50/200 EMA + Daily 50 EMA Rejection"
+                            }
 
         return None
 

@@ -1130,7 +1130,28 @@ with t_signals:
             with st.container(border=True):
                 h1, h2 = st.columns([2, 3])
                 h1.markdown(f"### {name_r}  \n`${px:,.4f}`" if px < 1 else f"### {name_r}  \n`${px:,.2f}`")
-                h2.markdown(f"Box zone: {zone_txt}")
+                if lv:
+                    tb = lv.get("trend_bias", "NEUTRAL")
+                    e50 = lv.get("EMA50", 0.0)
+                    e200 = lv.get("EMA200", 0.0)
+                    if tb == "BEARISH":
+                        tb_html = (
+                            f"<div style='padding:6px 10px;border-radius:6px;background:#fef2f2;border-left:4px solid #ef4444;color:#991b1b;font-size:12.5px;margin-bottom:6px;'>"
+                            f"<strong>🔴 Daily Trend: BEARISH</strong> (&lt; 50 EMA <code>${e50:,.2f}</code> &amp; 200 EMA <code>${e200:,.2f}</code>) &rarr; <strong>SHORT Only</strong></div>"
+                        )
+                    elif tb == "BULLISH":
+                        tb_html = (
+                            f"<div style='padding:6px 10px;border-radius:6px;background:#f0fdf4;border-left:4px solid #22c55e;color:#166534;font-size:12.5px;margin-bottom:6px;'>"
+                            f"<strong>🟢 Daily Trend: BULLISH</strong> (&gt; 50 EMA <code>${e50:,.2f}</code> &amp; 200 EMA <code>${e200:,.2f}</code>) &rarr; <strong>LONG Only</strong></div>"
+                        )
+                    else:
+                        tb_html = (
+                            f"<div style='padding:6px 10px;border-radius:6px;background:#fefce8;border-left:4px solid #eab308;color:#854d0e;font-size:12.5px;margin-bottom:6px;'>"
+                            f"<strong>🟡 Daily Trend: RANGE MODE</strong> (Between 50 EMA <code>${e50:,.2f}</code> &amp; 200 EMA <code>${e200:,.2f}</code>) &rarr; <strong>Both RH &amp; RL Box Edges Active</strong></div>"
+                        )
+                    h2.markdown(tb_html + f"Box zone: {zone_txt} &nbsp;|&nbsp; **RH:** `${lv['RH']:,.2f}` &middot; **MID:** `${lv['MID']:,.2f}` &middot; **RL:** `${lv['RL']:,.2f}`", unsafe_allow_html=True)
+                else:
+                    h2.markdown(f"Box zone: {zone_txt}")
                 for r in rs:
                     sig = r["signal"]
                     if sig and sig["signal"] != "NEUTRAL":
@@ -2197,7 +2218,12 @@ with t_levels:
             elif _bias_name == "BEARISH":
                 _plan_card("🔴 SHORT in Sell Zone (RH → SH) or 50 EMA Resistance", _sell, "Primary plan (Daily < 50 & 200 EMA — Long alerts disabled)")
             else:
-                st.info("⚪ Neutral / Mixed EMA Bias: Daily close is between the 50 EMA and 200 EMA. Trade notifications are paused until price aligns cleanly above or below both EMAs.")
+                st.info("🟡 Daily Range Mode: Price is between the Daily 50 EMA and 200 EMA. BOTH Buy Zone (RL) and Sell Zone (RH) sweep-rejection alerts are active.")
+                c_b, c_s = st.columns(2)
+                with c_b:
+                    _plan_card("🟢 LONG in Buy Zone (RL → SL)", _buy, "Range Mode Buy Edge")
+                with c_s:
+                    _plan_card("🔴 SHORT in Sell Zone (RH → SH)", _sell, "Range Mode Sell Edge")
 
             render_chart_fragment(selected_pair, levels, is_light_theme, margin_inr, leverage, usd_inr)
             st.markdown("---")

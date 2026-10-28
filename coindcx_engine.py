@@ -1297,34 +1297,34 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
         "profit_tp1_inr": profit_tp1_inr,
         "profit_tp2_inr": profit_tp2_inr,
         "loss_sl_inr": loss_sl_inr,
-        "target_roe_met": roe_tp1 >= 5.0
+        "target_roe_met": roe_tp1 >= 3.0
     }
 
 def detect_zone_signal(levels: dict, o: float, h: float, l: float, c: float):
     """
-    Classifies ONE CLOSED candle against the daily box zones, strictly gated by Daily 50 & 200 EMA trend bias:
+    Classifies ONE CLOSED candle against the daily box zones, gated by Daily 50 & 200 EMA trend bias:
       - BEARISH (Daily Close < 50 EMA & < 200 EMA): Sell Zone RH-SH sweep & rejection -> SHORT only
       - BULLISH (Daily Close > 50 EMA & > 200 EMA): Buy Zone RL-SL sweep & rejection -> LONG only
-      - NEUTRAL (Between 50 EMA & 200 EMA): No trade signal
-    Enforces Single TP = min(20% ROE [4% price], MID) (must be >= 5% ROE [1% price])
+      - NEUTRAL (Between 50 EMA & 200 EMA — Range Mode): BOTH Sell Zone RH-SH & Buy Zone RL-SL active
+    Enforces Single TP = min(20% ROE [4% price], MID) (must be >= 3% ROE [0.6% price])
     and Strict SL = min(5% ROE [1% price], Structural Sweep SL).
     """
     rh, rl, sh, sl, mid = levels["RH"], levels["RL"], levels["SH"], levels["SL"], levels["MID"]
     bias = levels.get("trend_bias", "NEUTRAL")
 
-    if bias == "BEARISH" and h >= rh and c < rh:
+    if bias in ("BEARISH", "NEUTRAL") and h >= rh and c < rh:
         struct_stop = max(h, sh) * 1.002
         tp_dist = min(abs(c - mid), c * 0.04)
-        if tp_dist < c * 0.0098:
+        if tp_dist < c * 0.0058:
             return None
         sl_dist = min(abs(struct_stop - c), c * 0.01)
         tp_p = round(c - tp_dist, 4)
         return {"kind": "REVERSAL", "direction": "SHORT", "zone": "Sell Zone RH-SH",
                 "stop": round(c + sl_dist, 4), "tp1": tp_p, "tp2": tp_p}
-    if bias == "BULLISH" and l <= rl and c > rl:
+    if bias in ("BULLISH", "NEUTRAL") and l <= rl and c > rl:
         struct_stop = min(l, sl) * 0.998
         tp_dist = min(abs(mid - c), c * 0.04)
-        if tp_dist < c * 0.0098:
+        if tp_dist < c * 0.0058:
             return None
         sl_dist = min(abs(c - struct_stop), c * 0.01)
         tp_p = round(c + tp_dist, 4)
@@ -1338,7 +1338,7 @@ def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> di
     Daily 50 EMA & 200 EMA Trend Bias Filter:
       - BEARISH: Daily Price < 50 EMA AND Daily Price < 200 EMA (SHORT setups only)
       - BULLISH: Daily Price > 50 EMA AND Daily Price > 200 EMA (LONG setups only)
-      - NEUTRAL / RANGE: Daily Price is between 50 EMA and 200 EMA (NO TRADE)
+      - NEUTRAL / RANGE: Daily Price is between 50 EMA and 200 EMA (Range Mode — Both Box Edges Active)
     """
     out = {"bias": "NEUTRAL / RANGE", "score": 0, "reasons": []}
     try:
@@ -1362,7 +1362,7 @@ def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> di
             else:
                 out["bias"] = "NEUTRAL / RANGE"
                 out["score"] = 0
-                out["reasons"].append(f"Daily Price (${d_close:,.2f}) is between 50 EMA (${ema50:,.2f}) & 200 EMA (${ema200:,.2f}) → Wait for trend alignment")
+                out["reasons"].append(f"Daily Price (${d_close:,.2f}) is between 50 EMA (${ema50:,.2f}) & 200 EMA (${ema200:,.2f}) → Range Mode (Both RH & RL Box Edges Active)")
     except Exception as e:
         out["reasons"].append(f"Bias unavailable: {e}")
     return out

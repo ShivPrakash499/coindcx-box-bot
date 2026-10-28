@@ -103,8 +103,8 @@ def scan_and_alert(pairs=None, margin_inr: float = 100000.0, leverage: int = 5, 
                     results.append({**row, "message": "no signal"})
                     continue
 
-                if float(sig.get("roe_tp1", 0.0)) < 5.0:
-                    results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 5% minimum"})
+                if float(sig.get("roe_tp1", 0.0)) < 3.0:
+                    results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})
                     continue
 
                 if daily_count >= MAX_DAILY_ALERTS_PER_PAIR:
@@ -131,7 +131,8 @@ def scan_and_alert(pairs=None, margin_inr: float = 100000.0, leverage: int = 5, 
                         pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
                         tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=sig["margin_inr"], leverage=sig["leverage"],
                         zone=sig.get("trigger_zone") or "", kind="SIGNAL", note=_note(s.id, sig),
-                        strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""))
+                        strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
+                        levels=sig.get("levels"))
                     if emailed:
                         now_sent = time.time()
                         state[key] = {"candle_ts": sig["candle_ts"], "sent_at": now_sent, "direction": sig["signal"]}
