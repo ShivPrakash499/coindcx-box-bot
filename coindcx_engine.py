@@ -2117,6 +2117,40 @@ def clear_autotrade_active_lock() -> dict:
     return save_autotrade_config({"active_trade_lock": None})
 
 
+def cancel_coindcx_open_entry_orders(pair: str, order_id: str = None) -> int:
+    """
+    Cancels any unfilled resting limit orders (such as an unfilled Entry 2 @ Sweep order)
+    for `pair` once TP1 is reached or the trade closes.
+    """
+    cancelled = 0
+    try:
+        if order_id and order_id != "CONFIRMED":
+            res, _ = _send_coindcx_signed_request(
+                "POST",
+                "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel",
+                {"id": str(order_id), "timestamp": int(round(time.time() * 1000))},
+            )
+            if res is not None and res.status_code == 200:
+                cancelled += 1
+        open_orders = fetch_coindcx_open_orders() or []
+        for o in open_orders:
+            o_id = o.get("id")
+            o_pair = o.get("pair")
+            o_stage = o.get("stage", "")
+            o_type = str(o.get("order_type", "")).lower()
+            if o_id and o_pair == pair and o_stage != "tpsl_exit" and "limit" in o_type:
+                res, _ = _send_coindcx_signed_request(
+                    "POST",
+                    "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel",
+                    {"id": str(o_id), "timestamp": int(round(time.time() * 1000))},
+                )
+                if res is not None and res.status_code == 200:
+                    cancelled += 1
+    except Exception as e:
+        print(f"[Cancel Unfilled Entry 2 Notice]: {e}")
+    return cancelled
+
+
 def register_app_trade_lock(
     pair: str,
     direction: str,
@@ -2131,6 +2165,8 @@ def register_app_trade_lock(
     qty2: float = 0.0,
     mode: str = "App/API Executed Trade",
     is_live_exchange: bool = False,
+    entry2_order_id: str = "",
+    tp1_order_id: str = "",
 ) -> dict:
     """
     Registers an active 1-Crypto-at-a-Time lock strictly for trades executed via our App/API.
@@ -2142,8 +2178,14 @@ def register_app_trade_lock(
         "direction": str(direction).upper(),
         "entry": float(entry or 0.0),
         "entry2_sweep": float(entry2_sweep or entry or 0.0),
+        "entry2_filled": False,
+        "entry2_cancelled": False,
+        "entry2_order_id": str(entry2_order_id or ""),
+        "tp1_order_id": str(tp1_order_id or ""),
         "tp1": float(tp1 or 0.0),
         "tp2": float(tp2 or tp1 or 0.0),
+        "tp1_hit": False,
+        "runner_halfway_ratcheted": False,
         "stop_loss": float(stop_loss or 0.0),
         "qty1": float(qty1 or 0.0),
         "qty2": float(qty2 or 0.0),
@@ -2163,34 +2205,46 @@ def register_app_trade_lock(
 
 def get_active_portfolio_trade_status() -> dict:
     """
-    Checks whether an App/API-originated crypto trade is currently open across the portfolio so we
-    strictly enforce '1 Crypto at a Time' ONLY for trades executed from our App/API.
-    Manual trades placed directly on the CoinDCX app/exchange do NOT lock our App from trading.
+    Checks whether an App/API-originated crypto trade is currently open across the portfolio AND
+    automatically manages the 3-stage 50/50 Runner lifecycle when Entry 1 fills (with or without Entry 2):
+      - Stage 1 (Price hits TP1 without hitting Entry 2):
+          1. Cancels the unfilled resting Entry 2 limit order at SL/SH.
+          2. Books 50% of the open Entry 1 position at TP1.
+          3. Ratchets Stop Loss into profit (Entry 1 +/- 50% of TP1 distance) while holding the remaining 50% for TP2.
+      - Stage 2 (Price reaches halfway between TP1 and TP2):
+          Ratchets Stop Loss to TP1 (MID).
+      - Stage 3 (Price hits TP2 or hits the Stop Loss):
+          Cancels any remaining resting orders and releases the 1-Crypto-at-a-Time App Lock.
     """
     cfg = get_autotrade_config()
     lock = cfg.get("active_trade_lock")
     if isinstance(lock, dict) and lock.get("pair"):
         l_pair = lock["pair"]
         l_dir = str(lock.get("direction", "LONG")).upper()
+        l_entry = float(lock.get("entry", 0.0) or 0.0)
+        l_entry2 = float(lock.get("entry2_sweep", 0.0) or 0.0)
         l_tp1 = float(lock.get("tp1", 0.0) or 0.0)
-        l_tp2 = float(lock.get("tp2", 0.0) or 0.0)
+        l_tp2 = float(lock.get("tp2", 0.0) or l_tp1 or 0.0)
         l_sl = float(lock.get("stop_loss", 0.0) or 0.0)
         l_ts = float(lock.get("opened_ts", 0.0) or 0.0)
         is_live_ex = bool(lock.get("is_live_exchange", False))
+        tp1_already_hit = bool(lock.get("tp1_hit", False))
 
-        # Auto-release lock if > 8 hours elapsed or if the App/API trade was closed / hit TP or SL
         try:
             if l_ts > 0 and (time.time() - l_ts) > 8 * 3600:
+                if is_live_ex:
+                    cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
                 clear_autotrade_active_lock()
                 return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
 
             if l_ts > 0 and (time.time() - l_ts) >= 60:
-                # If this trade was placed on CoinDCX via our App/API, check if that specific pair's position closed
+                matched_live_pos = None
                 if is_live_ex:
                     live_positions = fetch_coindcx_active_positions()
                     if live_positions is not None:
-                        matched = next((p for p in live_positions if p.get("pair") == l_pair), None)
-                        if not matched and fetch_coindcx_futures_balance().get("is_live_api"):
+                        matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
+                        if not matched_live_pos and fetch_coindcx_futures_balance().get("is_live_api"):
+                            cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
                             clear_autotrade_active_lock()
                             return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
 
@@ -2198,11 +2252,65 @@ def get_active_portfolio_trade_status() -> dict:
                 px = float(tk.get("last_price", 0.0) or 0.0)
                 if px > 0:
                     is_long = l_dir in ("LONG", "BUY")
-                    hit_tp = (px >= l_tp1) if (is_long and l_tp1 > 0) else ((px <= l_tp1) if (not is_long and l_tp1 > 0) else False)
+
+                    # Check if Entry 2 @ Sweep filled before TP1 was reached
+                    if not tp1_already_hit and not lock.get("entry2_filled") and l_entry2 > 0:
+                        swept_e2 = (px <= l_entry2 and px > l_sl) if is_long else (px >= l_entry2 and px < l_sl)
+                        if swept_e2:
+                            avg_e = round_asset_price((l_entry + l_entry2) / 2.0, l_entry)
+                            tp1_d = min(abs(l_tp1 - avg_e), avg_e * 0.02)
+                            new_tp1 = round_asset_price((avg_e + tp1_d) if is_long else (avg_e - tp1_d), l_entry)
+                            lock["entry"] = avg_e
+                            lock["tp1"] = new_tp1
+                            lock["entry2_filled"] = True
+                            l_entry = avg_e
+                            l_tp1 = new_tp1
+                            save_autotrade_config({"active_trade_lock": lock})
+
+                    hit_tp2 = (px >= l_tp2) if (is_long and l_tp2 > 0) else ((px <= l_tp2) if (not is_long and l_tp2 > 0) else False)
                     hit_sl = (px <= l_sl) if (is_long and l_sl > 0) else ((px >= l_sl) if (not is_long and l_sl > 0) else False)
-                    if hit_tp or hit_sl:
+
+                    # Full Exit at TP2 or Stop Loss (Catastrophe SL or Ratcheted Runner SL)
+                    if hit_tp2 or hit_sl:
+                        if is_live_ex:
+                            cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
                         clear_autotrade_active_lock()
                         return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Completed)"}
+
+                    # Stage 1: Price reaches TP1 (without hitting Entry 2) -> Book 50%, Cancel Entry 2, Ratchet SL!
+                    hit_tp1 = (px >= l_tp1) if (is_long and l_tp1 > 0) else ((px <= l_tp1) if (not is_long and l_tp1 > 0) else False)
+                    if hit_tp1 and not tp1_already_hit:
+                        # 1. Cancel unfilled Entry 2 limit order so it never fills late
+                        if is_live_ex and not lock.get("entry2_filled"):
+                            cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
+                            lock["entry2_cancelled"] = True
+
+                        # 2. Ratchet Stop Loss into profit (Entry 1 + 50% of TP1 distance) for the 50% TP2 Runner
+                        ratcheted_sl = round_asset_price(
+                            (l_entry + 0.5 * (l_tp1 - l_entry)) if is_long else (l_entry - 0.5 * (l_entry - l_tp1)),
+                            l_entry,
+                        )
+                        lock["tp1_hit"] = True
+                        lock["stop_loss"] = ratcheted_sl
+                        lock["mode"] = f"{lock.get('mode', 'App Trade')} [TP1 50% Booked -> 50% Runner to TP2]"
+                        l_sl = ratcheted_sl
+                        save_autotrade_config({"active_trade_lock": lock})
+
+                        # Update SL on CoinDCX position while keeping TP at TP2
+                        if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
+                            update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=ratcheted_sl, pair=l_pair)
+
+                    # Stage 2: Runner reaches 50% of distance between TP1 and TP2 -> Ratchet SL to TP1
+                    elif tp1_already_hit and not lock.get("runner_halfway_ratcheted") and l_tp1 > 0 and l_tp2 > 0:
+                        mid_runner = 0.5 * (l_tp1 + l_tp2)
+                        hit_mid_runner = (px >= mid_runner) if is_long else (px <= mid_runner)
+                        if hit_mid_runner:
+                            lock["runner_halfway_ratcheted"] = True
+                            lock["stop_loss"] = l_tp1
+                            l_sl = l_tp1
+                            save_autotrade_config({"active_trade_lock": lock})
+                            if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
+                                update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_tp1, pair=l_pair)
         except Exception:
             pass
 
@@ -2214,6 +2322,8 @@ def get_active_portfolio_trade_status() -> dict:
             "entry2_sweep": float(lock.get("entry2_sweep", 0.0) or 0.0),
             "tp1": l_tp1,
             "tp2": l_tp2,
+            "tp1_hit": bool(lock.get("tp1_hit", False)),
+            "entry2_cancelled": bool(lock.get("entry2_cancelled", False)),
             "stop_loss": l_sl,
             "source": lock.get("mode", "App/API Active Trade Lock"),
             "count": 1,
@@ -2231,10 +2341,12 @@ def execute_autotrade_two_entry_signal(
 ) -> tuple[bool, str, dict]:
     """
     Executes the 2-Entry Sweep Scale-In + 50/50 Runner setup for a single crypto at 10x leverage:
-      1. Verifies no other crypto position is currently active ('1 Crypto at a Time').
-      2. Allocates 50% of `single_trade_margin_inr` to Entry 1 (Zone Entry with TP1 + Catastrophe SL).
-      3. Allocates the remaining 50% of `single_trade_margin_inr` to Entry 2 (Limit Order at SL/SH Sweep).
-      4. Locks the portfolio slot to this crypto until the trade completes.
+      1. Verifies no other App/API crypto position is currently active ('1 Crypto at a Time').
+      2. Allocates 50% of `single_trade_margin_inr` to Entry 1 (`qty1`) with Position TP = TP2 and SL = Catastrophe SL.
+      3. Places a 50% partial-take-profit limit order (`0.5 * qty1`, opposite side) at TP1 so if price moves straight to TP1
+         without touching Entry 2, 50% of Entry 1 books at TP1 while the remaining 50% rides risk-free to TP2!
+      4. Allocates the remaining 50% of `single_trade_margin_inr` to Entry 2 (`qty2` Limit Order at SL/SH Sweep), which is
+         automatically cancelled if TP1 is hit first.
     """
     cfg = get_autotrade_config()
     margin_inr = float(single_trade_margin_inr or cfg.get("single_trade_margin_inr", 30000.0))
@@ -2251,6 +2363,7 @@ def execute_autotrade_two_entry_signal(
 
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     side = "BUY" if direction in ("LONG", "BUY") else "SELL"
+    opp_side = "SELL" if side == "BUY" else "BUY"
     entry1_px = round_asset_price(float(sig["entry"]), float(sig["entry"]))
     entry2_px = round_asset_price(float(sig.get("entry2_sweep") or sig["entry"]), entry1_px)
     tp1_px = round_asset_price(float(sig["tp1"]), entry1_px)
@@ -2267,11 +2380,13 @@ def execute_autotrade_two_entry_signal(
     if (qty1 * entry1_px * u_inr) < 2448.0 and (margin_inr * lev) >= 2448.0:
         qty1 = format_order_quantity(pair, ((margin_inr * lev) / u_inr) / entry1_px)
 
+    # 50% of Entry 1 quantity to book at TP1 (remaining 50% of Entry 1 rides to TP2)
+    qty1_tp1_half = format_order_quantity(pair, qty1 * 0.5)
+
     wallet = fetch_coindcx_futures_balance()
-    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
 
     if wallet.get("is_live_api"):
-        # Leg 1: Market/Limit Order for Entry 1 (50% Margin) with TP1 + Catastrophe SL
+        # Leg 1: Entry 1 (50% Margin = qty1) with Position Bracket TP set to TP2 (Runner) & SL set to Catastrophe SL
         ok1, msg1, extra1 = place_coindcx_futures_order(
             pair=pair,
             side=side,
@@ -2279,10 +2394,22 @@ def execute_autotrade_two_entry_signal(
             leverage=lev,
             order_type="market_order",
             margin_currency="INR",
-            tp_price=tp1_px,
+            tp_price=tp2_px,
             sl_price=sl_px,
         )
-        # Leg 2: Resting Limit Order for Entry 2 @ Sweep (50% Margin)
+        # Leg 2: Partial TP1 Limit Order (50% of Entry 1 = 0.5 * qty1, opposite side at TP1)
+        ok_tp1, msg_tp1, extra_tp1 = False, "TP1 managed by daemon", {}
+        if ok1 and qty1_tp1_half > 0 and (qty1_tp1_half * tp1_px * u_inr) >= 2448.0:
+            ok_tp1, msg_tp1, extra_tp1 = place_coindcx_futures_order(
+                pair=pair,
+                side=opp_side,
+                quantity=qty1_tp1_half,
+                leverage=lev,
+                order_type="limit_order",
+                price=tp1_px,
+                margin_currency="INR",
+            )
+        # Leg 3: Resting Limit Order for Entry 2 @ Sweep (50% Margin = qty2)
         ok2, msg2, extra2 = False, "Skipped (Entry 1 failed)", {}
         if ok1 and qty2 > 0 and (qty2 * entry2_px * u_inr) >= 2448.0:
             ok2, msg2, extra2 = place_coindcx_futures_order(
@@ -2300,9 +2427,15 @@ def execute_autotrade_two_entry_signal(
                 tp1=tp1_px, tp2=tp2_px, entry2_sweep=entry2_px, margin_inr=margin_inr,
                 leverage=lev, qty1=qty1, qty2=qty2,
                 mode="App/API Live AutoTrade (2-Entry + Runner)", is_live_exchange=True,
+                entry2_order_id=str(extra2.get("order_id", "")),
+                tp1_order_id=str(extra_tp1.get("order_id", "")),
             )
-            return True, f"Live AutoTrade Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) + Entry 2 Limit ({qty2} @ ${entry2_px})", {
-                "entry1_order": extra1, "entry2_order": extra2, "lock": lock_info
+            return True, (
+                f"Live AutoTrade Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | "
+                f"TP1 50% Book ({qty1_tp1_half} @ ${tp1_px}) | TP2 50% Runner (@ ${tp2_px}) | "
+                f"Entry 2 Limit ({qty2} @ ${entry2_px})"
+            ), {
+                "entry1_order": extra1, "tp1_partial_order": extra_tp1, "entry2_order": extra2, "lock": lock_info
             }
         return False, f"CoinDCX Live AutoTrade Error on {pair}: {msg1}", {"entry1_order": extra1}
     else:
@@ -2314,8 +2447,9 @@ def execute_autotrade_two_entry_signal(
             mode="App/API Simulated AutoTrade (2-Entry Armed)", is_live_exchange=False,
         )
         return True, (
-            f"AutoTrade Armed (Simulated — update CoinDCX API Key for live exchange fill): "
-            f"{direction} {pair} | Entry 1 (50%): ${entry1_px} ({qty1}) + Entry 2 @ Sweep (50%): ${entry2_px} ({qty2}) @ {lev}x"
+            f"AutoTrade Armed (Simulated): {direction} {pair} | "
+            f"Entry 1 (50%): ${entry1_px} ({qty1}) -> 50% books at TP1 ${tp1_px} ({qty1_tp1_half}) & 50% rides to TP2 ${tp2_px} | "
+            f"Entry 2 @ Sweep (50%): ${entry2_px} ({qty2}) @ {lev}x"
         ), {"lock": lock_info}
 
 
