@@ -30,13 +30,27 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+_MODULE_MTIMES = sys.__dict__.setdefault("_app_module_mtimes", {})
+
+def _reload_if_updated(mod):
+    """Hot-reloads a backend module only when its file on disk has actually been updated."""
+    try:
+        mod_file = getattr(mod, "__file__", None)
+        if not mod_file or not os.path.exists(mod_file):
+            return
+        mtime = os.path.getmtime(mod_file)
+        name = mod.__name__
+        if _MODULE_MTIMES.get(name) != mtime:
+            if name in _MODULE_MTIMES:
+                importlib.reload(mod)
+            _MODULE_MTIMES[name] = mtime
+    except Exception:
+        pass
+
 # Safe, hot-reloadable module imports with graceful fallbacks
 try:
     import coindcx_engine
-    try:
-        importlib.reload(coindcx_engine)
-    except Exception:
-        pass
+    _reload_if_updated(coindcx_engine)
 
     GLOBAL_FUTURES_PAIRS = coindcx_engine.GLOBAL_FUTURES_PAIRS
     calculate_daily_box_levels = coindcx_engine.calculate_daily_box_levels
@@ -69,10 +83,7 @@ except Exception as _mod_err:
 
 try:
     import strategies as strategy_registry
-    try:
-        importlib.reload(strategy_registry)
-    except Exception:
-        pass
+    _reload_if_updated(strategy_registry)
 except Exception as _strat_err:
     st.error(f"❌ Strategy Registry Initialization Error: {_strat_err}")
     st.code(traceback.format_exc())
@@ -80,10 +91,7 @@ except Exception as _strat_err:
 
 try:
     import sheets_logger
-    try:
-        importlib.reload(sheets_logger)
-    except Exception:
-        pass
+    _reload_if_updated(sheets_logger)
     log_trade_to_google_sheet = sheets_logger.log_trade_to_google_sheet
 except Exception as _sheet_err:
     def log_trade_to_google_sheet(*args, **kwargs):
@@ -91,10 +99,7 @@ except Exception as _sheet_err:
 
 try:
     import alert_notifier
-    try:
-        importlib.reload(alert_notifier)
-    except Exception:
-        pass
+    _reload_if_updated(alert_notifier)
     send_sweep_alert = alert_notifier.send_sweep_alert
     send_email_notification = alert_notifier.send_email_notification
 except Exception as _alert_err:
@@ -106,11 +111,8 @@ except Exception as _alert_err:
 try:
     import email_notifier
     import signal_monitor
-    try:
-        importlib.reload(email_notifier)
-        importlib.reload(signal_monitor)
-    except Exception:
-        pass
+    _reload_if_updated(email_notifier)
+    _reload_if_updated(signal_monitor)
     from email_notifier import send_trade_email, send_test_trade_email, get_email_config
 except Exception as _em_err:
     _EMAIL_ERR = str(_em_err)

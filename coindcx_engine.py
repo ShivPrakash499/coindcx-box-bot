@@ -249,8 +249,38 @@ def fetch_futures_funding_rate(pair="B-ETH_USDT"):
         "status": "DEFAULT"
     }
 
+import sys as _sys
+import threading as _threading
+
+# Process-wide persistent state that survives importlib.reload(coindcx_engine) across Streamlit reruns
+_PERSIST = _sys.__dict__.setdefault("_coindcx_persistent_state", {
+    "lock": _threading.Lock(),
+    "last_ts_ms": 0,
+    "last_ts_sec": 0,
+    "session": requests.Session(),
+    "session_verified": False,
+    "wallet_cache": {"data": None, "ts": 0.0, "last_good_live": None, "last_good_ts": 0.0},
+    "positions_cache": {"data": None, "ts": 0.0},
+    "api_key": "",
+    "api_secret": "",
+})
+
+_COINDCX_SIGN_LOCK = _PERSIST["lock"]
+_WALLET_BALANCE_CACHE = _PERSIST["wallet_cache"]
+_ACTIVE_POSITIONS_CACHE = _PERSIST["positions_cache"]
+
+
+def _next_monotonic_ms() -> int:
+    """Returns a strictly increasing millisecond epoch timestamp."""
+    now_ms = int(round(time.time() * 1000))
+    if now_ms <= _PERSIST["last_ts_ms"]:
+        now_ms = _PERSIST["last_ts_ms"] + 1
+    _PERSIST["last_ts_ms"] = now_ms
+    return now_ms
+
+
 def _get_coindcx_credentials() -> tuple[str, str]:
-    """Reads CoinDCX API Key & Secret dynamically from Streamlit Secrets or os.environ."""
+    """Reads CoinDCX API Key & Secret dynamically from Streamlit Secrets, os.environ, or process-wide cache."""
     api_key = ""
     api_secret = ""
     try:
@@ -280,49 +310,87 @@ def _get_coindcx_credentials() -> tuple[str, str]:
         api_secret = os.getenv("COINDCX_API_SECRET", "").strip().strip('"').strip("'")
     if api_secret == "your_coindcx_secret_key_here":
         api_secret = ""
+
+    api_key = "".join(api_key.split())
+    api_secret = "".join(api_secret.split())
+
+    if api_key and api_secret:
+        _PERSIST["api_key"] = api_key
+        _PERSIST["api_secret"] = api_secret
+    elif _PERSIST.get("api_key") and _PERSIST.get("api_secret"):
+        api_key = _PERSIST["api_key"]
+        api_secret = _PERSIST["api_secret"]
+
     return api_key, api_secret
 
 
 def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
     """
-    Helper to execute signed CoinDCX REST API requests with HMAC-SHA256 authentication.
-    Handles timestamp formatting (auto-retries with milliseconds if seconds fails) and secret sanitation.
+    Executes signed CoinDCX REST API requests with HMAC-SHA256 authentication.
+    - Uses a process-persistent HTTP Keep-Alive session so once a TCP socket is pinned to the
+      allowlisted Cloud NAT IP (e.g. 34.127.33.101), all subsequent requests reuse that exact socket.
+    - If a socket ever hits a non-allowlisted NAT IP or timestamp mismatch (HTTP 401/400), automatically
+      cycles to a fresh TCP socket and alternates seconds/milliseconds timestamps up to 6 attempts.
     """
     api_key, api_secret = _get_coindcx_credentials()
 
     if not api_key or not api_secret:
         return None, "API credentials not configured in .env or Streamlit Secrets"
 
+    has_explicit_ms = isinstance(payload, dict) and int(payload.get("timestamp", 0) or 0) > 100000000000
+
     try:
-        body = payload.copy() if payload else {}
-        auto_ts = "timestamp" not in body
-        if auto_ts:
-            body["timestamp"] = int(time.time())
+        res = None
+        for attempt in range(6):
+            with _COINDCX_SIGN_LOCK:
+                body = payload.copy() if payload else {}
+                # Alternate between seconds and milliseconds across attempts
+                use_ms = (attempt % 2 == 0) if has_explicit_ms else (attempt % 2 == 1)
+                body["timestamp"] = _next_monotonic_ms() if use_ms else int(time.time())
 
-        json_body = json.dumps(body, separators=(',', ':'))
-        signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+                json_body = json.dumps(body, separators=(',', ':'))
+                signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-AUTH-APIKEY': api_key,
+                    'X-AUTH-SIGNATURE': signature,
+                    'Connection': 'keep-alive',
+                }
+                sess = _PERSIST["session"]
+                try:
+                    if method.upper() == "GET":
+                        res = sess.get(url, data=json_body, headers=headers, timeout=timeout)
+                    else:
+                        res = sess.post(url, data=json_body, headers=headers, timeout=timeout)
+                except Exception:
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+                    _PERSIST["session"] = requests.Session()
+                    _PERSIST["session_verified"] = False
+                    continue
 
-        headers = {
-            'Content-Type': 'application/json',
-            'X-AUTH-APIKEY': api_key,
-            'X-AUTH-SIGNATURE': signature
-        }
+                if res.status_code == 200:
+                    _PERSIST["session_verified"] = True
+                    return res, None
 
-        if method.upper() == "GET":
-            res = requests.get(url, data=json_body, headers=headers, timeout=timeout)
-        else:
-            res = requests.post(url, data=json_body, headers=headers, timeout=timeout)
+                # Non-auth business logic error (e.g. 422 min order size) means auth & IP succeeded!
+                if res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
+                    _PERSIST["session_verified"] = True
+                    return res, None
 
-        # Retry with millisecond epoch timestamp if seconds timestamp was rejected (400/401/422)
-        if res.status_code != 200 and auto_ts and "expired" not in res.text.lower():
-            body["timestamp"] = int(round(time.time() * 1000))
-            json_body = json.dumps(body, separators=(',', ':'))
-            signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
-            headers['X-AUTH-SIGNATURE'] = signature
-            if method.upper() == "GET":
-                res = requests.get(url, data=json_body, headers=headers, timeout=timeout)
-            else:
-                res = requests.post(url, data=json_body, headers=headers, timeout=timeout)
+                # If 401 Invalid credentials occurred (e.g. Cloud NAT picked a secondary egress IP),
+                # cycle to a brand-new TCP session (new ephemeral port -> re-hashes NAT IP) after testing both ts formats
+                if res.status_code == 401 and attempt >= 1:
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+                    _PERSIST["session"] = requests.Session()
+                    _PERSIST["session_verified"] = False
+
+            time.sleep(0.08)
 
         return res, None
     except Exception as e:
@@ -396,6 +464,12 @@ def fetch_coindcx_futures_balance():
             "source": "Synced Wallet Balance (₹40,569.80)"
         }
 
+    # Return fresh cached live balance if queried within the last 12 seconds to prevent parallel nonce bursts
+    now_ts = time.time()
+    cached_bal = _WALLET_BALANCE_CACHE.get("data")
+    if cached_bal and (now_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))) < 12.0 and cached_bal.get("_key_prefix") == api_key[:8]:
+        return dict(cached_bal)
+
     usdt_balance = 0.0
     inr_balance = 0.0
     locked_inr = 0.0
@@ -434,11 +508,11 @@ def fetch_coindcx_futures_balance():
             api_err_msg = f"HTTP {res_fut.status_code}"
 
     # 2. Secondary / Fallback: CoinDCX Spot & General Balances (/exchange/v1/users/balances)
-    if not is_live or (usdt_balance == 0.0 and inr_balance == 0.0):
+    if not is_live:
         res_spot, err_spot = _send_coindcx_signed_request(
             "POST",
             "https://api.coindcx.com/exchange/v1/users/balances",
-            {"timestamp": int(round(time.time() * 1000))},
+            {},
         )
         if res_spot is not None and res_spot.status_code == 200:
             try:
@@ -469,7 +543,7 @@ def fetch_coindcx_futures_balance():
         if total_inr <= 0:
             total_inr = default_balance
             avail_inr = default_balance
-        return {
+        live_res = {
             "total_inr": round(total_inr, 2),
             "available_inr": round(avail_inr, 2),
             "inr_cash": round(inr_balance if inr_balance > 0 else total_inr, 2),
@@ -480,8 +554,24 @@ def fetch_coindcx_futures_balance():
             "cross_user_margin_usd": round(cross_margin_usd, 4),
             "live_usd_inr": usd_inr,
             "is_live_api": True,
-            "source": "CoinDCX Live Futures API"
+            "source": "CoinDCX Live Futures API",
+            "_key_prefix": api_key[:8],
         }
+        _WALLET_BALANCE_CACHE["data"] = live_res
+        _WALLET_BALANCE_CACHE["ts"] = now_ts
+        _WALLET_BALANCE_CACHE["last_good_live"] = live_res
+        _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+        return dict(live_res)
+
+    # If this same API key succeeded recently (< 30 mins ago), preserve the live connection state across transient hiccups
+    last_good = _WALLET_BALANCE_CACHE.get("last_good_live")
+    if (
+        isinstance(last_good, dict)
+        and last_good.get("_key_prefix") == api_key[:8]
+        and (now_ts - float(_WALLET_BALANCE_CACHE.get("last_good_ts", 0.0))) < 1800.0
+        and "expired" not in str(api_err_msg).lower()
+    ):
+        return dict(last_good)
 
     return {
         "total_inr": round(default_balance, 2),
@@ -503,6 +593,9 @@ def fetch_coindcx_active_positions():
     using real-time market mark prices and CoinDCX's exact settlement currency
     conversion price (settlement_currency_avg_price).
     """
+    now_pos_ts = time.time()
+    if _ACTIVE_POSITIONS_CACHE.get("data") is not None and (now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) < 4.0:
+        return list(_ACTIVE_POSITIONS_CACHE["data"])
     live_usdt_inr = get_coindcx_live_usdt_inr_rate()
     payload = {
         "page": "1",
@@ -627,6 +720,8 @@ def fetch_coindcx_active_positions():
     except Exception as e:
         print(f"[CoinDCX Positions Parse Error]: {e}")
 
+    _ACTIVE_POSITIONS_CACHE["data"] = active_positions
+    _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts
     return active_positions
 
 def fetch_coindcx_open_orders():
