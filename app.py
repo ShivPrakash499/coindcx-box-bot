@@ -604,6 +604,12 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
             "profit_tp1_inr": 500.0, "loss_sl_inr": 500.0
         }, return_details=True)
         (st.success if ok else st.error)(msg)
+    try:
+        import requests as _req_ip
+        _srv_ip = _req_ip.get("https://api.ipify.org", timeout=2.5).text.strip()
+        st.caption(f"🌐 **Server Outbound IP (for CoinDCX API):** `{_srv_ip}`")
+    except Exception:
+        pass
     if st.button("🔒 Lock Session", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()
