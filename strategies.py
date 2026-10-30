@@ -133,10 +133,11 @@ def classify_daily_ema_bias(close_val: float, ema50_val: float, ema200_val: floa
     return "NEUTRAL"
 
 
-# Dynamic 2-Entry + Runner TP1/TP2 & Sweep Scale-In Constants (at 5x default leverage)
-MAX_TP_ROE_PCT = 10.0         # TP1 (50% Early Book) = min(10% ROE [2.0% price move at 5x], MID)
-MIN_TP_ROE_PCT = 3.0          # Skip trade if TP1 distance is < 3% ROE (0.6% price move at 5x)
-MAX_SL_ROE_PCT = 5.0          # Strict 5% ROE max catastrophe SL cap (1.0% price distance at 5x)
+# Dynamic 2-Entry + Runner TP1/TP2 & Sweep Scale-In Constants (at 10x default leverage; 50% Tranche 1 = 5x effective)
+DEFAULT_LEVERAGE = 10         # 10x leverage per trade (50% margin on Entry 1 + 50% margin reserved for Entry 2)
+MAX_TP_ROE_PCT = 10.0         # TP1 (50% Early Book) = min(2.0% price move [10% total-margin ROE], MID)
+MIN_TP_ROE_PCT = 3.0          # Skip trade if TP1 distance is < 0.6% price move
+MAX_SL_ROE_PCT = 5.0          # Strict 1.0% max catastrophe SL price distance (5% ROE on Entry 1's 50% margin at 10x)
 MAX_TRADES_PER_DAY = 2        # Max 2 trades per coin per day
 DAILY_WIN_ROE_LOCK_PCT = 10.0 # Done for the day once a trade hits >= 10% ROE
 
@@ -147,57 +148,56 @@ def build_two_entry_runner_plan(
     sweep_level: float,
     struct_tp1: float,
     struct_tp2: float,
-    leverage: int = 5,
+    leverage: int = DEFAULT_LEVERAGE,
     max_tp1_roe: float = MAX_TP_ROE_PCT,
     min_tp1_roe: float = MIN_TP_ROE_PCT,
     enforce_min_tp: bool = True,
 ) -> dict | None:
     """
-    2-Entry Sweep Scale-In + 2-Stage Runner Exit Plan:
+    2-Entry Sweep Scale-In + 2-Stage Runner Exit Plan (10x Leverage, 50/50 Tranche Split):
       - Entry 1 (50% Margin): Confirmed rejection close price (`entry`).
       - Entry 2 (50% Margin — Same Amount): Placed at the `SH` / `SL` / wick sweep level (`sweep_level`),
         turning stop-hunts into a 2nd fill instead of a premature stop-out.
       - Emergency Catastrophe SL (`stop_price`): Placed just beyond `Entry 2` (`SH`/`SL`) and strictly
-        capped at 5% ROE (`1.0%` price move at 5x) so total risk never exceeds 5% ROE.
+        capped at 1.0% price move (`5% ROE` on Tranche 1's 50% margin at 10x).
       - TP1 (Close 50% / Book Early Profit + Free-Ride Runner):
-        `min(struct_tp1 [MID], 10% ROE [2.0% price move at 5x])`.
+        `min(struct_tp1 [MID], 2.0% price move [20% ROE on Tranche 1 / 10% ROE on Total Trade Margin])`.
       - TP2 (Hold Remaining 50% Risk-Free Runner for Big Drop):
         Opposite Box Edge (`RL`/`SL` for SHORT, `RH`/`SH` for LONG).
     """
     if entry <= 0:
         return None
     lev = max(1, int(leverage))
+    eff_lev = 5.0  # 50% Tranche 1 @ 10x leverage = 5x effective leverage on total trade margin
     is_long = direction.upper() in ("LONG", "BUY")
 
-    # 1. TP1 (Early Profit Booking on 50% of position: <= 10% ROE or MID whichever is closer)
+    # 1. TP1 (Early Profit Booking on 50% of position: <= 2.0% price move or MID whichever is closer)
     struct_tp1_dist = abs(struct_tp1 - entry)
-    max_tp1_dist = entry * (max_tp1_roe / 100.0 / lev)
-    min_tp1_dist = entry * (min_tp1_roe / 100.0 / lev)
-    max_sl_dist = entry * (MAX_SL_ROE_PCT / 100.0 / lev)  # 1.0% price move at 5x
+    max_tp1_dist = entry * (max_tp1_roe / 100.0 / eff_lev)
+    min_tp1_dist = entry * (min_tp1_roe / 100.0 / eff_lev)
+    max_sl_dist = entry * (MAX_SL_ROE_PCT / 100.0 / eff_lev)  # 1.0% structural price distance
 
     tp1_dist = min(struct_tp1_dist, max_tp1_dist)
     if enforce_min_tp and tp1_dist < (min_tp1_dist * 0.98):
         return None
 
-    # 2. Entry 2 (Equal-size scale-in order at SH / SL sweep level) & Strict <=5% ROE Catastrophe SL Cap
+    # 2. Entry 2 (Equal-size scale-in order at SH / SL sweep level) & Strict Catastrophe SL Cap
     if is_long:
         raw_e2 = min(sweep_level, entry * 0.996) if (0 < sweep_level < entry) else entry * 0.995
         entry2 = max(raw_e2, entry * 0.994)  # Entry 2 sits 0.4% - 0.6% below Entry 1 at SL/sweep wick
         avg_entry = (entry + entry2) / 2.0
-        # Give Entry 2 a ~0.4%-0.5% wick cushion while strictly capping catastrophe SL at 5% ROE (1.0% below Entry 1)
         stop_price = max(min(entry2 * 0.995, sweep_level * 0.9955 if sweep_level > 0 else entry2 * 0.995), entry - max_sl_dist)
         tp1_price = entry + tp1_dist
-        raw_tp2_dist = (struct_tp2 - entry) if struct_tp2 > tp1_price else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / lev))
+        raw_tp2_dist = (struct_tp2 - entry) if struct_tp2 > tp1_price else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / eff_lev))
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
         tp2_price = entry + tp2_dist
     else:
         raw_e2 = max(sweep_level, entry * 1.004) if (sweep_level > entry) else entry * 1.005
         entry2 = min(raw_e2, entry * 1.006)  # Entry 2 sits 0.4% - 0.6% above Entry 1 at SH/sweep wick
         avg_entry = (entry + entry2) / 2.0
-        # Give Entry 2 a ~0.4%-0.5% wick cushion while strictly capping catastrophe SL at 5% ROE (1.0% above Entry 1)
         stop_price = min(max(entry2 * 1.005, sweep_level * 1.0045 if sweep_level > 0 else entry2 * 1.005), entry + max_sl_dist)
         tp1_price = entry - tp1_dist
-        raw_tp2_dist = (entry - struct_tp2) if (0 < struct_tp2 < tp1_price) else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / lev))
+        raw_tp2_dist = (entry - struct_tp2) if (0 < struct_tp2 < tp1_price) else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / eff_lev))
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
         tp2_price = entry - tp2_dist
 
@@ -223,7 +223,7 @@ def apply_dynamic_roe_tp_sl(
     entry: float,
     struct_stop: float,
     struct_tp1: float,
-    leverage: int = 5,
+    leverage: int = DEFAULT_LEVERAGE,
     max_tp_roe: float = MAX_TP_ROE_PCT,
     max_sl_roe: float = MAX_SL_ROE_PCT,
     min_tp_roe: float = MIN_TP_ROE_PCT,
@@ -264,7 +264,7 @@ class Strategy:
     def compute_levels(self, pair):
         raise NotImplementedError
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=5, usd_inr=85.0):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         raise NotImplementedError
 
     def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr) -> dict:
@@ -325,7 +325,7 @@ class BoxTheorySweep(Strategy):
     def _reason(sig: dict) -> str:
         return sig.get("trigger_reason", "")
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=5, usd_inr=85.0):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
@@ -704,7 +704,7 @@ class BoxTheorySweep(Strategy):
             scale_in_lvl = max(sh, p_high, c_high)
             struct_tp1 = mid if c_close > mid else rl
             struct_tp2 = rl if c_close > rl * 1.012 else sl
-            plan = build_two_entry_runner_plan("SHORT", c_close, scale_in_lvl, struct_tp1, struct_tp2, leverage=5)
+            plan = build_two_entry_runner_plan("SHORT", c_close, scale_in_lvl, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
             if plan:
                 z_lbl = "Swept SH Swing High" if swept_sh_rej else "Swept RH Sell Zone"
                 return {
@@ -721,7 +721,7 @@ class BoxTheorySweep(Strategy):
                 sweep_hi = max(p_high, c_high, daily_ema50, sh)
                 struct_tp1 = mid if c_close > mid else rl
                 struct_tp2 = rl if c_close > rl * 1.012 else sl
-                plan = build_two_entry_runner_plan("SHORT", c_close, sweep_hi, struct_tp1, struct_tp2, leverage=5)
+                plan = build_two_entry_runner_plan("SHORT", c_close, sweep_hi, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
                 if plan and plan["stop"] > c_close > plan["tp1"]:
                     return {
                         "direction": "SHORT", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
@@ -751,7 +751,7 @@ class BoxTheorySweep(Strategy):
             scale_in_lvl = min(sl, p_low, c_low)
             struct_tp1 = mid if c_close < mid else rh
             struct_tp2 = rh if c_close < rh * 0.988 else sh
-            plan = build_two_entry_runner_plan("LONG", c_close, scale_in_lvl, struct_tp1, struct_tp2, leverage=5)
+            plan = build_two_entry_runner_plan("LONG", c_close, scale_in_lvl, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
             if plan:
                 z_lbl = "Swept SL Swing Low" if swept_sl_rej else "Swept RL Buy Zone"
                 return {
@@ -768,7 +768,7 @@ class BoxTheorySweep(Strategy):
                 sweep_lo = min(p_low, c_low, daily_ema50, sl)
                 struct_tp1 = mid if c_close < mid else rh
                 struct_tp2 = rh if c_close < rh * 0.988 else sh
-                plan = build_two_entry_runner_plan("LONG", c_close, sweep_lo, struct_tp1, struct_tp2, leverage=5)
+                plan = build_two_entry_runner_plan("LONG", c_close, sweep_lo, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
                 if plan and plan["stop"] < c_close < plan["tp1"]:
                     return {
                         "direction": "LONG", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
@@ -889,7 +889,7 @@ def detect_atr_reversal(records, j: int, atr: float, bias: str):
         side_txt = "below 50 & 200 EMA"
         move = "Spike"
 
-    plan = build_two_entry_runner_plan(direction, entry, extreme, struct_tp1, origin, leverage=5)
+    plan = build_two_entry_runner_plan(direction, entry, extreme, struct_tp1, origin, leverage=DEFAULT_LEVERAGE)
     if not plan:
         return None
     return {
@@ -949,7 +949,7 @@ class AtrReversal(Strategy):
         recs5 = df5.to_dict("records") if not df5.empty else []
         return levels, recs15, recs5
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=5, usd_inr=85.0):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels, recs15, recs5 = self._context(pair, levels)
         if not levels or not recs15:
             return None

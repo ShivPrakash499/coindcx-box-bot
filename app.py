@@ -139,21 +139,24 @@ import time
 @st.cache_resource
 def _ensure_background_monitor():
     """Starts the 24/7 background monitor daemon exactly once per Streamlit server process,
-    BEFORE check_authentication() so alerts run 24/7 even when no browser session is logged in."""
+    BEFORE check_authentication() so alerts and AutoTrade run 24/7 even when no browser session is logged in."""
     def _monitor_worker():
         while True:
             try:
                 if signal_monitor:
-                    rot = coindcx_engine.get_rotational_margin_inr()
-                    m_inr = float(rot.get("margin_inr", 100000.0))
-                    lev = int(os.getenv("LEVERAGE", 5))
+                    auto_cfg = coindcx_engine.get_autotrade_config()
+                    rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
+                    m_inr = float(auto_cfg.get("single_trade_margin_inr") or rot.get("margin_inr", 100000.0))
+                    lev = int(auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
                     u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
+                    watch_pairs = coindcx_engine.get_high_volatility_watchlist(top_n=12)
                     signal_monitor.scan_and_alert(
-                        pairs=["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"],
+                        pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
                         usd_inr=u_inr,
-                        send=True
+                        send=True,
+                        autotrade=bool(auto_cfg.get("enabled", False)),
                     )
             except Exception as e:
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
@@ -499,21 +502,76 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # ----------------- SIDEBAR CONTROLS -----------------
-st.sidebar.markdown("### 💰 Account Margin Overview")
+st.sidebar.markdown("### 💰 Account & Single-Trade Margin")
 wallet_data = get_cached_balance()
-st.sidebar.metric("Futures Balance", f"₹{wallet_data['total_inr']:,.2f}", wallet_data["source"])
+st.sidebar.metric("Whole Futures Wallet", f"₹{wallet_data['total_inr']:,.2f}", wallet_data["source"])
 
-_rot = get_rotational_margin_inr()
-default_margin = float(_rot["margin_inr"])
-margin_inr = st.sidebar.number_input("Margin per Trade (INR)", value=int(default_margin), step=500)
-st.sidebar.caption(f"Rotational sizing: 1/3 of {'live' if _rot['is_live_api'] else 'configured'} wallet ₹{_rot['wallet_equity_inr']:,.0f} = ₹{_rot['margin_inr']:,.0f}")
+_auto_cfg = coindcx_engine.get_autotrade_config()
+_rot = get_rotational_margin_inr(leverage=10)
+default_margin = float(_auto_cfg.get("single_trade_margin_inr") or _rot["margin_inr"])
+margin_inr = st.sidebar.number_input(
+    "Single-Trade Margin out of Wallet (INR)",
+    min_value=500,
+    max_value=max(int(wallet_data["total_inr"]), 1000000),
+    value=int(default_margin),
+    step=1000,
+    help="Total margin allocated to ONE active crypto trade out of your whole Futures Wallet (split 50% on Entry 1 and 50% reserved for Entry 2 @ Sweep)."
+)
+st.sidebar.caption(
+    f"🔹 **Entry 1 (50% Zone):** ₹{margin_inr * 0.5:,.0f}  \n"
+    f"🔹 **Entry 2 (50% @ SL/SH Sweep):** ₹{margin_inr * 0.5:,.0f}  \n"
+    f"🛡️ **Unallocated Wallet Reserve:** ₹{max(0.0, wallet_data['total_inr'] - margin_inr):,.0f}"
+)
 
-default_lev = int(os.getenv("LEVERAGE", 5))
-leverage = st.sidebar.slider("Leverage Multiplier", min_value=1, max_value=20, value=default_lev)
+default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
+leverage = st.sidebar.slider("Leverage Multiplier (10x Plan)", min_value=1, max_value=20, value=default_lev)
 
 live_crypto_rate = get_coindcx_live_usdt_inr_rate()
 usd_inr = st.sidebar.number_input("USDT / INR Rate (Live CoinDCX)", value=float(live_crypto_rate), step=0.5)
 st.sidebar.caption(f"🟢 CoinDCX Live Spot USDT: **₹{live_crypto_rate:,.2f} INR**")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 🤖 AutoTrade (1 Crypto at a Time)")
+autotrade_on = st.sidebar.toggle(
+    "🚀 Enable AutoTrade (Place 2-Entry Orders)",
+    value=bool(_auto_cfg.get("enabled", False)),
+    key="sidebar_autotrade_toggle",
+    help="When ON, the assistant automatically places Entry 1 (50% margin) + Entry 2 Limit @ Sweep (50% margin) at 10x leverage for the first confirmed signal, and locks out all other coins until that trade exits."
+)
+if (
+    autotrade_on != bool(_auto_cfg.get("enabled", False))
+    or float(margin_inr) != float(_auto_cfg.get("single_trade_margin_inr", 0.0))
+    or int(leverage) != int(_auto_cfg.get("leverage", 10))
+):
+    _auto_cfg = coindcx_engine.save_autotrade_config({
+        "enabled": bool(autotrade_on),
+        "single_trade_margin_inr": float(margin_inr),
+        "leverage": int(leverage),
+    })
+
+_slot_status = coindcx_engine.get_active_portfolio_trade_status()
+if autotrade_on:
+    st.sidebar.success(
+        f"🟢 **AutoTrade ARMED ({leverage}x)**  \n"
+        f"Single-Trade Margin: **₹{margin_inr:,.0f}**  \n"
+        f"(`₹{margin_inr*0.5:,.0f}` Entry 1 + `₹{margin_inr*0.5:,.0f}` Entry 2)"
+    )
+else:
+    st.sidebar.info("⚪ **AutoTrade OFF** (Alert-Only / Manual Execution Mode)")
+
+if _slot_status.get("is_occupied"):
+    _act_p = _slot_status.get("active_pair", "")
+    _act_d = _slot_status.get("active_direction", "")
+    st.sidebar.warning(
+        f"🔒 **1/1 Active Trade Lock:** `{_act_p}` ({_act_d})  \n"
+        f"Source: *{_slot_status.get('source', '')}*  \n"
+        f"New coins paused so 50% margin stays reserved for `{_act_p}` Entry 2."
+    )
+    if st.sidebar.button("🔓 Release Active Trade Lock (Mark Closed)", key="btn_clear_autotrade_lock", use_container_width=True):
+        coindcx_engine.clear_autotrade_active_lock()
+        st.rerun()
+else:
+    st.sidebar.caption("🟢 **Portfolio Slot: 0/1 Active (FREE)** — Ready for next high-volatility signal.")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📧 Gmail Trade Alerts")
@@ -536,16 +594,16 @@ if st.sidebar.button("📧 Send Test Trade Alert Email", key="btn_send_test_emai
             ok, msg = send_test_trade_email(st.session_state.selected_pair, test_ticker.get("last_price", 100.0), margin_inr)
             (st.success if ok else st.error)(("✅ " if ok else "❌ ") + msg)
 
-st.sidebar.markdown("### 📡 24/7 Signal Monitor")
-st.sidebar.caption("🟢 Background Daemon Active: Scans 15m candles 24/7 with every registered strategy and sends strategy-tagged emails even if this tab is closed.")
+st.sidebar.markdown("### 📡 24/7 High-Volatility Signal Monitor")
+st.sidebar.caption("🟢 Scans high-volatility crypto futures 24/7 (ranked by 24h range movement) and enforces strictly 1 active trade at a time.")
 monitor_on = st.sidebar.toggle("Auto-Email Alert Notifications", value=True, key="monitor_on")
 _strategy_names = [s.name for s in strategy_registry.list_strategies()]
 monitor_strategy_names = st.sidebar.multiselect("Strategies on the Signals tab", _strategy_names, default=_strategy_names,
                                                 key="monitor_strategies")
 monitor_strategy_ids = [s.id for s in strategy_registry.list_strategies() if s.name in monitor_strategy_names]
-_default_watch = ["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"]
+_default_watch = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
 monitor_pairs = st.sidebar.multiselect(
-    "Watchlist", GLOBAL_FUTURES_PAIRS,
+    "High-Volatility Watchlist (Auto-Ranked by 24h Movement)", GLOBAL_FUTURES_PAIRS,
     default=[p for p in _default_watch if p in GLOBAL_FUTURES_PAIRS], key="monitor_pairs")
 st.sidebar.caption("Standalone terminal scanner: `python signal_scanner.py`.")
 
@@ -1096,18 +1154,50 @@ with t_signals:
         st.session_state["exec_strategy_mode"] = f"{strategy_name} Only"
 
     @st.fragment(run_every="60s")
-    def render_signals_panel(watch, auto_send, m_inr, lev, u_inr, strat_ids):
-        st.subheader("🎯 Strategy Signals — every registered strategy, every watchlist pair")
-        st.caption("Evaluated on the last CLOSED 15m candle. Each new confirmation is e-mailed once, tagged with its strategy "
-                   "(60-min cooldown per strategy/pair/direction). Open the **🛡️ Trade Execution** tab to review the pre-filled ticket.")
+    def render_signals_panel(watch, auto_send, m_inr, lev, u_inr, strat_ids, auto_trade_enabled=False):
+        st.subheader("🎯 High-Volatility Strategy Signals (1 Crypto at a Time @ 10x)")
+        st.caption(
+            "Scans top high-volatility crypto futures (ranked by 24h range movement) on the last CLOSED 15m candle. "
+            "Strictly enforces **1 Active Crypto Trade at a Time** so 50% of your single-trade margin is always reserved for Entry 2 @ Sweep."
+        )
         if not watch:
-            st.info("Pick at least one derivative in the sidebar **Signal Monitor** watchlist.")
+            st.info("Pick at least one derivative in the sidebar **High-Volatility Watchlist**.")
             return
         if not strat_ids:
             st.info("Pick at least one strategy in the sidebar **Strategies on the Signals tab** selector.")
             return
-        results = signal_monitor.scan_and_alert(watch, m_inr, lev, u_inr, send=auto_send, strategy_ids=strat_ids) if signal_monitor else []
-        st.caption(f"Last scan: {datetime.now(IST).strftime('%I:%M:%S %p IST')} • auto e-mail {'ON' if auto_send else 'OFF'}")
+
+        # Top 24h Volatility Futures Leaderboard Strip
+        top_movers = coindcx_engine.fetch_top_volatility_movers(watch, top_n=min(6, len(watch)))
+        if top_movers:
+            with st.expander("🔥 Live 24h High-Volatility Crypto Futures Leaderboard (Ranked by 24h Range %)", expanded=True):
+                vcols = st.columns(len(top_movers))
+                for vc, mv in zip(vcols, top_movers):
+                    p_lbl = mv["symbol"]
+                    lp = mv["last_price"]
+                    p_fmt = f"${lp:,.4f}" if lp < 1.0 else f"${lp:,.2f}"
+                    vc.metric(
+                        f"#{top_movers.index(mv)+1} {p_lbl}",
+                        p_fmt,
+                        f"{mv['range_24h_pct']:.1f}% Range ({mv['change_24h_pct']:+.1f}%)"
+                    )
+
+        slot_now = coindcx_engine.get_active_portfolio_trade_status()
+        if slot_now.get("is_occupied"):
+            st.warning(
+                f"🔒 **1-Crypto-at-a-Time Active Lock:** Currently in **`{slot_now.get('active_pair')}` ({slot_now.get('active_direction')})** "
+                f"[{slot_now.get('source')}]. Other coins will not auto-trigger until this trade exits so 50% margin stays reserved for Entry 2."
+            )
+        else:
+            st.success(
+                f"🟢 **Portfolio Slot Free (0/1 Active)** • Single-Trade Margin: **₹{m_inr:,.0f}** (`₹{m_inr*0.5:,.0f}` Entry 1 + `₹{m_inr*0.5:,.0f}` Entry 2 @ Sweep) • "
+                f"Leverage: **{lev}x** • AutoTrade: **{'ON 🚀' if auto_trade_enabled else 'OFF (Manual)'}**"
+            )
+
+        results = signal_monitor.scan_and_alert(
+            watch, m_inr, lev, u_inr, send=auto_send, strategy_ids=strat_ids, autotrade=auto_trade_enabled
+        ) if signal_monitor else []
+        st.caption(f"Last scan: {datetime.now(IST).strftime('%I:%M:%S %p IST')} • auto e-mail {'ON' if auto_send else 'OFF'} • AutoTrade {'ON 🚀' if auto_trade_enabled else 'OFF'}")
 
         by_pair = {}
         for r in results:
@@ -1137,12 +1227,12 @@ with t_signals:
                     if tb == "BEARISH":
                         tb_html = (
                             f"<div style='padding:6px 10px;border-radius:6px;background:#fef2f2;border-left:4px solid #ef4444;color:#991b1b;font-size:12.5px;margin-bottom:6px;'>"
-                            f"<strong>🔴 Daily Trend: BEARISH</strong> (&lt; 50 EMA <code>${e50:,.2f}</code> &amp; 200 EMA <code>${e200:,.2f}</code>) &rarr; <strong>SHORT Only</strong></div>"
+                            f"<strong>🔴 Daily Trend: BEARISH</strong> (&lt; 50 EMA <code>${e50:,.2f}</code> &amp; 200 EMA <code>${e200:,.2f}</code>) &rarr; <strong>SHORT + Extreme SL Bounce</strong></div>"
                         )
                     elif tb == "BULLISH":
                         tb_html = (
                             f"<div style='padding:6px 10px;border-radius:6px;background:#f0fdf4;border-left:4px solid #22c55e;color:#166534;font-size:12.5px;margin-bottom:6px;'>"
-                            f"<strong>🟢 Daily Trend: BULLISH</strong> (&gt; 50 EMA <code>${e50:,.2f}</code> &amp; 200 EMA <code>${e200:,.2f}</code>) &rarr; <strong>LONG Only</strong></div>"
+                            f"<strong>🟢 Daily Trend: BULLISH</strong> (&gt; 50 EMA <code>${e50:,.2f}</code> &amp; 200 EMA <code>${e200:,.2f}</code>) &rarr; <strong>LONG + Extreme SH Rejection</strong></div>"
                         )
                     else:
                         tb_html = (
@@ -1170,13 +1260,25 @@ with t_signals:
                                    f"📧 {'sent' if r['emailed'] else r['message']}")
                         if sig["signal_kind"] == "CONTINUATION":
                             st.caption("⚠️ Continuation (tower) signals are alert-only ideas and have not been backtested.")
-                        if st.button(f"➡️ Load {name_r} ({r['strategy_name']}) into Execution tab", key=f"btn_load_sig_{r['strategy_id']}_{pair_r}",
-                                     use_container_width=True, on_click=_load_signal_into_exec, args=(pair_r, r["strategy_name"])):
-                            st.rerun()
+                        b_col1, b_col2 = st.columns(2)
+                        with b_col1:
+                            if st.button(f"➡️ Load {name_r} ({r['strategy_name']}) into Execution tab", key=f"btn_load_sig_{r['strategy_id']}_{pair_r}",
+                                         use_container_width=True, on_click=_load_signal_into_exec, args=(pair_r, r["strategy_name"])):
+                                st.rerun()
+                        with b_col2:
+                            if st.button(f"🤖 Auto-Execute 2-Entry {name_r} Now (₹{m_inr:,.0f} @ {lev}x)", key=f"btn_auto_exec_{r['strategy_id']}_{pair_r}",
+                                         type="primary", use_container_width=True):
+                                ok_a, msg_a, _ = coindcx_engine.execute_autotrade_two_entry_signal(
+                                    pair=pair_r, sig=sig, single_trade_margin_inr=m_inr, leverage=lev, usd_inr=u_inr
+                                )
+                                if ok_a:
+                                    st.success(f"✅ {msg_a}")
+                                else:
+                                    st.error(f"❌ {msg_a}")
                     else:
                         st.caption(f"**{r['strategy_name']}** — no confirmation on the last closed 15m candle • {r['message']}")
 
-    render_signals_panel(monitor_pairs, monitor_on, margin_inr, leverage, usd_inr, monitor_strategy_ids)
+    render_signals_panel(monitor_pairs, monitor_on, margin_inr, leverage, usd_inr, monitor_strategy_ids, autotrade_on)
 
 # ==============================================================================
 # TAB 1: LIVE TRADE EXECUTION, FEES & CAPITAL PRESERVATION (REQUIREMENTS 2, 3, 4, 5)
@@ -1331,7 +1433,7 @@ with t_exec:
             # Check if active position exists for this pair to auto-match leverage
             matching_active_pos = next((p for p in live_positions if p["pair"] == pair), None) if live_positions else None
             active_pos_leverage = int(round(float(matching_active_pos["leverage"]))) if matching_active_pos else None
-            default_slider_leverage = active_pos_leverage if active_pos_leverage else 5
+            default_slider_leverage = active_pos_leverage if active_pos_leverage else int(leverage)
 
             trade_leverage = st.slider(
                 "Leverage Multiplier:",
@@ -2338,10 +2440,10 @@ with t_sheets:
         """)
 
 # ==============================================================================
-# TAB 5: MULTI-DERIVATIVE BACKTEST (max 4 derivatives)
+# TAB 5: MULTI-DERIVATIVE & 1-CRYPTO-AT-A-TIME PORTFOLIO BACKTEST
 # ==============================================================================
 with t_backtest:
-    st.subheader("📊 Multi-Derivative Backtest")
+    st.subheader("📊 High-Volatility & 1-Crypto-at-a-Time Backtest (10x Leverage)")
     _bt_names = [s.name for s in strategy_registry.list_strategies()]
     _BT_CMP = "Compare All Strategies Side-by-Side"
     bt_strategy_sel = st.selectbox("Select Strategy to Backtest", _bt_names + [_BT_CMP], key="bt_strategy_sel")
@@ -2349,35 +2451,73 @@ with t_backtest:
                  else [strategy_registry.strategy_by_name(bt_strategy_sel)])
     for _s in bt_strats:
         st.caption(f"**{_s.name}:** {_s.description}")
-    st.caption("Up to 4 derivatives, 15m candles, CoinDCX taker fee 0.05% + 18% GST per side, 1/3 rotational margin per trade.")
+    st.caption("15m candles, CoinDCX taker fee 0.05% + 18% GST per side, 2-Entry Sweep Scale-In + 50/50 Free-Ride Runner.")
 
-    BT_OPTIONS = ["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT", "B-BNB_USDT", "B-XRP_USDT", "B-DOGE_USDT"]
-    bt_pairs = st.multiselect("Derivatives (max 4)", BT_OPTIONS, default=["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"],
-                              max_selections=4, key="bt_multi_pairs")
+    BT_OPTIONS = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE) + [
+        p for p in ["B-BNB_USDT", "B-LINK_USDT", "B-ADA_USDT", "B-DOT_USDT", "B-LTC_USDT"]
+        if p not in coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE
+    ]
+    bt_pairs = st.multiselect("Derivatives (select up to 12 high-volatility futures)", BT_OPTIONS,
+                              default=["B-INJ_USDT", "B-RENDER_USDT", "B-FET_USDT", "B-SOL_USDT"],
+                              max_selections=12, key="bt_multi_pairs")
     bc1, bc2, bc3 = st.columns(3)
-    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days"], index=4, key="bt_multi_dur")
-    bt_capital = bc2.number_input("Starting Capital (₹)", min_value=5000, value=30000, step=5000, key="bt_multi_cap")
-    bt_lev = bc3.slider("Leverage", 1, 10, 5, key="bt_multi_lev")
+    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days"], index=0, key="bt_multi_dur")
+    bt_capital = bc2.number_input("Single-Trade Margin / Capital (₹)", min_value=5000, value=int(margin_inr), step=5000, key="bt_multi_cap")
+    bt_lev = bc3.slider("Leverage", 1, 20, 10, key="bt_multi_lev")
 
-    bt_margin_mode = st.radio("Margin per trade", ["1/3 of capital (rotational)", "Custom margin"], horizontal=True, key="bt_multi_mm")
+    bt_margin_mode = st.radio("Margin per trade", ["Full Single-Trade Margin (1 Crypto at a Time)", "1/3 of capital (rotational)", "Custom margin"], horizontal=True, key="bt_multi_mm")
     if bt_margin_mode.startswith("Custom"):
-        bt_margin = st.number_input("Custom margin per trade (₹)", min_value=500, value=int(bt_capital / 3), step=500, key="bt_multi_custom")
+        bt_margin = st.number_input("Custom margin per trade (₹)", min_value=500, value=int(bt_capital), step=500, key="bt_multi_custom")
+    elif bt_margin_mode.startswith("Full"):
+        bt_margin = float(bt_capital)
+        st.caption(f"Single-Trade Margin = ₹{bt_margin:,.0f} (`₹{bt_margin*0.5:,.0f}` Entry 1 + `₹{bt_margin*0.5:,.0f}` Entry 2 @ Sweep)")
     else:
         bt_margin = bt_capital / 3.0
         st.caption(f"Margin per trade = ₹{bt_margin:,.0f}")
-    if len(bt_pairs) == 4 and not bt_margin_mode.startswith("Custom"):
-        st.warning("4 derivatives with 1/3 margin each can deploy up to 133% of capital if all trade at once. Treat the combined figure as an upper bound.")
 
+    st.markdown("#### 🏆 1-Crypto-at-a-Time High-Volatility Portfolio Simulation (Recommended)")
+    st.caption("Simulates scanning all 12 High-Volatility Crypto Futures (`INJ, RENDER, FET, APT, SUI, NEAR, DOGE, AVAX, XRP, SOL, ETH, BTC`) at **10x Leverage** while strictly allowing **ONLY 1 active crypto trade at any time**.")
+    if st.button("🏆 Run 1-Crypto-at-a-Time High-Volatility Portfolio Backtest (All 12 Top Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
+        days_p = int(bt_dur_label.split()[0])
+        with st.spinner(f"Running 1-Crypto-at-a-Time Portfolio Backtest across {len(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)} High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
+            port_res = coindcx_engine.run_portfolio_single_slot_backtest(
+                pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
+                duration_days=days_p,
+                margin_inr=bt_margin,
+                leverage=bt_lev,
+                usd_inr=usd_inr,
+                strategy_id=bt_strats[0].id,
+            )
+            st.session_state["bt_portfolio_1slot"] = port_res
+
+    port_out = st.session_state.get("bt_portfolio_1slot")
+    if port_out and port_out.get("total_trades", 0) > 0:
+        st.success(
+            f"✅ **1-Crypto-at-a-Time Portfolio Result ({bt_dur_label} @ {bt_lev}x):** "
+            f"**+₹{port_out['net_profit_inr']:,.2f}** (`{port_out['total_roi_pct']:+.2f}% ROI` on single ₹{bt_margin:,.0f} margin slot) • "
+            f"**{port_out['win_rate_pct']}% Win Rate** ({port_out['win_count']}W / {port_out['loss_count']}L) • "
+            f"**Profit Factor {port_out['profit_factor']}**"
+        )
+        pk1, pk2, pk3, pk4 = st.columns(4)
+        pk1.metric("Net Portfolio Profit", f"₹{port_out['net_profit_inr']:,.0f}", f"{port_out['total_roi_pct']:+.1f}% ROI")
+        pk2.metric("Portfolio Trades (1 at a time)", port_out["total_trades"])
+        pk3.metric("Win Rate", f"{port_out['win_rate_pct']}%", f"{port_out['win_count']}W / {port_out['loss_count']}L")
+        pk4.metric("Profit Factor", f"{port_out['profit_factor']}")
+        st.dataframe(port_out["coin_summary_df"], use_container_width=True, hide_index=True)
+        with st.expander("📜 View All 1-Crypto-at-a-Time Portfolio Trades"):
+            st.dataframe(port_out["trades_df"][["entry_time", "exit_time", "pair", "direction", "entry_price", "exit_price", "roe_pct", "net_pnl_inr", "trigger", "exit_reason"]], use_container_width=True, hide_index=True)
+
+    st.markdown("---")
     _EXIT_LABELS = {"50/50 Split": "50/50 Split (ratchet SL)", "TP1 Midpoint": "100% at TP1"}
-    st.markdown("**Exit mode per derivative** (applies to every selected strategy)")
+    st.markdown("**Individual Derivative Comparison**")
     bt_modes = {}
-    mode_cols = st.columns(max(1, len(bt_pairs)))
-    for col, pr in zip(mode_cols, bt_pairs):
-        default_idx = 1 if pr == "B-ETH_USDT" else 0
-        bt_modes[pr] = col.selectbox(pr.replace("B-", "").replace("_USDT", ""), ["50/50 Split", "TP1 Midpoint"], index=default_idx,
+    mode_cols = st.columns(max(1, min(4, len(bt_pairs))))
+    for idx_m, pr in enumerate(bt_pairs):
+        col = mode_cols[idx_m % len(mode_cols)]
+        bt_modes[pr] = col.selectbox(pr.replace("B-", "").replace("_USDT", ""), ["50/50 Split", "TP1 Midpoint"], index=0,
                                      format_func=lambda m: _EXIT_LABELS.get(m, m), key=f"bt_mode_{pr}")
 
-    if st.button("▶️ Run Backtest", key="btn_run_multi_bt", type="primary", use_container_width=True, disabled=not bt_pairs):
+    if st.button("▶️ Run Individual Derivatives Backtest", key="btn_run_multi_bt", use_container_width=True, disabled=not bt_pairs):
         days = int(bt_dur_label.split()[0])
         details, prog = {}, st.progress(0.0, text="Starting...")
         jobs = [(s, pr) for s in bt_strats for pr in bt_pairs]
