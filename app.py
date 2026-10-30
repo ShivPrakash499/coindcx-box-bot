@@ -1473,13 +1473,26 @@ elif active_section == "🎯 Execute":
                             min(float(active_trade["entry"]), shield_live_px) if trade_dir == "BUY" else max(float(active_trade["entry"]), shield_live_px),
                             float(active_trade["entry"])
                         )
-                        with st.spinner("Submitting Limit Maker order to CoinDCX..."):
+                        _e1_qty = _tranche_q if (_tranche_q * _maker_px * trade_usd_inr) >= 2448.0 else active_trade["crypto_qty"]
+                        _e2_px = round_asset_price(float(_e2_lvl), _maker_px)
+                        _e2_qty = format_order_quantity(selected_pair, (trade_margin_inr * 0.5 * trade_leverage / trade_usd_inr) / _e2_px) if _e2_px > 0 else 0.0
+                        _e2_order_id = ""
+                        with st.spinner("Submitting 2-Entry + Runner orders to CoinDCX..."):
                             ok, api_msg, api_extra = place_coindcx_futures_order(
-                                pair=selected_pair, side=trade_dir, quantity=active_trade["crypto_qty"],
+                                pair=selected_pair, side=trade_dir, quantity=_e1_qty,
                                 leverage=trade_leverage, order_type="limit_order", price=_maker_px,
-                                post_only=True, margin_currency="INR",
-                                tp_price=active_trade["tp1"], sl_price=active_trade["stop_loss"]
+                                post_only=False, margin_currency="INR",
+                                tp_price=active_trade["tp2"], sl_price=active_trade["stop_loss"]
                             )
+                            if ok and _e2_qty > 0 and (_e2_qty * _e2_px * trade_usd_inr) >= 2448.0 and abs(_e2_px - _maker_px) > 0:
+                                ok2, msg2, extra2 = place_coindcx_futures_order(
+                                    pair=selected_pair, side=trade_dir, quantity=_e2_qty,
+                                    leverage=trade_leverage, order_type="limit_order", price=_e2_px,
+                                    post_only=False, margin_currency="INR"
+                                )
+                                if ok2:
+                                    _e2_order_id = str((extra2 or {}).get("order_id", ""))
+                                    api_msg = f"{api_msg} + Entry 2 Sweep Limit ({_e2_qty} @ {fmt_px(_e2_px)})"
                             order_placed_ok = ok
                             live_api_msg = api_msg
                             st.session_state.api_error_logs.insert(0, {
@@ -1501,10 +1514,12 @@ elif active_section == "🎯 Execute":
                     coindcx_engine.register_app_trade_lock(
                         pair=selected_pair, direction=trade_dir, entry=limit_entry_px,
                         stop_loss=active_trade["stop_loss"], tp1=active_trade["tp1"], tp2=active_trade["tp2"],
-                        entry2_sweep=active_trade.get("entry2_sweep", limit_entry_px),
+                        entry2_sweep=float(_e2_lvl),
                         margin_inr=trade_margin_inr, leverage=trade_leverage, qty1=active_trade["crypto_qty"],
-                        mode="App/API Live Execution" if is_live else "App/API Paper Execution",
+                        mode="App/API Live Execution (2-Entry + Runner)" if is_live else "App/API Paper Execution",
                         is_live_exchange=is_live,
+                        entry2_order_id=_e2_order_id if is_live else "",
+                        tp1_order_id="DAEMON_50PCT_REDUCE_AT_TP1",
                     )
 
                     order_record = {

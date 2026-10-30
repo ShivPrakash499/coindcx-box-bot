@@ -852,7 +852,7 @@ def place_coindcx_futures_order(
         "margin_currency_short_name": margin_currency.upper(),
         "notification": "email_notification",
         "hidden": False,
-        "post_only": bool(post_only)
+        "post_only": False
     }
 
     if order_type == "limit_order":
@@ -2387,7 +2387,23 @@ def get_active_portfolio_trade_status() -> dict:
                             cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
                             lock["entry2_cancelled"] = True
 
-                        # 2. Ratchet Stop Loss into profit (Entry 1 + 50% of TP1 distance) for the 50% TP2 Runner
+                        # 2. Book 50% of the open CoinDCX position at TP1 via opposite-side Market Reduce order
+                        if is_live_ex and matched_live_pos:
+                            open_pos_qty = float(matched_live_pos.get("quantity", 0.0) or 0.0)
+                            half_pos_qty = format_order_quantity(l_pair, open_pos_qty * 0.5)
+                            pos_lev = int(round(float(matched_live_pos.get("leverage", lock.get("leverage", 10)) or 10)))
+                            opp_side = "SELL" if is_long else "BUY"
+                            if half_pos_qty > 0:
+                                place_coindcx_futures_order(
+                                    pair=l_pair,
+                                    side=opp_side,
+                                    quantity=half_pos_qty,
+                                    leverage=pos_lev,
+                                    order_type="market_order",
+                                    margin_currency="INR",
+                                )
+
+                        # 3. Ratchet Stop Loss into profit (Entry 1 + 50% of TP1 distance) for the 50% TP2 Runner
                         ratcheted_sl = round_asset_price(
                             (l_entry + 0.5 * (l_tp1 - l_entry)) if is_long else (l_entry - 0.5 * (l_entry - l_tp1)),
                             l_entry,
@@ -2398,7 +2414,7 @@ def get_active_portfolio_trade_status() -> dict:
                         l_sl = ratcheted_sl
                         save_autotrade_config({"active_trade_lock": lock})
 
-                        # Update SL on CoinDCX position while keeping TP at TP2
+                        # Update SL on CoinDCX position while keeping single native TP at TP2
                         if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
                             update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=ratcheted_sl, pair=l_pair)
 
@@ -2490,7 +2506,7 @@ def execute_autotrade_two_entry_signal(
     has_live_creds = bool(api_key_now and api_secret_now)
 
     if wallet.get("is_live_api") or has_live_creds:
-        # Leg 1: Entry 1 (50% Margin = qty1) with Position Bracket TP set to TP2 (Runner) & SL set to Catastrophe SL
+        # Leg 1: Entry 1 (50% Margin = qty1) with CoinDCX's single native Position TP = TP2 (Runner) & SL = Catastrophe SL
         ok1, msg1, extra1 = place_coindcx_futures_order(
             pair=pair,
             side=side,
@@ -2500,22 +2516,11 @@ def execute_autotrade_two_entry_signal(
             margin_currency="INR",
             tp_price=tp2_px,
             sl_price=sl_px,
+            post_only=False,
         )
-        # Leg 2: Partial TP1 Limit Order (50% of Entry 1 = 0.5 * qty1, opposite side at TP1)
-        ok_tp1, msg_tp1, extra_tp1 = False, "TP1 managed by daemon", {}
-        if ok1 and qty1_tp1_half > 0 and (qty1_tp1_half * tp1_px * u_inr) >= 2448.0:
-            ok_tp1, msg_tp1, extra_tp1 = place_coindcx_futures_order(
-                pair=pair,
-                side=opp_side,
-                quantity=qty1_tp1_half,
-                leverage=lev,
-                order_type="limit_order",
-                price=tp1_px,
-                margin_currency="INR",
-            )
-        # Leg 3: Resting Limit Order for Entry 2 @ Sweep (50% Margin = qty2)
+        # Leg 2: Resting Limit Order for Entry 2 @ Sweep (50% Margin = qty2, post_only=False)
         ok2, msg2, extra2 = False, "Skipped (Entry 1 failed)", {}
-        if ok1 and qty2 > 0 and (qty2 * entry2_px * u_inr) >= 2448.0:
+        if ok1 and qty2 > 0 and (qty2 * entry2_px * u_inr) >= 2448.0 and abs(entry2_px - entry1_px) > 0:
             ok2, msg2, extra2 = place_coindcx_futures_order(
                 pair=pair,
                 side=side,
@@ -2524,6 +2529,7 @@ def execute_autotrade_two_entry_signal(
                 order_type="limit_order",
                 price=entry2_px,
                 margin_currency="INR",
+                post_only=False,
             )
         if ok1:
             lock_info = register_app_trade_lock(
@@ -2532,14 +2538,14 @@ def execute_autotrade_two_entry_signal(
                 leverage=lev, qty1=qty1, qty2=qty2,
                 mode="App/API Live AutoTrade (2-Entry + Runner)", is_live_exchange=True,
                 entry2_order_id=str(extra2.get("order_id", "")),
-                tp1_order_id=str(extra_tp1.get("order_id", "")),
+                tp1_order_id="DAEMON_50PCT_REDUCE_AT_TP1",
             )
             return True, (
-                f"Live AutoTrade Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | "
-                f"TP1 50% Book ({qty1_tp1_half} @ ${tp1_px}) | TP2 50% Runner (@ ${tp2_px}) | "
-                f"Entry 2 Limit ({qty2} @ ${entry2_px})"
+                f"Live 2-Entry + Runner Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | "
+                f"Auto 50% Reduce Armed at TP1 (${tp1_px}) -> 50% Runner to CoinDCX TP (${tp2_px}) | "
+                f"Entry 2 Sweep Limit ({qty2} @ ${entry2_px})"
             ), {
-                "entry1_order": extra1, "tp1_partial_order": extra_tp1, "entry2_order": extra2, "lock": lock_info
+                "entry1_order": extra1, "entry2_order": extra2, "lock": lock_info
             }
         return False, f"CoinDCX Live AutoTrade Error on {pair}: {msg1}", {"entry1_order": extra1}
     else:
