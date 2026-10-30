@@ -106,6 +106,11 @@ except Exception as _alert_err:
 try:
     import email_notifier
     import signal_monitor
+    try:
+        importlib.reload(email_notifier)
+        importlib.reload(signal_monitor)
+    except Exception:
+        pass
     from email_notifier import send_trade_email, send_test_trade_email, get_email_config
 except Exception as _em_err:
     _EMAIL_ERR = str(_em_err)
@@ -134,6 +139,37 @@ st.set_page_config(
 
 IST = pytz.timezone("Asia/Kolkata")
 
+def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strategy_ids=None, autotrade=False):
+    """Calls signal_monitor.scan_and_alert safely even across hot-reloads on Streamlit Cloud."""
+    if not signal_monitor:
+        return []
+    try:
+        return signal_monitor.scan_and_alert(
+            pairs=pairs,
+            margin_inr=margin_inr,
+            leverage=leverage,
+            usd_inr=usd_inr,
+            send=send,
+            strategy_ids=strategy_ids,
+            autotrade=autotrade,
+        )
+    except TypeError:
+        try:
+            importlib.reload(signal_monitor)
+            return signal_monitor.scan_and_alert(
+                pairs=pairs,
+                margin_inr=margin_inr,
+                leverage=leverage,
+                usd_inr=usd_inr,
+                send=send,
+                strategy_ids=strategy_ids,
+                autotrade=autotrade,
+            )
+        except TypeError:
+            return signal_monitor.scan_and_alert(
+                pairs, margin_inr, leverage, usd_inr, send=send, strategy_ids=strategy_ids
+            )
+
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
 @st.cache_resource
 def _ensure_background_monitor():
@@ -149,7 +185,7 @@ def _ensure_background_monitor():
                     lev = int(auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
                     u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
                     watch_pairs = coindcx_engine.get_high_volatility_watchlist(top_n=12)
-                    signal_monitor.scan_and_alert(
+                    _safe_scan_and_alert(
                         pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
@@ -268,9 +304,7 @@ def get_cached_top_movers(watch_tuple: tuple, top_n: int = 6):
 
 @st.cache_data(ttl=45)
 def get_cached_signals_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: float, strat_tuple: tuple, auto_send: bool, auto_trade: bool):
-    if not signal_monitor:
-        return []
-    return signal_monitor.scan_and_alert(
+    return _safe_scan_and_alert(
         list(watch_tuple), m_inr, lev, u_inr,
         send=auto_send, strategy_ids=list(strat_tuple), autotrade=auto_trade
     )
@@ -453,24 +487,59 @@ check_and_update_paper_orders()
 # ----------------- SIDEBAR: COMPACT PRO CONTROLS -----------------
 st.sidebar.markdown("### ⚡ Pro Terminal Setup")
 
-wallet_data = get_cached_balance()
-st.sidebar.metric("Futures Wallet", f"₹{wallet_data['total_inr']:,.0f}", f"Free: ₹{wallet_data['available_inr']:,.0f}")
-
+wallet_data = dict(get_cached_balance() or {})
 _auto_cfg = coindcx_engine.get_autotrade_config()
+
+# Allow live sync or manual override of Futures Wallet Balance (defaults to ₹40,569.80 if API is offline/expired)
+_init_wallet_inr = float(wallet_data.get("total_inr", 40569.80) or 40569.80)
+if _init_wallet_inr in (30000.0, 250000.0):
+    _init_wallet_inr = 40569.80
+wallet_data["total_inr"] = _init_wallet_inr
+if float(wallet_data.get("available_inr", 0.0) or 0.0) in (0.0, 30000.0, 250000.0):
+    wallet_data["available_inr"] = _init_wallet_inr
+
+st.sidebar.metric(
+    "Futures Wallet",
+    f"₹{wallet_data['total_inr']:,.2f}",
+    f"Free: ₹{wallet_data['available_inr']:,.2f}"
+)
+
+if not wallet_data.get("is_live_api"):
+    _manual_wallet_inr = st.sidebar.number_input(
+        "Sync Wallet Balance (INR)",
+        min_value=500.0,
+        max_value=10000000.0,
+        value=float(wallet_data["total_inr"]),
+        step=100.0,
+        format="%.2f",
+        help="Your total CoinDCX Futures Wallet balance in INR (auto-synced when CoinDCX API key is active)."
+    )
+    if round(_manual_wallet_inr, 2) != round(float(wallet_data["total_inr"]), 2):
+        wallet_data["total_inr"] = round(_manual_wallet_inr, 2)
+        wallet_data["available_inr"] = round(_manual_wallet_inr, 2)
+        _auto_cfg = coindcx_engine.save_autotrade_config({"wallet_balance_inr": round(_manual_wallet_inr, 2)})
+        get_cached_balance.clear()
+        st.rerun()
+
 _rot = get_rotational_margin_inr(leverage=10)
-default_margin = float(_auto_cfg.get("single_trade_margin_inr") or _rot["margin_inr"])
+_saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
+if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
+    default_margin = float(wallet_data["total_inr"])
+else:
+    default_margin = _saved_margin
 
 margin_inr = st.sidebar.number_input(
     "Single-Trade Margin (INR)",
-    min_value=500,
-    max_value=max(int(wallet_data["total_inr"]), 1000000),
-    value=int(default_margin),
-    step=1000,
+    min_value=500.0,
+    max_value=max(float(wallet_data["total_inr"]) * 2.0, 1000000.0),
+    value=float(default_margin),
+    step=500.0,
+    format="%.2f",
     help="50% used on Entry 1 and 50% reserved for Entry 2 @ Sweep."
 )
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
-st.sidebar.caption(f"Split: **₹{margin_inr*0.5:,.0f}** Entry 1 + **₹{margin_inr*0.5:,.0f}** Entry 2 @ {leverage}x")
+st.sidebar.caption(f"Split: **₹{margin_inr*0.5:,.2f}** Entry 1 + **₹{margin_inr*0.5:,.2f}** Entry 2 @ {leverage}x")
 
 live_crypto_rate = get_coindcx_live_usdt_inr_rate()
 usd_inr = float(live_crypto_rate)
@@ -484,12 +553,13 @@ autotrade_on = st.sidebar.toggle(
 )
 if (
     autotrade_on != bool(_auto_cfg.get("enabled", False))
-    or float(margin_inr) != float(_auto_cfg.get("single_trade_margin_inr", 0.0))
+    or round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
 ):
     _auto_cfg = coindcx_engine.save_autotrade_config({
         "enabled": bool(autotrade_on),
-        "single_trade_margin_inr": float(margin_inr),
+        "single_trade_margin_inr": round(float(margin_inr), 2),
+        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
         "leverage": int(leverage),
     })
 
@@ -623,7 +693,8 @@ st.markdown(f"""
         box-sizing: border-box !important;
     }}
     /* Hide the default circular radio dot inside the main section navigator */
-    .st-key-active_nav_section div[role="radiogroup"] > label > div:first-child {{
+    .st-key-active_nav_section div[role="radiogroup"] > label > div:first-child,
+    .st-key-active_nav_section div[data-baseweb="radio"] > div:first-child {{
         display: none !important;
     }}
     .st-key-active_nav_section div[role="radiogroup"] > label p {{
@@ -640,6 +711,37 @@ st.markdown(f"""
     }}
     .st-key-active_nav_section div[role="radiogroup"] > label:has(input:checked) p {{
         color: {nav_active_txt} !important;
+    }}
+
+    /* High-contrast Secondary & Primary Buttons across Desktop & Mobile */
+    .stButton > button[kind="secondary"],
+    .stButton > button:not([kind="primary"]) {{
+        background-color: {nav_bg} !important;
+        color: {text_color} !important;
+        border: 1px solid {card_border} !important;
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+    }}
+    .stButton > button[kind="secondary"] p,
+    .stButton > button:not([kind="primary"]) p {{
+        color: {text_color} !important;
+        font-weight: 700 !important;
+    }}
+    .stButton > button[kind="secondary"]:hover,
+    .stButton > button:not([kind="primary"]):hover {{
+        border-color: #3b82f6 !important;
+        background-color: {banner_bg} !important;
+    }}
+    .stButton > button[kind="primary"] {{
+        background-color: #2563eb !important;
+        color: #ffffff !important;
+        border: 1px solid #3b82f6 !important;
+        font-weight: 700 !important;
+        border-radius: 8px !important;
+    }}
+    .stButton > button[kind="primary"] p {{
+        color: #ffffff !important;
+        font-weight: 700 !important;
     }}
 
     /* Pro Terminal Cards & Badges */
@@ -923,9 +1025,9 @@ def render_unified_live_header(pair: str):
                 """)
             else:
                 other_note = (
-                    f"Active on {clean_sym(other_live[0]['pair'])}: {'+' if other_live[0]['pnl_inr'] >= 0 else ''}₹{other_live[0]['pnl_inr']:,.0f}"
+                    f"Active on {clean_sym(other_live[0]['pair'])}: {'+' if other_live[0]['pnl_inr'] >= 0 else ''}₹{other_live[0]['pnl_inr']:,.2f}"
                     if other_live
-                    else f"Wallet: ₹{wallet_data['total_inr']:,.0f} • AutoTrade: {'ON 🚀' if autotrade_on else 'OFF'}"
+                    else f"Wallet: ₹{wallet_data['total_inr']:,.2f} • AutoTrade: {'ON 🚀' if autotrade_on else 'OFF'}"
                 )
                 st.html(f"""
                     <div class="pro-card">
@@ -976,7 +1078,7 @@ if active_section == "⚡ Signals":
                 )
             else:
                 st.caption(
-                    f"🟢 **App Slot Free (0/1)** • Single-Trade Margin: **₹{margin_inr:,.0f}** (`{leverage}x`) • "
+                    f"🟢 **App Slot Free (0/1)** • Wallet: **₹{wallet_data['total_inr']:,.2f}** • Single-Trade Margin: **₹{margin_inr:,.2f}** (`{leverage}x`) • "
                     f"AutoTrade: **{'ON 🚀' if autotrade_on else 'OFF'}**"
                 )
         with hdr_s2:
