@@ -170,6 +170,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
                 emailed = False
                 autotraded = False
+                already_autotraded_candle = (
+                    last.get("candle_ts") == sig["candle_ts"] and bool(last.get("autotraded", False))
+                )
+
                 if send and is_new_candle and cooled and pair_cooled:
                     emailed, msg = email_notifier.send_trade_email(
                         pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
@@ -179,7 +183,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0))
                     if emailed:
                         now_sent = time.time()
-                        state[key] = {"candle_ts": sig["candle_ts"], "sent_at": now_sent, "direction": sig["signal"]}
+                        state[key] = {
+                            "candle_ts": sig["candle_ts"],
+                            "sent_at": now_sent,
+                            "direction": sig["signal"],
+                            "autotraded": already_autotraded_candle,
+                        }
                         pair_last = {"candle_ts": sig["candle_ts"], "sent_at": now_sent, "direction": sig["signal"], "strategy_id": s.id}
                         state[pair_lock_key] = pair_last
                         daily_count += 1
@@ -188,22 +197,35 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         state[portfolio_daily_key] = portfolio_daily_count
                         _save(state)
 
-                    # If AutoTrade is toggled ON in Sidebar and no other coin is active, place the 2-Entry + Runner trade!
-                    if autotrade and not portfolio_occupied:
-                        ok_auto, auto_msg, _ = eng.execute_autotrade_two_entry_signal(
-                            pair=pair, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
+                # If AutoTrade is toggled ON in Sidebar and no other coin is active, place the 2-Entry + Runner trade!
+                if autotrade and not portfolio_occupied and not already_autotraded_candle and ((is_new_candle and cooled and pair_cooled) or emailed or last.get("candle_ts") == sig["candle_ts"]):
+                    ok_auto, auto_msg, _ = eng.execute_autotrade_two_entry_signal(
+                        pair=pair, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
+                    )
+                    autotraded = ok_auto
+                    msg = f"{msg} | 🤖 {auto_msg}"
+                    now_exec = time.time()
+                    if ok_auto:
+                        portfolio_occupied = True
+                        active_Slot_pair = pair
+                        state[key] = {
+                            "candle_ts": sig["candle_ts"],
+                            "sent_at": state.get(key, {}).get("sent_at", now_exec),
+                            "direction": sig["signal"],
+                            "autotraded": True,
+                        }
+                        if not emailed:
+                            daily_count += 1
+                            portfolio_daily_count += 1
+                            state[daily_count_key] = daily_count
+                            state[portfolio_daily_key] = portfolio_daily_count
+                        _save(state)
+                        email_notifier.send_trade_email(
+                            pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
+                            tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=margin_inr, leverage=leverage,
+                            zone=sig.get("trigger_zone") or "", kind="EXECUTED", note=auto_msg,
+                            strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
+                            levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0)
                         )
-                        autotraded = ok_auto
-                        msg = f"{msg} | 🤖 {auto_msg}"
-                        if ok_auto:
-                            portfolio_occupied = True
-                            active_Slot_pair = pair
-                            email_notifier.send_trade_email(
-                                pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
-                                tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=margin_inr, leverage=leverage,
-                                zone=sig.get("trigger_zone") or "", kind="EXECUTED", note=auto_msg,
-                                strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
-                                levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0)
-                            )
                 results.append({**row, "emailed": emailed, "autotraded": autotraded, "message": msg})
         return results

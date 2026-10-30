@@ -574,6 +574,13 @@ if _slot_status.get("is_occupied"):
 else:
     st.sidebar.caption(f"🟢 **App Slot Free (0/1)** • AutoTrade: **{'ON' if autotrade_on else 'OFF'}**")
 
+if wallet_data.get("is_live_api"):
+    st.sidebar.caption("✅ **CoinDCX Live API:** Connected & Ready")
+else:
+    _api_err = wallet_data.get("api_error", "")
+    if _api_err:
+        st.sidebar.caption(f"⚠️ **CoinDCX API Notice:** `{_api_err}`")
+
 with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
     chart_theme = st.radio(
         "Theme",

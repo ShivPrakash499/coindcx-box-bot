@@ -249,16 +249,49 @@ def fetch_futures_funding_rate(pair="B-ETH_USDT"):
         "status": "DEFAULT"
     }
 
+def _get_coindcx_credentials() -> tuple[str, str]:
+    """Reads CoinDCX API Key & Secret dynamically from Streamlit Secrets or os.environ."""
+    api_key = ""
+    api_secret = ""
+    try:
+        import streamlit as _st
+        if hasattr(_st, "secrets"):
+            if "COINDCX_API_KEY" in _st.secrets:
+                api_key = str(_st.secrets["COINDCX_API_KEY"]).strip().strip('"').strip("'")
+            if "COINDCX_API_SECRET" in _st.secrets:
+                api_secret = str(_st.secrets["COINDCX_API_SECRET"]).strip().strip('"').strip("'")
+            if not api_key or not api_secret:
+                for _k, _v in _st.secrets.items():
+                    if isinstance(_v, dict):
+                        if not api_key and "COINDCX_API_KEY" in _v:
+                            api_key = str(_v["COINDCX_API_KEY"]).strip().strip('"').strip("'")
+                        if not api_secret and "COINDCX_API_SECRET" in _v:
+                            api_secret = str(_v["COINDCX_API_SECRET"]).strip().strip('"').strip("'")
+            if api_key:
+                os.environ["COINDCX_API_KEY"] = api_key
+            if api_secret:
+                os.environ["COINDCX_API_SECRET"] = api_secret
+    except Exception:
+        pass
+
+    if not api_key:
+        api_key = os.getenv("COINDCX_API_KEY", "").strip().strip('"').strip("'")
+    if not api_secret:
+        api_secret = os.getenv("COINDCX_API_SECRET", "").strip().strip('"').strip("'")
+    if api_secret == "your_coindcx_secret_key_here":
+        api_secret = ""
+    return api_key, api_secret
+
+
 def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
     """
     Helper to execute signed CoinDCX REST API requests with HMAC-SHA256 authentication.
     Handles timestamp formatting (auto-retries with milliseconds if seconds fails) and secret sanitation.
     """
-    api_key = os.getenv("COINDCX_API_KEY", "").strip()
-    api_secret = os.getenv("COINDCX_API_SECRET", "").strip()
+    api_key, api_secret = _get_coindcx_credentials()
 
-    if not api_key or not api_secret or api_secret == "your_coindcx_secret_key_here":
-        return None, "API credentials not configured in .env"
+    if not api_key or not api_secret:
+        return None, "API credentials not configured in .env or Streamlit Secrets"
 
     try:
         body = payload.copy() if payload else {}
@@ -348,10 +381,9 @@ def fetch_coindcx_futures_balance():
     except Exception:
         pass
 
-    api_key = os.getenv("COINDCX_API_KEY", "").strip()
-    api_secret = os.getenv("COINDCX_API_SECRET", "").strip()
+    api_key, api_secret = _get_coindcx_credentials()
 
-    if not api_key or not api_secret or api_secret == "your_coindcx_secret_key_here":
+    if not api_key or not api_secret:
         return {
             "total_inr": round(default_balance, 2),
             "available_inr": round(default_balance, 2),
@@ -377,20 +409,22 @@ def fetch_coindcx_futures_balance():
     if res_fut is not None and res_fut.status_code == 200:
         try:
             wallets = res_fut.json()
-            if isinstance(wallets, list):
-                for w in wallets:
-                    curr = w.get("currency_short_name", "").upper()
-                    bal = float(w.get("balance", 0.0) or 0.0)
-                    locked = float(w.get("locked_balance", 0.0) or 0.0)
-                    cross = float(w.get("cross_user_margin", 0.0) or 0.0)
-                    if curr == "USDT":
-                        usdt_balance += bal
-                        locked_margin_usd += locked
-                        cross_margin_usd += cross
-                    elif curr == "INR":
-                        inr_balance += bal
-                        locked_inr += (locked + cross)
-                is_live = True
+            wallet_list = wallets if isinstance(wallets, list) else (wallets.get("wallets") or wallets.get("data") or []) if isinstance(wallets, dict) else []
+            for w in wallet_list:
+                if not isinstance(w, dict):
+                    continue
+                curr = str(w.get("currency_short_name") or w.get("currency") or "").upper()
+                bal = float(w.get("balance", 0.0) or w.get("available_balance", 0.0) or 0.0)
+                locked = float(w.get("locked_balance", 0.0) or 0.0)
+                cross = float(w.get("cross_user_margin", 0.0) or 0.0)
+                if curr == "USDT":
+                    usdt_balance += bal
+                    locked_margin_usd += locked
+                    cross_margin_usd += cross
+                elif curr == "INR":
+                    inr_balance += bal
+                    locked_inr += (locked + cross)
+            is_live = True
         except Exception as e:
             print(f"[Futures Wallet Parse Error]: {e}")
     elif res_fut is not None:
@@ -411,7 +445,7 @@ def fetch_coindcx_futures_balance():
                 balances = res_spot.json()
                 if isinstance(balances, list):
                     for item in balances:
-                        curr = item.get("currency", "").upper()
+                        curr = str(item.get("currency") or item.get("currency_short_name") or "").upper()
                         bal = float(item.get("balance", 0.0) or 0.0)
                         locked_s = float(item.get("locked_balance", 0.0) or 0.0)
                         if curr == "INR":
@@ -422,25 +456,32 @@ def fetch_coindcx_futures_balance():
                     is_live = True
             except Exception as e:
                 print(f"[Spot Balance Parse Error]: {e}")
+        elif not api_err_msg and res_spot is not None:
+            try:
+                api_err_msg = res_spot.json().get("message", f"HTTP {res_spot.status_code}")
+            except Exception:
+                api_err_msg = f"HTTP {res_spot.status_code}"
 
     if is_live:
         total_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
         avail_usdt = max(0.0, usdt_balance - locked_margin_usd - cross_margin_usd)
         avail_inr = inr_balance + (avail_usdt * usd_inr)
-        if total_inr > 0:
-            return {
-                "total_inr": round(total_inr, 2),
-                "available_inr": round(avail_inr, 2),
-                "inr_cash": round(inr_balance, 2),
-                "locked_inr": round(locked_inr, 2),
-                "usdt_cash": round(usdt_balance, 4),
-                "available_usdt": round(avail_usdt, 4),
-                "locked_margin_usd": round(locked_margin_usd, 4),
-                "cross_user_margin_usd": round(cross_margin_usd, 4),
-                "live_usd_inr": usd_inr,
-                "is_live_api": True,
-                "source": "CoinDCX Live Futures API"
-            }
+        if total_inr <= 0:
+            total_inr = default_balance
+            avail_inr = default_balance
+        return {
+            "total_inr": round(total_inr, 2),
+            "available_inr": round(avail_inr, 2),
+            "inr_cash": round(inr_balance if inr_balance > 0 else total_inr, 2),
+            "locked_inr": round(locked_inr, 2),
+            "usdt_cash": round(usdt_balance, 4),
+            "available_usdt": round(avail_usdt, 4),
+            "locked_margin_usd": round(locked_margin_usd, 4),
+            "cross_user_margin_usd": round(cross_margin_usd, 4),
+            "live_usd_inr": usd_inr,
+            "is_live_api": True,
+            "source": "CoinDCX Live Futures API"
+        }
 
     return {
         "total_inr": round(default_balance, 2),
@@ -2445,8 +2486,10 @@ def execute_autotrade_two_entry_signal(
     qty1_tp1_half = format_order_quantity(pair, qty1 * 0.5)
 
     wallet = fetch_coindcx_futures_balance()
+    api_key_now, api_secret_now = _get_coindcx_credentials()
+    has_live_creds = bool(api_key_now and api_secret_now)
 
-    if wallet.get("is_live_api"):
+    if wallet.get("is_live_api") or has_live_creds:
         # Leg 1: Entry 1 (50% Margin = qty1) with Position Bracket TP set to TP2 (Runner) & SL set to Catastrophe SL
         ok1, msg1, extra1 = place_coindcx_futures_order(
             pair=pair,
