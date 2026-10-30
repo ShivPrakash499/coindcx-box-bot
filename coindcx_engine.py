@@ -607,6 +607,10 @@ def exit_coindcx_position(position_id: str) -> tuple[bool, str]:
     payload = {"id": str(position_id).strip(), "timestamp": int(round(time.time() * 1000))}
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/exit", payload)
     if res is not None and res.status_code == 200:
+        try:
+            clear_autotrade_active_lock()
+        except Exception:
+            pass
         return True, f"Successfully executed market exit for position {position_id}"
     msg = res.text if res is not None else (err or "Exit request failed")
     try:
@@ -643,6 +647,10 @@ def exit_all_coindcx_positions() -> tuple[int, int, str]:
 
     # Clear all remaining open bracket/limit orders
     _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/cancel_all_open_orders", cancel_payload)
+    try:
+        clear_autotrade_active_lock()
+    except Exception:
+        pass
     return success_count, len(positions), f"Closed {success_count}/{len(positions)} active positions and cancelled all pending orders."
 
 def update_coindcx_position_tpsl(position_id: str, tp_price: float = None, sl_price: float = None, pair: str = None) -> tuple[bool, str]:
@@ -2109,33 +2117,56 @@ def clear_autotrade_active_lock() -> dict:
     return save_autotrade_config({"active_trade_lock": None})
 
 
+def register_app_trade_lock(
+    pair: str,
+    direction: str,
+    entry: float,
+    stop_loss: float,
+    tp1: float,
+    tp2: float = 0.0,
+    entry2_sweep: float = 0.0,
+    margin_inr: float = 0.0,
+    leverage: int = 10,
+    qty1: float = 0.0,
+    qty2: float = 0.0,
+    mode: str = "App/API Executed Trade",
+    is_live_exchange: bool = False,
+) -> dict:
+    """
+    Registers an active 1-Crypto-at-a-Time lock strictly for trades executed via our App/API.
+    Manual trades placed directly on CoinDCX outside our App/API do NOT trigger this lock.
+    """
+    now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    lock_info = {
+        "pair": pair,
+        "direction": str(direction).upper(),
+        "entry": float(entry or 0.0),
+        "entry2_sweep": float(entry2_sweep or entry or 0.0),
+        "tp1": float(tp1 or 0.0),
+        "tp2": float(tp2 or tp1 or 0.0),
+        "stop_loss": float(stop_loss or 0.0),
+        "qty1": float(qty1 or 0.0),
+        "qty2": float(qty2 or 0.0),
+        "margin_inr": float(margin_inr or 0.0),
+        "leverage": int(leverage or 10),
+        "opened_at": now_str,
+        "opened_ts": time.time(),
+        "mode": mode,
+        "is_live_exchange": bool(is_live_exchange),
+    }
+    cfg = get_autotrade_config()
+    hist = cfg.get("history", [])
+    hist.insert(0, {**lock_info, "status": "APP_API_LOCK_SET"})
+    save_autotrade_config({"active_trade_lock": lock_info, "history": hist[:30]})
+    return lock_info
+
+
 def get_active_portfolio_trade_status() -> dict:
     """
-    Checks whether ANY crypto trade is currently open across the portfolio so we strictly enforce
-    '1 Crypto at a Time' (keeping 50% of the single-trade margin reserved for Entry 2 @ Sweep).
-    Checks:
-      1. Live CoinDCX Futures open positions (`fetch_coindcx_active_positions()`)
-      2. Active AutoTrade lock in `.cache/autotrade_config.json` (auto-expires if price hit TP2/SL or after 8h)
+    Checks whether an App/API-originated crypto trade is currently open across the portfolio so we
+    strictly enforce '1 Crypto at a Time' ONLY for trades executed from our App/API.
+    Manual trades placed directly on the CoinDCX app/exchange do NOT lock our App from trading.
     """
-    # 1. Check live exchange positions first
-    try:
-        live_positions = fetch_coindcx_active_positions()
-        if live_positions:
-            p0 = live_positions[0]
-            return {
-                "is_occupied": True,
-                "active_pair": p0.get("pair", ""),
-                "active_direction": p0.get("direction", ""),
-                "entry_price": p0.get("entry_price", 0.0),
-                "roe_pct": p0.get("roe_pct", 0.0),
-                "pnl_inr": p0.get("pnl_inr", 0.0),
-                "source": "CoinDCX Live Exchange Position",
-                "count": len(live_positions),
-            }
-    except Exception:
-        pass
-
-    # 2. Check local AutoTrade lock (and auto-release if TP/SL was hit on live ticker)
     cfg = get_autotrade_config()
     lock = cfg.get("active_trade_lock")
     if isinstance(lock, dict) and lock.get("pair"):
@@ -2145,13 +2176,24 @@ def get_active_portfolio_trade_status() -> dict:
         l_tp2 = float(lock.get("tp2", 0.0) or 0.0)
         l_sl = float(lock.get("stop_loss", 0.0) or 0.0)
         l_ts = float(lock.get("opened_ts", 0.0) or 0.0)
+        is_live_ex = bool(lock.get("is_live_exchange", False))
 
-        # Auto-release lock if target or stop was reached (after at least 60s open) or > 8 hours elapsed
+        # Auto-release lock if > 8 hours elapsed or if the App/API trade was closed / hit TP or SL
         try:
             if l_ts > 0 and (time.time() - l_ts) > 8 * 3600:
                 clear_autotrade_active_lock()
-                return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous Trade Expired)"}
+                return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
+
             if l_ts > 0 and (time.time() - l_ts) >= 60:
+                # If this trade was placed on CoinDCX via our App/API, check if that specific pair's position closed
+                if is_live_ex:
+                    live_positions = fetch_coindcx_active_positions()
+                    if live_positions is not None:
+                        matched = next((p for p in live_positions if p.get("pair") == l_pair), None)
+                        if not matched and fetch_coindcx_futures_balance().get("is_live_api"):
+                            clear_autotrade_active_lock()
+                            return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
+
                 tk = fetch_live_ticker(l_pair)
                 px = float(tk.get("last_price", 0.0) or 0.0)
                 if px > 0:
@@ -2160,7 +2202,7 @@ def get_active_portfolio_trade_status() -> dict:
                     hit_sl = (px <= l_sl) if (is_long and l_sl > 0) else ((px >= l_sl) if (not is_long and l_sl > 0) else False)
                     if hit_tp or hit_sl:
                         clear_autotrade_active_lock()
-                        return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous Trade Completed)"}
+                        return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Completed)"}
         except Exception:
             pass
 
@@ -2173,11 +2215,11 @@ def get_active_portfolio_trade_status() -> dict:
             "tp1": l_tp1,
             "tp2": l_tp2,
             "stop_loss": l_sl,
-            "source": lock.get("mode", "AutoTrade Active Lock"),
+            "source": lock.get("mode", "App/API Active Trade Lock"),
             "count": 1,
         }
 
-    return {"is_occupied": False, "active_pair": None, "source": "Slot Free (0/1 Active)"}
+    return {"is_occupied": False, "active_pair": None, "source": "Slot Free (0/1 App Trades Active)"}
 
 
 def execute_autotrade_two_entry_signal(
@@ -2253,30 +2295,24 @@ def execute_autotrade_two_entry_signal(
                 margin_currency="INR",
             )
         if ok1:
-            lock_info = {
-                "pair": pair, "direction": direction, "entry": entry1_px, "entry2_sweep": entry2_px,
-                "tp1": tp1_px, "tp2": tp2_px, "stop_loss": sl_px, "qty1": qty1, "qty2": qty2,
-                "margin_inr": margin_inr, "leverage": lev, "opened_at": now_str, "opened_ts": time.time(),
-                "mode": "CoinDCX Live AutoTrade (2-Entry + Runner)",
-            }
-            hist = cfg.get("history", [])
-            hist.insert(0, {**lock_info, "status": "LIVE_AUTOTRADE_PLACED", "msg1": msg1, "msg2": msg2})
-            save_autotrade_config({"active_trade_lock": lock_info, "history": hist[:30]})
+            lock_info = register_app_trade_lock(
+                pair=pair, direction=direction, entry=entry1_px, stop_loss=sl_px,
+                tp1=tp1_px, tp2=tp2_px, entry2_sweep=entry2_px, margin_inr=margin_inr,
+                leverage=lev, qty1=qty1, qty2=qty2,
+                mode="App/API Live AutoTrade (2-Entry + Runner)", is_live_exchange=True,
+            )
             return True, f"Live AutoTrade Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) + Entry 2 Limit ({qty2} @ ${entry2_px})", {
                 "entry1_order": extra1, "entry2_order": extra2, "lock": lock_info
             }
         return False, f"CoinDCX Live AutoTrade Error on {pair}: {msg1}", {"entry1_order": extra1}
     else:
         # Paper / Simulated AutoTrade Lock when live CoinDCX API key is offline/expired
-        lock_info = {
-            "pair": pair, "direction": direction, "entry": entry1_px, "entry2_sweep": entry2_px,
-            "tp1": tp1_px, "tp2": tp2_px, "stop_loss": sl_px, "qty1": qty1, "qty2": qty2,
-            "margin_inr": margin_inr, "leverage": lev, "opened_at": now_str, "opened_ts": time.time(),
-            "mode": "Simulated AutoTrade (API Key Offline — 2-Entry Armed)",
-        }
-        hist = cfg.get("history", [])
-        hist.insert(0, {**lock_info, "status": "PAPER_AUTOTRADE_ARMED"})
-        save_autotrade_config({"active_trade_lock": lock_info, "history": hist[:30]})
+        lock_info = register_app_trade_lock(
+            pair=pair, direction=direction, entry=entry1_px, stop_loss=sl_px,
+            tp1=tp1_px, tp2=tp2_px, entry2_sweep=entry2_px, margin_inr=margin_inr,
+            leverage=lev, qty1=qty1, qty2=qty2,
+            mode="App/API Simulated AutoTrade (2-Entry Armed)", is_live_exchange=False,
+        )
         return True, (
             f"AutoTrade Armed (Simulated — update CoinDCX API Key for live exchange fill): "
             f"{direction} {pair} | Entry 1 (50%): ${entry1_px} ({qty1}) + Entry 2 @ Sweep (50%): ${entry2_px} ({qty2}) @ {lev}x"

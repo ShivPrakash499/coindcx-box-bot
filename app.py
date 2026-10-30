@@ -563,15 +563,15 @@ if _slot_status.get("is_occupied"):
     _act_p = _slot_status.get("active_pair", "")
     _act_d = _slot_status.get("active_direction", "")
     st.sidebar.warning(
-        f"🔒 **1/1 Active Trade Lock:** `{_act_p}` ({_act_d})  \n"
+        f"🔒 **1/1 App/API Trade Lock:** `{_act_p}` ({_act_d})  \n"
         f"Source: *{_slot_status.get('source', '')}*  \n"
-        f"New coins paused so 50% margin stays reserved for `{_act_p}` Entry 2."
+        f"Other App/API coins paused so 50% margin stays reserved for `{_act_p}` Entry 2. *(Manual trades placed directly on CoinDCX do not trigger this lock.)*"
     )
     if st.sidebar.button("🔓 Release Active Trade Lock (Mark Closed)", key="btn_clear_autotrade_lock", use_container_width=True):
         coindcx_engine.clear_autotrade_active_lock()
         st.rerun()
 else:
-    st.sidebar.caption("🟢 **Portfolio Slot: 0/1 Active (FREE)** — Ready for next high-volatility signal.")
+    st.sidebar.caption("🟢 **App/API Slot: 0/1 Active (FREE)** — Ready for next trade. *(Direct manual trades on CoinDCX never lock the app.)*")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📧 Gmail Trade Alerts")
@@ -1388,6 +1388,7 @@ with t_exec:
                     real_inr = diff * pqty * act_p.get("usd_inr", 85.0)
                     st.session_state.realized_pnl_inr += real_inr
                     st.session_state.active_position = None
+                    coindcx_engine.clear_autotrade_active_lock()
                     st.session_state.last_order_status = {
                         "type": "success",
                         "msg": f"Simulated position closed! Realized PnL: ₹{real_inr:,.2f}",
@@ -1802,6 +1803,22 @@ with t_exec:
                         already_reached = (cur_market_px <= limit_entry_px) if is_buy_dir else (cur_market_px >= limit_entry_px) if cur_market_px > 0 else True
 
                         order_status = "LIVE_FILLED" if is_live else ("PAPER_FILLED" if already_reached else "PAPER_PENDING")
+
+                        # Register App/API trade lock so strictly 1 App/API trade is active at a time
+                        coindcx_engine.register_app_trade_lock(
+                            pair=pair,
+                            direction=trade_dir,
+                            entry=limit_entry_px,
+                            stop_loss=active_trade["stop_loss"],
+                            tp1=active_trade["tp1"],
+                            tp2=active_trade["tp2"],
+                            entry2_sweep=active_trade.get("entry2_sweep", limit_entry_px),
+                            margin_inr=trade_margin_inr,
+                            leverage=trade_leverage,
+                            qty1=active_trade["crypto_qty"],
+                            mode="App/API Live Execution" if is_live else "App/API Paper Execution",
+                            is_live_exchange=is_live,
+                        )
 
                         order_record = {
                             "timestamp": exec_time,
