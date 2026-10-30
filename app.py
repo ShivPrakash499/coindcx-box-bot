@@ -130,6 +130,41 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
+IST = pytz.timezone('Asia/Kolkata')
+
+# ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
+import threading
+import time
+
+@st.cache_resource
+def _ensure_background_monitor():
+    """Starts the 24/7 background monitor daemon exactly once per Streamlit server process,
+    BEFORE check_authentication() so alerts run 24/7 even when no browser session is logged in."""
+    def _monitor_worker():
+        while True:
+            try:
+                if signal_monitor:
+                    rot = coindcx_engine.get_rotational_margin_inr()
+                    m_inr = float(rot.get("margin_inr", 100000.0))
+                    lev = int(os.getenv("LEVERAGE", 5))
+                    u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
+                    signal_monitor.scan_and_alert(
+                        pairs=["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"],
+                        margin_inr=m_inr,
+                        leverage=lev,
+                        usd_inr=u_inr,
+                        send=True
+                    )
+            except Exception as e:
+                print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
+            time.sleep(60)
+
+    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
+    th.start()
+    return True
+
+_ensure_background_monitor()
+
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
 def get_security_pin():
     try:
@@ -176,48 +211,13 @@ def check_authentication():
                     st.error("❌ Incorrect PIN. Access Denied.")
 
         st.markdown(
-            "<p style='text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;'>🔒 Private Session • All live API operations gated behind authentication</p>",
+            "<p style='text-align: center; color: #94a3b8; font-size: 11px; margin-top: 16px;'>🔒 Private Session • All live API operations gated behind authentication (24/7 Email Alert Daemon Active)</p>",
             unsafe_allow_html=True
         )
 
     st.stop()
 
 check_authentication()
-
-IST = pytz.timezone('Asia/Kolkata')
-
-# ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON -----------------
-import threading
-import time
-
-@st.cache_resource
-def _ensure_background_monitor():
-    """Starts the 24/7 background monitor daemon exactly once per Streamlit server process.
-    Scans every registered strategy (or ENABLED_STRATEGIES) on the default watchlist."""
-    def _monitor_worker():
-        while True:
-            try:
-                if signal_monitor:
-                    rot = coindcx_engine.get_rotational_margin_inr()
-                    m_inr = float(rot.get("margin_inr", 100000.0))
-                    lev = int(os.getenv("LEVERAGE", 5))
-                    u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
-                    signal_monitor.scan_and_alert(
-                        pairs=["B-SOL_USDT", "B-ETH_USDT", "B-BTC_USDT"],
-                        margin_inr=m_inr,
-                        leverage=lev,
-                        usd_inr=u_inr,
-                        send=True
-                    )
-            except Exception as e:
-                print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
-            time.sleep(60)
-
-    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
-    th.start()
-    return True
-
-_ensure_background_monitor()
 
 # ----------------- SESSION STATE & QUERY PARAMS INITIALIZATION -----------------
 if "executed_trades" not in st.session_state:
@@ -1159,12 +1159,14 @@ with t_signals:
                         badge = "badge-buy" if is_l else "badge-sell"
                         st.markdown(f"<span class='{badge}'>{r['strategy_name']} — {sig['signal']} ({sig['signal_kind']})</span> "
                                     f"&nbsp; {sig.get('trigger_reason') or sig.get('trigger_zone') or ''}", unsafe_allow_html=True)
-                        m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("Entry", f"${sig['entry']:,.4f}")
-                        m2.metric("Stop Loss", f"${sig['stop_loss']:,.4f}")
-                        m3.metric("TP1", f"${sig['tp1']:,.4f}")
-                        m4.metric("TP2", f"${sig['tp2']:,.4f}")
-                        st.caption(f"Margin ₹{sig['margin_inr']:,.0f} @ {sig['leverage']}x • TP1 ≈ +₹{sig['profit_tp1_inr']:,.0f} • SL ≈ -₹{sig['loss_sl_inr']:,.0f} • "
+                        m1, m2, m3, m4, m5 = st.columns(5)
+                        m1.metric("Entry 1 (50%)", f"${sig['entry']:,.4f}")
+                        m2.metric("Entry 2 @ Sweep (50%)", f"${sig.get('entry2_sweep', sig['entry']):,.4f}")
+                        m3.metric("TP1 (50% Book -> BE)", f"${sig['tp1']:,.4f}")
+                        m4.metric("TP2 (50% Runner)", f"${sig['tp2']:,.4f}")
+                        m5.metric("Catastrophe SL", f"${sig['stop_loss']:,.4f}")
+                        st.caption(f"Margin ₹{sig['margin_inr']:,.0f} (2 x ₹{sig['margin_inr']*0.5:,.0f}) @ {sig['leverage']}x • "
+                                   f"TP1 (+{sig['roe_tp1']}%) • TP2 Runner (+{sig['roe_tp2']}%) • "
                                    f"📧 {'sent' if r['emailed'] else r['message']}")
                         if sig["signal_kind"] == "CONTINUATION":
                             st.caption("⚠️ Continuation (tower) signals are alert-only ideas and have not been backtested.")
@@ -1516,41 +1518,49 @@ with t_exec:
                     usd_inr=trade_usd_inr
                 )
 
-                # Order Ticket Card
+                # Order Ticket Card (2-Entry Sweep Scale-In + 50/50 Runner)
+                _e2_lvl = active_trade.get("entry2_sweep") or (
+                    box_levels["SL"] if trade_dir == "BUY" else box_levels["SH"]
+                )
+                _avg_2x = (active_trade["entry"] + float(_e2_lvl)) / 2.0
+                _tranche_m = trade_margin_inr * 0.5
+                _tranche_q = format_order_quantity(pair, active_trade["crypto_qty"] * 0.5)
+                _blended_profit = 0.5 * active_trade["profit_tp1_inr"] + 0.5 * active_trade["profit_tp2_inr"]
+                _blended_roe = round(0.5 * active_trade["roe_tp1"] + 0.5 * active_trade["roe_tp2"], 2)
                 ticket_html = f"""
                 <div style="background:{card_bg}; border:2px solid {card_border}; border-radius:12px; padding:18px; margin-top:10px;">
                     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                        <span class="{color_class}">ORDER TICKET: {trade_dir} {cur_asset}</span>
+                        <span class="{color_class}">2-ENTRY + RUNNER TICKET: {trade_dir} {cur_asset}</span>
                         <span style="font-weight:700; color:{text_color}; font-size:1.05rem;">LTP: {fmt(cur_price)}</span>
                     </div>
                     <table style="width:100%; border-collapse:collapse; font-size:0.92rem; color:{text_color};">
                         <tr style="border-bottom:1px solid {card_border};">
-                            <td style="padding:6px 0;"><b>Planned Entry:</b></td>
-                            <td style="text-align:right; font-weight:700;">{fmt(active_trade['entry'])}</td>
+                            <td style="padding:6px 0;"><b>Entry 1 (50% Margin — Zone Entry):</b></td>
+                            <td style="text-align:right; font-weight:700;">{fmt(active_trade['entry'])} (₹{_tranche_m:,.0f} / {_tranche_q} {cur_asset})</td>
                         </tr>
                         <tr style="border-bottom:1px solid {card_border};">
-                            <td style="padding:6px 0;"><b>Stop Loss:</b></td>
+                            <td style="padding:6px 0;"><b>Entry 2 (50% Margin — Equal Limit @ {'SL' if trade_dir == 'BUY' else 'SH'} Sweep):</b></td>
+                            <td style="text-align:right; color:#8b5cf6; font-weight:700;">{fmt(_e2_lvl)} (Avg 2x: {fmt(_avg_2x)})</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid {card_border};">
+                            <td style="padding:6px 0;"><b>Take Profit 1 (Close 50% -> Move SL to BE):</b></td>
+                            <td style="text-align:right; color:#0284c7; font-weight:700;">{fmt(active_trade['tp1'])} (+{active_trade['roe_tp1']}% ROE)</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid {card_border};">
+                            <td style="padding:6px 0;"><b>Take Profit 2 (Hold 50% Runner for Big Drop):</b></td>
+                            <td style="text-align:right; color:#16a34a; font-weight:700;">{fmt(active_trade['tp2'])} (+{active_trade['roe_tp2']}% ROE)</td>
+                        </tr>
+                        <tr style="border-bottom:1px solid {card_border};">
+                            <td style="padding:6px 0;"><b>Catastrophe Stop Loss (Beyond Entry 2):</b></td>
                             <td style="text-align:right; color:#dc2626; font-weight:700;">{fmt(active_trade['stop_loss'])} (-{active_trade['roe_sl']}%)</td>
                         </tr>
                         <tr style="border-bottom:1px solid {card_border};">
-                            <td style="padding:6px 0;"><b>Take Profit 1 ({_tp1n}):</b></td>
-                            <td style="text-align:right; color:#0284c7; font-weight:700;">{fmt(active_trade['tp1'])} (+{active_trade['roe_tp1']}%)</td>
-                        </tr>
-                        <tr style="border-bottom:1px solid {card_border};">
-                            <td style="padding:6px 0;"><b>Take Profit 2 ({_tp2n}):</b></td>
-                            <td style="text-align:right; color:#16a34a; font-weight:700;">{fmt(active_trade['tp2'])} (+{active_trade['roe_tp2']}%)</td>
-                        </tr>
-                        <tr style="border-bottom:1px solid {card_border};">
-                            <td style="padding:6px 0;"><b>Order Quantity:</b></td>
-                            <td style="text-align:right; font-weight:700;">{active_trade['crypto_qty']} {cur_asset}</td>
-                        </tr>
-                        <tr style="border-bottom:1px solid {card_border};">
-                            <td style="padding:6px 0;"><b>Effective Margin:</b></td>
-                            <td style="text-align:right;">₹{trade_margin_inr:,.0f} @ {trade_leverage}x Leverage</td>
+                            <td style="padding:6px 0;"><b>Total Position Size (100%):</b></td>
+                            <td style="text-align:right; font-weight:700;">{active_trade['crypto_qty']} {cur_asset} (₹{trade_margin_inr:,.0f} @ {trade_leverage}x)</td>
                         </tr>
                         <tr>
-                            <td style="padding:6px 0;"><b>Projected Profit (TP1):</b></td>
-                            <td style="text-align:right; color:#16a34a; font-weight:800; font-size:1.05rem;">+₹{active_trade['profit_tp1_inr']:,.2f}</td>
+                            <td style="padding:6px 0;"><b>Projected Profit (50% TP1 + 50% TP2 Runner):</b></td>
+                            <td style="text-align:right; color:#16a34a; font-weight:800; font-size:1.05rem;">+₹{_blended_profit:,.2f} (+{_blended_roe}% ROE)</td>
                         </tr>
                     </table>
                 </div>

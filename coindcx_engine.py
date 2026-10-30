@@ -1226,9 +1226,13 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
 
 def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0, pair="B-ETH_USDT"):
     """
-    Calculates specific BUY (Long at Range Low) or SELL (Short at Range High)
-    trade setup parameters including targets, stops, and financial projections.
-    Quantizes order quantity to the pair's exchange lot size rules.
+    Calculates specific BUY (Long at Range Low / Swing Low) or SELL (Short at Range High / Swing High)
+    2-Entry + Runner trade setup parameters:
+      - Entry 1 (50% Margin): RL / RH rejection price
+      - Entry 2 (50% Margin — Same Amount): SL / SH sweep scale-in level
+      - Catastrophe SL: ~0.8% beyond Entry 2 (SL / SH)
+      - TP1 (50% Early Book + Move SL to Breakeven): min(10% ROE, MID)
+      - TP2 (50% Risk-Free Runner for Big Drop): Opposite Box Edge (RH / RL)
     """
     if not levels:
         return None
@@ -1237,35 +1241,43 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
     sh, sl = levels["SH"], levels["SL"]
     mid = levels["MID"]
 
+    lev = max(1, int(leverage))
     if direction.upper() in ["BUY", "LONG"]:
         dir_name = "BUY"
         entry = round_asset_price(live_price if live_price > 0 and live_price <= rl else rl, rh)
-        struct_sl = min(rl, sl) * 0.998
-        max_sl_dist = entry * (5.0 / 100.0 / max(1, leverage))
-        sl_dist = min(abs(entry - struct_sl), max_sl_dist)
-        stop_loss = round_asset_price(entry - sl_dist, rh)
-        max_tp_dist = entry * (20.0 / 100.0 / max(1, leverage))
-        tp_dist = min(abs(mid - entry), max_tp_dist)
-        tp1 = round_asset_price(entry + tp_dist, rh)
-        tp2 = tp1
-        setup_desc = "BUY (Long): Liquidity Sweep Rejection at Range Low (RL) [Single TP <=20% ROE, Strict SL <=5% ROE]"
+        entry2_sweep = round_asset_price(min(sl, entry * 0.992), rh)
+        avg_entry_2x = round_asset_price((entry + entry2_sweep) / 2.0, rh)
+        stop_loss = round_asset_price(min(entry2_sweep * 0.992, sl * 0.995), rh)
+        max_tp1_dist = entry * (10.0 / 100.0 / lev)
+        tp1_dist = min(abs(mid - entry), max_tp1_dist)
+        tp1 = round_asset_price(entry + tp1_dist, rh)
+        tp2_target = rh if entry < rh * 0.988 else sh
+        tp2 = round_asset_price(max(tp2_target, entry + tp1_dist * 2.0), rh)
+        setup_desc = (
+            f"BUY (Long): 2-Entry Sweep + Runner — Entry1 ${entry:,.2f} + Entry2 @ SL ${entry2_sweep:,.2f} | "
+            f"TP1 (50% Book <=10% ROE) -> TP2 (50% Runner to RH ${tp2:,.2f})"
+        )
     else:
         dir_name = "SELL"
         entry = round_asset_price(live_price if live_price > 0 and live_price >= rh else rh, rh)
-        struct_sl = max(rh, sh) * 1.002
-        max_sl_dist = entry * (5.0 / 100.0 / max(1, leverage))
-        sl_dist = min(abs(struct_sl - entry), max_sl_dist)
-        stop_loss = round_asset_price(entry + sl_dist, rh)
-        max_tp_dist = entry * (20.0 / 100.0 / max(1, leverage))
-        tp_dist = min(abs(entry - mid), max_tp_dist)
-        tp1 = round_asset_price(entry - tp_dist, rh)
-        tp2 = tp1
-        setup_desc = "SELL (Short): Liquidity Sweep Rejection at Range High (RH) [Single TP <=20% ROE, Strict SL <=5% ROE]"
+        entry2_sweep = round_asset_price(max(sh, entry * 1.008), rh)
+        avg_entry_2x = round_asset_price((entry + entry2_sweep) / 2.0, rh)
+        stop_loss = round_asset_price(max(entry2_sweep * 1.008, sh * 1.005), rh)
+        max_tp1_dist = entry * (10.0 / 100.0 / lev)
+        tp1_dist = min(abs(entry - mid), max_tp1_dist)
+        tp1 = round_asset_price(entry - tp1_dist, rh)
+        tp2_target = rl if entry > rl * 1.012 else sl
+        tp2 = round_asset_price(min(tp2_target, entry - tp1_dist * 2.0), rh)
+        setup_desc = (
+            f"SELL (Short): 2-Entry Sweep + Runner — Entry1 ${entry:,.2f} + Entry2 @ SH ${entry2_sweep:,.2f} | "
+            f"TP1 (50% Book <=10% ROE) -> TP2 (50% Runner to RL ${tp2:,.2f})"
+        )
 
     margin_usd = margin_inr / usd_inr
     position_usd = margin_usd * leverage
     raw_qty = position_usd / entry if entry > 0 else 0
     crypto_qty = format_order_quantity(pair, raw_qty)
+    tranche_qty = format_order_quantity(pair, (position_usd * 0.5) / entry) if entry > 0 else 0
 
     risk_per_unit = abs(entry - stop_loss) if stop_loss > 0 else 0
     reward_tp1 = abs(entry - tp1)
@@ -1273,16 +1285,22 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
 
     roe_tp1 = round((reward_tp1 / entry) * leverage * 100, 2) if entry > 0 else 0
     roe_tp2 = round((reward_tp2 / entry) * leverage * 100, 2) if entry > 0 else 0
+    roe_blended = round(0.5 * roe_tp1 + 0.5 * roe_tp2, 2)
     roe_sl = round((risk_per_unit / entry) * leverage * 100, 2) if entry > 0 else 0
 
     profit_tp1_inr = round((reward_tp1 * crypto_qty) * usd_inr, 2)
     profit_tp2_inr = round((reward_tp2 * crypto_qty) * usd_inr, 2)
+    profit_blended_inr = round(0.5 * profit_tp1_inr + 0.5 * profit_tp2_inr, 2)
     loss_sl_inr = round((risk_per_unit * crypto_qty) * usd_inr, 2)
 
     return {
         "direction": dir_name,
         "setup": setup_desc,
         "entry": entry,
+        "entry2_sweep": entry2_sweep,
+        "avg_entry_2x": avg_entry_2x,
+        "tranche_qty": tranche_qty,
+        "tranche_margin_inr": round(margin_inr * 0.5, 2),
         "stop_loss": stop_loss,
         "tp1": tp1,
         "tp2": tp2,
@@ -1293,43 +1311,42 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
         "usd_inr": usd_inr,
         "roe_tp1": roe_tp1,
         "roe_tp2": roe_tp2,
+        "roe_blended": roe_blended,
         "roe_sl": roe_sl,
         "profit_tp1_inr": profit_tp1_inr,
         "profit_tp2_inr": profit_tp2_inr,
+        "profit_blended_inr": profit_blended_inr,
         "loss_sl_inr": loss_sl_inr,
         "target_roe_met": roe_tp1 >= 3.0
     }
 
 def detect_zone_signal(levels: dict, o: float, h: float, l: float, c: float):
     """
-    Classifies ONE CLOSED candle against the daily box zones, gated by Daily 50 & 200 EMA trend bias:
-      - BEARISH (Daily Close < 50 EMA & < 200 EMA): Sell Zone RH-SH sweep & rejection -> SHORT only
-      - BULLISH (Daily Close > 50 EMA & > 200 EMA): Buy Zone RL-SL sweep & rejection -> LONG only
-      - NEUTRAL (Between 50 EMA & 200 EMA — Range Mode): BOTH Sell Zone RH-SH & Buy Zone RL-SL active
-    Enforces Single TP = min(20% ROE [4% price], MID) (must be >= 3% ROE [0.6% price])
-    and Strict SL = min(5% ROE [1% price], Structural Sweep SL).
+    Classifies ONE CLOSED candle against the daily box zones (RH/SH and RL/SL),
+    returning the 2-Entry + Runner levels (TP1 = min(10% ROE, MID) for 50% book, TP2 = RL/RH for 50% runner).
     """
     rh, rl, sh, sl, mid = levels["RH"], levels["RL"], levels["SH"], levels["SL"], levels["MID"]
-    bias = levels.get("trend_bias", "NEUTRAL")
 
-    if bias in ("BEARISH", "NEUTRAL") and h >= rh and c < rh:
-        struct_stop = max(h, sh) * 1.002
-        tp_dist = min(abs(c - mid), c * 0.04)
-        if tp_dist < c * 0.0058:
+    if (h >= rh and c < rh) or (h >= sh and c < sh):
+        entry2 = max(sh, h, c * 1.008)
+        stop_p = round(entry2 * 1.008, 4)
+        tp1_dist = min(abs(c - mid), c * 0.02)
+        if tp1_dist < c * 0.0058:
             return None
-        sl_dist = min(abs(struct_stop - c), c * 0.01)
-        tp_p = round(c - tp_dist, 4)
+        tp1_p = round(c - tp1_dist, 4)
+        tp2_p = round(min(rl if c > rl * 1.012 else sl, c - tp1_dist * 2.0), 4)
         return {"kind": "REVERSAL", "direction": "SHORT", "zone": "Sell Zone RH-SH",
-                "stop": round(c + sl_dist, 4), "tp1": tp_p, "tp2": tp_p}
-    if bias in ("BULLISH", "NEUTRAL") and l <= rl and c > rl:
-        struct_stop = min(l, sl) * 0.998
-        tp_dist = min(abs(mid - c), c * 0.04)
-        if tp_dist < c * 0.0058:
+                "entry2_sweep": round(entry2, 4), "stop": stop_p, "tp1": tp1_p, "tp2": tp2_p}
+    if (l <= rl and c > rl) or (l <= sl and c > sl):
+        entry2 = min(sl, l, c * 0.992)
+        stop_p = round(entry2 * 0.992, 4)
+        tp1_dist = min(abs(mid - c), c * 0.02)
+        if tp1_dist < c * 0.0058:
             return None
-        sl_dist = min(abs(c - struct_stop), c * 0.01)
-        tp_p = round(c + tp_dist, 4)
+        tp1_p = round(c + tp1_dist, 4)
+        tp2_p = round(max(rh if c < rh * 0.988 else sh, c + tp1_dist * 2.0), 4)
         return {"kind": "REVERSAL", "direction": "LONG", "zone": "Buy Zone RL-SL",
-                "stop": round(c - sl_dist, 4), "tp1": tp_p, "tp2": tp_p}
+                "entry2_sweep": round(entry2, 4), "stop": stop_p, "tp1": tp1_p, "tp2": tp2_p}
     return None
 
 
@@ -1583,38 +1600,107 @@ def run_strategy_backtest(
         if not strat.backtest_has_context(candle, strat_ctx):
             continue
 
-        # Check active trade exit conditions first (Single 100% Exit at TP or Strict SL)
+        # Check active trade exit & 2-Entry Scale-In + 50/50 Runner conditions
         if active_trade:
             pos_dir = active_trade["direction"]
             entry_p = active_trade["entry_price"]
+            entry2_p = active_trade.get("entry2_sweep", 0.0)
             sl_p = active_trade["stop_loss"]
             tp1_p = active_trade["tp1"]
             tp2_p = active_trade["tp2"]
             qty = active_trade["quantity"]
             notional_inr = active_trade["notional_inr"]
+            deployed_margin_inr = active_trade["deployed_margin_inr"]
+
+            # Step A: If Tranche 2 (at SH/SL sweep level) has not filled yet and TP1 not hit yet, check if price swept into Entry 2
+            if not active_trade.get("entry2_filled", False) and not active_trade.get("tp1_hit", False) and entry2_p > 0:
+                if (pos_dir == "LONG" and c_low <= entry2_p and c_low > sl_p) or (
+                    pos_dir == "SHORT" and c_high >= entry2_p and c_high < sl_p
+                ):
+                    new_avg_entry = (entry_p + entry2_p) / 2.0
+                    full_margin_usd = margin_inr / usd_inr
+                    full_pos_usd = full_margin_usd * leverage
+                    new_qty = format_order_quantity(pair, full_pos_usd / new_avg_entry) if new_avg_entry > 0 else qty
+                    tp1_dist_new = min(abs(tp1_p - new_avg_entry), new_avg_entry * (10.0 / 100.0 / max(1, leverage)))
+                    new_tp1 = (new_avg_entry + tp1_dist_new) if pos_dir == "LONG" else (new_avg_entry - tp1_dist_new)
+
+                    active_trade["entry_price"] = new_avg_entry
+                    active_trade["quantity"] = new_qty
+                    active_trade["tp1"] = new_tp1
+                    active_trade["entry2_filled"] = True
+
+                    entry_p = new_avg_entry
+                    tp1_p = new_tp1
+                    qty = new_qty
 
             exit_triggered = False
             exit_price = None
             exit_reason = None
+            scale_tag = " [2-Entry Averaged]" if active_trade.get("entry2_filled") else " [Entry 1]"
 
             if pos_dir == "LONG":
-                if c_low <= sl_p:
-                    exit_triggered = True
-                    exit_price = sl_p
-                    exit_reason = "Stop Loss (<=5% ROE / Sweep)"
-                elif c_high >= tp1_p:
-                    exit_triggered = True
-                    exit_price = tp1_p
-                    exit_reason = f"Take Profit ({active_trade['tp1_label']})"
+                if not active_trade.get("tp1_hit", False):
+                    if c_low <= sl_p:
+                        exit_triggered = True
+                        exit_price = sl_p
+                        exit_reason = f"Catastrophe Stop Loss Beyond SL Sweep{scale_tag}"
+                    elif c_high >= tp2_p:
+                        exit_triggered = True
+                        exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                        exit_reason = f"TP1 (50% Book) + TP2 (50% Big Drop Runner){scale_tag}"
+                    elif c_high >= tp1_p:
+                        active_trade["tp1_hit"] = True
+                        # Lock Runner SL at +50% of TP1 distance (or TP1 if already halfway to TP2) so runner never round-trips to zero
+                        mid_runner = 0.5 * (tp1_p + tp2_p)
+                        new_sl = tp1_p if c_high >= mid_runner else (entry_p + 0.5 * (tp1_p - entry_p))
+                        active_trade["stop_loss"] = new_sl
+                        sl_p = new_sl
+                else:
+                    # TP1 already booked (50% closed at tp1_p); managing the remaining 50% Free-Ride Runner
+                    mid_runner = 0.5 * (tp1_p + tp2_p)
+                    if c_high >= mid_runner and sl_p < tp1_p:
+                        active_trade["stop_loss"] = tp1_p
+                        sl_p = tp1_p
+                    if c_high >= tp2_p:
+                        exit_triggered = True
+                        exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                        exit_reason = f"TP1 (50% Book) + TP2 (50% Runner Hit RH){scale_tag}"
+                    elif c_low <= sl_p:
+                        exit_triggered = True
+                        exit_price = 0.5 * tp1_p + 0.5 * sl_p
+                        r_lbl = "Runner Locked at TP1" if sl_p >= tp1_p else "Runner Trailing Profit SL"
+                        exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
             else:  # SHORT
-                if c_high >= sl_p:
-                    exit_triggered = True
-                    exit_price = sl_p
-                    exit_reason = "Stop Loss (<=5% ROE / Sweep)"
-                elif c_low <= tp1_p:
-                    exit_triggered = True
-                    exit_price = tp1_p
-                    exit_reason = f"Take Profit ({active_trade['tp1_label']})"
+                if not active_trade.get("tp1_hit", False):
+                    if c_high >= sl_p:
+                        exit_triggered = True
+                        exit_price = sl_p
+                        exit_reason = f"Catastrophe Stop Loss Beyond SH Sweep{scale_tag}"
+                    elif c_low <= tp2_p:
+                        exit_triggered = True
+                        exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                        exit_reason = f"TP1 (50% Book) + TP2 (50% Big Drop Runner){scale_tag}"
+                    elif c_low <= tp1_p:
+                        active_trade["tp1_hit"] = True
+                        mid_runner = 0.5 * (tp1_p + tp2_p)
+                        new_sl = tp1_p if c_low <= mid_runner else (entry_p - 0.5 * (entry_p - tp1_p))
+                        active_trade["stop_loss"] = new_sl
+                        sl_p = new_sl
+                else:
+                    # TP1 already booked (50% closed at tp1_p); managing the remaining 50% Free-Ride Runner
+                    mid_runner = 0.5 * (tp1_p + tp2_p)
+                    if c_low <= mid_runner and sl_p > tp1_p:
+                        active_trade["stop_loss"] = tp1_p
+                        sl_p = tp1_p
+                    if c_low <= tp2_p:
+                        exit_triggered = True
+                        exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                        exit_reason = f"TP1 (50% Book) + TP2 (50% Runner Hit RL){scale_tag}"
+                    elif c_high >= sl_p:
+                        exit_triggered = True
+                        exit_price = 0.5 * tp1_p + 0.5 * sl_p
+                        r_lbl = "Runner Locked at TP1" if sl_p <= tp1_p else "Runner Trailing Profit SL"
+                        exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
 
             if exit_triggered:
                 # Calculate financial metrics with exact CoinDCX fee schedule
@@ -1629,8 +1715,8 @@ def run_strategy_backtest(
                 exit_fee_inr = exit_notional_inr * taker_fee_rate
                 total_fees_inr = entry_fee_inr + exit_fee_inr
                 net_pnl_inr = gross_pnl_inr - total_fees_inr
-                roe_pct = (net_pnl_inr / margin_inr) * 100.0
-                gross_roe_pct = (gross_pnl_inr / margin_inr) * 100.0
+                roe_pct = (net_pnl_inr / deployed_margin_inr) * 100.0 if deployed_margin_inr > 0 else 0.0
+                gross_roe_pct = (gross_pnl_inr / deployed_margin_inr) * 100.0 if deployed_margin_inr > 0 else 0.0
 
                 current_equity += net_pnl_inr
 
@@ -1651,7 +1737,7 @@ def run_strategy_backtest(
                     "entry_price": round_asset_price(entry_p, entry_p),
                     "exit_price": round_asset_price(exit_price, entry_p),
                     "stop_loss": round_asset_price(sl_p, entry_p),
-                    "target_tp": round_asset_price(tp1_p, entry_p),
+                    "target_tp": round_asset_price(tp2_p, entry_p),
                     "exit_reason": exit_reason,
                     "quantity": qty,
                     "gross_pnl_inr": round(gross_pnl_inr, 2),
@@ -1683,6 +1769,7 @@ def run_strategy_backtest(
             if entry_sig:
                 trade_dir = entry_sig["direction"]
                 entry_p = entry_sig["entry"]
+                entry2_p = entry_sig.get("entry2_sweep", 0.0)
                 sl_p = entry_sig["stop"]
                 tp1_p = entry_sig["tp1"]
                 tp2_p = entry_sig["tp2"]
@@ -1701,15 +1788,18 @@ def run_strategy_backtest(
                     "entry_date": c_date,
                     "entry_idx": idx,
                     "entry_price": entry_p,
+                    "entry2_sweep": entry2_p,
+                    "entry2_filled": False,
                     "stop_loss": sl_p,
                     "tp1": tp1_p,
                     "tp2": tp2_p,
                     "quantity": qty,
                     "notional_inr": notional_inr,
+                    "deployed_margin_inr": margin_inr,
                     "session": sess_name,
                     "tp1_hit": False,
-                    "tp1_label": entry_sig.get("tp1_label", "Single TP"),
-                    "tp2_label": entry_sig.get("tp2_label", "Single TP"),
+                    "tp1_label": entry_sig.get("tp1_label", "50% Book"),
+                    "tp2_label": entry_sig.get("tp2_label", "50% Runner"),
                     "reason": entry_sig.get("reason", "")
                 }
                 day_trade_count[c_date] = day_trade_count.get(c_date, 0) + 1

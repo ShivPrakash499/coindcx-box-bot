@@ -62,16 +62,14 @@ def _state_key(strategy_id: str, pair: str, sig: dict) -> str:
 
 
 def _note(strategy_id: str, sig: dict) -> str:
-    if strategy_id == "box_theory":
-        return (
-            "Daily 50/200 EMA trend-aligned rejection confirmed. "
-            "Single Complete Exit TP = min(20% ROE, MID) | Strict SL = min(5% ROE, Sweep SL). "
-            "Max 2 trades/day — if this trade hits >=10% ROE, you are done for the day."
-        )
+    e1 = sig.get("entry", 0.0)
+    e2 = sig.get("entry2_sweep", 0.0)
+    tp1 = sig.get("tp1", 0.0)
+    tp2 = sig.get("tp2", 0.0)
     return (
-        "Daily 50/200 EMA trend-aligned 5m crossover confirmed. "
-        "Single Complete Exit TP = min(20% ROE, 50% Retrace) | Strict SL = min(5% ROE, Extreme SL). "
-        "Max 2 trades/day — if this trade hits >=10% ROE, you are done for the day."
+        f"2-Entry + Runner Plan: Enter 50% (Tranche 1) at ${e1:,.2f} and place an equal 50% Limit Order (Tranche 2) "
+        f"at the Sweep Level (${e2:,.2f}). Book 50% early profit at TP1 (${tp1:,.2f}) & move SL to Breakeven; "
+        f"hold the remaining 50% risk-free Runner to TP2 (${tp2:,.2f}) to capture the big drop/move!"
     )
 
 
@@ -132,7 +130,7 @@ def scan_and_alert(pairs=None, margin_inr: float = 100000.0, leverage: int = 5, 
                         tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=sig["margin_inr"], leverage=sig["leverage"],
                         zone=sig.get("trigger_zone") or "", kind="SIGNAL", note=_note(s.id, sig),
                         strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
-                        levels=sig.get("levels"))
+                        levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0))
                     if emailed:
                         now_sent = time.time()
                         state[key] = {"candle_ts": sig["candle_ts"], "sent_at": now_sent, "direction": sig["signal"]}
