@@ -661,12 +661,40 @@ else:
 # ----------------- RESPONSIVE CSS (DESKTOP HORIZONTAL NAV / IPHONE VERTICAL NAV) -----------------
 st.markdown(f"""
 <style>
-    /* Global anti-horizontal-scroll enforcement */
+    /* Global anti-horizontal-scroll enforcement & top header theme sync */
     html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
         overflow-x: hidden !important;
         max-width: 100vw !important;
-        background-color: {bg_main};
-        color: {text_color};
+        background-color: {bg_main} !important;
+        color: {text_color} !important;
+    }}
+    header[data-testid="stHeader"] {{
+        background-color: {bg_main} !important;
+        color: {text_color} !important;
+        border-bottom: 1px solid {card_border} !important;
+    }}
+    /* Left Sidebar full theme synchronization (Dark & Crisp Light Mode) */
+    section[data-testid="stSidebar"],
+    section[data-testid="stSidebar"] > div,
+    div[data-testid="stSidebarContent"],
+    div[data-testid="stSidebarUserContent"] {{
+        background-color: {card_bg} !important;
+        color: {text_color} !important;
+        border-right: 1px solid {card_border} !important;
+    }}
+    section[data-testid="stSidebar"] h1,
+    section[data-testid="stSidebar"] h2,
+    section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] h4,
+    section[data-testid="stSidebar"] p,
+    section[data-testid="stSidebar"] label,
+    section[data-testid="stSidebar"] span,
+    section[data-testid="stSidebar"] div[data-testid="stMarkdownContainer"] p,
+    section[data-testid="stSidebar"] div[data-testid="stCaptionContainer"] p {{
+        color: {text_color} !important;
+    }}
+    section[data-testid="stSidebar"] hr {{
+        border-color: {card_border} !important;
     }}
     .block-container {{
         padding-top: 1.4rem !important;
@@ -892,21 +920,112 @@ st.markdown(f"""
     div[data-testid="stCaptionContainer"],
     div[data-testid="stCaptionContainer"] p,
     div[data-testid="stExpander"] summary p,
-    div[data-testid="stExpander"] summary span {{
+    div[data-testid="stExpander"] summary span,
+    div[data-testid="stAlert"] p,
+    div[data-testid="stAlert"] span {{
         color: {text_color} !important;
+    }}
+    div[data-testid="stMarkdownContainer"] code,
+    div[data-testid="stCaptionContainer"] code,
+    div[data-testid="stAlert"] code {{
+        background-color: {banner_bg} !important;
+        color: {'#0284c7' if is_light_theme else '#38bdf8'} !important;
+        padding: 2px 6px !important;
+        border-radius: 5px !important;
+        border: 1px solid {card_border} !important;
+        font-weight: 700 !important;
+    }}
+    div[data-testid="stExpander"],
+    div[data-testid="stExpander"] details,
+    div[data-testid="stExpander"] summary {{
+        background-color: {card_bg} !important;
+        color: {text_color} !important;
+        border-color: {card_border} !important;
+        border-radius: 8px !important;
+    }}
+    div[data-testid="stAlert"] {{
+        background-color: {banner_bg} !important;
+        color: {text_color} !important;
+        border: 1px solid {card_border} !important;
     }}
     div[data-baseweb="select"] > div,
     div[data-baseweb="input"],
-    div[data-baseweb="base-input"] {{
+    div[data-baseweb="base-input"],
+    div[data-testid="stNumberInputContainer"],
+    button[data-testid="stNumberInputStepDown"],
+    button[data-testid="stNumberInputStepUp"] {{
         background-color: {nav_bg} !important;
         color: {text_color} !important;
         border-color: {card_border} !important;
     }}
     div[data-baseweb="select"] span,
     div[data-baseweb="select"] div,
-    div[data-baseweb="input"] input {{
+    div[data-baseweb="input"] input,
+    div[data-baseweb="base-input"] input,
+    button[data-testid="stNumberInputStepDown"] svg,
+    button[data-testid="stNumberInputStepUp"] svg {{
+        background-color: transparent !important;
         color: {text_color} !important;
+        fill: {text_color} !important;
         -webkit-text-fill-color: {text_color} !important;
+    }}
+    div[data-baseweb="popover"] div,
+    ul[role="listbox"],
+    li[role="option"] {{
+        background-color: {card_bg} !important;
+        color: {text_color} !important;
+    }}
+    li[role="option"]:hover {{
+        background-color: {banner_bg} !important;
+    }}
+
+    /* Pro Terminal Native HTML Tables (Dark & Crisp Light Mode, Zero Row Clipping) */
+    .pro-table-wrap {{
+        width: 100%;
+        overflow-x: auto;
+        background: {card_bg};
+        border: 1px solid {card_border};
+        border-radius: 10px;
+        margin-top: 6px;
+        margin-bottom: 12px;
+    }}
+    table.pro-table {{
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.84rem;
+        color: {text_color};
+        background: {card_bg};
+    }}
+    table.pro-table thead th {{
+        background: {banner_bg};
+        color: {subtext_color};
+        font-weight: 700;
+        text-align: left;
+        padding: 9px 12px;
+        border-bottom: 1px solid {card_border};
+        white-space: nowrap;
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.02em;
+    }}
+    table.pro-table tbody td {{
+        padding: 8px 12px;
+        border-bottom: 1px solid {card_border};
+        color: {text_color};
+        white-space: nowrap;
+        font-weight: 600;
+    }}
+    table.pro-table tbody tr:hover td {{
+        background: {nav_bg};
+    }}
+    table.pro-table tfoot td {{
+        background: {banner_bg};
+        color: {text_color};
+        font-weight: 800;
+        padding: 10px 12px;
+        border-top: 2px solid #3b82f6;
+        white-space: nowrap;
+        font-size: 0.88rem;
     }}
 
     /* =========================================================================
@@ -1265,7 +1384,29 @@ if active_section == "⚡ Signals":
             })
 
         if matrix_rows:
-            st.dataframe(pd.DataFrame(matrix_rows), use_container_width=True, hide_index=True)
+            _m_trs = []
+            for _mr in matrix_rows:
+                _st_col = "#10b981" if "LONG" in _mr["Status"] else ("#ef4444" if "SHORT" in _mr["Status"] else subtext_color)
+                _m_trs.append(
+                    f"<tr>"
+                    f"<td style='font-weight:800;'>{_mr['Asset']}</td>"
+                    f"<td>{_mr['Price']}</td>"
+                    f"<td>{_mr['Bias']}</td>"
+                    f"<td>{_mr['Zone']}</td>"
+                    f"<td style='color:{_st_col};font-weight:700;'>{_mr['Status']}</td>"
+                    f"<td style='color:#ef4444;'>{_mr['SH']}</td>"
+                    f"<td style='color:#f97316;'>{_mr['RH']}</td>"
+                    f"<td style='color:#38bdf8;'>{_mr['MID']}</td>"
+                    f"<td style='color:#10b981;'>{_mr['RL']}</td>"
+                    f"<td style='color:#059669;'>{_mr['SL']}</td>"
+                    f"</tr>"
+                )
+            st.html(
+                f"<div class='pro-table-wrap'><table class='pro-table'>"
+                f"<thead><tr><th>Asset</th><th>Price</th><th>Bias</th><th>Zone</th><th>Status</th>"
+                f"<th>SH</th><th>RH</th><th>MID</th><th>RL</th><th>SL</th></tr></thead>"
+                f"<tbody>{''.join(_m_trs)}</tbody></table></div>"
+            )
 
 # ==============================================================================
 # SECTION 2: STREAMLINED ORDER EXECUTION STATION
@@ -2156,15 +2297,146 @@ elif active_section == "🧪 Backtest":
 
     port_out = st.session_state.get("bt_portfolio_1slot")
     if port_out and port_out.get("total_trades", 0) > 0:
+        _used_m = float(port_out.get("margin_inr") or bt_capital or 20000.0)
+        _used_l = int(port_out.get("leverage") or bt_lev or 10)
+        _tot_net = float(port_out["net_profit_inr"])
+        _tot_roi = float(port_out["total_roi_pct"])
+        _tot_tr = int(port_out["total_trades"])
+        _tot_w = int(port_out["win_count"])
+        _tot_l = int(port_out["loss_count"])
+        _tot_wr = float(port_out["win_rate_pct"])
+        _tot_pf = float(port_out["profit_factor"])
+        _eq_1l_profit = (_tot_roi / 100.0) * 100000.0
+
         pk1, pk2, pk3, pk4 = st.columns(4)
-        pk1.metric("Net Portfolio Profit", f"₹{port_out['net_profit_inr']:,.0f}", f"{port_out['total_roi_pct']:+.1f}% ROI")
-        pk2.metric("Total Trades (1 Slot)", port_out["total_trades"])
-        pk3.metric("Win Rate", f"{port_out['win_rate_pct']}%", f"{port_out['win_count']}W / {port_out['loss_count']}L")
-        pk4.metric("Profit Factor", f"{port_out['profit_factor']}")
-        st.dataframe(port_out["coin_summary_df"], use_container_width=True, hide_index=True)
-        with st.expander("📜 View Individual Portfolio Trades"):
-            st.dataframe(
-                port_out["trades_df"][["entry_time", "exit_time", "pair", "direction", "entry_price", "exit_price", "roe_pct", "net_pnl_inr", "trigger", "exit_reason"]],
-                use_container_width=True,
-                hide_index=True
+        pk1.metric("Net Portfolio Profit", f"₹{_tot_net:,.2f}", f"{_tot_roi:+.2f}% ROI")
+        pk2.metric("Total Trades (1 Slot)", _tot_tr)
+        pk3.metric("Win Rate", f"{_tot_wr}%", f"{_tot_w}W / {_tot_l}L")
+        pk4.metric("Profit Factor", f"{_tot_pf}")
+
+        if abs(_used_m - 100000.0) > 1.0:
+            st.caption(
+                f"💡 **Margin Scale Note:** Simulated with **₹{_used_m:,.0f}** Single-Trade Margin (`{_used_l}x`) -> **+₹{_tot_net:,.2f}** (`{_tot_roi:+.2f}% ROI`). "
+                f"At **₹1,00,000 (`₹1L`)** Single-Trade Margin, this exact same `{_tot_roi:+.2f}% ROI` equals **+₹{_eq_1l_profit:,.2f}**."
             )
+
+        # 1. 1-Slot Shared Portfolio Breakdown Table (All 12 Coins + Exact Total Row)
+        st.markdown("##### 1️⃣ 1-Slot Shared Portfolio Breakdown (All 12 Coins — Strictly 1 Trade Open Across Portfolio at a Time)")
+        cs_df = port_out.get("coin_summary_df")
+        if cs_df is not None and not cs_df.empty:
+            _cs_rows = []
+            for _, r in cs_df.iterrows():
+                _p_name = str(r.get("pair", ""))
+                _tr_c = int(r.get("Trades", 0))
+                _w_c = int(r.get("Wins", 0))
+                _l_c = int(r.get("Losses", max(0, _tr_c - _w_c)))
+                _wr_c = float(r.get("Win_Rate_%", 0.0))
+                _np_c = float(r.get("Net_Profit_INR", 0.0))
+                _roi_c = float(r.get("ROI_Pct", (_np_c / _used_m * 100.0) if _used_m > 0 else 0.0))
+                _av_c = float(r.get("Avg_ROE_Pct", 0.0))
+                _np_col = "#10b981" if _np_c > 0 else ("#ef4444" if _np_c < 0 else subtext_color)
+                _np_sgn = "+" if _np_c > 0 else ""
+                _roi_sgn = "+" if _roi_c > 0 else ""
+                _cs_rows.append(
+                    f"<tr>"
+                    f"<td style='font-weight:800;'>{_p_name}</td>"
+                    f"<td>{_tr_c}</td>"
+                    f"<td style='color:#10b981;'>{_w_c}</td>"
+                    f"<td style='color:#ef4444;'>{_l_c}</td>"
+                    f"<td>{_wr_c:.1f}%</td>"
+                    f"<td style='color:{_np_col};font-weight:800;'>{_np_sgn}₹{_np_c:,.2f}</td>"
+                    f"<td style='color:{_np_col};font-weight:700;'>{_roi_sgn}{_roi_c:.2f}%</td>"
+                    f"<td>{_av_c:+.2f}%</td>"
+                    f"</tr>"
+                )
+            _tot_col = "#10b981" if _tot_net >= 0 else "#ef4444"
+            _tot_sgn = "+" if _tot_net >= 0 else ""
+            _avg_all = float(port_out["trades_df"]["roe_pct"].mean()) if not port_out["trades_df"].empty else 0.0
+            _tfoot_html = (
+                f"<tfoot><tr>"
+                f"<td>TOTAL (ALL {len(cs_df)} COINS)</td>"
+                f"<td>{_tot_tr}</td>"
+                f"<td style='color:#10b981;'>{_tot_w}</td>"
+                f"<td style='color:#ef4444;'>{_tot_l}</td>"
+                f"<td>{_tot_wr:.1f}%</td>"
+                f"<td style='color:{_tot_col};'>{_tot_sgn}₹{_tot_net:,.2f}</td>"
+                f"<td style='color:{_tot_col};'>{_tot_sgn}{_tot_roi:.2f}%</td>"
+                f"<td>{_avg_all:+.2f}%</td>"
+                f"</tr></tfoot>"
+            )
+            st.html(
+                f"<div class='pro-table-wrap'><table class='pro-table'>"
+                f"<thead><tr><th>Futures Pair</th><th>1-Slot Trades</th><th>Wins</th><th>Losses</th>"
+                f"<th>Win Rate</th><th>Net Profit (₹)</th><th>Portfolio ROI %</th><th>Avg ROE / Trade</th></tr></thead>"
+                f"<tbody>{''.join(_cs_rows)}</tbody>{_tfoot_html}</table></div>"
+            )
+
+        # 2. Standalone Per-Coin Backtest Table (Matches Section B of our 30-Day Report)
+        st_df = port_out.get("standalone_summary_df")
+        if st_df is not None and not st_df.empty:
+            with st.expander("📊 View Standalone Per-Coin Backtest (If Each Coin Is Traded Individually Without Sharing the 1-Slot Lock)", expanded=True):
+                st.caption(
+                    f"Each row below shows that coin's **standalone {bt_dur_label} backtest** (`₹{_used_m:,.0f}` margin @ `{_used_l}x` leverage) "
+                    f"when taking all of its own valid setups without waiting on the other 11 coins."
+                )
+                _st_rows = []
+                for _, sr in st_df.iterrows():
+                    _sp = str(sr.get("pair", ""))
+                    _str = int(sr.get("Trades", 0))
+                    _sw = int(sr.get("Wins", 0))
+                    _sl = int(sr.get("Losses", 0))
+                    _swr = float(sr.get("Win_Rate_%", 0.0))
+                    _snp = float(sr.get("Net_Profit_INR", 0.0))
+                    _sroi = float(sr.get("ROI_Pct", 0.0))
+                    _spf = float(sr.get("Profit_Factor", 0.0))
+                    _scol = "#10b981" if _snp >= 0 else "#ef4444"
+                    _ssgn = "+" if _snp >= 0 else ""
+                    _st_rows.append(
+                        f"<tr>"
+                        f"<td style='font-weight:800;'>{_sp}</td>"
+                        f"<td>{_str}</td>"
+                        f"<td style='color:#10b981;'>{_sw}</td>"
+                        f"<td style='color:#ef4444;'>{_sl}</td>"
+                        f"<td>{_swr:.1f}%</td>"
+                        f"<td style='color:{_scol};font-weight:800;'>{_ssgn}₹{_snp:,.2f} ({_ssgn}{_sroi:.2f}%)</td>"
+                        f"<td>{_spf:.2f}</td>"
+                        f"</tr>"
+                    )
+                st.html(
+                    f"<div class='pro-table-wrap'><table class='pro-table'>"
+                    f"<thead><tr><th>Futures Pair</th><th>Standalone Trades</th><th>Wins</th><th>Losses</th>"
+                    f"<th>Win Rate</th><th>Standalone Net Profit (₹ & ROI%)</th><th>Profit Factor</th></tr></thead>"
+                    f"<tbody>{''.join(_st_rows)}</tbody></table></div>"
+                )
+
+        # 3. Individual Portfolio Trades Log (Themed HTML Table)
+        with st.expander(f"📜 View Individual 1-Slot Portfolio Trades ({_tot_tr} Trades)"):
+            t_df = port_out.get("trades_df")
+            if t_df is not None and not t_df.empty:
+                _tr_rows = []
+                for _idx_t, tr_row in t_df.iterrows():
+                    _tp = str(tr_row.get("pair", ""))
+                    _td = str(tr_row.get("direction", ""))
+                    _tcol = "#10b981" if float(tr_row.get("net_pnl_inr", 0.0)) >= 0 else "#ef4444"
+                    _tsgn = "+" if float(tr_row.get("net_pnl_inr", 0.0)) >= 0 else ""
+                    _d_badge = "badge-buy" if _td in ("LONG", "BUY") else "badge-sell"
+                    _tr_rows.append(
+                        f"<tr>"
+                        f"<td>{int(_idx_t) + 1}</td>"
+                        f"<td>{tr_row.get('entry_time', '')}</td>"
+                        f"<td>{tr_row.get('exit_time', '')}</td>"
+                        f"<td style='font-weight:800;'>{_tp}</td>"
+                        f"<td><span class='{_d_badge}'>{_td}</span></td>"
+                        f"<td>{fmt_px(float(tr_row.get('entry_price', 0.0)))}</td>"
+                        f"<td>{fmt_px(float(tr_row.get('exit_price', 0.0)))}</td>"
+                        f"<td style='color:{_tcol};font-weight:700;'>{float(tr_row.get('roe_pct', 0.0)):+.2f}%</td>"
+                        f"<td style='color:{_tcol};font-weight:800;'>{_tsgn}₹{float(tr_row.get('net_pnl_inr', 0.0)):,.2f}</td>"
+                        f"<td>{tr_row.get('exit_reason', '')}</td>"
+                        f"</tr>"
+                    )
+                st.html(
+                    f"<div class='pro-table-wrap'><table class='pro-table'>"
+                    f"<thead><tr><th>#</th><th>Entry Time</th><th>Exit Time</th><th>Pair</th><th>Side</th>"
+                    f"<th>Entry</th><th>Exit</th><th>ROE %</th><th>Net PnL (₹)</th><th>Exit Reason</th></tr></thead>"
+                    f"<tbody>{''.join(_tr_rows)}</tbody></table></div>"
+                )

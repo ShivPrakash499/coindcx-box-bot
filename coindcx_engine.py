@@ -3066,14 +3066,34 @@ def run_portfolio_single_slot_backtest(
       - Strictly allows ONLY 1 active trade across the entire portfolio at any time (so 50% margin
         is always reserved for Entry 2 @ Sweep on the active coin).
       - Enforces daily discipline (max 3 portfolio trades/day; done for the day after a >=10% ROE win).
+      - Also returns `standalone_summary_df` so the user can compare the 1-Slot Shared Portfolio
+        breakdown against each coin's Standalone 30-Day Backtest.
     """
-    universe = pairs or HIGH_VOL_FUTURES_UNIVERSE
+    universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
     all_candidates = []
+    standalone_rows = []
     for rank, p in enumerate(universe):
         res = run_strategy_backtest(
             pair=p, duration_days=duration_days, interval="15m",
             margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr, strategy_id=strategy_id
         )
+        st_tot = int(res.get("total_trades", 0) or 0)
+        st_wins = int(res.get("win_count", 0) or 0)
+        st_losses = int(res.get("loss_count", 0) or 0)
+        st_wr = float(res.get("win_rate_pct", 0.0) or 0.0)
+        st_net = round(float(res.get("net_profit_inr", 0.0) or 0.0), 2)
+        st_roi = round((st_net / margin_inr) * 100.0, 2) if margin_inr > 0 else 0.0
+        st_pf = float(res.get("profit_factor", 0.0) or 0.0)
+        standalone_rows.append({
+            "pair": p,
+            "Trades": st_tot,
+            "Wins": st_wins,
+            "Losses": st_losses,
+            "Win_Rate_%": round(st_wr, 1),
+            "Net_Profit_INR": st_net,
+            "ROI_Pct": st_roi,
+            "Profit_Factor": round(st_pf, 2),
+        })
         tdf = res.get("trades_df")
         if tdf is not None and not tdf.empty:
             for _, row in tdf.iterrows():
@@ -3081,11 +3101,16 @@ def run_portfolio_single_slot_backtest(
                 d["vol_rank"] = rank
                 all_candidates.append(d)
 
+    standalone_df = pd.DataFrame(standalone_rows)
+    if not standalone_df.empty:
+        standalone_df = standalone_df.sort_values(by="Net_Profit_INR", ascending=False).reset_index(drop=True)
+
     if not all_candidates:
         return {
             "total_trades": 0, "win_count": 0, "loss_count": 0, "win_rate_pct": 0.0,
             "net_profit_inr": 0.0, "total_roi_pct": 0.0, "profit_factor": 0.0,
-            "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(), "coin_Summary_df": pd.DataFrame(),
+            "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(),
+            "coin_summary_df": pd.DataFrame(), "standalone_summary_df": standalone_df,
         }
 
     df_all = pd.DataFrame(all_candidates).sort_values(by=["entry_time", "vol_rank"]).reset_index(drop=True)
@@ -3125,13 +3150,30 @@ def run_portfolio_single_slot_backtest(
         pdf.groupby("pair", as_index=False)
         .agg(
             Trades=("is_win", "count"),
-            Wins=("is_win", "sum"),
+            Wins=("is_win", lambda s: int(s.sum())),
             Net_Profit_INR=("net_pnl_inr", lambda s: round(float(s.sum()), 2)),
             Avg_ROE_Pct=("roe_pct", lambda s: round(float(s.mean()), 2)),
         )
-        .sort_values(by="Net_Profit_INR", ascending=False)
     )
-    coin_grp["Win_Rate_%"] = (coin_grp["Wins"] / coin_grp["Trades"] * 100.0).round(1)
+    # Ensure all pairs in universe are represented so no coin is silently omitted
+    existing_pairs = set(coin_grp["pair"].tolist()) if not coin_grp.empty else set()
+    missing_rows = [
+        {"pair": p, "Trades": 0, "Wins": 0, "Net_Profit_INR": 0.0, "Avg_ROE_Pct": 0.0}
+        for p in universe if p not in existing_pairs
+    ]
+    if missing_rows:
+        coin_grp = pd.concat([coin_grp, pd.DataFrame(missing_rows)], ignore_index=True)
+
+    coin_grp["Losses"] = (coin_grp["Trades"] - coin_grp["Wins"]).astype(int)
+    coin_grp["Win_Rate_%"] = coin_grp.apply(
+        lambda r: round((float(r["Wins"]) / float(r["Trades"])) * 100.0, 1) if r["Trades"] > 0 else 0.0,
+        axis=1,
+    )
+    coin_grp["ROI_Pct"] = coin_grp["Net_Profit_INR"].apply(
+        lambda x: round((float(x) / margin_inr) * 100.0, 2) if margin_inr > 0 else 0.0
+    )
+    coin_grp = coin_grp.sort_values(by=["Net_Profit_INR", "Trades"], ascending=[False, False]).reset_index(drop=True)
+    coin_grp = coin_grp[["pair", "Trades", "Wins", "Losses", "Win_Rate_%", "Net_Profit_INR", "ROI_Pct", "Avg_ROE_Pct"]]
 
     return {
         "total_trades": tot,
@@ -3146,6 +3188,10 @@ def run_portfolio_single_slot_backtest(
         "total_gross_loss": round(gl, 2),
         "trades_df": pdf,
         "coin_summary_df": coin_grp,
+        "standalone_summary_df": standalone_df,
+        "margin_inr": margin_inr,
+        "leverage": leverage,
+        "duration_days": duration_days,
     }
 
 
