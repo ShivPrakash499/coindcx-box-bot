@@ -837,13 +837,76 @@ st.markdown(f"""
         border-radius: 8px;
         padding: 8px 10px !important;
     }}
-    div[data-testid="stMetricLabel"] > div {{
-        font-size: 0.76rem !important;
-        color: {subtext_color} !important;
+    div[data-testid="stMetricLabel"],
+    div[data-testid="stMetricLabel"] > div,
+    div[data-testid="stMetricLabel"] p,
+    div[data-testid="stMetricLabel"] span {{
+        font-size: 0.78rem !important;
+        font-weight: 600 !important;
+        color: {'#475569' if is_light_theme else '#cbd5e1'} !important;
     }}
-    div[data-testid="stMetricValue"] > div {{
-        font-size: 1.05rem !important;
+    div[data-testid="stMetricValue"],
+    div[data-testid="stMetricValue"] > div,
+    div[data-testid="stMetricValue"] p,
+    div[data-testid="stMetricValue"] span {{
+        font-size: 1.08rem !important;
+        font-weight: 800 !important;
+        color: {text_color} !important;
+    }}
+
+    /* High-contrast text for all Radio Buttons (Nav, Timeframes 1m/5m/15m/1h/4h/1d, Tickets) */
+    div[role="radiogroup"] label,
+    div[role="radiogroup"] label p,
+    div[role="radiogroup"] label span,
+    div[data-baseweb="radio"] div,
+    div[data-baseweb="radio"] p,
+    div[data-baseweb="radio"] span {{
+        color: {text_color} !important;
         font-weight: 700 !important;
+    }}
+    div[role="radiogroup"] > label {{
+        background: {nav_bg} !important;
+        border: 1px solid {card_border} !important;
+        border-radius: 8px !important;
+        padding: 5px 10px !important;
+        margin-right: 4px !important;
+    }}
+    div[role="radiogroup"] > label:has(input:checked) {{
+        background: {nav_active_bg} !important;
+        border-color: #3b82f6 !important;
+    }}
+    div[role="radiogroup"] > label:has(input:checked) p,
+    div[role="radiogroup"] > label:has(input:checked) span {{
+        color: #ffffff !important;
+    }}
+
+    /* High-contrast text for all Widget Labels, Markdown, Captions, Expanders, Selectboxes & Inputs */
+    div[data-testid="stWidgetLabel"] p,
+    div[data-testid="stWidgetLabel"] label,
+    div[data-testid="stMarkdownContainer"] p,
+    div[data-testid="stMarkdownContainer"] li,
+    div[data-testid="stMarkdownContainer"] h1,
+    div[data-testid="stMarkdownContainer"] h2,
+    div[data-testid="stMarkdownContainer"] h3,
+    div[data-testid="stMarkdownContainer"] h4,
+    div[data-testid="stCaptionContainer"],
+    div[data-testid="stCaptionContainer"] p,
+    div[data-testid="stExpander"] summary p,
+    div[data-testid="stExpander"] summary span {{
+        color: {text_color} !important;
+    }}
+    div[data-baseweb="select"] > div,
+    div[data-baseweb="input"],
+    div[data-baseweb="base-input"] {{
+        background-color: {nav_bg} !important;
+        color: {text_color} !important;
+        border-color: {card_border} !important;
+    }}
+    div[data-baseweb="select"] span,
+    div[data-baseweb="select"] div,
+    div[data-baseweb="input"] input {{
+        color: {text_color} !important;
+        -webkit-text-fill-color: {text_color} !important;
     }}
 
     /* =========================================================================
@@ -1779,13 +1842,13 @@ elif active_section == "📊 Positions":
             live_px=mark_p,
             levels=pos_box_levels,
         )
-        tp1 = float(plan.get("tp1") or pos_norm["tp1"])
-        tp2 = float(cur_tp or plan.get("tp2") or pos_norm["tp2"])
-        e2_target = float(plan.get("entry2_sweep") or pos_norm["entry2_sweep"])
-        sl_target = float(cur_sl or plan.get("sl") or pos_norm["stop_loss"])
+        tp1 = float(pos_norm["tp1"])
+        tp2 = float(pos_norm["tp2"])
+        e2_target = float(pos_norm["entry2_sweep"])
+        sl_target = float(pos_norm["stop_loss"])
 
-        # Auto-sync missing TP2, SL, TP1 Limit & Entry 2 Limit onto active CoinDCX position once per session
-        if (not cur_sl or not cur_tp) and pid not in auto_synced_pids:
+        # Auto-sync missing or un-upgraded TP2, SL, TP1 Limit & Entry 2 Limit onto active CoinDCX position once per session
+        if pid not in auto_synced_pids:
             auto_synced_pids.add(pid)
             s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                 pair=pr,
@@ -1828,11 +1891,11 @@ elif active_section == "📊 Positions":
                 unsafe_allow_html=True
             )
             m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Entry 1 / Mark", f"{fmt_px(entry_p)} / {fmt_px(mark_p)}")
+            m1.metric("Entry 1 (Mark)", fmt_px(entry_p), f"Mark {mark_p:g}")
             m2.metric("Entry 2 (Sweep)", fmt_px(e2_target))
-            m3.metric("Current SL", fmt_px(float(cur_sl)) if cur_sl else "Not set")
-            m4.metric("TP1 (50% Limit)", fmt_px(tp1) if tp1 else "—")
-            m5.metric("TP2 (Position TP)", fmt_px(float(cur_tp)) if cur_tp else fmt_px(tp2))
+            m3.metric("Current SL", fmt_px(float(cur_sl)) if cur_sl else fmt_px(sl_target))
+            m4.metric("TP1 (50% Limit)", fmt_px(tp1))
+            m5.metric("TP2 (Position TP)", fmt_px(tp2))
             st.caption(f"{ratchet} • Liq: {fmt_px(float(p.get('liquidation_price', 0) or 0))} • Margin: ₹{float(p.get('locked_margin_inr', 0) or 0):,.0f}")
 
             b1, b2, b3, b4 = st.columns(4)

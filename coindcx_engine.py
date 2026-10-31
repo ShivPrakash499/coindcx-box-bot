@@ -1209,54 +1209,107 @@ def calculate_trade_costs_and_safe_tp(direction="BUY", entry_price=0.0, margin_i
 
 def fetch_coindcx_candles(pair="B-ETH_USDT", interval="15m", limit=100, sync_live_price=True):
     """
-    Fetches historical candlestick data for any timeframe (1m, 5m, 15m, 1h, 4h, 1d)
-    from CoinDCX / Binance public APIs. Guarantees ascending order and syncs with live price.
+    Fetches historical candlestick data for any timeframe (1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d)
+    from CoinDCX Futures Candlesticks API (`pcode=f`), CoinDCX Public Candles API, and
+    Binance Vision / Binance public APIs. Guarantees ascending order and syncs with live price.
     """
     df = pd.DataFrame()
-    intv = interval.lower()
+    intv = str(interval).lower().strip()
+    lim = max(10, int(limit or 100))
 
-    # 1. Try CoinDCX Public API
-    url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={intv}&limit={limit}"
-    try:
-        response = requests.get(url, timeout=8)
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, list) and len(data) > 0:
-                raw_df = pd.DataFrame(data)
-                if 'time' in raw_df.columns:
-                    raw_df = raw_df.rename(columns={'time': 'timestamp'})
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    if col in raw_df.columns:
-                        raw_df[col] = raw_df[col].astype(float)
-                if 'timestamp' in raw_df.columns:
-                    raw_df['timestamp'] = pd.to_numeric(raw_df['timestamp'], errors='coerce')
-                    if len(raw_df) > 0 and raw_df['timestamp'].iloc[0] < 1e11:
-                        raw_df['timestamp'] = raw_df['timestamp'] * 1000
-                    df = raw_df.sort_values('timestamp').reset_index(drop=True)
-                    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-    except Exception as e:
-        print(f"[CoinDCX Candles Notice]: {e}. Attempting Binance fallback...")
+    intv_minutes_map = {
+        "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
+    }
+    dcx_res_map = {
+        "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+        "1h": "60", "2h": "120", "4h": "240", "6h": "360", "1d": "1D",
+    }
 
-    # 2. Fallback to Binance Public API
-    if df.empty:
+    # 1. Primary: CoinDCX Native Futures Candlesticks API (supports 1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d!)
+    if intv in dcx_res_map:
         try:
-            clean_pair = pair.replace("B-", "").replace("I-", "").replace("_", "")
-            url_binance = f"https://api.binance.com/api/v3/klines?symbol={clean_pair}&interval={intv}&limit={limit}"
-            r = requests.get(url_binance, timeout=8).json()
-            if isinstance(r, list) and len(r) > 0 and isinstance(r[0], list):
-                b_df = pd.DataFrame(r, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-                ])
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    b_df[col] = b_df[col].astype(float)
-                b_df['timestamp'] = pd.to_numeric(b_df['timestamp'], errors='coerce')
-                df = b_df.sort_values('timestamp').reset_index(drop=True)
-                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            now_sec = int(time.time())
+            mins = intv_minutes_map.get(intv, 15)
+            from_sec = now_sec - int((lim + 15) * mins * 60)
+            r_fut = requests.get(
+                "https://public.coindcx.com/market_data/candlesticks",
+                params={
+                    "pair": pair,
+                    "from": from_sec,
+                    "to": now_sec,
+                    "resolution": dcx_res_map[intv],
+                    "pcode": "f",
+                },
+                timeout=7,
+            )
+            if r_fut.status_code == 200:
+                payload = r_fut.json()
+                data = payload.get("data", []) if isinstance(payload, dict) else []
+                if isinstance(data, list) and len(data) > 0:
+                    raw_df = pd.DataFrame(data)
+                    if "time" in raw_df.columns:
+                        raw_df = raw_df.rename(columns={"time": "timestamp"})
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        if col in raw_df.columns:
+                            raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").astype(float)
+                    if "timestamp" in raw_df.columns:
+                        raw_df["timestamp"] = pd.to_numeric(raw_df["timestamp"], errors="coerce")
+                        if len(raw_df) > 0 and raw_df["timestamp"].iloc[0] < 1e11:
+                            raw_df["timestamp"] = raw_df["timestamp"] * 1000
+                        raw_df = raw_df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+                        df = raw_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).tail(lim).reset_index(drop=True)
+                        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
         except Exception as e:
-            print(f"[Binance Fallback Error]: {e}")
+            print(f"[CoinDCX Futures Candlesticks Notice ({pair} {intv})]: {e}")
 
-    # 3. Synchronize the active (last) candle's close with the real-time ticker
+    # 2. Secondary: CoinDCX Public Market Data Candles API (supports [1m, 15m, 1h, 1d])
+    if df.empty and intv in ("1m", "15m", "1h", "1d"):
+        url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={intv}&limit={lim}"
+        try:
+            response = requests.get(url, timeout=7)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    raw_df = pd.DataFrame(data)
+                    if 'time' in raw_df.columns:
+                        raw_df = raw_df.rename(columns={'time': 'timestamp'})
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        if col in raw_df.columns:
+                            raw_df[col] = raw_df[col].astype(float)
+                    if 'timestamp' in raw_df.columns:
+                        raw_df['timestamp'] = pd.to_numeric(raw_df['timestamp'], errors='coerce')
+                        if len(raw_df) > 0 and raw_df['timestamp'].iloc[0] < 1e11:
+                            raw_df['timestamp'] = raw_df['timestamp'] * 1000
+                        df = raw_df.sort_values('timestamp').reset_index(drop=True)
+                        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        except Exception as e:
+            print(f"[CoinDCX Candles Notice]: {e}")
+
+    # 3. Fallback to Binance Vision (US-accessible global mirror) & Binance Public API
+    if df.empty:
+        clean_pair = pair.replace("B-", "").replace("I-", "").replace("_", "")
+        for base_host in ("https://data-api.binance.vision", "https://api.binance.com"):
+            try:
+                url_binance = f"{base_host}/api/v3/klines?symbol={clean_pair}&interval={intv}&limit={lim}"
+                resp_b = requests.get(url_binance, timeout=7)
+                if resp_b.status_code == 200:
+                    r = resp_b.json()
+                    if isinstance(r, list) and len(r) > 0 and isinstance(r[0], list):
+                        b_df = pd.DataFrame(r, columns=[
+                            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+                        ])
+                        for col in ['open', 'high', 'low', 'close', 'volume']:
+                            b_df[col] = b_df[col].astype(float)
+                        b_df['timestamp'] = pd.to_numeric(b_df['timestamp'], errors='coerce')
+                        df = b_df.sort_values('timestamp').reset_index(drop=True)
+                        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                        break
+            except Exception as e:
+                print(f"[Binance Fallback Error ({base_host})]: {e}")
+
+    # 4. Synchronize the active (last) candle's close with the real-time ticker
     if sync_live_price and not df.empty:
         try:
             ticker = fetch_live_ticker(pair)
@@ -1317,9 +1370,9 @@ def fetch_historical_candles_paginated(
     batch_size = 1000
     batches_needed = (total_candles_needed + batch_size - 1) // batch_size
 
-    # Multi-batch fetching loop
+    # Multi-batch fetching loop (uses US-accessible data-api.binance.vision first, then api.binance.com)
     for b_idx in range(batches_needed):
-        url = f"https://api.binance.com/api/v3/klines?symbol={clean_pair}&interval={interval}&limit={batch_size}"
+        url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_pair}&interval={interval}&limit={batch_size}"
         if end_time:
             url += f"&endTime={end_time}"
 
@@ -1600,15 +1653,15 @@ def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> di
             if d_close < ema50 and d_close < ema200:
                 out["bias"] = "BEARISH"
                 out["score"] = -2
-                out["reasons"].append(f"Daily Price (${d_close:,.2f}) < 50 EMA (${ema50:,.2f}) & < 200 EMA (${ema200:,.2f}) → SHORT setups only")
+                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) < 50 EMA (`${ema50:,.2f}`) & < 200 EMA (`${ema200:,.2f}`) → SHORT setups only")
             elif d_close > ema50 and d_close > ema200:
                 out["bias"] = "BULLISH"
                 out["score"] = 2
-                out["reasons"].append(f"Daily Price (${d_close:,.2f}) > 50 EMA (${ema50:,.2f}) & > 200 EMA (${ema200:,.2f}) → LONG setups only")
+                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) > 50 EMA (`${ema50:,.2f}`) & > 200 EMA (`${ema200:,.2f}`) → LONG setups only")
             else:
                 out["bias"] = "NEUTRAL / RANGE"
                 out["score"] = 0
-                out["reasons"].append(f"Daily Price (${d_close:,.2f}) is between 50 EMA (${ema50:,.2f}) & 200 EMA (${ema200:,.2f}) → Range Mode (Both RH & RL Box Edges Active)")
+                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) is between 50 EMA (`${ema50:,.2f}`) & 200 EMA (`${ema200:,.2f}`) → Range Mode (Both RH & RL Box Edges Active)")
     except Exception as e:
         out["reasons"].append(f"Bias unavailable: {e}")
     return out
@@ -2860,6 +2913,23 @@ def get_active_portfolio_trade_status() -> dict:
             "source": lock.get("mode", "App/API Active Trade Lock"),
             "count": 1,
         }
+
+    # Fallback: if local lock file was cleared or container restarted, check live CoinDCX active positions directly
+    try:
+        live_pos = fetch_coindcx_active_positions() or []
+        if live_pos:
+            first_p = live_pos[0]
+            return {
+                "is_occupied": True,
+                "active_pair": first_p.get("pair"),
+                "active_direction": first_p.get("direction", "LONG"),
+                "entry_price": float(first_p.get("entry_price", 0.0) or 0.0),
+                "stop_loss": float(first_p.get("stop_loss", 0.0) or 0.0),
+                "source": "CoinDCX Live Active Position",
+                "count": len(live_pos),
+            }
+    except Exception:
+        pass
 
     return {"is_occupied": False, "active_pair": None, "source": "Slot Free (0/1 App Trades Active)"}
 
