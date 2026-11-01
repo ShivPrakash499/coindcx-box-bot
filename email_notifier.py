@@ -24,14 +24,18 @@ IST = pytz.timezone("Asia/Kolkata")
 
 
 def _cfg(name: str, default: str = "") -> str:
-    """Streamlit secrets first (cloud), then environment / .env."""
+    """Streamlit secrets first (cloud, top-level or nested), then environment / .env."""
     try:
         import streamlit as st  # noqa: WPS433
-        if hasattr(st, "secrets") and name in st.secrets:
-            return str(st.secrets[name]).strip()
+        if hasattr(st, "secrets"):
+            if name in st.secrets:
+                return str(st.secrets[name]).strip().strip('"').strip("'")
+            for sec_v in st.secrets.values():
+                if hasattr(sec_v, "get") and name in sec_v:
+                    return str(sec_v[name]).strip().strip('"').strip("'")
     except Exception:
         pass
-    return os.getenv(name, default).strip()
+    return os.getenv(name, default).strip().strip('"').strip("'")
 
 
 def short_name(pair: str) -> str:
@@ -81,22 +85,20 @@ def _send(subject: str, html: str, text: str) -> tuple[bool, str]:
             server.login(cfg["sender"], cfg["password"])
             server.sendmail(cfg["sender"], [cfg["receiver"]], msg.as_string())
         return True, f"Email alert sent successfully to {cfg['receiver']}"
-    except (smtplib.SMTPAuthenticationError, smtplib.SMTPResponseException) as e:
+    except smtplib.SMTPAuthenticationError as e:
         err_msg = str(e)
         if "534" in err_msg or "Application-specific" in err_msg or "InvalidSecondFactor" in err_msg or not cfg["is_app_password"]:
             return False, f"Gmail rejected login: {app_pwd_hint}"
         return False, f"Gmail authentication error: {err_msg} {app_pwd_hint}"
-    except smtplib.SMTPServerDisconnected:
-        # Fallback to Port 465 SSL
+    except Exception as e_587:
+        # Attempt 2: Automatic fallback to Port 465 SSL if Port 587 timed out or disconnected
         try:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=12) as server:
                 server.login(cfg["sender"], cfg["password"])
                 server.sendmail(cfg["sender"], [cfg["receiver"]], msg.as_string())
             return True, f"Email alert sent successfully to {cfg['receiver']} via SSL"
         except Exception as e_ssl:
-            return False, f"Gmail connection closed. If using normal account password, Google blocks it: {app_pwd_hint}"
-    except Exception as e:
-        return False, f"Failed to send email ({type(e).__name__}): {e}"
+            return False, f"Failed to send email (587: {e_587} | 465: {e_ssl})"
 
 
 def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2: float,

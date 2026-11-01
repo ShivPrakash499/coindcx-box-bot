@@ -2403,11 +2403,12 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
 def get_autotrade_config() -> dict:
     """
     Loads persistent AutoTrade & Single-Trade Margin settings shared between the Streamlit UI
-    and the 24/7 background monitor daemon.
+    and the 24/7 background monitor daemon. Defaults AutoTrade to ON (True) with ₹20,000
+    Single-Trade Margin so a git push / cloud restart never disables AutoTrade.
     """
     default_cfg = {
-        "enabled": False,
-        "single_trade_margin_inr": float(get_rotational_margin_inr(leverage=10)["margin_inr"]),
+        "enabled": os.getenv("AUTOTRADE_ENABLED", "true").lower() in ("true", "1", "yes"),
+        "single_trade_margin_inr": float(os.getenv("SINGLE_TRADE_MARGIN_INR", 20000.0)),
         "leverage": 10,
         "one_crypto_at_a_time": True,
         "high_vol_scan_enabled": True,
@@ -2847,33 +2848,35 @@ def get_active_portfolio_trade_status() -> dict:
                 return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
 
             matched_live_pos = None
-            if is_live_ex:
-                live_positions = fetch_coindcx_active_positions()
-                if live_positions is not None:
-                    matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
-                    if matched_live_pos and matched_live_pos.get("id"):
-                        if matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None:
-                            norm_lvls = normalize_two_entry_runner_levels(
-                                pair=l_pair,
-                                direction=l_dir,
-                                entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
-                                entry2_px=l_entry2,
-                                tp1_px=l_tp1,
-                                tp2_px=l_tp2,
-                                sl_px=l_sl,
-                                live_px=float(matched_live_pos.get("mark_price") or l_entry),
-                            )
-                            l_tp2 = norm_lvls["tp2"]
-                            if not tp1_already_hit:
-                                l_sl = norm_lvls["stop_loss"]
-                            lock["tp2"] = l_tp2
-                            lock["stop_loss"] = l_sl
-                            save_autotrade_config({"active_trade_lock": lock})
-                            update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_sl, pair=l_pair)
-                    elif l_ts > 0 and (time.time() - l_ts) >= 60 and fetch_coindcx_futures_balance().get("is_live_api"):
+            live_positions = fetch_coindcx_active_positions()
+            if live_positions is not None:
+                matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
+                if matched_live_pos and matched_live_pos.get("id"):
+                    is_live_ex = True
+                    lock["is_live_exchange"] = True
+                    if matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None:
+                        norm_lvls = normalize_two_entry_runner_levels(
+                            pair=l_pair,
+                            direction=l_dir,
+                            entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
+                            entry2_px=l_entry2,
+                            tp1_px=l_tp1,
+                            tp2_px=l_tp2,
+                            sl_px=l_sl,
+                            live_px=float(matched_live_pos.get("mark_price") or l_entry),
+                        )
+                        l_tp2 = norm_lvls["tp2"]
+                        if not tp1_already_hit:
+                            l_sl = norm_lvls["stop_loss"]
+                        lock["tp2"] = l_tp2
+                        lock["stop_loss"] = l_sl
+                        save_autotrade_config({"active_trade_lock": lock})
+                        update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_sl, pair=l_pair)
+                elif l_ts > 0 and (time.time() - l_ts) >= 45 and fetch_coindcx_futures_balance().get("is_live_api"):
+                    if is_live_ex:
                         cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
-                        clear_autotrade_active_lock()
-                        return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
+                    clear_autotrade_active_lock()
+                    return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
 
             if l_ts > 0 and (time.time() - l_ts) >= 15:
                 tk = fetch_live_ticker(l_pair)
@@ -3109,6 +3112,16 @@ def execute_autotrade_two_entry_signal(
     tp2_px = norm["tp2"]
     sl_px = norm["stop_loss"]
 
+    wallet = fetch_coindcx_futures_balance()
+    api_key_now, api_secret_now = _get_coindcx_credentials()
+    has_live_creds = bool(api_key_now and api_secret_now)
+
+    # Cap total 2-entry margin to 95% of live available futures wallet balance if configured margin exceeds free balance
+    if wallet.get("is_live_api"):
+        avail_inr = float(wallet.get("available_inr", 0.0) or 0.0)
+        if avail_inr >= 2500.0 and margin_inr > avail_inr * 0.95:
+            margin_inr = round(avail_inr * 0.95, 2)
+
     # Split single-trade margin 50% for Entry 1 and 50% for Entry 2 @ Sweep
     tranche_margin_inr = margin_inr * 0.5
     tranche_notional_usd = (tranche_margin_inr * lev) / u_inr
@@ -3121,10 +3134,6 @@ def execute_autotrade_two_entry_signal(
 
     # 50% of Entry 1 quantity to book at TP1 (remaining 50% of Entry 1 rides to TP2)
     qty1_tp1_half = format_order_quantity(pair, qty1 * 0.5)
-
-    wallet = fetch_coindcx_futures_balance()
-    api_key_now, api_secret_now = _get_coindcx_credentials()
-    has_live_creds = bool(api_key_now and api_secret_now)
 
     if wallet.get("is_live_api") or has_live_creds:
         # Leg 1: Entry 1 (50% Margin = qty1) with CoinDCX's single native Position TP = TP2 (Runner) & SL = Catastrophe SL

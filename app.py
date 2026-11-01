@@ -14,14 +14,21 @@ if CURRENT_DIR not in sys.path:
 
 import streamlit as st
 
-# Sync Streamlit Cloud secrets into os.environ BEFORE backend modules initialize
-try:
-    if hasattr(st, "secrets"):
-        for _sec_k, _sec_v in st.secrets.items():
-            if isinstance(_sec_v, (str, int, float, bool)):
-                os.environ[str(_sec_k)] = str(_sec_v)
-except Exception:
-    pass
+def _sync_secrets_to_env():
+    """Sync Streamlit Cloud secrets (both top-level and nested sections) into os.environ."""
+    try:
+        if hasattr(st, "secrets"):
+            for _sec_k, _sec_v in st.secrets.items():
+                if isinstance(_sec_v, (str, int, float, bool)):
+                    os.environ[str(_sec_k)] = str(_sec_v).strip().strip('"').strip("'")
+                elif hasattr(_sec_v, "items"):
+                    for _sub_k, _sub_v in _sec_v.items():
+                        if isinstance(_sub_v, (str, int, float, bool)):
+                            os.environ[str(_sub_k)] = str(_sub_v).strip().strip('"').strip("'")
+    except Exception:
+        pass
+
+_sync_secrets_to_env()
 
 import pandas as pd
 import pytz
@@ -180,24 +187,26 @@ def _ensure_background_monitor():
     def _monitor_worker():
         while True:
             try:
-                if signal_monitor:
-                    auto_cfg = coindcx_engine.get_autotrade_config()
-                    rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
-                    m_inr = float(auto_cfg.get("single_trade_margin_inr") or rot.get("margin_inr", 100000.0))
+                _sync_secrets_to_env()
+                import coindcx_engine as _eng_live
+                import signal_monitor as _mon_live
+                if _mon_live:
+                    auto_cfg = _eng_live.get_autotrade_config()
+                    m_inr = float(auto_cfg.get("single_trade_margin_inr") or 20000.0)
                     lev = int(auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
-                    u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
-                    watch_pairs = coindcx_engine.get_high_volatility_watchlist(top_n=12)
+                    u_inr = float(_eng_live.get_coindcx_live_usdt_inr_rate())
+                    watch_pairs = _eng_live.get_high_volatility_watchlist(top_n=12)
                     _safe_scan_and_alert(
                         pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
                         usd_inr=u_inr,
                         send=True,
-                        autotrade=bool(auto_cfg.get("enabled", False)),
+                        autotrade=bool(auto_cfg.get("enabled", True)),
                     )
             except Exception as e:
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
-            time.sleep(60)
+            time.sleep(30)
 
     th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
     th.start()
@@ -304,7 +313,7 @@ def get_cached_strategy_plan(strategy_id, pair, live_px, m_inr, lev, u_inr):
 def get_cached_top_movers(watch_tuple: tuple, top_n: int = 6):
     return coindcx_engine.fetch_top_volatility_movers(list(watch_tuple), top_n=top_n)
 
-@st.cache_data(ttl=45)
+@st.cache_data(ttl=30)
 def get_cached_signals_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: float, strat_tuple: tuple, auto_send: bool, auto_trade: bool):
     return _safe_scan_and_alert(
         list(watch_tuple), m_inr, lev, u_inr,
@@ -526,7 +535,7 @@ if not wallet_data.get("is_live_api"):
 _rot = get_rotational_margin_inr(leverage=10)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
 if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
-    default_margin = float(wallet_data["total_inr"])
+    default_margin = 20000.0
 else:
     default_margin = _saved_margin
 
@@ -550,11 +559,11 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (1-Slot)")
 autotrade_on = st.sidebar.toggle(
     "Enable AutoTrade (10x 2-Entry)",
-    value=bool(_auto_cfg.get("enabled", False)),
+    value=bool(_auto_cfg.get("enabled", True)),
     key="sidebar_autotrade_toggle",
 )
 if (
-    autotrade_on != bool(_auto_cfg.get("enabled", False))
+    autotrade_on != bool(_auto_cfg.get("enabled", True))
     or round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
 ):
@@ -1142,12 +1151,20 @@ with st.container(key="quick_asset_bar"):
                 use_container_width=True,
             )
 
-# Single Unified Live Header Fragment (Live Price + Selected Asset PnL + 10s V2 Lifecycle Ratchet)
+# Single Unified Live Header Fragment (Live Price + Selected Asset PnL + 10s V2 Lifecycle Ratchet + 30s Auto-Scan)
 @st.fragment(run_every="10s")
 def render_unified_live_header(pair: str):
-    # Run the V2 3-Rule lifecycle check every 10s so TP1 BE/Profit Lock, TP1-Candle E2 & 50% TP1-TP2 Ratchet fire in real time
+    # 1. Run the V2 3-Rule lifecycle check every 10s so TP1 BE/Profit Lock, TP1-Candle E2 & 50% TP1-TP2 Ratchet fire in real time
     try:
         coindcx_engine.get_active_portfolio_trade_status()
+    except Exception:
+        pass
+    # 2. Trigger cached 30s watchlist signal scan across all tabs so Email Alerts & AutoTrade fire even when viewing Positions/Backtest/Chart
+    try:
+        if signal_monitor and (monitor_on or autotrade_on):
+            _watch_t = tuple(monitor_pairs or coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
+            _strat_t = tuple(monitor_strategy_ids or [s.id for s in strategy_registry.list_strategies()])
+            get_cached_signals_scan(_watch_t, float(margin_inr), int(leverage), float(usd_inr), _strat_t, bool(monitor_on), bool(autotrade_on))
     except Exception:
         pass
     sym = clean_sym(pair)

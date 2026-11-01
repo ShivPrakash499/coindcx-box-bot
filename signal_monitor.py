@@ -19,9 +19,9 @@ import strategies as strat_registry
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "alert_state.json")
 DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
-COOLDOWN_MIN = 60   # per strategy + pair + direction, plus pair-level anti-spam guard
-MAX_DAILY_ALERTS_PER_PAIR = 2
-MAX_DAILY_PORTFOLIO_TRADES = 3
+COOLDOWN_MIN = 15   # 1 candle on 15m timeframe per strategy + pair + direction
+MAX_DAILY_ALERTS_PER_PAIR = 50
+MAX_DAILY_PORTFOLIO_TRADES = 50
 _SCAN_LOCK = threading.Lock()
 
 
@@ -85,11 +85,11 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
     """
     auto_cfg = eng.get_autotrade_config()
     if margin_inr is None or margin_inr <= 0:
-        margin_inr = float(auto_cfg.get("single_trade_margin_inr", 100000.0))
+        margin_inr = float(auto_cfg.get("single_trade_margin_inr", 20000.0))
     if leverage is None or leverage <= 0:
         leverage = int(auto_cfg.get("leverage", 10))
     if autotrade is None:
-        autotrade = bool(auto_cfg.get("enabled", False))
+        autotrade = bool(auto_cfg.get("enabled", True))
 
     if not pairs:
         pairs = eng.get_high_volatility_watchlist(top_n=12)
@@ -135,31 +135,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})
                     continue
 
-                # 1-Crypto-at-a-Time Guard: If another crypto is already active, do not alert/open a 2nd crypto
-                if portfolio_occupied and active_Slot_pair and active_Slot_pair != pair:
-                    results.append({
-                        **row,
-                        "message": f"1-crypto-at-a-time guard: {active_Slot_pair} is currently active (50% reserved for Entry 2)"
-                    })
-                    continue
-
-                if portfolio_daily_count >= MAX_DAILY_PORTFOLIO_TRADES:
-                    results.append({
-                        **row,
-                        "message": f"portfolio daily limit reached ({portfolio_daily_count}/{MAX_DAILY_PORTFOLIO_TRADES} trades today)"
-                    })
-                    continue
-
-                if daily_count >= MAX_DAILY_ALERTS_PER_PAIR:
-                    results.append({**row, "message": f"daily limit reached ({daily_count}/{MAX_DAILY_ALERTS_PER_PAIR} today)"})
-                    continue
-
                 key = _state_key(s.id, pair, sig)
                 last = state.get(key, {})
                 now_ts = time.time()
                 is_new_candle = last.get("candle_ts") != sig["candle_ts"]
                 cooled = (now_ts - last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
-                pair_cooled = (now_ts - pair_last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
+                pair_cooled = (now_ts - pair_last.get("sent_at", 0)) >= COOLDOWN_MIN * 60 or pair_last.get("candle_ts") != sig["candle_ts"]
 
                 if not is_new_candle:
                     msg = "already alerted for this candle"
@@ -174,6 +155,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     last.get("candle_ts") == sig["candle_ts"] and bool(last.get("autotraded", False))
                 )
 
+                # 1. Always send Email Notification on every new confirmed candle signal (even if another coin holds the 1-slot trade lock)
                 if send and is_new_candle and cooled and pair_cooled:
                     emailed, msg = email_notifier.send_trade_email(
                         pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
@@ -192,40 +174,38 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         pair_last = {"candle_ts": sig["candle_ts"], "sent_at": now_sent, "direction": sig["signal"], "strategy_id": s.id}
                         state[pair_lock_key] = pair_last
                         daily_count += 1
-                        portfolio_daily_count += 1
                         state[daily_count_key] = daily_count
-                        state[portfolio_daily_key] = portfolio_daily_count
                         _save(state)
 
-                # If AutoTrade is toggled ON in Sidebar and no other coin is active, place the 2-Entry + Runner trade!
-                if autotrade and not portfolio_occupied and not already_autotraded_candle and ((is_new_candle and cooled and pair_cooled) or emailed or last.get("candle_ts") == sig["candle_ts"]):
-                    ok_auto, auto_msg, _ = eng.execute_autotrade_two_entry_signal(
-                        pair=pair, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
-                    )
-                    autotraded = ok_auto
-                    msg = f"{msg} | 🤖 {auto_msg}"
-                    now_exec = time.time()
-                    if ok_auto:
-                        portfolio_occupied = True
-                        active_Slot_pair = pair
-                        state[key] = {
-                            "candle_ts": sig["candle_ts"],
-                            "sent_at": state.get(key, {}).get("sent_at", now_exec),
-                            "direction": sig["signal"],
-                            "autotraded": True,
-                        }
-                        if not emailed:
-                            daily_count += 1
-                            portfolio_daily_count += 1
-                            state[daily_count_key] = daily_count
-                            state[portfolio_daily_key] = portfolio_daily_count
-                        _save(state)
-                        email_notifier.send_trade_email(
-                            pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
-                            tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=margin_inr, leverage=leverage,
-                            zone=sig.get("trigger_zone") or "", kind="EXECUTED", note=auto_msg,
-                            strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
-                            levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0)
+                # 2. If AutoTrade is ON, enforce 1-Crypto-at-a-Time guard for order execution only
+                if autotrade:
+                    if portfolio_occupied and active_Slot_pair and active_Slot_pair != pair:
+                        msg = f"{msg} | 🔒 1-crypto-at-a-time guard: {active_Slot_pair} is currently active"
+                    elif not portfolio_occupied and not already_autotraded_candle and ((is_new_candle and cooled and pair_cooled) or emailed or last.get("candle_ts") == sig["candle_ts"]):
+                        ok_auto, auto_msg, _ = eng.execute_autotrade_two_entry_signal(
+                            pair=pair, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
                         )
+                        autotraded = ok_auto
+                        msg = f"{msg} | 🤖 {auto_msg}"
+                        now_exec = time.time()
+                        if ok_auto:
+                            portfolio_occupied = True
+                            active_Slot_pair = pair
+                            portfolio_daily_count += 1
+                            state[portfolio_daily_key] = portfolio_daily_count
+                            state[key] = {
+                                "candle_ts": sig["candle_ts"],
+                                "sent_at": state.get(key, {}).get("sent_at", now_exec),
+                                "direction": sig["signal"],
+                                "autotraded": True,
+                            }
+                            _save(state)
+                            email_notifier.send_trade_email(
+                                pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
+                                tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=margin_inr, leverage=leverage,
+                                zone=sig.get("trigger_zone") or "", kind="EXECUTED", note=auto_msg,
+                                strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
+                                levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0)
+                            )
                 results.append({**row, "emailed": emailed, "autotraded": autotraded, "message": msg})
         return results
