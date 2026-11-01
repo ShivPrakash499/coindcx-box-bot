@@ -1142,9 +1142,14 @@ with st.container(key="quick_asset_bar"):
                 use_container_width=True,
             )
 
-# Single Unified Live Header Fragment (Live Price + Selected Asset PnL side-by-side)
+# Single Unified Live Header Fragment (Live Price + Selected Asset PnL + 10s V2 Lifecycle Ratchet)
 @st.fragment(run_every="10s")
 def render_unified_live_header(pair: str):
+    # Run the V2 3-Rule lifecycle check every 10s so TP1 BE/Profit Lock, TP1-Candle E2 & 50% TP1-TP2 Ratchet fire in real time
+    try:
+        coindcx_engine.get_active_portfolio_trade_status()
+    except Exception:
+        pass
     sym = clean_sym(pair)
     tick = get_cached_ticker(pair)
     fund = get_cached_funding(pair)
@@ -1988,8 +1993,15 @@ elif active_section == "📊 Positions":
         e2_target = float(pos_norm["entry2_sweep"])
         sl_target = float(pos_norm["stop_loss"])
 
+        # Preserve V2 ratcheted SL & Entry 2 if TP1 has already been hit on this position
+        if auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("tp1_hit"):
+            if float(auto_lock_cfg.get("stop_loss") or 0.0) > 0:
+                sl_target = float(auto_lock_cfg["stop_loss"])
+            if float(auto_lock_cfg.get("entry2_sweep") or 0.0) > 0:
+                e2_target = float(auto_lock_cfg["entry2_sweep"])
+
         # Auto-sync missing or un-upgraded TP2, SL, TP1 Limit & Entry 2 Limit onto active CoinDCX position once per session
-        if pid not in auto_synced_pids:
+        if pid not in auto_synced_pids and not (auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("tp1_hit")):
             auto_synced_pids.add(pid)
             s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                 pair=pr,
@@ -2014,10 +2026,13 @@ elif active_section == "📊 Positions":
         if tp1 and tp2:
             half = (tp1 + tp2) / 2.0
             reached = (lambda lvl: mark_p >= lvl) if is_long else (lambda lvl: mark_p <= lvl)
-            if reached(half):
-                ratchet, target_sl = "🔒 ≥50% to TP2: Ratchet SL to TP1", tp1
-            elif reached(tp1):
-                ratchet, target_sl = "✅ TP1 reached: Move SL to Breakeven", entry_p
+            if reached(half) or (auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("runner_halfway_ratcheted")):
+                ratchet, target_sl = "🔒 ≥50% to TP2: SL Locked at TP1 & E2 at Prev Candle of TP1", tp1
+            elif reached(tp1) or (auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("tp1_hit")):
+                be_lock = coindcx_engine.format_order_price(
+                    pr, (entry_p + 0.5 * (tp1 - entry_p)) if is_long else (entry_p - 0.5 * (entry_p - tp1))
+                )
+                ratchet, target_sl = f"✅ TP1 Reached: SL Protected @ {fmt_px(be_lock)} & TP1-Candle E2 Armed", be_lock
 
         pnl_inr, roe = float(p["pnl_inr"]), float(p["roe_pct"])
         col = "#10b981" if pnl_inr >= 0 else "#ef4444"
