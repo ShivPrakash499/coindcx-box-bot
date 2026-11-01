@@ -181,7 +181,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
 @st.cache_resource
-def _ensure_background_monitor():
+def _ensure_background_monitor(daemon_v: int = 2):
     """Starts the 24/7 background monitor daemon exactly once per Streamlit server process,
     BEFORE check_authentication() so alerts and AutoTrade run 24/7 even when no browser session is logged in."""
     def _monitor_worker():
@@ -189,7 +189,13 @@ def _ensure_background_monitor():
             try:
                 _sync_secrets_to_env()
                 import coindcx_engine as _eng_live
+                import email_notifier as _em_live
+                import strategies as _st_live
                 import signal_monitor as _mon_live
+                _reload_if_updated(_eng_live)
+                _reload_if_updated(_em_live)
+                _reload_if_updated(_st_live)
+                _reload_if_updated(_mon_live)
                 if _mon_live:
                     auto_cfg = _eng_live.get_autotrade_config()
                     m_inr = float(auto_cfg.get("single_trade_margin_inr") or 20000.0)
@@ -208,11 +214,11 @@ def _ensure_background_monitor():
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
             time.sleep(30)
 
-    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
+    th = threading.Thread(target=_monitor_worker, daemon=True, name=f"CryptoTradeAssistantDaemonV{daemon_v}")
     th.start()
     return True
 
-_ensure_background_monitor()
+_ensure_background_monitor(2)
 
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
 def get_security_pin():
@@ -1154,6 +1160,16 @@ with st.container(key="quick_asset_bar"):
 # Single Unified Live Header Fragment (Live Price + Selected Asset PnL + 10s V2 Lifecycle Ratchet + 30s Auto-Scan)
 @st.fragment(run_every="10s")
 def render_unified_live_header(pair: str):
+    # 0. Hot-reload backend modules inside the 10s fragment so git pushes apply without requiring manual page refresh
+    try:
+        _sync_secrets_to_env()
+        _reload_if_updated(coindcx_engine)
+        if email_notifier:
+            _reload_if_updated(email_notifier)
+        if signal_monitor:
+            _reload_if_updated(signal_monitor)
+    except Exception:
+        pass
     # 1. Run the V2 3-Rule lifecycle check every 10s so TP1 BE/Profit Lock, TP1-Candle E2 & 50% TP1-TP2 Ratchet fire in real time
     try:
         coindcx_engine.get_active_portfolio_trade_status()

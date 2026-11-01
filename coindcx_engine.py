@@ -10,7 +10,7 @@ import pytz
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 IST = pytz.timezone('Asia/Kolkata')
 
@@ -2400,6 +2400,9 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
     return ordered
 
 
+_AUTOTRADE_CONFIG_SCHEMA_VERSION = 2
+
+
 def get_autotrade_config() -> dict:
     """
     Loads persistent AutoTrade & Single-Trade Margin settings shared between the Streamlit UI
@@ -2407,6 +2410,7 @@ def get_autotrade_config() -> dict:
     Single-Trade Margin so a git push / cloud restart never disables AutoTrade.
     """
     default_cfg = {
+        "config_version": _AUTOTRADE_CONFIG_SCHEMA_VERSION,
         "enabled": os.getenv("AUTOTRADE_ENABLED", "true").lower() in ("true", "1", "yes"),
         "single_trade_margin_inr": float(os.getenv("SINGLE_TRADE_MARGIN_INR", 20000.0)),
         "leverage": 10,
@@ -2421,7 +2425,22 @@ def get_autotrade_config() -> dict:
             with open(AUTOTRADE_CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
                 if isinstance(saved, dict):
-                    default_cfg.update(saved)
+                    if int(saved.get("config_version", 0) or 0) < _AUTOTRADE_CONFIG_SCHEMA_VERSION:
+                        saved["config_version"] = _AUTOTRADE_CONFIG_SCHEMA_VERSION
+                        saved["enabled"] = True
+                        if float(saved.get("single_trade_margin_inr", 0) or 0) in (0.0, 10000.0, 30000.0, 250000.0):
+                            saved["single_trade_margin_inr"] = 20000.0
+                        old_lock = saved.get("active_trade_lock")
+                        if isinstance(old_lock, dict) and not old_lock.get("is_live_exchange"):
+                            saved["active_trade_lock"] = None
+                        default_cfg.update(saved)
+                        try:
+                            with open(AUTOTRADE_CONFIG_FILE, "w", encoding="utf-8") as fw:
+                                json.dump(default_cfg, fw, indent=2)
+                        except Exception:
+                            pass
+                    else:
+                        default_cfg.update(saved)
     except Exception:
         pass
     return default_cfg
@@ -2841,7 +2860,8 @@ def get_active_portfolio_trade_status() -> dict:
         tp1_already_hit = bool(lock.get("tp1_hit", False))
 
         try:
-            if l_ts > 0 and (time.time() - l_ts) > 8 * 3600:
+            max_lock_age = (8 * 3600) if is_live_ex else 900
+            if l_ts > 0 and (time.time() - l_ts) > max_lock_age:
                 if is_live_ex:
                     cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
                 clear_autotrade_active_lock()

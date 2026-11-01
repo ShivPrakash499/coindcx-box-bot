@@ -22,18 +22,27 @@ DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
 COOLDOWN_MIN = 15   # 1 candle on 15m timeframe per strategy + pair + direction
 MAX_DAILY_ALERTS_PER_PAIR = 50
 MAX_DAILY_PORTFOLIO_TRADES = 50
+_STATE_SCHEMA_VERSION = 2
 _SCAN_LOCK = threading.Lock()
 
 
 def _load() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                if data.get("_schema_version") != _STATE_SCHEMA_VERSION:
+                    fresh = {"_schema_version": _STATE_SCHEMA_VERSION}
+                    _save(fresh)
+                    return fresh
+                return data
     except Exception:
-        return {}
+        pass
+    return {"_schema_version": _STATE_SCHEMA_VERSION}
 
 
 def _save(state: dict) -> None:
+    state["_schema_version"] = _STATE_SCHEMA_VERSION
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
