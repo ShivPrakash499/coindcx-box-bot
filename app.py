@@ -14,21 +14,14 @@ if CURRENT_DIR not in sys.path:
 
 import streamlit as st
 
-def _sync_secrets_to_env():
-    """Sync Streamlit Cloud secrets (both top-level and nested sections) into os.environ."""
-    try:
-        if hasattr(st, "secrets"):
-            for _sec_k, _sec_v in st.secrets.items():
-                if isinstance(_sec_v, (str, int, float, bool)):
-                    os.environ[str(_sec_k)] = str(_sec_v).strip().strip('"').strip("'")
-                elif hasattr(_sec_v, "items"):
-                    for _sub_k, _sub_v in _sec_v.items():
-                        if isinstance(_sub_v, (str, int, float, bool)):
-                            os.environ[str(_sub_k)] = str(_sub_v).strip().strip('"').strip("'")
-    except Exception:
-        pass
-
-_sync_secrets_to_env()
+# Sync Streamlit Cloud secrets into os.environ BEFORE backend modules initialize
+try:
+    if hasattr(st, "secrets"):
+        for _sec_k, _sec_v in st.secrets.items():
+            if isinstance(_sec_v, (str, int, float, bool)):
+                os.environ[str(_sec_k)] = str(_sec_v)
+except Exception:
+    pass
 
 import pandas as pd
 import pytz
@@ -181,44 +174,36 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
 @st.cache_resource
-def _ensure_background_monitor(daemon_v: int = 2):
+def _ensure_background_monitor():
     """Starts the 24/7 background monitor daemon exactly once per Streamlit server process,
     BEFORE check_authentication() so alerts and AutoTrade run 24/7 even when no browser session is logged in."""
     def _monitor_worker():
         while True:
             try:
-                _sync_secrets_to_env()
-                import coindcx_engine as _eng_live
-                import email_notifier as _em_live
-                import strategies as _st_live
-                import signal_monitor as _mon_live
-                _reload_if_updated(_eng_live)
-                _reload_if_updated(_em_live)
-                _reload_if_updated(_st_live)
-                _reload_if_updated(_mon_live)
-                if _mon_live:
-                    auto_cfg = _eng_live.get_autotrade_config()
-                    m_inr = float(auto_cfg.get("single_trade_margin_inr") or 20000.0)
+                if signal_monitor:
+                    auto_cfg = coindcx_engine.get_autotrade_config()
+                    rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
+                    m_inr = float(auto_cfg.get("single_trade_margin_inr") or rot.get("margin_inr", 100000.0))
                     lev = int(auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
-                    u_inr = float(_eng_live.get_coindcx_live_usdt_inr_rate())
-                    watch_pairs = _eng_live.get_high_volatility_watchlist(top_n=12)
+                    u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
+                    watch_pairs = coindcx_engine.get_high_volatility_watchlist(top_n=12)
                     _safe_scan_and_alert(
                         pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
                         usd_inr=u_inr,
                         send=True,
-                        autotrade=bool(auto_cfg.get("enabled", True)),
+                        autotrade=bool(auto_cfg.get("enabled", False)),
                     )
             except Exception as e:
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
-            time.sleep(30)
+            time.sleep(60)
 
-    th = threading.Thread(target=_monitor_worker, daemon=True, name=f"CryptoTradeAssistantDaemonV{daemon_v}")
+    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
     th.start()
     return True
 
-_ensure_background_monitor(2)
+_ensure_background_monitor()
 
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
 def get_security_pin():
@@ -319,7 +304,7 @@ def get_cached_strategy_plan(strategy_id, pair, live_px, m_inr, lev, u_inr):
 def get_cached_top_movers(watch_tuple: tuple, top_n: int = 6):
     return coindcx_engine.fetch_top_volatility_movers(list(watch_tuple), top_n=top_n)
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=45)
 def get_cached_signals_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: float, strat_tuple: tuple, auto_send: bool, auto_trade: bool):
     return _safe_scan_and_alert(
         list(watch_tuple), m_inr, lev, u_inr,
@@ -541,7 +526,7 @@ if not wallet_data.get("is_live_api"):
 _rot = get_rotational_margin_inr(leverage=10)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
 if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
-    default_margin = 20000.0
+    default_margin = float(wallet_data["total_inr"])
 else:
     default_margin = _saved_margin
 
@@ -565,11 +550,11 @@ st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (1-Slot)")
 autotrade_on = st.sidebar.toggle(
     "Enable AutoTrade (10x 2-Entry)",
-    value=bool(_auto_cfg.get("enabled", True)),
+    value=bool(_auto_cfg.get("enabled", False)),
     key="sidebar_autotrade_toggle",
 )
 if (
-    autotrade_on != bool(_auto_cfg.get("enabled", True))
+    autotrade_on != bool(_auto_cfg.get("enabled", False))
     or round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
 ):
@@ -1157,32 +1142,9 @@ with st.container(key="quick_asset_bar"):
                 use_container_width=True,
             )
 
-# Single Unified Live Header Fragment (Live Price + Selected Asset PnL + 10s V2 Lifecycle Ratchet + 30s Auto-Scan)
+# Single Unified Live Header Fragment (Live Price + Selected Asset PnL side-by-side)
 @st.fragment(run_every="10s")
 def render_unified_live_header(pair: str):
-    # 0. Hot-reload backend modules inside the 10s fragment so git pushes apply without requiring manual page refresh
-    try:
-        _sync_secrets_to_env()
-        _reload_if_updated(coindcx_engine)
-        if email_notifier:
-            _reload_if_updated(email_notifier)
-        if signal_monitor:
-            _reload_if_updated(signal_monitor)
-    except Exception:
-        pass
-    # 1. Run the V2 3-Rule lifecycle check every 10s so TP1 BE/Profit Lock, TP1-Candle E2 & 50% TP1-TP2 Ratchet fire in real time
-    try:
-        coindcx_engine.get_active_portfolio_trade_status()
-    except Exception:
-        pass
-    # 2. Trigger cached 30s watchlist signal scan across all tabs so Email Alerts & AutoTrade fire even when viewing Positions/Backtest/Chart
-    try:
-        if signal_monitor and (monitor_on or autotrade_on):
-            _watch_t = tuple(monitor_pairs or coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
-            _strat_t = tuple(monitor_strategy_ids or [s.id for s in strategy_registry.list_strategies()])
-            get_cached_signals_scan(_watch_t, float(margin_inr), int(leverage), float(usd_inr), _strat_t, bool(monitor_on), bool(autotrade_on))
-    except Exception:
-        pass
     sym = clean_sym(pair)
     tick = get_cached_ticker(pair)
     fund = get_cached_funding(pair)
@@ -2026,15 +1988,8 @@ elif active_section == "📊 Positions":
         e2_target = float(pos_norm["entry2_sweep"])
         sl_target = float(pos_norm["stop_loss"])
 
-        # Preserve V2 ratcheted SL & Entry 2 if TP1 has already been hit on this position
-        if auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("tp1_hit"):
-            if float(auto_lock_cfg.get("stop_loss") or 0.0) > 0:
-                sl_target = float(auto_lock_cfg["stop_loss"])
-            if float(auto_lock_cfg.get("entry2_sweep") or 0.0) > 0:
-                e2_target = float(auto_lock_cfg["entry2_sweep"])
-
         # Auto-sync missing or un-upgraded TP2, SL, TP1 Limit & Entry 2 Limit onto active CoinDCX position once per session
-        if pid not in auto_synced_pids and not (auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("tp1_hit")):
+        if pid not in auto_synced_pids:
             auto_synced_pids.add(pid)
             s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                 pair=pr,
@@ -2059,13 +2014,10 @@ elif active_section == "📊 Positions":
         if tp1 and tp2:
             half = (tp1 + tp2) / 2.0
             reached = (lambda lvl: mark_p >= lvl) if is_long else (lambda lvl: mark_p <= lvl)
-            if reached(half) or (auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("runner_halfway_ratcheted")):
-                ratchet, target_sl = "🔒 ≥50% to TP2: SL Locked at TP1 & E2 at Prev Candle of TP1", tp1
-            elif reached(tp1) or (auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("tp1_hit")):
-                be_lock = coindcx_engine.format_order_price(
-                    pr, (entry_p + 0.5 * (tp1 - entry_p)) if is_long else (entry_p - 0.5 * (entry_p - tp1))
-                )
-                ratchet, target_sl = f"✅ TP1 Reached: SL Protected @ {fmt_px(be_lock)} & TP1-Candle E2 Armed", be_lock
+            if reached(half):
+                ratchet, target_sl = "🔒 ≥50% to TP2: Ratchet SL to TP1", tp1
+            elif reached(tp1):
+                ratchet, target_sl = "✅ TP1 reached: Move SL to Breakeven", entry_p
 
         pnl_inr, roe = float(p["pnl_inr"]), float(p["roe_pct"])
         col = "#10b981" if pnl_inr >= 0 else "#ef4444"

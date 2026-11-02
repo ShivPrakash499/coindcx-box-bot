@@ -9,7 +9,6 @@ Direct Action Link: <APP_URL>/?tab=execute&strategy=<ID>&pair=<PAIR>&direction=<
 """
 from __future__ import annotations
 
-import base64
 import os
 import smtplib
 import ssl
@@ -20,38 +19,19 @@ from email.mime.text import MIMEText
 import pytz
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+load_dotenv()
 IST = pytz.timezone("Asia/Kolkata")
-
-_DEFAULT_SENDER_B64 = "andhbGFzaGl2YUBnbWFpbC5jb20="
-_DEFAULT_APP_PWD_B64 = "b3J0eSBmcHRrIGV5eGEgZnZhbw=="
-_DEFAULT_RECEIVER_B64 = "YmlubmlzaW5naHNoYXVyeWFAZ21haWwuY29t"
-
-
-def _b64_str(val: str) -> str:
-    try:
-        return base64.b64decode(val.encode("ascii")).decode("utf-8").strip()
-    except Exception:
-        return ""
 
 
 def _cfg(name: str, default: str = "") -> str:
-    """Streamlit secrets first (cloud, top-level or nested), then environment / .env."""
+    """Streamlit secrets first (cloud), then environment / .env."""
     try:
         import streamlit as st  # noqa: WPS433
-        if hasattr(st, "secrets"):
-            if name in st.secrets:
-                v = str(st.secrets[name]).strip().strip('"').strip("'")
-                if v:
-                    return v
-            for sec_v in st.secrets.values():
-                if hasattr(sec_v, "get") and name in sec_v:
-                    v = str(sec_v[name]).strip().strip('"').strip("'")
-                    if v:
-                        return v
+        if hasattr(st, "secrets") and name in st.secrets:
+            return str(st.secrets[name]).strip()
     except Exception:
         pass
-    return os.getenv(name, default).strip().strip('"').strip("'")
+    return os.getenv(name, default).strip()
 
 
 def short_name(pair: str) -> str:
@@ -59,9 +39,9 @@ def short_name(pair: str) -> str:
 
 
 def get_email_config() -> dict:
-    sender = _cfg("GMAIL_SENDER") or _cfg("SENDER_EMAIL") or _b64_str(_DEFAULT_SENDER_B64)
-    password = _cfg("GMAIL_APP_PASSWORD") or _cfg("SENDER_APP_PASSWORD") or _b64_str(_DEFAULT_APP_PWD_B64)
-    receiver = _cfg("GMAIL_RECEIVER") or _cfg("RECEIVER_EMAIL") or _b64_str(_DEFAULT_RECEIVER_B64) or sender
+    sender = _cfg("GMAIL_SENDER") or _cfg("SENDER_EMAIL")
+    password = _cfg("GMAIL_APP_PASSWORD") or _cfg("SENDER_APP_PASSWORD")
+    receiver = _cfg("GMAIL_RECEIVER") or _cfg("RECEIVER_EMAIL") or sender
     clean_pwd = password.replace(" ", "").strip()
     # 16-character check for standard Google App Passwords
     is_app_password = len(clean_pwd) == 16
@@ -101,20 +81,22 @@ def _send(subject: str, html: str, text: str) -> tuple[bool, str]:
             server.login(cfg["sender"], cfg["password"])
             server.sendmail(cfg["sender"], [cfg["receiver"]], msg.as_string())
         return True, f"Email alert sent successfully to {cfg['receiver']}"
-    except smtplib.SMTPAuthenticationError as e:
+    except (smtplib.SMTPAuthenticationError, smtplib.SMTPResponseException) as e:
         err_msg = str(e)
         if "534" in err_msg or "Application-specific" in err_msg or "InvalidSecondFactor" in err_msg or not cfg["is_app_password"]:
             return False, f"Gmail rejected login: {app_pwd_hint}"
         return False, f"Gmail authentication error: {err_msg} {app_pwd_hint}"
-    except Exception as e_587:
-        # Attempt 2: Automatic fallback to Port 465 SSL if Port 587 timed out or disconnected
+    except smtplib.SMTPServerDisconnected:
+        # Fallback to Port 465 SSL
         try:
             with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=12) as server:
                 server.login(cfg["sender"], cfg["password"])
                 server.sendmail(cfg["sender"], [cfg["receiver"]], msg.as_string())
             return True, f"Email alert sent successfully to {cfg['receiver']} via SSL"
         except Exception as e_ssl:
-            return False, f"Failed to send email (587: {e_587} | 465: {e_ssl})"
+            return False, f"Gmail connection closed. If using normal account password, Google blocks it: {app_pwd_hint}"
+    except Exception as e:
+        return False, f"Failed to send email ({type(e).__name__}): {e}"
 
 
 def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2: float,
