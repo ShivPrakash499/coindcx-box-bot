@@ -525,7 +525,7 @@ if not wallet_data.get("is_live_api"):
 
 _rot = get_rotational_margin_inr(leverage=10)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
-if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
+if _saved_margin <= 0 or _saved_margin == 250000.0:
     default_margin = float(wallet_data["total_inr"])
 else:
     default_margin = _saved_margin
@@ -539,6 +539,11 @@ margin_inr = st.sidebar.number_input(
     format="%.2f",
     help="50% used on Entry 1 and 50% reserved for Entry 2 @ Sweep."
 )
+if st.session_state.get("_last_sidebar_margin_inr") != round(float(margin_inr), 2):
+    st.session_state["_last_sidebar_margin_inr"] = round(float(margin_inr), 2)
+    for _k in list(st.session_state.keys()):
+        if _k.startswith("exec_margin_inr_") or _k == "bt_multi_cap":
+            st.session_state[_k] = int(round(float(margin_inr)))
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
 st.sidebar.caption(f"Split: **₹{margin_inr*0.5:,.2f}** Entry 1 + **₹{margin_inr*0.5:,.2f}** Entry 2 @ {leverage}x")
