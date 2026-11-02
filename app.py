@@ -174,11 +174,14 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
 @st.cache_resource
-def _ensure_background_monitor():
+def _ensure_background_monitor_v2():
     """Starts the 24/7 background monitor daemon exactly once per Streamlit server process,
     BEFORE check_authentication() so alerts and AutoTrade run 24/7 even when no browser session is logged in."""
     def _monitor_worker():
+        my_tid = threading.get_ident()
         while True:
+            if sys.__dict__.get("_active_daemon_thread_id") not in (None, my_tid):
+                break
             try:
                 _reload_if_updated(coindcx_engine)
                 if strategy_registry:
@@ -203,11 +206,12 @@ def _ensure_background_monitor():
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
             time.sleep(60)
 
-    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
+    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemonV2")
     th.start()
-    return True
+    sys.__dict__["_active_daemon_thread_id"] = th.ident
+    return th.ident
 
-_ensure_background_monitor()
+_ensure_background_monitor_v2()
 
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
 def get_security_pin():
@@ -591,6 +595,11 @@ else:
     _api_err = wallet_data.get("api_error", "")
     if _api_err:
         st.sidebar.caption(f"⚠️ **CoinDCX API Notice:** `{_api_err}`")
+
+_ui_build_ver = getattr(coindcx_engine, "ENGINE_BUILD_VERSION", "v2026.11.03-R2")
+_daemon_ver = _auto_cfg.get("daemon_build_version", _ui_build_ver)
+_daemon_hb_ist = _auto_cfg.get("daemon_heartbeat_ist", "Active (60s cycle)")
+st.sidebar.caption(f"🛡️ **Engine:** `{_ui_build_ver}` • **Daemon:** `{_daemon_ver}` (`{_daemon_hb_ist}`)")
 
 with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
     chart_theme = st.radio(

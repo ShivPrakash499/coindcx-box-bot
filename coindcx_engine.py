@@ -2693,13 +2693,22 @@ def sync_full_2entry_runner_to_position(
 
     # 3. Place Entry 2 / Trade 2 (50% Sweep Scale-In) same-side Limit Order ONLY if TP1 has NOT been hit
     e2_order_id = str(existing_lock.get("entry2_order_id", "")) if same_existing_lock else ""
-    tranche_m_inr = max(float(total_margin_inr or 20000.0) * 0.5, float(matched_pos.get("locked_margin_inr", 10000.0) or 10000.0))
+    locked_m_now = float(matched_pos.get("locked_margin_inr", 0.0) or 0.0)
+    if total_margin_inr > 0 and locked_m_now >= float(total_margin_inr) * 0.70:
+        entry2_already_filled = True
+    # Also do not place Entry 2 if price has already moved >= 60% of the way toward TP1
+    if abs(tp1_val - e1_val) > 0:
+        prog_to_tp1 = ((pos_mark - e1_val) / (tp1_val - e1_val)) if is_long else ((e1_val - pos_mark) / (e1_val - tp1_val))
+        if prog_to_tp1 >= 0.60:
+            entry2_already_cancelled = True
+
+    tranche_m_inr = float(total_margin_inr or 20000.0) * 0.5
     qty2 = format_order_quantity(pair, ((tranche_m_inr * pos_lev) / u_inr) / e2_val) if e2_val > 0 else 0.0
 
     if tp1_already_hit or entry2_already_cancelled or entry2_already_filled:
         if existing_same_side_limit and not entry2_already_filled:
             cancel_coindcx_open_entry_orders(pair, str(existing_same_side_limit.get("id", "")), side=side.lower())
-        status_parts.append("Entry 2 Limit: Cancelled/Inactive (TP1 Already Reached)")
+        status_parts.append("Entry 2 Limit: Cancelled/Inactive (TP1/Margin Guard Active)")
     elif existing_same_side_limit:
         e2_order_id = str(existing_same_side_limit.get("id", ""))
         status_parts.append(f"Entry 2 Limit ({existing_same_side_limit.get('total_quantity')} @ ${existing_same_side_limit.get('price')}): Already Open")
@@ -2993,6 +3002,9 @@ def get_active_portfolio_trade_status() -> dict:
     return {"is_occupied": False, "active_pair": None, "source": "Slot Free (0/1 App Trades Active)"}
 
 
+ENGINE_BUILD_VERSION = "v2026.11.03-R2"
+
+
 def execute_autotrade_two_entry_signal(
     pair: str,
     sig: dict,
@@ -3003,10 +3015,11 @@ def execute_autotrade_two_entry_signal(
     """
     Executes the 2-Entry Sweep Scale-In + 50/50 Runner setup for a single crypto at 10x leverage:
       1. Verifies no other App/API crypto position is currently active ('1 Crypto at a Time').
-      2. Allocates 50% of `single_trade_margin_inr` to Entry 1 (`qty1`) with Position TP = TP2 and SL = Catastrophe SL.
-      3. Places a 50% partial-take-profit limit order (`0.5 * qty1`, opposite side) at TP1 so if price moves straight to TP1
+      2. Enforces Engine-Level Pre-Execution Firewalls (Daily Trend Bias + Sat/Sun/Mon SH/SL Guard + Live Exchange Position Check).
+      3. Allocates 50% of `single_trade_margin_inr` to Entry 1 (`qty1`) with Position TP = TP2 and SL = Catastrophe SL.
+      4. Places a 50% partial-take-profit limit order (`0.5 * qty1`, opposite side) at TP1 so if price moves straight to TP1
          without touching Entry 2, 50% of Entry 1 books at TP1 while the remaining 50% rides risk-free to TP2!
-      4. Allocates the remaining 50% of `single_trade_margin_inr` to Entry 2 (`qty2` Limit Order at SL/SH Sweep), which is
+      5. Allocates the remaining 50% of `single_trade_margin_inr` to Entry 2 (`qty2` Limit Order at SL/SH Sweep), which is
          automatically cancelled if TP1 is hit first.
     """
     cfg = get_autotrade_config()
@@ -3022,9 +3035,60 @@ def execute_autotrade_two_entry_signal(
             f"Skipping {pair} so 50% margin stays reserved for {act_p} Entry 2."
         ), {"slot_status": slot}
 
+    # Hard Firewall A: Check live CoinDCX active positions directly (force_refresh=True) before placing any Entry 1
+    try:
+        fresh_live_pos = fetch_coindcx_active_positions(force_refresh=True) or []
+        if fresh_live_pos:
+            open_p = fresh_live_pos[0].get("pair", "UNKNOWN")
+            return False, (
+                f"Engine Live Position Firewall: Active position already open on CoinDCX ({open_p}). "
+                f"Blocked new Entry 1 on {pair}."
+            ), {"live_positions": fresh_live_pos}
+    except Exception:
+        pass
+
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     side = "BUY" if direction in ("LONG", "BUY") else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
+
+    # Hard Firewall B: Engine-Level Daily Trend Bias & Weekend/Monday Outer-Edge Verification
+    try:
+        chk_levels = sig.get("levels") or calculate_daily_box_levels(pair)
+        if isinstance(chk_levels, dict):
+            d_close = float(chk_levels.get("daily_close", chk_levels.get("MID", 0.0)) or 0.0)
+            ema50 = float(chk_levels.get("EMA50", d_close) or d_close)
+            ema200 = float(chk_levels.get("EMA200", d_close) or d_close)
+            if d_close < ema50 and d_close < ema200:
+                t_bias = "BEARISH"
+            elif d_close > ema50 and d_close > ema200:
+                t_bias = "BULLISH"
+            else:
+                t_bias = str(chk_levels.get("trend_bias", "NEUTRAL")).upper()
+
+            reason_txt = f"{sig.get('setup', '')} {sig.get('trigger_reason', '')}".upper()
+            wkday = datetime.now(IST).weekday()
+            is_wknd_mon = wkday in (5, 6, 0)
+
+            if is_wknd_mon and ("SWEPT SH" in reason_txt or "SWEPT SL" in reason_txt):
+                return False, (
+                    f"Engine Weekend/Monday Firewall: Blocked outer SH/SL Entry 1 on {pair} "
+                    f"(SH/SL reserved strictly for Entry 2 scale-in on Sat/Sun/Mon)."
+                ), {"trend_bias": t_bias}
+
+            if t_bias == "BEARISH" and side == "BUY" and "SWEPT SL" not in reason_txt:
+                return False, (
+                    f"Engine Trend-Bias Firewall: Blocked counter-trend LONG on {pair} "
+                    f"(Daily Trend Bias is BEARISH: close ${d_close:,.4f} < 50 EMA ${ema50:,.4f} & 200 EMA ${ema200:,.4f})."
+                ), {"trend_bias": t_bias}
+
+            if t_bias == "BULLISH" and side == "SELL" and "SWEPT SH" not in reason_txt:
+                return False, (
+                    f"Engine Trend-Bias Firewall: Blocked counter-trend SHORT on {pair} "
+                    f"(Daily Trend Bias is BULLISH: close ${d_close:,.4f} > 50 EMA ${ema50:,.4f} & 200 EMA ${ema200:,.4f})."
+                ), {"trend_bias": t_bias}
+    except Exception:
+        pass
+
     live_tk_px = float(fetch_live_ticker(pair).get("last_price", 0.0) or 0.0)
     norm = normalize_two_entry_runner_levels(
         pair=pair,

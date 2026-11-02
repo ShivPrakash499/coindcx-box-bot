@@ -115,6 +115,19 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
          using the user's configured Single-Trade Margin out of the Futures Wallet.
     """
     _hot_reload_dependencies()
+    cur_th_name = threading.current_thread().name
+    if cur_th_name.startswith("CryptoTradeAssistantDaemon"):
+        active_daemon_tid = sys.__dict__.get("_active_daemon_thread_id")
+        if active_daemon_tid and threading.get_ident() != active_daemon_tid:
+            return []
+        try:
+            eng.save_autotrade_config({
+                "daemon_heartbeat_ts": time.time(),
+                "daemon_heartbeat_ist": datetime.now(eng.IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                "daemon_build_version": getattr(eng, "ENGINE_BUILD_VERSION", "v2026.11.03-R2"),
+            })
+        except Exception:
+            pass
     auto_cfg = eng.get_autotrade_config()
     if margin_inr is None or margin_inr <= 0:
         margin_inr = float(auto_cfg.get("single_trade_margin_inr", 100000.0))
