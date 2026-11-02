@@ -667,6 +667,9 @@ class BoxTheorySweep(Strategy):
             if curr_dow in (0, 6) and i >= 2 and raw_width < (0.52 * atr):
                 rh = max(float(daily_records[i - 2]["high"]), rh)
                 rl = min(float(daily_records[i - 2]["low"]), rl)
+                if curr_dow == 0 and i >= 3 and (rh - rl) < (0.55 * atr):
+                    rh = max(float(daily_records[i - 3]["high"]), rh)
+                    rl = min(float(daily_records[i - 3]["low"]), rl)
 
             prev_close = float(prev_day["close"])
             ema50 = float(prev_day["EMA50"])
@@ -679,9 +682,11 @@ class BoxTheorySweep(Strategy):
             prior_highs = [float(x["high"]) for x in prior_slice] if prior_slice else []
             prior_lows = [float(x["low"]) for x in prior_slice] if prior_slice else []
 
-            sh_c = [h for h in prior_highs if h > rh]
+            min_sh_d = rh * 0.0025
+            min_sl_d = rl * 0.0025
+            sh_c = [h for h in prior_highs if (h - rh) > min_sh_d]
             sh = min(sh_c) if sh_c else rh * 1.015
-            sl_c = [l for l in prior_lows if l < rl]
+            sl_c = [l for l in prior_lows if (rl - l) > min_sl_d]
             sl = max(sl_c) if sl_c else rl * 0.985
 
             daily_boxes[curr_day_str] = {

@@ -2233,17 +2233,17 @@ elif active_section == "📈 Chart & Levels":
             fig.add_trace(go.Scatter(x=ts_series, y=ema50_curve, mode="lines", name="50 EMA", line=dict(color="#8b5cf6", width=1.8)))
             fig.add_trace(go.Scatter(x=ts_series, y=ema200_curve, mode="lines", name="200 EMA", line=dict(color="#f59e0b", width=1.8, dash="dot")))
 
-            for lbl, key_l, col_l, dsh in [
-                ("SH", "SH", "#ef4444", "dash"),
-                ("RH", "RH", "#f97316", "solid"),
-                ("MID", "MID", "#0284c7", "dot"),
-                ("RL", "RL", "#10b981", "solid"),
-                ("SL", "SL", "#059669", "dash"),
+            for lbl, key_l, col_l, dsh, apos in [
+                ("SH", "SH", "#ef4444", "dash", "top left"),
+                ("RH", "RH", "#f97316", "solid", "bottom left"),
+                ("MID", "MID", "#0284c7", "dot", "bottom right"),
+                ("RL", "RL", "#10b981", "solid", "top left"),
+                ("SL", "SL", "#059669", "dash", "bottom left"),
             ]:
                 fig.add_hline(
                     y=levels[key_l], line_dash=dsh, line_color=col_l, line_width=1.8,
                     annotation_text=f"<b>{lbl}: {fmt_px(levels[key_l])}</b>",
-                    annotation_position="top left" if key_l in ("SH", "RH", "MID") else "bottom left",
+                    annotation_position=apos,
                     annotation_bgcolor=col_l, annotation_font=dict(size=10, color="#ffffff")
                 )
 
