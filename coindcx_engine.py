@@ -1436,10 +1436,24 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
 
     df_all_completed = df_daily.iloc[:-1].reset_index(drop=True)
     # Limit search strictly to maximum 30 completed daily candles (never go beyond 30 days)
-    df_completed = df_all_completed.tail(30)
+    df_completed = df_all_completed.tail(30).reset_index(drop=True)
     prev_day = df_completed.iloc[-1]
     rh = float(prev_day['high'])
     rl = float(prev_day['low'])
+
+    # Extreme Weekend Compression Merge (< 52% of 14d ATR on Sunday or Monday):
+    # Merge with the preceding day so RH/RL never sit inside a tiny 1.5% weekend inside-bar.
+    recent_ranges = (df_completed['high'] - df_completed['low']).tail(14)
+    atr14_val = float(recent_ranges.mean()) if len(recent_ranges) > 0 else (rh - rl)
+    raw_width = rh - rl
+    curr_dt_ist = datetime.fromtimestamp(float(df_daily.iloc[-1]['timestamp']) / 1000.0, tz=IST)
+    curr_dow = int(curr_dt_ist.weekday())  # 0=Mon .. 5=Sat, 6=Sun
+    is_compressed = raw_width < (0.55 * atr14_val)
+    if curr_dow in (0, 6) and len(df_completed) >= 2 and raw_width < (0.52 * atr14_val):
+        prev2_day = df_completed.iloc[-2]
+        rh = max(float(prev2_day['high']), rh)
+        rl = min(float(prev2_day['low']), rl)
+
     daily_close = current_daily_close
     mid = (rh + rl) / 2.0
 
@@ -1503,7 +1517,9 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
         "trend_bias": trend_bias,
         "prev_day_date": datetime.fromtimestamp(prev_day['timestamp'] / 1000, tz=IST).strftime("%Y-%m-%d"),
         "avg_daily_rise": round(avg_daily_rise, 2),
-        "avg_daily_drop": round(avg_daily_drop, 2)
+        "avg_daily_drop": round(avg_daily_drop, 2),
+        "dow": curr_dow,
+        "is_compressed": is_compressed
     }
 
 def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0, pair="B-ETH_USDT"):

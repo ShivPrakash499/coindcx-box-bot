@@ -388,28 +388,42 @@ class BoxTheorySweep(Strategy):
         )
         out["daily_trend_summary"] = bias_label
 
-        recent_15m = recs_15m[-3:]
+        recent_15m = recs_15m[-2:]
+        now_ist = datetime.now(IST)
+        curr_dow = int(levels.get("dow", now_ist.weekday()))
+        is_wknd_or_mon = curr_dow in (5, 6, 0)  # Sat, Sun, Mon
+
+        c15_range = c15_high - c15_low
+        p15_high = float(prev_c15["high"])
+        p15_low = float(prev_c15["low"])
 
         # ------------------------------------------------------------------
-        # 1. SHORT SETUPS:
-        #    - Outer Box RH or SH Liquidity Sweep + Rejection (active in all regimes; tagged with Daily Bias)
+        # 1. SHORT SETUPS (Synced with backtest_entry + Weekend/Monday Protection):
+        #    - In BEARISH or NEUTRAL (Range) bias: RH or SH Sweep + Confirmed 15m Bearish Rejection
+        #    - On Sat/Sun/Mon, SH is reserved strictly for Entry 2 scale-in (never a new Entry 1 breakout trade)
         #    - Daily 50 EMA Touch + Next-Candle Rejection (strictly when Daily Bias == BEARISH)
         # ------------------------------------------------------------------
-        swept_rh_prior = any(float(r["high"]) >= rh or float(r["open"]) >= rh for r in recent_15m)
-        swept_rh_curr15 = (c15_high >= rh) or (float(prev_c15["high"]) >= rh)
-        rejected_rh_5m = swept_rh_prior and (c5_close < rh) and (c5_close <= c5_open or c5_close < prev_c5_close)
-        rejected_rh_15m = swept_rh_curr15 and (c15_close < rh) and (c15_close <= c15_open or c15_close < prev_c15_close)
+        upper_wick_15m = c15_high - max(c15_open, c15_close)
+        has_bear_confirm_15m = (c15_close < c15_open and c15_close < prev_c15_close) or (
+            c15_close < c15_open and c15_range > 0 and (upper_wick_15m / c15_range) >= 0.30
+        )
+        swept_rh_seq = (p15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(p15_high, c15_high) <= sh * 1.005)
+        swept_sh_seq = (p15_high >= sh or c15_high >= sh) and (c15_close < sh) and (max(p15_high, c15_high) <= sh * 1.012)
 
-        swept_sh_prior = any(float(r["high"]) >= sh or float(r["open"]) >= sh for r in recent_15m)
-        swept_sh_curr15 = (c15_high >= sh) or (float(prev_c15["high"]) >= sh)
-        rejected_sh_5m = swept_sh_prior and (c5_close < sh) and (c5_close <= c5_open or c5_close < prev_c5_close)
-        rejected_sh_15m = swept_sh_curr15 and (c15_close < sh) and (c15_close <= c15_open or c15_close < prev_c15_close)
+        rejected_rh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_rh_seq and has_bear_confirm_15m
+        if is_wknd_or_mon:
+            rejected_sh_15m = False
+        else:
+            rejected_sh_15m = (
+                (trend_bias in ("BEARISH", "NEUTRAL") or (c15_close < c15_open and c15_close < p15_low))
+                and swept_sh_seq
+                and has_bear_confirm_15m
+            )
 
-        if rejected_rh_5m or rejected_rh_15m or rejected_sh_5m or rejected_sh_15m:
-            use_5m = rejected_rh_5m or rejected_sh_5m
-            raw_entry = c5_close if use_5m else c15_close
+        if rejected_rh_15m or rejected_sh_15m:
+            raw_entry = c15_close
             entry = eng.round_asset_price(raw_entry, rh)
-            sweep_high = max(float(r["high"]) for r in recent_15m)
+            sweep_high = max(p15_high, c15_high)
             scale_in_lvl = max(sh, sweep_high, entry * 1.008)
             struct_tp1 = mid if entry > mid else rl
             struct_tp2 = rl if entry > rl * 1.012 else sl
@@ -419,10 +433,9 @@ class BoxTheorySweep(Strategy):
                 tp1 = eng.round_asset_price(plan["tp1"], rh)
                 tp2 = eng.round_asset_price(plan["tp2"], rh)
                 entry2 = eng.round_asset_price(plan["entry2_sweep"], rh)
-                tf_lbl = "5m" if use_5m else "15m"
-                lvl_tag = f"SH (${sh:,.2f})" if (rejected_sh_5m or rejected_sh_15m) else f"RH (${rh:,.2f})"
+                lvl_tag = f"SH (${sh:,.2f})" if rejected_sh_15m else f"RH (${rh:,.2f})"
                 reason = (
-                    f"{bias_label} | Swept {lvl_tag} + {tf_lbl} rejection "
+                    f"{bias_label} | Swept {lvl_tag} + 15m rejection "
                     f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
@@ -430,7 +443,7 @@ class BoxTheorySweep(Strategy):
                     "trigger_reason": reason,
                     "setup": f"SELL (Short): {lvl_tag} Sweep + 2-Entry Runner ({session['name']})",
                     "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                    "candle_ts": int(c5["timestamp"] if use_5m else c15["timestamp"]),
+                    "candle_ts": int(c15["timestamp"]),
                 })
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                 return self._stamp(out)
@@ -439,18 +452,18 @@ class BoxTheorySweep(Strategy):
             min_short_zone = rl + 0.35 * (rh - rl)
             touched_daily_ema50 = (
                 (daily_close < daily_ema50)
-                and any(float(r["high"]) >= daily_ema50 * 0.999 and float(r["low"]) <= daily_ema50 * 1.005 for r in recent_15m)
-                and c5_close >= min_short_zone
+                and (p15_high >= daily_ema50 * 0.9995 and p15_low <= daily_ema50 * 1.005)
+                and c15_close >= min_short_zone
             )
             rejected_d_ema50 = (
                 touched_daily_ema50
-                and (c5_close < daily_ema50)
-                and (c5_close < c5_open)
-                and (c5_close < prev_c5_close)
+                and (c15_close < daily_ema50)
+                and (c15_close < c15_open)
+                and (c15_close < prev_c15_close)
             )
             if rejected_d_ema50:
-                entry = eng.round_asset_price(c5_close, rh)
-                sweep_high = max(float(prev_c15["high"]), c15_high, c5_high, daily_ema50)
+                entry = eng.round_asset_price(c15_close, rh)
+                sweep_high = max(p15_high, c15_high, daily_ema50)
                 struct_tp1 = mid if entry > mid else rl
                 struct_tp2 = rl if entry > rl * 1.012 else sl
                 plan = build_two_entry_runner_plan("SHORT", entry, max(sweep_high, sh), struct_tp1, struct_tp2, leverage)
@@ -469,31 +482,38 @@ class BoxTheorySweep(Strategy):
                             "trigger_reason": reason,
                             "setup": f"SELL (Short): Daily 50 EMA Touch + 2-Entry Runner ({session['name']})",
                             "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                            "candle_ts": int(c5["timestamp"]),
+                            "candle_ts": int(c15["timestamp"]),
                         })
                         out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                         return self._stamp(out)
 
         # ------------------------------------------------------------------
-        # 2. LONG SETUPS:
-        #    - Outer Box RL or SL Liquidity Sweep + Rejection (active in all regimes; tagged with Daily Bias)
+        # 2. LONG SETUPS (Synced with backtest_entry + Weekend/Monday Protection):
+        #    - In BULLISH or NEUTRAL (Range) bias: RL or SL Sweep + Confirmed 15m Bullish Rejection
+        #    - On Sat/Sun/Mon, SL is reserved strictly for Entry 2 scale-in (never a new Entry 1 breakdown trade)
         #    - Daily 50 EMA Touch + Next-Candle Rejection (strictly when Daily Bias == BULLISH)
         # ------------------------------------------------------------------
-        swept_rl_prior = any(float(r["low"]) <= rl or float(r["open"]) <= rl for r in recent_15m)
-        swept_rl_curr15 = (c15_low <= rl) or (float(prev_c15["low"]) <= rl)
-        rejected_rl_5m = swept_rl_prior and (c5_close > rl) and (c5_close >= c5_open or c5_close > prev_c5_close)
-        rejected_rl_15m = swept_rl_curr15 and (c15_close > rl) and (c15_close >= c15_open or c15_close > prev_c15_close)
+        lower_wick_15m = min(c15_open, c15_close) - c15_low
+        has_bull_confirm_15m = (c15_close > c15_open and c15_close > prev_c15_close) or (
+            c15_close > c15_open and c15_range > 0 and (lower_wick_15m / c15_range) >= 0.30
+        )
+        swept_rl_seq = (p15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(p15_low, c15_low) >= sl * 0.995)
+        swept_sl_seq = (p15_low <= sl or c15_low <= sl) and (c15_close > sl) and (min(p15_low, c15_low) >= sl * 0.988)
 
-        swept_sl_prior = any(float(r["low"]) <= sl or float(r["open"]) <= sl for r in recent_15m)
-        swept_sl_curr15 = (c15_low <= sl) or (float(prev_c15["low"]) <= sl)
-        rejected_sl_5m = swept_sl_prior and (c5_close > sl) and (c5_close >= c5_open or c5_close > prev_c5_close)
-        rejected_sl_15m = swept_sl_curr15 and (c15_close > sl) and (c15_close >= c15_open or c15_close > prev_c15_close)
+        rejected_rl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm_15m
+        if is_wknd_or_mon:
+            rejected_sl_15m = False
+        else:
+            rejected_sl_15m = (
+                (trend_bias in ("BULLISH", "NEUTRAL") or (c15_close > c15_open and c15_close > p15_high))
+                and swept_sl_seq
+                and has_bull_confirm_15m
+            )
 
-        if rejected_rl_5m or rejected_rl_15m or rejected_sl_5m or rejected_sl_15m:
-            use_5m = rejected_rl_5m or rejected_sl_5m
-            raw_entry = c5_close if use_5m else c15_close
+        if rejected_rl_15m or rejected_sl_15m:
+            raw_entry = c15_close
             entry = eng.round_asset_price(raw_entry, rl)
-            sweep_low = min(float(r["low"]) for r in recent_15m)
+            sweep_low = min(p15_low, c15_low)
             scale_in_lvl = min(sl, sweep_low, entry * 0.992)
             struct_tp1 = mid if entry < mid else rh
             struct_tp2 = rh if entry < rh * 0.988 else sh
@@ -503,10 +523,9 @@ class BoxTheorySweep(Strategy):
                 tp1 = eng.round_asset_price(plan["tp1"], rl)
                 tp2 = eng.round_asset_price(plan["tp2"], rl)
                 entry2 = eng.round_asset_price(plan["entry2_sweep"], rl)
-                tf_lbl = "5m" if use_5m else "15m"
-                lvl_tag = f"SL (${sl:,.2f})" if (rejected_sl_5m or rejected_sl_15m) else f"RL (${rl:,.2f})"
+                lvl_tag = f"SL (${sl:,.2f})" if rejected_sl_15m else f"RL (${rl:,.2f})"
                 reason = (
-                    f"{bias_label} | Swept {lvl_tag} + {tf_lbl} rejection "
+                    f"{bias_label} | Swept {lvl_tag} + 15m rejection "
                     f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
@@ -514,7 +533,7 @@ class BoxTheorySweep(Strategy):
                     "trigger_reason": reason,
                     "setup": f"BUY (Long): {lvl_tag} Sweep + 2-Entry Runner ({session['name']})",
                     "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                    "candle_ts": int(c5["timestamp"] if use_5m else c15["timestamp"]),
+                    "candle_ts": int(c15["timestamp"]),
                 })
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                 return self._stamp(out)
@@ -523,18 +542,18 @@ class BoxTheorySweep(Strategy):
             max_long_zone = rh - 0.35 * (rh - rl)
             touched_daily_ema50 = (
                 (daily_close > daily_ema50)
-                and any(float(r["low"]) <= daily_ema50 * 1.001 and float(r["high"]) >= daily_ema50 * 0.995 for r in recent_15m)
-                and c5_close <= max_long_zone
+                and (p15_low <= daily_ema50 * 1.0005 and p15_high >= daily_ema50 * 0.995)
+                and c15_close <= max_long_zone
             )
             rejected_d_ema50 = (
                 touched_daily_ema50
-                and (c5_close > daily_ema50)
-                and (c5_close > c5_open)
-                and (c5_close > prev_c5_close)
+                and (c15_close > daily_ema50)
+                and (c15_close > c15_open)
+                and (c15_close > prev_c15_close)
             )
             if rejected_d_ema50:
-                entry = eng.round_asset_price(c5_close, rl)
-                sweep_low = min(float(prev_c15["low"]), c15_low, c5_low, daily_ema50)
+                entry = eng.round_asset_price(c15_close, rl)
+                sweep_low = min(p15_low, c15_low, daily_ema50)
                 struct_tp1 = mid if entry < mid else rh
                 struct_tp2 = rh if entry < rh * 0.988 else sh
                 plan = build_two_entry_runner_plan("LONG", entry, min(sweep_low, sl), struct_tp1, struct_tp2, leverage)
@@ -553,7 +572,7 @@ class BoxTheorySweep(Strategy):
                             "trigger_reason": reason,
                             "setup": f"BUY (Long): Daily 50 EMA Touch + 2-Entry Runner ({session['name']})",
                             "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                            "candle_ts": int(c5["timestamp"]),
+                            "candle_ts": int(c15["timestamp"]),
                         })
                         out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                         return self._stamp(out)
@@ -621,6 +640,10 @@ class BoxTheorySweep(Strategy):
         d = df_daily.copy().reset_index(drop=True)
         d["EMA50"] = d["close"].ewm(span=50, adjust=False).mean()
         d["EMA200"] = d["close"].ewm(span=200, adjust=False).mean()
+        d["dt_ist"] = pd.to_datetime(d["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(IST)
+        d["dow"] = d["dt_ist"].dt.day_of_week  # 0=Mon .. 5=Sat, 6=Sun
+        d["range"] = d["high"] - d["low"]
+        d["atr14"] = d["range"].rolling(14, min_periods=5).mean()
         daily_records = d.to_dict("records")
 
         # Also precompute 15m 50 EMA across the execution candles
@@ -628,10 +651,23 @@ class BoxTheorySweep(Strategy):
 
         daily_boxes = {}
         for i in range(1, len(daily_records)):
-            curr_day_str = daily_records[i]["date_str"]
+            curr_day = daily_records[i]
+            curr_day_str = curr_day["date_str"]
+            curr_dow = int(curr_day["dow"])
             prev_day = daily_records[i - 1]
+            atr = float(prev_day.get("atr14") or (float(prev_day["high"]) - float(prev_day["low"])))
+
             rh = float(prev_day["high"])
             rl = float(prev_day["low"])
+            raw_width = rh - rl
+            is_compressed = raw_width < (0.55 * atr)
+
+            # Extreme Weekend Compression Merge (< 52% of 14d ATR on Sunday or Monday):
+            # Merge with the preceding day so RH/RL never sit inside a tiny 1.5% weekend inside-bar.
+            if curr_dow in (0, 6) and i >= 2 and raw_width < (0.52 * atr):
+                rh = max(float(daily_records[i - 2]["high"]), rh)
+                rl = min(float(daily_records[i - 2]["low"]), rl)
+
             prev_close = float(prev_day["close"])
             ema50 = float(prev_day["EMA50"])
             ema200 = float(prev_day["EMA200"])
@@ -650,7 +686,8 @@ class BoxTheorySweep(Strategy):
 
             daily_boxes[curr_day_str] = {
                 "RH": rh, "RL": rl, "MID": mid, "SH": sh, "SL": sl,
-                "EMA50": ema50, "EMA200": ema200, "bias": bias
+                "EMA50": ema50, "EMA200": ema200, "bias": bias,
+                "dow": curr_dow, "is_compressed": is_compressed
             }
         return {"boxes": daily_boxes, "ema50_15m": ema50_15m_list}
 
@@ -662,6 +699,8 @@ class BoxTheorySweep(Strategy):
             return None
         box = ctx["boxes"][candle["date_str"]]
         bias = box["bias"]
+        dow = box.get("dow", -1)
+        is_wknd_or_mon = dow in (5, 6, 0)  # Sat, Sun, Mon
 
         rh, rl, mid = box["RH"], box["RL"], box["MID"]
         sh, sl = box["SH"], box["SL"]
@@ -685,7 +724,8 @@ class BoxTheorySweep(Strategy):
 
         # 1. SHORT SETUPS:
         #    - In BEARISH or NEUTRAL (Range) bias: RH or SH Sweep + Next-Candle Bearish Confirmation
-        #    - In BULLISH bias: only take counter-trend Short when outer SH Swing High is swept with bearish engulfing close (< prev low)
+        #    - On Sat/Sun/Mon, SH is reserved strictly for Entry 2 scale-in (never a new Entry 1 breakout trade)
+        #    - In BULLISH bias (Tue-Fri): only take counter-trend Short when outer SH Swing High is swept with bearish engulfing close (< prev low)
         upper_wick = c_high - max(c_open, c_close)
         has_bear_confirm = (c_close < c_open and c_close < p_close) or (
             c_close < c_open and candle_range > 0 and (upper_wick / candle_range) >= 0.30
@@ -694,11 +734,14 @@ class BoxTheorySweep(Strategy):
         swept_sh_seq = (p_high >= sh or c_high >= sh) and (c_close < sh) and (max(p_high, c_high) <= sh * 1.012)
 
         swept_rh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_rh_seq and has_bear_confirm
-        swept_sh_rej = (
-            (bias in ("BEARISH", "NEUTRAL") or (c_close < c_open and c_close < p_low))
-            and swept_sh_seq
-            and has_bear_confirm
-        )
+        if is_wknd_or_mon:
+            swept_sh_rej = False
+        else:
+            swept_sh_rej = (
+                (bias in ("BEARISH", "NEUTRAL") or (c_close < c_open and c_close < p_low))
+                and swept_sh_seq
+                and has_bear_confirm
+            )
 
         if swept_rh_rej or swept_sh_rej:
             scale_in_lvl = max(sh, p_high, c_high)
@@ -732,7 +775,8 @@ class BoxTheorySweep(Strategy):
 
         # 2. LONG SETUPS:
         #    - In BULLISH or NEUTRAL (Range) bias: RL or SL Sweep + Next-Candle Bullish Confirmation
-        #    - In BEARISH bias: only take counter-trend Long when outer SL Swing Low is swept with bullish engulfing close (> prev high)
+        #    - On Sat/Sun/Mon, SL is reserved strictly for Entry 2 scale-in (never a new Entry 1 breakdown trade)
+        #    - In BEARISH bias (Tue-Fri): only take counter-trend Long when outer SL Swing Low is swept with bullish engulfing close (> prev high)
         lower_wick = min(c_open, c_close) - c_low
         has_bull_confirm = (c_close > c_open and c_close > p_close) or (
             c_close > c_open and candle_range > 0 and (lower_wick / candle_range) >= 0.30
@@ -741,11 +785,14 @@ class BoxTheorySweep(Strategy):
         swept_sl_seq = (p_low <= sl or c_low <= sl) and (c_close > sl) and (min(p_low, c_low) >= sl * 0.988)
 
         swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
-        swept_sl_rej = (
-            (bias in ("BULLISH", "NEUTRAL") or (c_close > c_open and c_close > p_high))
-            and swept_sl_seq
-            and has_bull_confirm
-        )
+        if is_wknd_or_mon:
+            swept_sl_rej = False
+        else:
+            swept_sl_rej = (
+                (bias in ("BULLISH", "NEUTRAL") or (c_close > c_open and c_close > p_high))
+                and swept_sl_seq
+                and has_bull_confirm
+            )
 
         if swept_rl_rej or swept_sl_rej:
             scale_in_lvl = min(sl, p_low, c_low)
