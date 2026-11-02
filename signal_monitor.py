@@ -6,8 +6,10 @@ It never places orders unless AutoTrade is explicitly enabled.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import sys
 import threading
 import time
 
@@ -16,6 +18,24 @@ from datetime import datetime
 import coindcx_engine as eng
 import email_notifier
 import strategies as strat_registry
+
+_MONITOR_MTIMES = sys.__dict__.setdefault("_signal_monitor_mtimes", {})
+
+
+def _hot_reload_dependencies():
+    """Ensures background 24/7 daemon always uses the latest on-disk coindcx_engine & strategies code."""
+    for mod in (eng, strat_registry):
+        try:
+            f_path = getattr(mod, "__file__", None)
+            if f_path and os.path.exists(f_path):
+                mt = os.path.getmtime(f_path)
+                m_name = mod.__name__
+                if _MONITOR_MTIMES.get(m_name) != mt:
+                    if m_name in _MONITOR_MTIMES:
+                        importlib.reload(mod)
+                    _MONITOR_MTIMES[m_name] = mt
+        except Exception:
+            pass
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "alert_state.json")
 DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
@@ -94,6 +114,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
       4. When AutoTrade is toggled ON in the Sidebar, automatically executes the 2-Entry + Runner setup
          using the user's configured Single-Trade Margin out of the Futures Wallet.
     """
+    _hot_reload_dependencies()
     auto_cfg = eng.get_autotrade_config()
     if margin_inr is None or margin_inr <= 0:
         margin_inr = float(auto_cfg.get("single_trade_margin_inr", 100000.0))

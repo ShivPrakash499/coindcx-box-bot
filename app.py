@@ -180,7 +180,11 @@ def _ensure_background_monitor():
     def _monitor_worker():
         while True:
             try:
+                _reload_if_updated(coindcx_engine)
+                if strategy_registry:
+                    _reload_if_updated(strategy_registry)
                 if signal_monitor:
+                    _reload_if_updated(signal_monitor)
                     auto_cfg = coindcx_engine.get_autotrade_config()
                     rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
                     m_inr = float(auto_cfg.get("single_trade_margin_inr") or rot.get("margin_inr", 100000.0))
@@ -1993,8 +1997,11 @@ elif active_section == "📊 Positions":
         e2_target = float(pos_norm["entry2_sweep"])
         sl_target = float(pos_norm["stop_loss"])
 
-        # Auto-sync missing or un-upgraded TP2, SL, TP1 Limit & Entry 2 Limit onto active CoinDCX position once per session
-        if pid not in auto_synced_pids:
+        # Auto-sync missing TP2/SL/TP1/Entry2 ONLY when position lacks TP/SL or is not yet tracked in active_trade_lock
+        already_locked_for_pair = (auto_lock_cfg.get("pair") == pr)
+        already_tp1_hit = already_locked_for_pair and bool(auto_lock_cfg.get("tp1_hit", False))
+        needs_initial_sync = (not already_locked_for_pair) or (cur_sl is None) or (cur_tp is None)
+        if pid not in auto_synced_pids and needs_initial_sync and not already_tp1_hit:
             auto_synced_pids.add(pid)
             s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                 pair=pr,
@@ -2014,6 +2021,8 @@ elif active_section == "📊 Positions":
                 get_cached_positions.clear()
                 get_cached_open_orders.clear()
                 live_open_orders = fetch_coindcx_open_orders() or []
+        else:
+            auto_synced_pids.add(pid)
 
         ratchet, target_sl = "⏳ Waiting for TP1", None
         if tp1 and tp2:
