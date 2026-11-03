@@ -243,7 +243,7 @@ def check_authentication():
     required_pin = get_security_pin()
     pin_slot = st.empty()
     with pin_slot.container():
-        st.markdown(
+        st.html(
             """
             <div style="max-width: 400px; margin: 48px auto 16px auto; padding: 28px 24px; background: #0f172a; border-radius: 16px; box-shadow: 0 12px 32px rgba(0,0,0,0.25); text-align: center; border: 1px solid #1e293b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
                 <div style="font-size: 38px; margin-bottom: 8px;">⚡</div>
@@ -251,8 +251,7 @@ def check_authentication():
                 <div style="display: inline-block; background: rgba(59,130,246,0.15); color: #60a5fa; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.5px;">24/7 Daemon Active</div>
                 <p style="color: #94a3b8; font-size: 12.5px; margin-top: 10px; margin-bottom: 0px;">Enter your PIN to unlock execution & position controls.</p>
             </div>
-            """,
-            unsafe_allow_html=True
+            """
         )
 
         _, col_center, _ = st.columns([1, 1.4, 1])
@@ -417,10 +416,11 @@ if _url_pair and _url_pair in GLOBAL_FUTURES_PAIRS:
     st.session_state["_pair_auto_synced"] = True
 elif "selected_pair" not in st.session_state or not st.session_state.get("_pair_auto_synced"):
     _active_trade_pair = _detect_active_trade_pair()
-    _init_pair = _active_trade_pair if _active_trade_pair else "B-ETH_USDT"
+    _init_pair = _active_trade_pair if _active_trade_pair else st.session_state.get("selected_pair", "B-ETH_USDT")
     st.session_state.selected_pair = _init_pair
     st.session_state.pair_selector_widget = _init_pair
-    st.session_state["_pair_auto_synced"] = True
+    if _active_trade_pair:
+        st.session_state["_pair_auto_synced"] = True
 
 _url_tab = _qp.get("tab", "").lower()
 is_execution_link = _url_tab in ("execute", "execution", "trade")
@@ -464,6 +464,7 @@ def _switch_pair_and_nav(target_pair: str, nav_section: str | None = None, strat
     if target_pair in GLOBAL_FUTURES_PAIRS:
         st.session_state.selected_pair = target_pair
         st.session_state.pair_selector_widget = target_pair
+        st.session_state["_pair_auto_synced"] = True
     if strategy_name:
         st.session_state["exec_strategy_mode"] = f"{strategy_name} Only"
     if nav_section in NAV_SECTIONS:
@@ -473,6 +474,7 @@ def _on_pair_dropdown_change():
     picked = st.session_state.get("pair_selector_widget")
     if picked in GLOBAL_FUTURES_PAIRS:
         st.session_state.selected_pair = picked
+        st.session_state["_pair_auto_synced"] = True
 
 def check_and_update_paper_orders():
     pending = st.session_state.get("paper_pending_orders", [])
@@ -576,18 +578,31 @@ usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (1-Slot)")
+# Sync stale browser session toggle state if v6 disarmed AutoTrade on disk
+_disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
+if st.session_state.get("_autotrade_disarm_sync_v") != 6:
+    st.session_state["_autotrade_disarm_sync_v"] = 6
+    st.session_state["sidebar_autotrade_toggle"] = _disk_auto_enabled
+
+
+def _on_sidebar_autotrade_toggle_change():
+    new_val = bool(st.session_state.get("sidebar_autotrade_toggle", False))
+    coindcx_engine.save_autotrade_config({"enabled": new_val})
+    get_cached_signals_scan.clear()
+    get_cached_positions.clear()
+
+
 autotrade_on = st.sidebar.toggle(
     "Enable AutoTrade (10x 2-Entry)",
-    value=bool(_auto_cfg.get("enabled", False)),
+    value=_disk_auto_enabled,
     key="sidebar_autotrade_toggle",
+    on_change=_on_sidebar_autotrade_toggle_change,
 )
 if (
-    autotrade_on != bool(_auto_cfg.get("enabled", False))
-    or round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
+    round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
 ):
     _auto_cfg = coindcx_engine.save_autotrade_config({
-        "enabled": bool(autotrade_on),
         "single_trade_margin_inr": round(float(margin_inr), 2),
         "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
         "leverage": int(leverage),
@@ -690,7 +705,7 @@ else:
     nav_active_txt = "#ffffff"
 
 # ----------------- RESPONSIVE CSS (DESKTOP HORIZONTAL NAV / IPHONE VERTICAL NAV) -----------------
-st.markdown(f"""
+st.html(f"""
 <style>
     /* Global anti-horizontal-scroll enforcement & top header theme sync */
     html, body, .stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] {{
@@ -1110,7 +1125,7 @@ st.markdown(f"""
         }}
     }}
 </style>
-""", unsafe_allow_html=True)
+""")
 
 # ==============================================================================
 # 1. PROMINENT ASSET SWITCHER + LIVE PRICE & MATCHED PNL HEADER
@@ -2000,6 +2015,22 @@ elif active_section == "📊 Positions":
 
     check_and_update_paper_orders()
     live_positions = get_cached_positions() or []
+    if not live_positions and not coindcx_engine._PERSIST.get("session_verified"):
+        # Trigger background NAT pinning + position refresh and auto-poll until verified
+        coindcx_engine._trigger_bg_positions_refresh()
+
+        @st.fragment(run_every="4s")
+        def _auto_poll_until_positions_synced():
+            cur_pos = coindcx_engine._ACTIVE_POSITIONS_CACHE.get("data") or []
+            if cur_pos or coindcx_engine._PERSIST.get("session_verified"):
+                if cur_pos:
+                    st.rerun()
+            else:
+                coindcx_engine._trigger_bg_positions_refresh()
+                st.caption("🔄 Synchronizing live positions & Cloud NAT session with CoinDCX...")
+
+        _auto_poll_until_positions_synced()
+
     paper = st.session_state.active_position
     plans = st.session_state.get("trade_plans", {})
     pending_paper = st.session_state.get("paper_pending_orders", [])

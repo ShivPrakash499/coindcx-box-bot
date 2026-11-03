@@ -426,16 +426,114 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 5
+_REQUIRED_DAEMON_VERSION = 6
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
+_NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
+
+
+class _ObsoleteDaemonStop(BaseException):
+    """Custom non-SystemExit exception so Uvicorn/Tornado never logs an unclean server shutdown."""
+    pass
 
 
 def _check_and_kill_obsolete_daemon():
-    """Immediately terminates any background daemon thread from an older version (< v5)."""
+    """Immediately terminates any background daemon thread from an older version (< v6)."""
     _tname = _threading.current_thread().name
     if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_REQUIRED_DAEMON_VERSION}":
         _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
-        raise SystemExit(f"Terminating obsolete daemon thread {_tname} (active is v{_REQUIRED_DAEMON_VERSION})")
+        raise _ObsoleteDaemonStop(f"Terminating obsolete daemon thread {_tname} (active is v{_REQUIRED_DAEMON_VERSION})")
+
+
+def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET", url: str = "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets", payload: dict | None = None, timeout: float = 3.5):
+    """
+    Single-flight Cloud NAT egress IP pinner:
+    - Holds candidate `requests.Session()` sockets open in `cand_pool` simultaneously so Google Cloud NAT
+      must allocate distinct egress IPs across its pool instead of recycling a single non-allowlisted NAT IP.
+    - Prioritizes the user's allowlisted NAT IP (`34.83.176.217`) immediately on sight, and falls back to testing
+      other unique candidate IPs in the pool.
+    - Uses a non-blocking single-flight lock (`_NAT_PIN_LOCK`) and 0.03s GIL yields so Streamlit static asset
+      serving is never starved.
+    """
+    if not _NAT_PIN_LOCK.acquire(blocking=False):
+        return None
+
+    cand_pool = []
+    winning_sess = None
+    winning_res = None
+    winning_ip = ""
+    try:
+        target_ip = "34.83.176.217"
+        seen_ips = {}
+
+        def _test_signed_on_sess(cand_sess):
+            with _COINDCX_SIGN_LOCK:
+                body = payload.copy() if payload else {}
+                body["timestamp"] = _next_monotonic_ms()
+                json_body = json.dumps(body, separators=(',', ':'))
+                signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-AUTH-APIKEY': api_key,
+                    'X-AUTH-SIGNATURE': signature,
+                    'Connection': 'keep-alive',
+                }
+            try:
+                if method.upper() == "GET":
+                    return cand_sess.get(url, data=json_body, headers=headers, timeout=timeout)
+                return cand_sess.post(url, data=json_body, headers=headers, timeout=timeout)
+            except Exception:
+                return None
+
+        # Keep sockets open in cand_pool so Cloud NAT assigns across all pool IPs
+        for _ in range(18):
+            cand = requests.Session()
+            cand_pool.append(cand)
+            cand_ip = _probe_session_coindcx_ip(cand, timeout=1.6)
+            if cand_ip == target_ip:
+                r_try = _test_signed_on_sess(cand)
+                if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
+                    winning_sess = cand
+                    winning_res = r_try
+                    winning_ip = cand_ip
+                    break
+            if cand_ip and cand_ip not in seen_ips:
+                seen_ips[cand_ip] = cand
+            time.sleep(0.03)
+
+        # If target_ip was not hit directly, test unique candidate IPs (prioritizing 34.* Cloud NAT IPs)
+        if winning_sess is None:
+            ordered_ips = sorted(seen_ips.keys(), key=lambda ip: (0 if ip == target_ip else (1 if ip.startswith("34.") else 2)))
+            for cand_ip in ordered_ips:
+                cand = seen_ips[cand_ip]
+                r_try = _test_signed_on_sess(cand)
+                if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
+                    winning_sess = cand
+                    winning_res = r_try
+                    winning_ip = cand_ip
+                    break
+                time.sleep(0.02)
+
+        if winning_sess is not None:
+            with _COINDCX_SIGN_LOCK:
+                old_sess = _PERSIST.get("session")
+                if old_sess is not None and old_sess is not winning_sess:
+                    try:
+                        old_sess.close()
+                    except Exception:
+                        pass
+                _PERSIST["session"] = winning_sess
+                _PERSIST["session_verified"] = True
+                _PERSIST["pinned_ip"] = winning_ip
+            return winning_res
+        return None
+    finally:
+        for s in cand_pool:
+            if s is not winning_sess:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+        _NAT_PIN_LOCK.release()
 
 
 def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
@@ -444,7 +542,8 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
     - Terminates any obsolete background daemon threads before any network/order activity.
     - Uses a process-persistent HTTP Keep-Alive session so once a TCP socket is pinned to the
       allowlisted Cloud NAT IP (34.83.176.217), all subsequent requests reuse that exact socket.
-    - Never spawns thread pools; if a 401 occurs, does at most 4 quick sequential socket checks (throttled).
+    - On HTTP 401 (unpinned Cloud NAT IP after container restart), uses the single-flight pool pinner
+      `_pin_coindcx_nat_session()` so `34.83.176.217` is acquired without spawning thread pools.
     """
     _check_and_kill_obsolete_daemon()
     api_key, api_secret = _get_coindcx_credentials()
@@ -454,7 +553,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
 
     try:
         res = None
-        max_attempts = 2 if _PERSIST.get("session_verified") else 3
+        max_attempts = 2 if _PERSIST.get("session_verified") else 2
         for attempt in range(max_attempts):
             with _COINDCX_SIGN_LOCK:
                 body = payload.copy() if payload else {}
@@ -505,47 +604,18 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
 
             time.sleep(0.03)
 
-        # Lightweight sequential NAT socket check ONLY when a user/order action got 401 (throttled to once per 30s)
+        # Single-flight NAT pool pinner when 401 occurs (acquires 34.83.176.217 by holding pool sockets open)
         is_order_or_exit = any(k in url for k in ("/exit", "/orders/create", "/cancel", "/create_tpsl"))
         now_probe = time.time()
         if (
             res is not None
             and res.status_code == 401
-            and (is_order_or_exit or (now_probe - float(_PERSIST.get("last_nat_probe_ts", 0.0))) > 30.0)
+            and (is_order_or_exit or (now_probe - float(_PERSIST.get("last_nat_probe_ts", 0.0))) > 6.0)
         ):
             _PERSIST["last_nat_probe_ts"] = now_probe
-            for _ in range(5):
-                cand = requests.Session()
-                cand_ip = _probe_session_coindcx_ip(cand, timeout=1.5)
-                with _COINDCX_SIGN_LOCK:
-                    body = payload.copy() if payload else {}
-                    body["timestamp"] = _next_monotonic_ms()
-                    json_body = json.dumps(body, separators=(',', ':'))
-                    signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
-                    headers = {
-                        'Content-Type': 'application/json',
-                        'X-AUTH-APIKEY': api_key,
-                        'X-AUTH-SIGNATURE': signature,
-                        'Connection': 'keep-alive',
-                    }
-                try:
-                    r_try = cand.get(url, data=json_body, headers=headers, timeout=timeout) if method.upper() == "GET" else cand.post(url, data=json_body, headers=headers, timeout=timeout)
-                    if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
-                        with _COINDCX_SIGN_LOCK:
-                            try:
-                                _PERSIST["session"].close()
-                            except Exception:
-                                pass
-                            _PERSIST["session"] = cand
-                            _PERSIST["session_verified"] = True
-                            _PERSIST["pinned_ip"] = cand_ip
-                        return r_try, None
-                except Exception:
-                    pass
-                try:
-                    cand.close()
-                except Exception:
-                    pass
+            r_pinned = _pin_coindcx_nat_session(api_key, api_secret, method=method, url=url, payload=payload, timeout=timeout)
+            if r_pinned is not None:
+                return r_pinned, None
 
         return res, None
     except Exception as e:
@@ -717,14 +787,16 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
 def _trigger_bg_wallet_refresh():
     """Spawns a background daemon thread to refresh wallet balance without blocking the Streamlit UI."""
     now_ts = time.time()
-    if _WALLET_BALANCE_CACHE.get("refreshing") and (now_ts - float(_WALLET_BALANCE_CACHE.get("refresh_start_ts", 0.0))) < 10.0:
+    if _WALLET_BALANCE_CACHE.get("refreshing") and (now_ts - float(_WALLET_BALANCE_CACHE.get("refresh_start_ts", 0.0))) < 15.0:
         return
     _WALLET_BALANCE_CACHE["refreshing"] = True
     _WALLET_BALANCE_CACHE["refresh_start_ts"] = now_ts
 
     def _bg_worker():
         try:
-            _fetch_coindcx_futures_balance_sync()
+            res = _fetch_coindcx_futures_balance_sync()
+            if isinstance(res, dict) and res.get("is_live_api") and not _ACTIVE_POSITIONS_CACHE.get("data"):
+                _fetch_coindcx_active_positions_sync()
         except Exception:
             pass
         finally:
@@ -906,14 +978,16 @@ def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> 
 def _trigger_bg_positions_refresh():
     """Spawns a background daemon thread to refresh active positions without blocking the UI."""
     now_ts = time.time()
-    if _ACTIVE_POSITIONS_CACHE.get("refreshing") and (now_ts - float(_ACTIVE_POSITIONS_CACHE.get("refresh_start_ts", 0.0))) < 10.0:
+    if _ACTIVE_POSITIONS_CACHE.get("refreshing") and (now_ts - float(_ACTIVE_POSITIONS_CACHE.get("refresh_start_ts", 0.0))) < 15.0:
         return
     _ACTIVE_POSITIONS_CACHE["refreshing"] = True
     _ACTIVE_POSITIONS_CACHE["refresh_start_ts"] = now_ts
 
     def _bg_pos_worker():
         try:
-            _fetch_coindcx_active_positions_sync()
+            pos = _fetch_coindcx_active_positions_sync()
+            if pos is not None and not _WALLET_BALANCE_CACHE.get("data"):
+                _fetch_coindcx_futures_balance_sync()
         except Exception:
             pass
         finally:
@@ -933,7 +1007,7 @@ def fetch_coindcx_active_positions(force_refresh: bool = False):
     cached_pos = _ACTIVE_POSITIONS_CACHE.get("data")
     if cached_pos is not None:
         age = now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))
-        if age >= 10.0:
+        if age >= 8.0 or (len(cached_pos) == 0 and not _PERSIST.get("session_verified")):
             _trigger_bg_positions_refresh()
         return list(cached_pos)
 
@@ -3627,6 +3701,10 @@ def _upgrade_all_in_memory_functions_and_disarm():
                 _threading.Thread(target=_cleanup_render_orders, daemon=True).start()
         except Exception:
             pass
+
+    # Proactively warm live positions & wallet balance in background if not yet verified
+    if not _PERSIST.get("session_verified") or not _ACTIVE_POSITIONS_CACHE.get("data"):
+        _trigger_bg_positions_refresh()
 
     try:
         import importlib as _il
