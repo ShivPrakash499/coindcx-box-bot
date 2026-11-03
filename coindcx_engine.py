@@ -731,8 +731,8 @@ def fetch_coindcx_futures_balance():
                         pass
                     return s, ip_b
 
-                with ThreadPoolExecutor(max_workers=20) as ex:
-                    pool_40 = list(ex.map(_probe_one, range(40)))
+                with ThreadPoolExecutor(max_workers=60) as ex:
+                    pool_40 = list(ex.map(_probe_one, range(60)))
 
                 # Group by unique IP
                 by_ip = {}
@@ -747,46 +747,39 @@ def fetch_coindcx_futures_balance():
 
                 diag_info["unique_40_ips"] = list(by_ip.keys())
 
-                # 4. For each unique IP socket, test GET /wallets and POST /balances with current key AND old key
-                keys_to_test = [
-                    ("new_d18a", api_key, api_secret),
-                    ("old_23a6", "23a6860f2262b2dc629f4533505ab436573f91ecf6a9473b", "d616ead690f7f737e9e8afb39744d865ca361a1a915adce8761e3a0e6573ed22"),
-                ]
+                # 4. Test timestamp offsets, endpoints, and headers on 34.83.176.217 and all unique IPs
                 ip_test_results = {}
                 for u_ip, u_sess in by_ip.items():
                     ip_test_results[u_ip] = {}
-                    for k_label, k_val, s_val in keys_to_test:
+                    # 4a. Test timestamp offsets on GET /wallets and POST /balances
+                    for off_label, ts_val in [
+                        ("ms_minus_3000", int(time.time() * 1000) - 3000),
+                        ("ms_minus_1500", int(time.time() * 1000) - 1500),
+                        ("ms_0", int(time.time() * 1000)),
+                        ("sec_0", int(time.time())),
+                        ("sec_minus_2", int(time.time()) - 2),
+                    ]:
                         for ep_label, ep_m, ep_url in [
                             ("fut_w", "GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets"),
                             ("spot_b", "POST", "https://api.coindcx.com/exchange/v1/users/balances"),
+                            ("usr_i", "POST", "https://api.coindcx.com/exchange/v1/users/info"),
+                            ("fut_p", "POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions"),
                         ]:
                             try:
-                                ts_now = int(round(time.time() * 1000))
-                                jb = json.dumps({"timestamp": ts_now}, separators=(",", ":"))
-                                sig = hmac.new(s_val.encode("utf-8"), jb.encode("utf-8"), hashlib.sha256).hexdigest()
+                                jb = json.dumps({"timestamp": ts_val}, separators=(",", ":"))
+                                sig = hmac.new(api_secret.encode("utf-8"), jb.encode("utf-8"), hashlib.sha256).hexdigest()
                                 hdr = {
                                     "Content-Type": "application/json",
-                                    "X-AUTH-APIKEY": k_val,
+                                    "X-AUTH-APIKEY": api_key,
                                     "X-AUTH-SIGNATURE": sig,
                                     "Connection": "keep-alive",
                                 }
                                 r_ep = u_sess.request(ep_m, ep_url, data=jb, headers=hdr, timeout=4)
-                                # Check trace after
-                                r_after = u_sess.get("https://api.coindcx.com/cdn-cgi/trace", timeout=2)
-                                ip_a = ""
-                                for ln in r_after.text.splitlines():
-                                    if ln.startswith("ip="):
-                                        ip_a = ln.split("=", 1)[1].strip()
-                                p_obj = list(u_sess.adapters["https://"].poolmanager.pools._container.values())[0]
-                                ip_test_results[u_ip][f"{k_label}_{ep_label}"] = {
-                                    "code": r_ep.status_code,
-                                    "body": r_ep.text[:80],
-                                    "ip_after": ip_a,
-                                    "conns": p_obj.num_connections,
-                                    "reqs": p_obj.num_requests,
-                                }
+                                ip_test_results[u_ip][f"{off_label}_{ep_label}"] = f"{r_ep.status_code}:{r_ep.text[:50]}"
+                                if off_label == "ms_0" and ep_label == "fut_w":
+                                    ip_test_results[u_ip]["sample_headers"] = dict(r_ep.headers)
                             except Exception as _e:
-                                ip_test_results[u_ip][f"{k_label}_{ep_label}"] = f"err:{_e}"
+                                ip_test_results[u_ip][f"{off_label}_{ep_label}"] = f"err:{_e}"
                     try:
                         u_sess.close()
                     except Exception:
@@ -798,7 +791,7 @@ def fetch_coindcx_futures_balance():
                 ws = sheets_logger._get_ws(book, "_Cloud_Diag")
                 ws.append_row([
                     datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                    "LIVE_OK" if is_ok else "FAIL_V2",
+                    "LIVE_OK" if is_ok else "FAIL_V3",
                     round(float(tot_val), 2),
                     str(_PERSIST.get("pinned_ip", "")),
                     json.dumps(_PERSIST.get("last_ip_status_map", {})),
