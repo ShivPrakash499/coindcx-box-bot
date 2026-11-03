@@ -3140,12 +3140,43 @@ def execute_autotrade_two_entry_signal(
                 leverage=lev,
                 usd_inr=u_inr,
             )
+            if not sync_ok:
+                time.sleep(0.8)
+                sync_ok, sync_msg, sync_details = sync_full_2entry_runner_to_position(
+                    pair=pair,
+                    direction=direction,
+                    entry1_px=entry1_px,
+                    entry2_px=entry2_px,
+                    tp1_px=tp1_px,
+                    tp2_px=tp2_px,
+                    sl_px=sl_px,
+                    total_margin_inr=margin_inr,
+                    leverage=lev,
+                    usd_inr=u_inr,
+                )
+            lock_obj = (sync_details or {}).get("lock")
+            if not lock_obj:
+                lock_obj = register_app_trade_lock(
+                    pair=pair,
+                    direction=direction,
+                    entry=entry1_px,
+                    stop_loss=sl_px,
+                    tp1=tp1_px,
+                    tp2=tp2_px,
+                    entry2_sweep=entry2_px,
+                    margin_inr=margin_inr,
+                    leverage=lev,
+                    qty1=qty1,
+                    qty2=qty2,
+                    mode="App/API Live AutoTrade (Entry 1 Placed)",
+                    is_live_exchange=True,
+                )
             return True, (
                 f"Live 2-Entry + Runner Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | {sync_msg}"
             ), {
                 "entry1_order": extra1,
                 "sync_details": sync_details,
-                "lock": sync_details.get("lock"),
+                "lock": lock_obj,
             }
         return False, f"CoinDCX Live AutoTrade Error on {pair}: {msg1}", {"entry1_order": extra1}
     else:

@@ -196,6 +196,7 @@ def _ensure_background_monitor():
         while True:
             try:
                 _reload_if_updated(coindcx_engine)
+                _reload_if_updated(signal_monitor)
                 if signal_monitor:
                     auto_cfg = coindcx_engine.get_autotrade_config()
                     rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
@@ -584,6 +585,8 @@ if (
         "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
         "leverage": int(leverage),
     })
+    get_cached_signals_scan.clear()
+    get_cached_positions.clear()
 
 _slot_status = coindcx_engine.get_active_portfolio_trade_status()
 if _slot_status.get("is_occupied"):
@@ -1327,6 +1330,44 @@ if active_section == "⚡ Signals":
         )
         active_signals = [r for r in results if r.get("signal") and r["signal"].get("signal") not in (None, "NEUTRAL")]
 
+        # If AutoTrade is ON and the 1-Slot is still free (e.g., scan came from 45s cache before AutoTrade ran),
+        # immediately execute the highest-priority confirmed signal so already-confirmed signals trigger right away!
+        if autotrade_on and active_signals and not _slot_status.get("is_occupied"):
+            _just_autotraded = next((r for r in results if r.get("autotraded")), None)
+            if _just_autotraded:
+                st.session_state["last_autotrade_banner"] = (
+                    f"🚀 **AutoTrade Executed ({clean_sym(_just_autotraded['pair'])}):** {_just_autotraded.get('message', '')}"
+                )
+                get_cached_positions.clear()
+                get_cached_balance.clear()
+                st.rerun()
+            elif not any(r.get("autotrade_error") for r in active_signals):
+                _top_r = active_signals[0]
+                _ok_now, _msg_now, _ = coindcx_engine.execute_autotrade_two_entry_signal(
+                    pair=_top_r["pair"],
+                    sig=_top_r["signal"],
+                    single_trade_margin_inr=float(margin_inr),
+                    leverage=int(leverage),
+                    usd_inr=float(usd_inr),
+                )
+                if _ok_now:
+                    st.session_state["last_autotrade_banner"] = (
+                        f"🚀 **AutoTrade Executed ({clean_sym(_top_r['pair'])}):** {_msg_now}"
+                    )
+                    get_cached_signals_scan.clear()
+                    get_cached_positions.clear()
+                    get_cached_balance.clear()
+                    st.rerun()
+                else:
+                    _top_r["autotrade_error"] = _msg_now
+
+        if st.session_state.get("last_autotrade_banner"):
+            st.success(st.session_state.pop("last_autotrade_banner"))
+
+        for _err_r in active_signals:
+            if _err_r.get("autotrade_error"):
+                st.warning(f"⚠️ **AutoTrade Notice ({clean_sym(_err_r['pair'])}):** {_err_r['autotrade_error']}")
+
         if active_signals:
             st.markdown(f"#### 🔥 Active Confirmed Signals ({len(active_signals)})")
             for r in active_signals:
@@ -1336,7 +1377,7 @@ if active_section == "⚡ Signals":
                 is_l = sig["signal"] == "LONG"
                 badge = "badge-buy" if is_l else "badge-sell"
                 with st.container(border=True):
-                    _trig_txt = str(sig.get("trigger_reason") or sig.get("trigger_zone") or "").replace("$", "\\$")
+                    _trig_txt = str(sig.get("trigger_reason") or sig.get("trigger_zone") or "").replace("$", "&#36;")
                     st.markdown(
                         f"<span class='{badge}'>{sig['signal']} {name_r}/USDT</span> &nbsp; "
                         f"**{r['strategy_name']}** • {_trig_txt}",
@@ -1366,7 +1407,14 @@ if active_section == "⚡ Signals":
                         ok_a, msg_a, _ = coindcx_engine.execute_autotrade_two_entry_signal(
                             pair=pair_r, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
                         )
-                        (st.success if ok_a else st.error)(msg_a)
+                        if ok_a:
+                            st.session_state["last_autotrade_banner"] = f"🚀 **Auto-Executed ({name_r}):** {msg_a}"
+                            get_cached_signals_scan.clear()
+                            get_cached_positions.clear()
+                            get_cached_balance.clear()
+                            st.rerun()
+                        else:
+                            st.error(msg_a)
 
         st.markdown("#### 📡 High-Volatility Watchlist Matrix")
         matrix_rows = []

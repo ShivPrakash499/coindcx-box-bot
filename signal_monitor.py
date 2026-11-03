@@ -21,9 +21,9 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", 
 DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
 COOLDOWN_MIN = 60          # per strategy + pair + direction, plus pair-level anti-spam guard
 SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zone in the same direction
-MAX_DAILY_ALERTS_PER_PAIR = 2
-MAX_DAILY_PORTFOLIO_TRADES = 3
-_STATE_SCHEMA_VERSION = 2
+MAX_DAILY_ALERTS_PER_PAIR = 3
+MAX_DAILY_PORTFOLIO_TRADES = 6
+_STATE_SCHEMA_VERSION = 3
 _SCAN_LOCK = threading.Lock()
 
 
@@ -117,8 +117,8 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         slot_status = eng.get_active_portfolio_trade_status()
         portfolio_occupied = bool(slot_status.get("is_occupied", False))
         active_Slot_pair = slot_status.get("active_pair")
-        portfolio_daily_key = f"PORTFOLIO_DAILY_COUNT|{today_ist}"
-        portfolio_daily_count = int(state.get(portfolio_daily_key, 0))
+        autotrade_daily_key = f"AUTOTRADE_DAILY_COUNT|{today_ist}"
+        autotrade_daily_count = int(state.get(autotrade_daily_key, 0))
 
         # Collect all pairs currently in a Live CoinDCX position or active App Trade Lock
         open_live_pairs = set()
@@ -134,14 +134,14 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         for pair in pairs:
             pair_lock_key = f"PAIR_LOCK|{pair}"
             pair_last = state.get(pair_lock_key, {})
-            daily_count_key = f"DAILY_COUNT|{pair}|{today_ist}"
-            daily_count = int(state.get(daily_count_key, 0))
+            email_daily_key = f"EMAIL_COUNT|{pair}|{today_ist}"
+            email_daily_count = int(state.get(email_daily_key, 0))
 
             for sid in strategy_ids:
                 s = strat_registry.get_strategy(sid)
                 row = {
                     "pair": pair, "strategy_id": s.id, "strategy_name": s.name,
-                    "signal": None, "emailed": False, "autotraded": False
+                    "signal": None, "emailed": False, "autotraded": False, "autotrade_error": ""
                 }
                 try:
                     sig = scan_pair(pair, margin_inr, leverage, usd_inr, s.id)
@@ -173,17 +173,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     })
                     continue
 
-                if portfolio_daily_count >= MAX_DAILY_PORTFOLIO_TRADES:
-                    results.append({
-                        **row,
-                        "message": f"portfolio daily limit reached ({portfolio_daily_count}/{MAX_DAILY_PORTFOLIO_TRADES} trades today)"
-                    })
-                    continue
-
-                if daily_count >= MAX_DAILY_ALERTS_PER_PAIR:
-                    results.append({**row, "message": f"daily limit reached ({daily_count}/{MAX_DAILY_ALERTS_PER_PAIR} today)"})
-                    continue
-
                 key = _state_key(s.id, pair, sig)
                 last = state.get(key, {})
                 now_ts = time.time()
@@ -191,7 +180,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 cooled = (now_ts - last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
                 pair_cooled = (now_ts - pair_last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
 
-                # Same-setup deduplication: if same direction & entry within 0.8%, suppress for 4 hours
+                # Same-setup deduplication: if same direction & entry within 0.8%, suppress duplicate email for 4 hours
                 last_entry = float(last.get("entry", 0.0) or 0.0)
                 cur_entry = float(sig.get("entry", 0.0) or 0.0)
                 same_price_zone = (
@@ -213,11 +202,25 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
                 emailed = False
                 autotraded = False
+                autotrade_error = ""
                 already_autotraded_candle = (
                     last.get("candle_ts") == sig["candle_ts"] and bool(last.get("autotraded", False))
                 )
+                last_autotraded_at = float(last.get("autotraded_at", 0.0) or 0.0)
+                already_autotraded_setup = (
+                    bool(last.get("autotraded", False))
+                    and same_price_zone
+                    and ((now_ts - last_autotraded_at) < COOLDOWN_MIN * 60)
+                )
 
-                if send and is_new_candle and cooled and pair_cooled and not same_setup_locked:
+                if (
+                    send
+                    and is_new_candle
+                    and cooled
+                    and pair_cooled
+                    and not same_setup_locked
+                    and email_daily_count < MAX_DAILY_ALERTS_PER_PAIR
+                ):
                     emailed, msg = email_notifier.send_trade_email(
                         pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
                         tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=sig["margin_inr"], leverage=sig["leverage"],
@@ -233,6 +236,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             "entry": cur_entry,
                             "tp1": float(sig.get("tp1", 0.0) or 0.0),
                             "autotraded": already_autotraded_candle,
+                            "autotraded_at": last_autotraded_at,
                         }
                         pair_last = {
                             "candle_ts": sig["candle_ts"],
@@ -242,14 +246,20 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             "strategy_id": s.id,
                         }
                         state[pair_lock_key] = pair_last
-                        daily_count += 1
-                        portfolio_daily_count += 1
-                        state[daily_count_key] = daily_count
-                        state[portfolio_daily_key] = portfolio_daily_count
+                        email_daily_count += 1
+                        state[email_daily_key] = email_daily_count
                         _save(state)
 
                 # If AutoTrade is toggled ON in Sidebar and no other coin is active, place the 2-Entry + Runner trade!
-                if autotrade and not portfolio_occupied and not already_autotraded_candle and not same_setup_locked and ((is_new_candle and cooled and pair_cooled) or emailed or last.get("candle_ts") == sig["candle_ts"]):
+                # Even if a SIGNAL email was already sent earlier while AutoTrade was OFF, execute immediately
+                # as long as this confirmed signal has not already been autotraded!
+                if (
+                    autotrade
+                    and not portfolio_occupied
+                    and not already_autotraded_candle
+                    and not already_autotraded_setup
+                    and autotrade_daily_count < MAX_DAILY_PORTFOLIO_TRADES
+                ):
                     ok_auto, auto_msg, _ = eng.execute_autotrade_two_entry_signal(
                         pair=pair, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
                     )
@@ -267,12 +277,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             "entry": cur_entry,
                             "tp1": float(sig.get("tp1", 0.0) or 0.0),
                             "autotraded": True,
+                            "autotraded_at": now_exec,
                         }
-                        if not emailed:
-                            daily_count += 1
-                            portfolio_daily_count += 1
-                            state[daily_count_key] = daily_count
-                            state[portfolio_daily_key] = portfolio_daily_count
+                        autotrade_daily_count += 1
+                        state[autotrade_daily_key] = autotrade_daily_count
                         _save(state)
                         email_notifier.send_trade_email(
                             pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
@@ -281,5 +289,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
                             levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0)
                         )
-                results.append({**row, "emailed": emailed, "autotraded": autotraded, "message": msg})
+                    else:
+                        autotrade_error = auto_msg
+                results.append({**row, "emailed": emailed, "autotraded": autotraded, "autotrade_error": autotrade_error, "message": msg})
         return results
