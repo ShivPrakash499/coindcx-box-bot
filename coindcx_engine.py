@@ -425,150 +425,70 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-def _send_coindcx_signed_request(method, url, payload=None, timeout=4.5):
+def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
     """
     Executes signed CoinDCX REST API requests with HMAC-SHA256 authentication.
-    - Uses a process-persistent HTTP Keep-Alive session inside _COINDCX_SIGN_LOCK so once a TCP socket
-      is pinned to the allowlisted Cloud NAT IP (34.83.176.217), all subsequent requests reuse that exact
-      single socket and arrive in strictly monotonic timestamp order (preventing urllib3 from opening a
-      second unpinned socket on a non-allowlisted NAT IP).
-    - If the socket is unverified, reset, or receives HTTP 401 Invalid credentials, automatically probes
-      20 concurrent NAT sockets via https://api.coindcx.com/cdn-cgi/trace to re-pin 34.83.176.217.
+    - Uses a process-persistent HTTP Keep-Alive session so once a TCP socket is pinned to the
+      allowlisted Cloud NAT IP (34.83.176.217), all subsequent requests reuse that exact socket.
+    - Never holds _COINDCX_SIGN_LOCK across network I/O so UI and background threads never block each other.
     """
     api_key, api_secret = _get_coindcx_credentials()
 
     if not api_key or not api_secret:
         return None, "API credentials not configured in .env or Streamlit Secrets"
 
-    def _exec_on_session(sess: requests.Session, use_ms: bool = True):
-        body = payload.copy() if payload else {}
-        body["timestamp"] = _next_monotonic_ms() if use_ms else int(time.time())
-        json_body = json.dumps(body, separators=(',', ':'))
-        signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
-        headers = {
-            'Content-Type': 'application/json',
-            'X-AUTH-APIKEY': api_key,
-            'X-AUTH-SIGNATURE': signature,
-            'Connection': 'keep-alive',
-        }
-        if method.upper() == "GET":
-            return sess.get(url, data=json_body, headers=headers, timeout=timeout)
-        return sess.post(url, data=json_body, headers=headers, timeout=timeout)
-
     try:
         res = None
-        ip_status_map = {}
+        max_attempts = 2 if _PERSIST.get("session_verified") else 3
+        for attempt in range(max_attempts):
+            with _COINDCX_SIGN_LOCK:
+                body = payload.copy() if payload else {}
+                body["timestamp"] = _next_monotonic_ms()
+                json_body = json.dumps(body, separators=(',', ':'))
+                signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+                headers = {
+                    'Content-Type': 'application/json',
+                    'X-AUTH-APIKEY': api_key,
+                    'X-AUTH-SIGNATURE': signature,
+                    'Connection': 'keep-alive',
+                }
+                sess = _PERSIST["session"]
 
-        # Bounded lock: a slow NAT re-pin scan in one thread must never freeze the Streamlit UI thread.
-        # If the lock cannot be acquired within 8s, run only the fast path (no 20-socket scan).
-        _lock_acquired = _COINDCX_SIGN_LOCK.acquire(timeout=8.0)
-        try:
-            # Step 1: Fast path on persistent Keep-Alive session (13-digit ms timestamp first)
-            sess = _PERSIST["session"]
-            for attempt in range(2):
-                use_ms = (attempt == 0)
-                try:
-                    res = _exec_on_session(sess, use_ms=use_ms)
-                except Exception:
-                    res = None
-                    break
+            try:
+                if method.upper() == "GET":
+                    res = sess.get(url, data=json_body, headers=headers, timeout=timeout)
+                else:
+                    res = sess.post(url, data=json_body, headers=headers, timeout=timeout)
+            except Exception:
+                with _COINDCX_SIGN_LOCK:
+                    if _PERSIST["session"] is sess:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                        _PERSIST["session"] = requests.Session()
+                        _PERSIST["session_verified"] = False
+                continue
 
-                if res is not None and res.status_code == 200:
-                    _PERSIST["session_verified"] = True
-                    return res, None
+            if res.status_code == 200:
+                _PERSIST["session_verified"] = True
+                return res, None
 
-                if (
-                    res is not None
-                    and res.status_code not in (400, 401, 429, 500, 502, 503)
-                    and "timestamp" not in res.text.lower()
-                    and "credential" not in res.text.lower()
-                ):
-                    _PERSIST["session_verified"] = True
-                    return res, None
+            if res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
+                _PERSIST["session_verified"] = True
+                return res, None
 
-                time.sleep(0.04)
+            if res.status_code == 401:
+                with _COINDCX_SIGN_LOCK:
+                    if _PERSIST["session"] is sess:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                        _PERSIST["session"] = requests.Session()
+                        _PERSIST["session_verified"] = False
 
-            # Step 2: If HTTP 401 Invalid credentials or socket error occurred, open 20 concurrent TCP sockets
-            # across the Cloud NAT pool so 34.83.176.217 is immediately found and re-pinned!
-            if _lock_acquired and (res is None or res.status_code == 401 or "credential" in (res.text.lower() if res is not None else "")):
-                _PERSIST["session_verified"] = False
-                from concurrent.futures import ThreadPoolExecutor
-
-                def _open_and_probe(_idx: int):
-                    s = requests.Session()
-                    ip = _probe_session_coindcx_ip(s, timeout=2.2)
-                    return s, ip
-
-                concurrent_pool = []
-                try:
-                    with ThreadPoolExecutor(max_workers=10) as ex:
-                        concurrent_pool = list(ex.map(_open_and_probe, range(12)))
-
-                    pinned_pref = _PERSIST.get("pinned_ip") or "34.83.176.217"
-                    concurrent_pool.sort(
-                        key=lambda item: (
-                            0 if item[1] == "34.83.176.217"
-                            else (1 if item[1] == pinned_pref else (2 if str(item[1]).startswith("34.") else 3))
-                        )
-                    )
-
-                    tested_ips_in_batch = set()
-                    for cand_sess, cand_ip in concurrent_pool:
-                        if cand_ip and cand_ip in tested_ips_in_batch and cand_ip != "34.83.176.217":
-                            continue
-                        if cand_ip:
-                            tested_ips_in_batch.add(cand_ip)
-
-                        cand_ok = False
-                        for attempt in range(2):
-                            use_ms = (attempt == 0)
-                            try:
-                                res = _exec_on_session(cand_sess, use_ms=use_ms)
-                            except Exception:
-                                res = None
-                                break
-                            if res is not None:
-                                ip_status_map[cand_ip or "unknown"] = res.status_code
-                            if res is not None and res.status_code == 200:
-                                cand_ok = True
-                                break
-                            if (
-                                res is not None
-                                and res.status_code not in (400, 401, 429, 500, 502, 503)
-                                and "timestamp" not in res.text.lower()
-                                and "credential" not in res.text.lower()
-                            ):
-                                cand_ok = True
-                                break
-                            time.sleep(0.04)
-
-                        if cand_ok:
-                            try:
-                                _PERSIST["session"].close()
-                            except Exception:
-                                pass
-                            _PERSIST["session"] = cand_sess
-                            _PERSIST["session_verified"] = True
-                            _PERSIST["pinned_ip"] = cand_ip
-                            _PERSIST["last_ip_status_map"] = ip_status_map
-                            for other_s, _ in concurrent_pool:
-                                if other_s is not cand_sess:
-                                    try:
-                                        other_s.close()
-                                    except Exception:
-                                        pass
-                            return res, None
-                finally:
-                    _PERSIST["last_ip_status_map"] = ip_status_map
-                    for other_s, _ in concurrent_pool:
-                        if other_s is not _PERSIST.get("session"):
-                            try:
-                                other_s.close()
-                            except Exception:
-                                pass
-        finally:
-            if _lock_acquired:
-                _COINDCX_SIGN_LOCK.release()
+            time.sleep(0.03)
 
         return res, None
     except Exception as e:
