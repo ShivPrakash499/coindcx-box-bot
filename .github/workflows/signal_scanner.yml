@@ -1,0 +1,39 @@
+name: 24/7 Signal Scanner & Streamlit Keep-Alive
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+jobs:
+  scan_and_wake:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Wake Streamlit Cloud App (Keep 24/7 Background Daemon Alive)
+        run: |
+          curl -s -L -o /dev/null -w "Streamlit HTTP Status: %{http_code}\n" "https://shiv-prakash-trade-assistant.streamlit.app" || true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Standalone Signal Scanner Once (if Gmail Secrets configured)
+        env:
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_RECEIVER: ${{ secrets.GMAIL_RECEIVER }}
+          APP_WEB_URL: "https://shiv-prakash-trade-assistant.streamlit.app"
+        run: |
+          if [ -n "$GMAIL_SENDER" ] && [ -n "$GMAIL_APP_PASSWORD" ]; then
+            python signal_scanner.py --once
+          else
+            echo "Streamlit wake ping completed; set GMAIL_SENDER, GMAIL_APP_PASSWORD, GMAIL_RECEIVER in GitHub Repo Secrets for backup GitHub-side email dispatch."
+          fi
