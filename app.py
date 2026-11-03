@@ -605,14 +605,12 @@ else:
     st.sidebar.caption(f"🟢 **App Slot Free (0/1)** • AutoTrade: **{'ON' if autotrade_on else 'OFF'}**")
 
 if wallet_data.get("is_live_api"):
-    _pinned = coindcx_engine._PERSIST.get("pinned_ip", "")
-    _ip_tag = f" (`{_pinned}`)" if _pinned else ""
-    st.sidebar.caption(f"✅ **CoinDCX Live API:** Connected & Ready{_ip_tag}")
+    st.sidebar.caption("✅ **CoinDCX Live API:** Connected & Ready")
 else:
     _api_err = wallet_data.get("api_error", "")
     if _api_err:
         st.sidebar.caption(f"⚠️ **CoinDCX API Notice:** `{_api_err}`")
-    if st.sidebar.button("🔄 Reconnect & Scan NAT IPs", key="btn_rescan_coindcx_nat", use_container_width=True):
+    if st.sidebar.button("🔄 Reconnect & Refresh Live Wallet", key="btn_rescan_coindcx_nat", use_container_width=True):
         coindcx_engine._WALLET_BALANCE_CACHE["data"] = None
         coindcx_engine._WALLET_BALANCE_CACHE["ts"] = 0.0
         get_cached_balance.clear()
@@ -650,18 +648,9 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
         }, return_details=True)
         (st.success if ok else st.error)(msg)
     try:
-        _ip_info = coindcx_engine.get_coindcx_outbound_ip_info()
-        _cdx_ips = _ip_info.get("comma_separated", "")
         import requests as _req_ip
-        try:
-            _ipify = _req_ip.get("https://api.ipify.org", timeout=2.0).text.strip()
-        except Exception:
-            _ipify = ""
-        if _ipify and _ipify not in (_ip_info.get("all_coindcx_ips") or []):
-            _display_ips = f"{_cdx_ips}, {_ipify}" if _cdx_ips else _ipify
-        else:
-            _display_ips = _cdx_ips or _ipify
-        st.caption(f"🌐 **Exact IP(s) Seen by CoinDCX API:** `{_display_ips}`")
+        _srv_ip = _req_ip.get("https://api.ipify.org", timeout=2.5).text.strip()
+        st.caption(f"🌐 **Server Outbound IP (for CoinDCX API):** `{_srv_ip}`")
     except Exception:
         pass
     if st.button("🔒 Lock Session", use_container_width=True):

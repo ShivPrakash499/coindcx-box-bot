@@ -667,147 +667,28 @@ def fetch_coindcx_futures_balance():
 
     def _emit_cloud_diag(is_ok: bool, tot_val: float, err_str: str):
         last_d = float(_PERSIST.get("last_diag_ts", 0.0) or 0.0)
-        if (time.time() - last_d) < 20.0:
+        if (time.time() - last_d) < 30.0:
             return
         _PERSIST["last_diag_ts"] = time.time()
 
         def _bg():
             try:
                 import sheets_logger
-                from concurrent.futures import ThreadPoolExecutor
-                diag_info = {}
-                # 0. Raw st.secrets check
-                try:
-                    import streamlit as _st
-                    sk_raw = str(_st.secrets.get("COINDCX_API_KEY", ""))
-                    ss_raw = str(_st.secrets.get("COINDCX_API_SECRET", ""))
-                    diag_info["st_secrets_match"] = {
-                        "key_eq_d18a": (sk_raw.strip() == _DEFAULT_ACTIVE_KEY),
-                        "sec_eq_47f0": (ss_raw.strip() == _DEFAULT_ACTIVE_SECRET),
-                        "raw_k_prefix": sk_raw[:8],
-                        "raw_s_prefix": ss_raw[:8],
-                        "raw_k_len": len(sk_raw),
-                        "raw_s_len": len(ss_raw),
-                    }
-                except Exception as _se:
-                    diag_info["st_secrets_err"] = str(_se)
-
-                # 1. Check clock vs Cloudflare trace ts
-                try:
-                    r_tr = requests.get("https://api.coindcx.com/cdn-cgi/trace", timeout=3)
-                    tr_map = dict(line.split("=", 1) for line in r_tr.text.splitlines() if "=" in line)
-                    cf_ts_ms = int(float(tr_map.get("ts", 0)) * 1000)
-                    loc_ts_ms = int(time.time() * 1000)
-                    diag_info["clock_diff_ms"] = loc_ts_ms - cf_ts_ms
-                    diag_info["persist_last_ts_ms_diff"] = _PERSIST.get("last_ts_ms", 0) - loc_ts_ms
-                    diag_info["cf_colo"] = tr_map.get("colo", "")
-                except Exception as _e:
-                    diag_info["trace_err"] = str(_e)
-
-                # 2. Check external IP services
-                ext_ips = {}
-                for name, u in [
-                    ("ipify4", "https://api.ipify.org"),
-                    ("ipify64", "https://api64.ipify.org"),
-                    ("aws", "https://checkip.amazonaws.com"),
-                    ("ifconfig", "https://ifconfig.me/ip"),
-                ]:
-                    try:
-                        ext_ips[name] = requests.get(u, timeout=2.5).text.strip()
-                    except Exception as _e:
-                        ext_ips[name] = f"err:{_e}"
-                diag_info["ext_ips"] = ext_ips
-
-                # 3. Open 40 concurrent sockets and keep them open while probing /cdn-cgi/trace
-                def _probe_one(_i):
-                    s = requests.Session()
-                    ip_b = ""
-                    try:
-                        r1 = s.get("https://api.coindcx.com/cdn-cgi/trace", headers={"Connection": "keep-alive"}, timeout=3)
-                        for ln in r1.text.splitlines():
-                            if ln.startswith("ip="):
-                                ip_b = ln.split("=", 1)[1].strip()
-                    except Exception:
-                        pass
-                    return s, ip_b
-
-                with ThreadPoolExecutor(max_workers=60) as ex:
-                    pool_40 = list(ex.map(_probe_one, range(60)))
-
-                # Group by unique IP
-                by_ip = {}
-                for s, ip_b in pool_40:
-                    if ip_b and ip_b not in by_ip:
-                        by_ip[ip_b] = s
-                    else:
-                        try:
-                            s.close()
-                        except Exception:
-                            pass
-
-                diag_info["unique_40_ips"] = list(by_ip.keys())
-
-                # 4. Test timestamp offsets, endpoints, and headers on 34.83.176.217 and all unique IPs
-                ip_test_results = {}
-                for u_ip, u_sess in by_ip.items():
-                    ip_test_results[u_ip] = {}
-                    # 4a. Test timestamp offsets on GET /wallets and POST /balances
-                    for off_label, ts_val in [
-                        ("ms_minus_3000", int(time.time() * 1000) - 3000),
-                        ("ms_minus_1500", int(time.time() * 1000) - 1500),
-                        ("ms_0", int(time.time() * 1000)),
-                        ("sec_0", int(time.time())),
-                        ("sec_minus_2", int(time.time()) - 2),
-                    ]:
-                        for ep_label, ep_m, ep_url in [
-                            ("fut_w", "GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets"),
-                            ("spot_b", "POST", "https://api.coindcx.com/exchange/v1/users/balances"),
-                            ("usr_i", "POST", "https://api.coindcx.com/exchange/v1/users/info"),
-                            ("fut_p", "POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions"),
-                        ]:
-                            try:
-                                jb = json.dumps({"timestamp": ts_val}, separators=(",", ":"))
-                                sig = hmac.new(api_secret.encode("utf-8"), jb.encode("utf-8"), hashlib.sha256).hexdigest()
-                                hdr = {
-                                    "Content-Type": "application/json",
-                                    "X-AUTH-APIKEY": api_key,
-                                    "X-AUTH-SIGNATURE": sig,
-                                    "Connection": "keep-alive",
-                                }
-                                r_ep = u_sess.request(ep_m, ep_url, data=jb, headers=hdr, timeout=4)
-                                ip_test_results[u_ip][f"{off_label}_{ep_label}"] = f"{r_ep.status_code}:{r_ep.text[:50]}"
-                                if off_label == "ms_0" and ep_label == "fut_w":
-                                    ip_test_results[u_ip]["sample_headers"] = dict(r_ep.headers)
-                            except Exception as _e:
-                                ip_test_results[u_ip][f"{off_label}_{ep_label}"] = f"err:{_e}"
-                    try:
-                        u_sess.close()
-                    except Exception:
-                        pass
-
-                diag_info["ip_tests"] = ip_test_results
-
                 book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
                 ws = sheets_logger._get_ws(book, "_Cloud_Diag")
                 ws.append_row([
                     datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                    "LIVE_OK" if is_ok else "FAIL_V3",
+                    "LIVE_OK" if is_ok else "FAIL",
                     round(float(tot_val), 2),
                     str(_PERSIST.get("pinned_ip", "")),
                     json.dumps(_PERSIST.get("last_ip_status_map", {})),
                     ", ".join(_PERSIST.get("seen_coindcx_ips") or []),
-                    f"{api_key[:6]}..{api_key[-4:]} (len={len(api_key)})",
-                    f"{api_secret[:4]}..{api_secret[-4:]} (len={len(api_secret)})",
-                    json.dumps(diag_info),
+                    f"{api_key[:6]}..{api_key[-4:]}",
+                    f"{api_secret[:4]}..{api_secret[-4:]}",
+                    str(err_str),
                 ])
-            except Exception as _outer_e:
-                try:
-                    import sheets_logger
-                    book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
-                    ws = sheets_logger._get_ws(book, "_Cloud_Diag")
-                    ws.append_row([datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"), "DIAG_ERR", str(_outer_e)])
-                except Exception:
-                    pass
+            except Exception:
+                pass
 
         _threading.Thread(target=_bg, daemon=True).start()
 
@@ -867,7 +748,7 @@ def fetch_coindcx_futures_balance():
         "locked_margin_usd": 0.0,
         "cross_user_margin_usd": 0.0,
         "is_live_api": False,
-        "api_error": detailed_err,
+        "api_error": api_err_msg,
         "source": f"Wallet Balance ({api_err_msg})" if api_err_msg else "Synced Wallet Balance"
     }
 
