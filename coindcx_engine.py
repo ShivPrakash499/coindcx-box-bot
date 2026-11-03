@@ -459,7 +459,10 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=4.5):
         res = None
         ip_status_map = {}
 
-        with _COINDCX_SIGN_LOCK:
+        # Bounded lock: a slow NAT re-pin scan in one thread must never freeze the Streamlit UI thread.
+        # If the lock cannot be acquired within 8s, run only the fast path (no 20-socket scan).
+        _lock_acquired = _COINDCX_SIGN_LOCK.acquire(timeout=8.0)
+        try:
             # Step 1: Fast path on persistent Keep-Alive session (13-digit ms timestamp first)
             sess = _PERSIST["session"]
             for attempt in range(2):
@@ -487,7 +490,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=4.5):
 
             # Step 2: If HTTP 401 Invalid credentials or socket error occurred, open 20 concurrent TCP sockets
             # across the Cloud NAT pool so 34.83.176.217 is immediately found and re-pinned!
-            if res is None or res.status_code == 401 or "credential" in (res.text.lower() if res is not None else ""):
+            if _lock_acquired and (res is None or res.status_code == 401 or "credential" in (res.text.lower() if res is not None else "")):
                 _PERSIST["session_verified"] = False
                 from concurrent.futures import ThreadPoolExecutor
 
@@ -499,7 +502,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=4.5):
                 concurrent_pool = []
                 try:
                     with ThreadPoolExecutor(max_workers=10) as ex:
-                        concurrent_pool = list(ex.map(_open_and_probe, range(20)))
+                        concurrent_pool = list(ex.map(_open_and_probe, range(12)))
 
                     pinned_pref = _PERSIST.get("pinned_ip") or "34.83.176.217"
                     concurrent_pool.sort(
@@ -563,6 +566,9 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=4.5):
                                 other_s.close()
                             except Exception:
                                 pass
+        finally:
+            if _lock_acquired:
+                _COINDCX_SIGN_LOCK.release()
 
         return res, None
     except Exception as e:
