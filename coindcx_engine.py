@@ -472,7 +472,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
 
                     tested_ips_in_batch = set()
                     for cand_sess, cand_ip in concurrent_pool:
-                        if cand_ip and cand_ip in tested_ips_in_batch and cand_ip != "34.83.176.217":
+                        if cand_ip and cand_ip in tested_ips_in_batch:
                             continue
                         if cand_ip:
                             tested_ips_in_batch.add(cand_ip)
@@ -674,21 +674,147 @@ def fetch_coindcx_futures_balance():
         def _bg():
             try:
                 import sheets_logger
+                from concurrent.futures import ThreadPoolExecutor
+                diag_info = {}
+                # 0. Raw st.secrets check
+                try:
+                    import streamlit as _st
+                    sk_raw = str(_st.secrets.get("COINDCX_API_KEY", ""))
+                    ss_raw = str(_st.secrets.get("COINDCX_API_SECRET", ""))
+                    diag_info["st_secrets_match"] = {
+                        "key_eq_d18a": (sk_raw.strip() == _DEFAULT_ACTIVE_KEY),
+                        "sec_eq_47f0": (ss_raw.strip() == _DEFAULT_ACTIVE_SECRET),
+                        "raw_k_prefix": sk_raw[:8],
+                        "raw_s_prefix": ss_raw[:8],
+                        "raw_k_len": len(sk_raw),
+                        "raw_s_len": len(ss_raw),
+                    }
+                except Exception as _se:
+                    diag_info["st_secrets_err"] = str(_se)
+
+                # 1. Check clock vs Cloudflare trace ts
+                try:
+                    r_tr = requests.get("https://api.coindcx.com/cdn-cgi/trace", timeout=3)
+                    tr_map = dict(line.split("=", 1) for line in r_tr.text.splitlines() if "=" in line)
+                    cf_ts_ms = int(float(tr_map.get("ts", 0)) * 1000)
+                    loc_ts_ms = int(time.time() * 1000)
+                    diag_info["clock_diff_ms"] = loc_ts_ms - cf_ts_ms
+                    diag_info["persist_last_ts_ms_diff"] = _PERSIST.get("last_ts_ms", 0) - loc_ts_ms
+                    diag_info["cf_colo"] = tr_map.get("colo", "")
+                except Exception as _e:
+                    diag_info["trace_err"] = str(_e)
+
+                # 2. Check external IP services
+                ext_ips = {}
+                for name, u in [
+                    ("ipify4", "https://api.ipify.org"),
+                    ("ipify64", "https://api64.ipify.org"),
+                    ("aws", "https://checkip.amazonaws.com"),
+                    ("ifconfig", "https://ifconfig.me/ip"),
+                ]:
+                    try:
+                        ext_ips[name] = requests.get(u, timeout=2.5).text.strip()
+                    except Exception as _e:
+                        ext_ips[name] = f"err:{_e}"
+                diag_info["ext_ips"] = ext_ips
+
+                # 3. Open 40 concurrent sockets and keep them open while probing /cdn-cgi/trace
+                def _probe_one(_i):
+                    s = requests.Session()
+                    ip_b = ""
+                    try:
+                        r1 = s.get("https://api.coindcx.com/cdn-cgi/trace", headers={"Connection": "keep-alive"}, timeout=3)
+                        for ln in r1.text.splitlines():
+                            if ln.startswith("ip="):
+                                ip_b = ln.split("=", 1)[1].strip()
+                    except Exception:
+                        pass
+                    return s, ip_b
+
+                with ThreadPoolExecutor(max_workers=20) as ex:
+                    pool_40 = list(ex.map(_probe_one, range(40)))
+
+                # Group by unique IP
+                by_ip = {}
+                for s, ip_b in pool_40:
+                    if ip_b and ip_b not in by_ip:
+                        by_ip[ip_b] = s
+                    else:
+                        try:
+                            s.close()
+                        except Exception:
+                            pass
+
+                diag_info["unique_40_ips"] = list(by_ip.keys())
+
+                # 4. For each unique IP socket, test GET /wallets and POST /balances with current key AND old key
+                keys_to_test = [
+                    ("new_d18a", api_key, api_secret),
+                    ("old_23a6", "23a6860f2262b2dc629f4533505ab436573f91ecf6a9473b", "d616ead690f7f737e9e8afb39744d865ca361a1a915adce8761e3a0e6573ed22"),
+                ]
+                ip_test_results = {}
+                for u_ip, u_sess in by_ip.items():
+                    ip_test_results[u_ip] = {}
+                    for k_label, k_val, s_val in keys_to_test:
+                        for ep_label, ep_m, ep_url in [
+                            ("fut_w", "GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets"),
+                            ("spot_b", "POST", "https://api.coindcx.com/exchange/v1/users/balances"),
+                        ]:
+                            try:
+                                ts_now = int(round(time.time() * 1000))
+                                jb = json.dumps({"timestamp": ts_now}, separators=(",", ":"))
+                                sig = hmac.new(s_val.encode("utf-8"), jb.encode("utf-8"), hashlib.sha256).hexdigest()
+                                hdr = {
+                                    "Content-Type": "application/json",
+                                    "X-AUTH-APIKEY": k_val,
+                                    "X-AUTH-SIGNATURE": sig,
+                                    "Connection": "keep-alive",
+                                }
+                                r_ep = u_sess.request(ep_m, ep_url, data=jb, headers=hdr, timeout=4)
+                                # Check trace after
+                                r_after = u_sess.get("https://api.coindcx.com/cdn-cgi/trace", timeout=2)
+                                ip_a = ""
+                                for ln in r_after.text.splitlines():
+                                    if ln.startswith("ip="):
+                                        ip_a = ln.split("=", 1)[1].strip()
+                                p_obj = list(u_sess.adapters["https://"].poolmanager.pools._container.values())[0]
+                                ip_test_results[u_ip][f"{k_label}_{ep_label}"] = {
+                                    "code": r_ep.status_code,
+                                    "body": r_ep.text[:80],
+                                    "ip_after": ip_a,
+                                    "conns": p_obj.num_connections,
+                                    "reqs": p_obj.num_requests,
+                                }
+                            except Exception as _e:
+                                ip_test_results[u_ip][f"{k_label}_{ep_label}"] = f"err:{_e}"
+                    try:
+                        u_sess.close()
+                    except Exception:
+                        pass
+
+                diag_info["ip_tests"] = ip_test_results
+
                 book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
                 ws = sheets_logger._get_ws(book, "_Cloud_Diag")
                 ws.append_row([
                     datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                    "LIVE_OK" if is_ok else "FAIL",
+                    "LIVE_OK" if is_ok else "FAIL_V2",
                     round(float(tot_val), 2),
                     str(_PERSIST.get("pinned_ip", "")),
                     json.dumps(_PERSIST.get("last_ip_status_map", {})),
                     ", ".join(_PERSIST.get("seen_coindcx_ips") or []),
-                    f"{api_key[:6]}..{api_key[-4:]}",
-                    f"{api_secret[:4]}..{api_secret[-4:]}",
-                    str(err_str),
+                    f"{api_key[:6]}..{api_key[-4:]} (len={len(api_key)})",
+                    f"{api_secret[:4]}..{api_secret[-4:]} (len={len(api_secret)})",
+                    json.dumps(diag_info),
                 ])
-            except Exception:
-                pass
+            except Exception as _outer_e:
+                try:
+                    import sheets_logger
+                    book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
+                    ws = sheets_logger._get_ws(book, "_Cloud_Diag")
+                    ws.append_row([datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"), "DIAG_ERR", str(_outer_e)])
+                except Exception:
+                    pass
 
         _threading.Thread(target=_bg, daemon=True).start()
 
