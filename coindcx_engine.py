@@ -666,35 +666,6 @@ def fetch_coindcx_futures_balance():
             except Exception:
                 api_err_msg = f"HTTP {res_spot.status_code}"
 
-    def _emit_cloud_diag(is_ok: bool, tot_val: float, err_str: str):
-        last_d = float(_PERSIST.get("last_diag_ts", 0.0) or 0.0)
-        if not is_ok and (time.time() - last_d) < 15.0:
-            return
-        if is_ok and (time.time() - last_d) < 5.0:
-            return
-        _PERSIST["last_diag_ts"] = time.time()
-
-        def _bg():
-            try:
-                import sheets_logger
-                book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
-                ws = sheets_logger._get_ws(book, "_Cloud_Diag")
-                ws.append_row([
-                    datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                    "LIVE_OK" if is_ok else "FAIL",
-                    round(float(tot_val), 2),
-                    str(_PERSIST.get("pinned_ip", "")),
-                    json.dumps(_PERSIST.get("last_ip_status_map", {})),
-                    ", ".join(_PERSIST.get("seen_coindcx_ips") or []),
-                    f"{api_key[:6]}..{api_key[-4:]}",
-                    f"{api_secret[:4]}..{api_secret[-4:]}",
-                    str(err_str),
-                ])
-            except Exception:
-                pass
-
-        _threading.Thread(target=_bg, daemon=True).start()
-
     if is_live:
         total_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
         avail_usdt = max(0.0, usdt_balance - locked_margin_usd - cross_margin_usd)
@@ -720,7 +691,6 @@ def fetch_coindcx_futures_balance():
         _WALLET_BALANCE_CACHE["ts"] = now_ts
         _WALLET_BALANCE_CACHE["last_good_live"] = live_res
         _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
-        _emit_cloud_diag(True, total_inr, "OK")
         return dict(live_res)
 
     # If this same API key succeeded recently (< 30 mins ago), preserve the live connection state across transient hiccups
@@ -732,15 +702,6 @@ def fetch_coindcx_futures_balance():
         and "expired" not in str(api_err_msg).lower()
     ):
         return dict(last_good)
-
-    seen_ips = _PERSIST.get("seen_coindcx_ips") or []
-    status_map = _PERSIST.get("last_ip_status_map") or {}
-    map_str = ", ".join(f"{k}:{v}" for k, v in status_map.items()) if status_map else ", ".join(seen_ips)
-    ip_hint = f" | Tested IPs: {map_str}" if map_str else ""
-    key_hint = f" | Key: {api_key[:6]}..{api_key[-4:]}" if len(api_key) >= 12 else ""
-    sec_hint = f" | Sec: {api_secret[:4]}..{api_secret[-4:]}" if len(api_secret) >= 12 else ""
-    detailed_err = f"{api_err_msg}{ip_hint}{key_hint}{sec_hint}" if api_err_msg else ""
-    _emit_cloud_diag(False, default_balance, detailed_err)
 
     return {
         "total_inr": round(default_balance, 2),
