@@ -221,13 +221,6 @@ def _ensure_background_monitor():
 
 _ensure_background_monitor()
 
-if not coindcx_engine._PERSIST.get("session_verified"):
-    try:
-        coindcx_engine._WALLET_BALANCE_CACHE["data"] = None
-        coindcx_engine.fetch_coindcx_futures_balance()
-    except Exception:
-        pass
-
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
 def get_security_pin():
     try:
@@ -518,10 +511,6 @@ check_and_update_paper_orders()
 st.sidebar.markdown("### ⚡ Pro Terminal Setup")
 
 wallet_data = dict(get_cached_balance() or {})
-if not wallet_data.get("is_live_api") or float(wallet_data.get("total_inr", 0) or 0) in (0.0, 30000.0, 250000.0, 40569.80):
-    _fresh_w = fetch_coindcx_futures_balance()
-    if isinstance(_fresh_w, dict) and _fresh_w.get("is_live_api"):
-        wallet_data = dict(_fresh_w)
 _auto_cfg = coindcx_engine.get_autotrade_config()
 
 # Allow live sync or manual override of Futures Wallet Balance (defaults to ₹47,287.18 if API is offline/expired)
@@ -555,7 +544,6 @@ if not wallet_data.get("is_live_api"):
         get_cached_balance.clear()
         st.rerun()
 
-_rot = get_rotational_margin_inr(leverage=10)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
 if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
     default_margin = float(wallet_data["total_inr"])
@@ -651,12 +639,7 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
             "profit_tp1_inr": 500.0, "loss_sl_inr": 500.0
         }, return_details=True)
         (st.success if ok else st.error)(msg)
-    try:
-        import requests as _req_ip
-        _srv_ip = _req_ip.get("https://api.ipify.org", timeout=2.5).text.strip()
-        st.caption(f"🌐 **Server Outbound IP (for CoinDCX API):** `{_srv_ip}`")
-    except Exception:
-        pass
+    st.caption("🌐 **Server Outbound IP (for CoinDCX API):** `34.83.176.217`")
     if st.button("🔒 Lock Session", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()
@@ -1131,7 +1114,7 @@ asset_name = clean_sym(selected_pair)
 
 # Check if any active live position or App/API lock exists
 _all_live_pos = get_cached_positions() or []
-_slot_info = coindcx_engine.get_active_portfolio_trade_status()
+_slot_info = _slot_status
 _active_pos_pairs = [p["pair"] for p in _all_live_pos if p.get("pair") in GLOBAL_FUTURES_PAIRS]
 if _slot_info.get("is_occupied") and _slot_info.get("active_pair") in GLOBAL_FUTURES_PAIRS:
     if _slot_info["active_pair"] not in _active_pos_pairs:
@@ -1305,7 +1288,7 @@ if active_section == "⚡ Signals":
     else:
         hdr_s1, hdr_s2 = st.columns([3.2, 1.0])
         with hdr_s1:
-            slot_now = coindcx_engine.get_active_portfolio_trade_status()
+            slot_now = _slot_status
             if slot_now.get("is_occupied"):
                 st.warning(
                     f"🔒 **App/API Trade Lock Active:** `{clean_sym(slot_now.get('active_pair'))}` ({slot_now.get('active_direction')}) • "
@@ -1353,9 +1336,10 @@ if active_section == "⚡ Signals":
                 is_l = sig["signal"] == "LONG"
                 badge = "badge-buy" if is_l else "badge-sell"
                 with st.container(border=True):
+                    _trig_txt = str(sig.get("trigger_reason") or sig.get("trigger_zone") or "").replace("$", "\\$")
                     st.markdown(
                         f"<span class='{badge}'>{sig['signal']} {name_r}/USDT</span> &nbsp; "
-                        f"**{r['strategy_name']}** • {sig.get('trigger_reason') or sig.get('trigger_zone') or ''}",
+                        f"**{r['strategy_name']}** • {_trig_txt}",
                         unsafe_allow_html=True
                     )
                     m1, m2, m3, m4, m5 = st.columns(5)
