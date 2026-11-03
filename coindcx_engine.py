@@ -292,9 +292,10 @@ _ACTIVE_POSITIONS_CACHE = _PERSIST["positions_cache"]
 _OBSOLETE_KEYS = {
     "928412b3788b773f668d691062ddee2dd273f021f63d5520",
     "23a6860f2262b2dc629f4533505ab436573f91ecf6a9473b",
+    "d18ac02afefd234af117dba1f0e232199636c719ae5437cd",
 }
-_DEFAULT_ACTIVE_KEY = "d18ac02afefd234af117dba1f0e232199636c719ae5437cd"
-_DEFAULT_ACTIVE_SECRET = "47f08c2c0bcfd75a55ab6e898dcff690bf295ce82d465203badc3743a3fa6ca8"
+_DEFAULT_ACTIVE_KEY = "bcce1ecadc5a06815a9e6e30ad6b5849463a4ec647ae74be"
+_DEFAULT_ACTIVE_SECRET = "f2e91a5bbe065891afad811250a31b82891b7869174b9aac3a4fe883ffb1b411"
 
 
 def _next_monotonic_ms() -> int:
@@ -667,7 +668,9 @@ def fetch_coindcx_futures_balance():
 
     def _emit_cloud_diag(is_ok: bool, tot_val: float, err_str: str):
         last_d = float(_PERSIST.get("last_diag_ts", 0.0) or 0.0)
-        if (time.time() - last_d) < 30.0:
+        if not is_ok and (time.time() - last_d) < 15.0:
+            return
+        if is_ok and (time.time() - last_d) < 5.0:
             return
         _PERSIST["last_diag_ts"] = time.time()
 
@@ -3402,3 +3405,11 @@ def get_rotational_margin_inr(leverage: int = 10) -> dict:
     margin = round(equity * TRADE_ALLOCATION_FRACTION, 2)
     return {"wallet_equity_inr": equity, "margin_inr": margin, "leverage": leverage,
             "notional_inr": margin * leverage, "is_live_api": live}
+
+
+if _PERSIST.get("boot_tested_key") != _DEFAULT_ACTIVE_KEY:
+    _PERSIST["boot_tested_key"] = _DEFAULT_ACTIVE_KEY
+    _PERSIST["last_diag_ts"] = 0.0
+    _WALLET_BALANCE_CACHE["data"] = None
+    _WALLET_BALANCE_CACHE["ts"] = 0.0
+    _threading.Thread(target=fetch_coindcx_futures_balance, daemon=True).start()
