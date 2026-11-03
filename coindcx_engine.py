@@ -2840,7 +2840,7 @@ def register_app_trade_lock(
             except Exception as _se:
                 print(f"[Auto Sheet Log Notice]: {_se}")
 
-        threading.Thread(target=_async_sheet_log, daemon=True).start()
+        _threading.Thread(target=_async_sheet_log, daemon=True).start()
 
     return lock_info
 
