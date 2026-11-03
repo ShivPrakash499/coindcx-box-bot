@@ -181,21 +181,20 @@ def build_two_entry_runner_plan(
     if enforce_min_tp and tp1_dist < (min_tp1_dist * 0.98):
         return None
 
-    # 2. Entry 2 (Equal-size scale-in order at SH / SL sweep level) & Strict Catastrophe SL Cap
+    # 2. Entry 2 (Equal-size scale-in order at structural SH / SL sweep level, >= 0.8% from Entry 1)
+    #    & Catastrophe SL placed 0.5% beyond Entry 2 (SH / SL) so price never stops out inside the RH-SH / RL-SL zone
     if is_long:
-        raw_e2 = min(sweep_level, entry * 0.996) if (0 < sweep_level < entry) else entry * 0.995
-        entry2 = max(raw_e2, entry * 0.994)  # Entry 2 sits 0.4% - 0.6% below Entry 1 at SL/sweep wick
+        entry2 = min(sweep_level, entry * 0.992) if (0 < sweep_level < entry) else entry * 0.992
         avg_entry = (entry + entry2) / 2.0
-        stop_price = max(min(entry2 * 0.995, sweep_level * 0.9955 if sweep_level > 0 else entry2 * 0.995), entry - max_sl_dist)
+        stop_price = min(entry2 * 0.995, sweep_level * 0.995 if sweep_level > 0 else entry2 * 0.995)
         tp1_price = entry + tp1_dist
         raw_tp2_dist = (struct_tp2 - entry) if struct_tp2 > tp1_price else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / eff_lev))
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
         tp2_price = entry + tp2_dist
     else:
-        raw_e2 = max(sweep_level, entry * 1.004) if (sweep_level > entry) else entry * 1.005
-        entry2 = min(raw_e2, entry * 1.006)  # Entry 2 sits 0.4% - 0.6% above Entry 1 at SH/sweep wick
+        entry2 = max(sweep_level, entry * 1.008) if (sweep_level > entry) else entry * 1.008
         avg_entry = (entry + entry2) / 2.0
-        stop_price = min(max(entry2 * 1.005, sweep_level * 1.0045 if sweep_level > 0 else entry2 * 1.005), entry + max_sl_dist)
+        stop_price = max(entry2 * 1.005, sweep_level * 1.005 if sweep_level > 0 else entry2 * 1.005)
         tp1_price = entry - tp1_dist
         raw_tp2_dist = (entry - struct_tp2) if (0 < struct_tp2 < tp1_price) else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / eff_lev))
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
@@ -643,10 +642,10 @@ class BoxTheorySweep(Strategy):
             prior_highs = [float(x["high"]) for x in prior_slice] if prior_slice else []
             prior_lows = [float(x["low"]) for x in prior_slice] if prior_slice else []
 
-            sh_c = [h for h in prior_highs if h > rh]
-            sh = min(sh_c) if sh_c else rh * 1.015
-            sl_c = [l for l in prior_lows if l < rl]
-            sl = max(sl_c) if sl_c else rl * 0.985
+            sh_c = [h for h in prior_highs if h >= rh * 1.008]
+            sh = min(sh_c) if (sh_c and min(sh_c) <= rh * 1.035) else rh * 1.015
+            sl_c = [l for l in prior_lows if l <= rl * 0.992]
+            sl = max(sl_c) if (sl_c and max(sl_c) >= rl * 0.965) else rl * 0.985
 
             daily_boxes[curr_day_str] = {
                 "RH": rh, "RL": rl, "MID": mid, "SH": sh, "SL": sl,

@@ -1608,31 +1608,37 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
     if avg_daily_drop <= 0:
         avg_daily_drop = (rh - rl) * 0.25
 
-    # Look for swing peaks beyond RH strictly within the 30-day window
+    # Minimum structural separation between RH <-> SH and RL <-> SL so SH/SL never collapse onto RH/RL
+    min_sh_gap = max(rh * 0.008, avg_daily_rise * 0.35)
+    max_sh_gap = max(avg_daily_rise, min_sh_gap)
+    min_sl_gap = max(rl * 0.008, avg_daily_drop * 0.35)
+    max_sl_gap = max(avg_daily_drop, min_sl_gap)
+
+    # Look for swing peaks beyond RH + min_sh_gap strictly within the 30-day window
     historical_highs = df_hist['high'].tolist() if not df_hist.empty else []
-    sh_candidates = [float(h) for h in historical_highs if float(h) > rh]
+    sh_candidates = [float(h) for h in historical_highs if float(h) >= rh + min_sh_gap]
     if sh_candidates:
         nearest_sh = min(sh_candidates)
-        # If candidate is within average daily rise distance from RH, use it; otherwise place at RH + avg_daily_rise
-        if (nearest_sh - rh) <= avg_daily_rise:
+        # If candidate is within average daily rise distance from RH, use it; otherwise place at RH + max_sh_gap
+        if (nearest_sh - rh) <= max_sh_gap:
             sh = nearest_sh
         else:
-            sh = rh + avg_daily_rise
+            sh = rh + max_sh_gap
     else:
-        sh = rh + avg_daily_rise
+        sh = rh + max_sh_gap
 
-    # Look for swing troughs beyond RL strictly within the 30-day window
+    # Look for swing troughs beyond RL - min_sl_gap strictly within the 30-day window
     historical_lows = df_hist['low'].tolist() if not df_hist.empty else []
-    sl_candidates = [float(l) for l in historical_lows if float(l) < rl]
+    sl_candidates = [float(l) for l in historical_lows if float(l) <= rl - min_sl_gap]
     if sl_candidates:
         nearest_sl = max(sl_candidates)
-        # If candidate is within average daily drop distance from RL, use it; otherwise place at RL - avg_daily_drop
-        if (rl - nearest_sl) <= avg_daily_drop:
+        # If candidate is within average daily drop distance from RL, use it; otherwise place at RL - max_sl_gap
+        if (rl - nearest_sl) <= max_sl_gap:
             sl = nearest_sl
         else:
-            sl = rl - avg_daily_drop
+            sl = rl - max_sl_gap
     else:
-        sl = rl - avg_daily_drop
+        sl = rl - max_sl_gap
 
     return {
         "RH": round_asset_price(rh),

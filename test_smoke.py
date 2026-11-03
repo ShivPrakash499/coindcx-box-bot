@@ -173,7 +173,14 @@ def test_4_strategy_and_two_entry_levels():
     assert short_lvls["tp2"] < short_lvls["tp1"] < short_lvls["entry"] < short_lvls["entry2_sweep"] < short_lvls["stop_loss"], (
         f"Invalid SHORT level ordering: {short_lvls}"
     )
-    print(f"  -> PASS: LONG ({long_lvls}) & SHORT ({short_lvls}) level invariants verified.")
+
+    # Verify build_two_entry_runner_plan places Entry 2 at SH ($7.43) and Catastrophe SL beyond SH (> $7.43), never inside RH-SH
+    inj_plan = strat.build_two_entry_runner_plan("SHORT", entry=7.30, sweep_level=7.43, struct_tp1=7.10, struct_tp2=6.89, leverage=10)
+    assert inj_plan is not None
+    assert abs(inj_plan["entry2_sweep"] - 7.43) < 1e-6, f"Expected Entry 2 at SH $7.43, got {inj_plan['entry2_sweep']}"
+    assert inj_plan["stop"] > 7.43, f"Expected Catastrophe SL strictly above SH $7.43, got {inj_plan['stop']}"
+
+    print(f"  -> PASS: LONG ({long_lvls}), SHORT ({short_lvls}) & SH/SL structural Entry2/SL verified.")
 
 
 def test_5_daily_bias_enforcement():
