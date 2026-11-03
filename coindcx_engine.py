@@ -610,6 +610,7 @@ def fetch_coindcx_futures_balance():
 
     # 1. Primary: CoinDCX Futures Wallet Endpoint (/exchange/v1/derivatives/futures/wallets)
     res_fut, err_fut = _send_coindcx_signed_request("GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets")
+    raw_fut_txt = res_fut.text[:500] if res_fut is not None else f"None:{err_fut}"
     if res_fut is not None and res_fut.status_code == 200:
         try:
             wallets = res_fut.json()
@@ -667,12 +668,31 @@ def fetch_coindcx_futures_balance():
                 api_err_msg = f"HTTP {res_spot.status_code}"
 
     if is_live:
-        total_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
+        raw_calc_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
+        total_inr = raw_calc_inr
         avail_usdt = max(0.0, usdt_balance - locked_margin_usd - cross_margin_usd)
         avail_inr = inr_balance + (avail_usdt * usd_inr)
         if total_inr <= 0:
             total_inr = default_balance
             avail_inr = default_balance
+        if not _PERSIST.get("logged_wallet_json_v1"):
+            _PERSIST["logged_wallet_json_v1"] = True
+            def _log_w():
+                try:
+                    import sheets_logger
+                    book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
+                    ws = sheets_logger._get_ws(book, "_Cloud_Diag")
+                    ws.append_row([
+                        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                        "WALLET_DUMP",
+                        f"fut_code={res_fut.status_code if res_fut is not None else 'None'}",
+                        f"raw_calc={raw_calc_inr}",
+                        f"inr={inr_balance}, locked={locked_inr}, usdt={usdt_balance}",
+                        raw_fut_txt,
+                    ])
+                except Exception:
+                    pass
+            _threading.Thread(target=_log_w, daemon=True).start()
         live_res = {
             "total_inr": round(total_inr, 2),
             "available_inr": round(avail_inr, 2),
@@ -3368,9 +3388,8 @@ def get_rotational_margin_inr(leverage: int = 10) -> dict:
             "notional_inr": margin * leverage, "is_live_api": live}
 
 
-if _PERSIST.get("boot_tested_key") != _DEFAULT_ACTIVE_KEY:
-    _PERSIST["boot_tested_key"] = _DEFAULT_ACTIVE_KEY
-    _PERSIST["last_diag_ts"] = 0.0
+if _PERSIST.get("boot_tested_key") != "dump_v1":
+    _PERSIST["boot_tested_key"] = "dump_v1"
     _WALLET_BALANCE_CACHE["data"] = None
     _WALLET_BALANCE_CACHE["ts"] = 0.0
     _threading.Thread(target=fetch_coindcx_futures_balance, daemon=True).start()
