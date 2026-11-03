@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 
@@ -24,7 +25,8 @@ SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zo
 MAX_DAILY_ALERTS_PER_PAIR = 3
 MAX_DAILY_PORTFOLIO_TRADES = 6
 _STATE_SCHEMA_VERSION = 3
-_SCAN_LOCK = threading.Lock()
+_SCAN_LOCK = sys.__dict__.setdefault("_signal_monitor_scan_lock", threading.Lock())
+_LAST_SCAN_CACHE = sys.__dict__.setdefault("_signal_monitor_last_scan", {"ts": 0.0, "results": []})
 
 
 def _load() -> dict:
@@ -111,10 +113,18 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
     strategy_ids = strategy_ids or enabled_strategy_ids()
     today_ist = datetime.now(eng.IST).strftime("%Y-%m-%d")
+    is_daemon_thread = threading.current_thread().name.startswith("CryptoTradeAssistantDaemon")
+
+    # Fast-path for UI threads: if _SCAN_LOCK is busy or last scan was < 50s ago, return cached results in 0ms!
+    if not is_daemon_thread and _LAST_SCAN_CACHE.get("results"):
+        cache_age = time.time() - float(_LAST_SCAN_CACHE.get("ts", 0.0))
+        if cache_age < 50.0 or _SCAN_LOCK.locked():
+            return list(_LAST_SCAN_CACHE["results"])
+
     with _SCAN_LOCK:
         state = _load()
         results = []
-        slot_status = eng.get_active_portfolio_trade_status()
+        slot_status = eng.get_active_portfolio_trade_status(manage_exchange=is_daemon_thread)
         portfolio_occupied = bool(slot_status.get("is_occupied", False))
         active_Slot_pair = slot_status.get("active_pair")
         autotrade_daily_key = f"AUTOTRADE_DAILY_COUNT|{today_ist}"
@@ -292,4 +302,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     else:
                         autotrade_error = auto_msg
                 results.append({**row, "emailed": emailed, "autotraded": autotraded, "autotrade_error": autotrade_error, "message": msg})
+        _LAST_SCAN_CACHE["results"] = list(results)
+        _LAST_SCAN_CACHE["ts"] = time.time()
         return results

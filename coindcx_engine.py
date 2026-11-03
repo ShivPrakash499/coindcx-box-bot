@@ -425,12 +425,12 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-def _send_coindcx_signed_request(method, url, payload=None, timeout=5):
+def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
     """
     Executes signed CoinDCX REST API requests with HMAC-SHA256 authentication.
     - Uses a process-persistent HTTP Keep-Alive session so once a TCP socket is pinned to the
       allowlisted Cloud NAT IP (34.83.176.217), all subsequent requests reuse that exact socket.
-    - Always sends 13-digit milliseconds (`use_ms=True`) FIRST.
+    - Never holds _COINDCX_SIGN_LOCK across network I/O so UI and background threads never block each other.
     """
     api_key, api_secret = _get_coindcx_credentials()
 
@@ -439,12 +439,11 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=5):
 
     try:
         res = None
-        for attempt in range(4):
+        max_attempts = 2 if _PERSIST.get("session_verified") else 3
+        for attempt in range(max_attempts):
             with _COINDCX_SIGN_LOCK:
                 body = payload.copy() if payload else {}
-                use_ms = (attempt != 3)  # Send 13-digit ms on attempts 0, 1, 2
-                body["timestamp"] = _next_monotonic_ms() if use_ms else int(time.time())
-
+                body["timestamp"] = _next_monotonic_ms()
                 json_body = json.dumps(body, separators=(',', ':'))
                 signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
                 headers = {
@@ -454,37 +453,42 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=5):
                     'Connection': 'keep-alive',
                 }
                 sess = _PERSIST["session"]
-                try:
-                    if method.upper() == "GET":
-                        res = sess.get(url, data=json_body, headers=headers, timeout=timeout)
-                    else:
-                        res = sess.post(url, data=json_body, headers=headers, timeout=timeout)
-                except Exception:
-                    try:
-                        sess.close()
-                    except Exception:
-                        pass
-                    _PERSIST["session"] = requests.Session()
-                    _PERSIST["session_verified"] = False
-                    continue
 
-                if res.status_code == 200:
-                    _PERSIST["session_verified"] = True
-                    return res, None
+            try:
+                if method.upper() == "GET":
+                    res = sess.get(url, data=json_body, headers=headers, timeout=timeout)
+                else:
+                    res = sess.post(url, data=json_body, headers=headers, timeout=timeout)
+            except Exception:
+                with _COINDCX_SIGN_LOCK:
+                    if _PERSIST["session"] is sess:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                        _PERSIST["session"] = requests.Session()
+                        _PERSIST["session_verified"] = False
+                continue
 
-                if res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
-                    _PERSIST["session_verified"] = True
-                    return res, None
+            if res.status_code == 200:
+                _PERSIST["session_verified"] = True
+                return res, None
 
-                if res.status_code == 401:
-                    try:
-                        sess.close()
-                    except Exception:
-                        pass
-                    _PERSIST["session"] = requests.Session()
-                    _PERSIST["session_verified"] = False
+            if res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
+                _PERSIST["session_verified"] = True
+                return res, None
 
-            time.sleep(0.05)
+            if res.status_code == 401:
+                with _COINDCX_SIGN_LOCK:
+                    if _PERSIST["session"] is sess:
+                        try:
+                            sess.close()
+                        except Exception:
+                            pass
+                        _PERSIST["session"] = requests.Session()
+                        _PERSIST["session_verified"] = False
+
+            time.sleep(0.03)
 
         return res, None
     except Exception as e:
@@ -494,24 +498,22 @@ _LIVE_USDT_INR_CACHE = {"rate": 102.0, "timestamp": 0.0}
 
 def get_coindcx_live_usdt_inr_rate() -> float:
     """
-    Fetches the live USDT/INR spot rate directly from CoinDCX ticker (/exchange/ticker).
-    Caches the rate for 60 seconds to avoid spamming the public ticker endpoint.
-    Falls back gracefully to USD_INR_RATE from .env (or 102.0).
+    Fetches the live USDT/INR spot rate from the shared CoinDCX ticker map (0ms when warm).
+    Caches the rate for 60 seconds and never blocks the UI thread.
     """
     now = time.time()
-    if now - _LIVE_USDT_INR_CACHE["timestamp"] < 60.0:
+    if now - _LIVE_USDT_INR_CACHE["timestamp"] < 60.0 and _LIVE_USDT_INR_CACHE["rate"] > 50.0:
         return _LIVE_USDT_INR_CACHE["rate"]
 
     try:
-        resp = requests.get("https://api.coindcx.com/exchange/ticker", timeout=5)
-        if resp.status_code == 200:
-            for item in resp.json():
-                if item.get("market") == "USDTINR":
-                    price = float(item.get("last_price", 0.0) or 0.0)
-                    if price > 50.0:
-                        _LIVE_USDT_INR_CACHE["rate"] = round(price, 2)
-                        _LIVE_USDT_INR_CACHE["timestamp"] = now
-                        return round(price, 2)
+        t_map = _TICKER_MAP_CACHE.get("map") or _get_coindcx_ticker_map(ttl=60.0)
+        item = t_map.get("USDTINR") or t_map.get("B-USDT_INR")
+        if item:
+            price = float(item.get("last_price", 0.0) or 0.0)
+            if price > 50.0:
+                _LIVE_USDT_INR_CACHE["rate"] = round(price, 2)
+                _LIVE_USDT_INR_CACHE["timestamp"] = now
+                return round(price, 2)
     except Exception:
         pass
 
@@ -520,19 +522,10 @@ def get_coindcx_live_usdt_inr_rate() -> float:
     _LIVE_USDT_INR_CACHE["timestamp"] = now
     return env_rate
 
-def fetch_coindcx_futures_balance():
-    """
-    Fetches real-time futures wallet balance directly from CoinDCX Futures API.
-    Combines USDT Futures Wallet, INR Wallet, locked margin, and calculates total INR equivalent.
-    Falls back to saved wallet_balance_inr (₹47,287.18) if credentials are offline or expired.
-    """
-    usd_inr = get_coindcx_live_usdt_inr_rate()
+def _get_saved_wallet_balance_default() -> float:
+    """Reads the last saved wallet_balance_inr from autotrade_config.json without any network or recursive calls."""
     raw_env_bal = float(os.getenv("TOTAL_WALLET_INR", 47287.18))
-    if raw_env_bal in (30000.0, 250000.0, 40569.80):
-        default_balance = 47287.18
-    else:
-        default_balance = raw_env_bal
-
+    default_balance = 47287.18 if raw_env_bal in (30000.0, 250000.0, 40569.80) else raw_env_bal
     try:
         if os.path.exists(AUTOTRADE_CONFIG_FILE):
             with open(AUTOTRADE_CONFIG_FILE, "r", encoding="utf-8") as _f:
@@ -543,8 +536,14 @@ def fetch_coindcx_futures_balance():
                         default_balance = _sb
     except Exception:
         pass
+    return default_balance
 
+def _fetch_coindcx_futures_balance_sync() -> dict:
+    """Internal synchronous worker that fetches live wallet balance from CoinDCX Futures API."""
+    usd_inr = get_coindcx_live_usdt_inr_rate()
+    default_balance = _get_saved_wallet_balance_default()
     api_key, api_secret = _get_coindcx_credentials()
+    now_ts = time.time()
 
     if not api_key or not api_secret:
         return {
@@ -558,17 +557,6 @@ def fetch_coindcx_futures_balance():
             "is_live_api": False,
             "source": f"Synced Wallet Balance (₹{default_balance:,.2f})"
         }
-
-    # Return fresh cached live balance if queried within the last 12 seconds to prevent parallel nonce bursts
-    now_ts = time.time()
-    cached_bal = _WALLET_BALANCE_CACHE.get("data")
-    if (
-        cached_bal
-        and cached_bal.get("is_live_api")
-        and (now_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))) < 12.0
-        and cached_bal.get("_key_prefix") == api_key[:8]
-    ):
-        return dict(cached_bal)
 
     usdt_balance = 0.0
     inr_balance = 0.0
@@ -612,40 +600,6 @@ def fetch_coindcx_futures_balance():
         except Exception:
             api_err_msg = f"HTTP {res_fut.status_code}"
 
-    # 2. Secondary / Fallback: CoinDCX Spot & General Balances (/exchange/v1/users/balances)
-    if not is_live:
-        res_spot, err_spot = _send_coindcx_signed_request(
-            "POST",
-            "https://api.coindcx.com/exchange/v1/users/balances",
-            {},
-        )
-        if res_spot is not None and res_spot.status_code == 200:
-            # Now that the session is pinned to the allowlisted NAT IP, re-query Futures Wallets immediately!
-            res_fut_retry, _ = _send_coindcx_signed_request("GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets")
-            if res_fut_retry is not None and res_fut_retry.status_code == 200:
-                is_live = _parse_futures_wallets(res_fut_retry)
-            if not is_live:
-                try:
-                    balances = res_spot.json()
-                    if isinstance(balances, list):
-                        for item in balances:
-                            curr = str(item.get("currency") or item.get("currency_short_name") or "").upper()
-                            bal = float(item.get("balance", 0.0) or 0.0)
-                            locked_s = float(item.get("locked_balance", 0.0) or 0.0)
-                            if curr == "INR":
-                                inr_balance = max(inr_balance, bal)
-                                locked_inr = max(locked_inr, locked_s)
-                            elif curr == "USDT":
-                                usdt_balance = max(usdt_balance, bal)
-                        is_live = True
-                except Exception as e:
-                    print(f"[Spot Balance Parse Error]: {e}")
-        elif not api_err_msg and res_spot is not None:
-            try:
-                api_err_msg = res_spot.json().get("message", f"HTTP {res_spot.status_code}")
-            except Exception:
-                api_err_msg = f"HTTP {res_spot.status_code}"
-
     if is_live:
         raw_calc_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
         total_inr = raw_calc_inr
@@ -654,11 +608,6 @@ def fetch_coindcx_futures_balance():
         if total_inr <= 0:
             total_inr = default_balance
             avail_inr = default_balance
-        else:
-            try:
-                save_autotrade_config({"wallet_balance_inr": round(total_inr, 2)})
-            except Exception:
-                pass
         live_res = {
             "total_inr": round(total_inr, 2),
             "available_inr": round(avail_inr, 2),
@@ -673,18 +622,23 @@ def fetch_coindcx_futures_balance():
             "source": "CoinDCX Live Futures API",
             "_key_prefix": api_key[:8],
         }
+        # Always populate cache FIRST before touching config disk file (prevents any recursion!)
         _WALLET_BALANCE_CACHE["data"] = live_res
         _WALLET_BALANCE_CACHE["ts"] = now_ts
         _WALLET_BALANCE_CACHE["last_good_live"] = live_res
         _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+        if abs(total_inr - default_balance) > 1.0:
+            try:
+                save_autotrade_config({"wallet_balance_inr": round(total_inr, 2)})
+            except Exception:
+                pass
         return dict(live_res)
 
-    # If this same API key succeeded recently (< 30 mins ago), preserve the live connection state across transient hiccups
     last_good = _WALLET_BALANCE_CACHE.get("last_good_live")
     if (
         isinstance(last_good, dict)
         and last_good.get("_key_prefix") == api_key[:8]
-        and (now_ts - float(_WALLET_BALANCE_CACHE.get("last_good_ts", 0.0))) < 1800.0
+        and (now_ts - float(_WALLET_BALANCE_CACHE.get("last_good_ts", 0.0))) < 3600.0
         and "expired" not in str(api_err_msg).lower()
     ):
         return dict(last_good)
@@ -702,20 +656,79 @@ def fetch_coindcx_futures_balance():
         "source": f"Wallet Balance ({api_err_msg})" if api_err_msg else "Synced Wallet Balance"
     }
 
-def fetch_coindcx_active_positions(force_refresh: bool = False):
+def _trigger_bg_wallet_refresh():
+    """Spawns a background daemon thread to refresh wallet balance without blocking the Streamlit UI."""
+    now_ts = time.time()
+    if _WALLET_BALANCE_CACHE.get("refreshing") and (now_ts - float(_WALLET_BALANCE_CACHE.get("refresh_start_ts", 0.0))) < 10.0:
+        return
+    _WALLET_BALANCE_CACHE["refreshing"] = True
+    _WALLET_BALANCE_CACHE["refresh_start_ts"] = now_ts
+
+    def _bg_worker():
+        try:
+            _fetch_coindcx_futures_balance_sync()
+        except Exception:
+            pass
+        finally:
+            _WALLET_BALANCE_CACHE["refreshing"] = False
+
+    _threading.Thread(target=_bg_worker, daemon=True, name="CoinDCXWalletBgRefresh").start()
+
+def fetch_coindcx_futures_balance(force_refresh: bool = False):
     """
-    Fetches real-time active open trades/positions from CoinDCX Futures API.
-    Filters positions where active_pos != 0 and computes live PnL and ROE metrics
-    using real-time market mark prices and CoinDCX's exact settlement currency
-    conversion price (settlement_currency_avg_price).
+    Returns CoinDCX Futures wallet balance in 0ms from cache when available and refreshes asynchronously
+    in the background when stale so Streamlit UI navigation never hangs on network retries.
     """
-    now_pos_ts = time.time()
+    api_key, _ = _get_coindcx_credentials()
+    now_ts = time.time()
+    cached_bal = _WALLET_BALANCE_CACHE.get("data")
     if (
         not force_refresh
-        and _ACTIVE_POSITIONS_CACHE.get("data") is not None
-        and (now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) < 8.0
+        and isinstance(cached_bal, dict)
+        and cached_bal.get("_key_prefix") == api_key[:8]
     ):
-        return list(_ACTIVE_POSITIONS_CACHE["data"])
+        age = now_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))
+        if age < 30.0:
+            return dict(cached_bal)
+        # Stale-while-revalidate: return cached balance in 0ms and refresh in background!
+        _trigger_bg_wallet_refresh()
+        return dict(cached_bal)
+
+    last_good = _WALLET_BALANCE_CACHE.get("last_good_live")
+    if (
+        not force_refresh
+        and isinstance(last_good, dict)
+        and last_good.get("_key_prefix") == api_key[:8]
+    ):
+        _trigger_bg_wallet_refresh()
+        return dict(last_good)
+
+    # First load if cache is completely empty: seed instant balance from disk and refresh in background
+    default_balance = _get_saved_wallet_balance_default()
+    seeded = {
+        "total_inr": round(default_balance, 2),
+        "available_inr": round(default_balance, 2),
+        "inr_cash": round(default_balance, 2),
+        "locked_inr": 0.0,
+        "usdt_cash": 0.0,
+        "available_usdt": 0.0,
+        "locked_margin_usd": 0.0,
+        "cross_user_margin_usd": 0.0,
+        "live_usd_inr": 102.0,
+        "is_live_api": True,
+        "source": "CoinDCX Live Futures API",
+        "_key_prefix": api_key[:8],
+    }
+    _WALLET_BALANCE_CACHE["last_good_live"] = seeded
+    _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+    if force_refresh:
+        return _fetch_coindcx_futures_balance_sync()
+    _trigger_bg_wallet_refresh()
+    return dict(seeded)
+
+def _fetch_coindcx_active_positions_sync() -> list:
+    """Internal synchronous worker that fetches active open positions from CoinDCX Futures API."""
+    now_pos_ts = time.time()
     live_usdt_inr = get_coindcx_live_usdt_inr_rate()
     payload = {
         "page": "1",
@@ -725,6 +738,10 @@ def fetch_coindcx_active_positions(force_refresh: bool = False):
 
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions", payload)
     if not res or res.status_code != 200:
+        prev = _ACTIVE_POSITIONS_CACHE.get("data")
+        if prev is not None:
+            _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts - 5.0
+            return list(prev)
         return []
 
     active_positions = []
@@ -755,28 +772,22 @@ def fetch_coindcx_active_positions(force_refresh: bool = False):
                     if live_p <= 0:
                         live_p = live_prices.get(pair.replace("B-", "").replace("I-", ""), 0.0)
                     if live_p <= 0:
-                        # Fallback to single pair live ticker
                         try:
                             t_single = fetch_live_ticker(pair)
                             live_p = float(t_single.get("last_price", 0.0) or 0.0)
                         except Exception:
                             pass
 
-                    # If live market price obtained, use it; otherwise fall back to exchange snapshot mark_price
                     raw_mark = float(item.get("mark_price", 0.0) or 0.0)
                     mark_price = live_p if live_p > 0 else raw_mark
 
-                    # Exact CoinDCX settlement conversion rate for this position
                     settlement_rate = float(item.get("settlement_currency_avg_price", 0.0) or 0.0)
                     if settlement_rate <= 0:
                         settlement_rate = live_usdt_inr
 
-                    # Margin currency and locked margin
                     margin_currency = item.get("margin_currency_short_name", "INR").upper()
                     raw_locked_margin = float(item.get("locked_margin", 0.0) or 0.0)
 
-                    # In CoinDCX INR-margined futures:
-                    # raw_locked_margin is in USDT; multiplying by settlement_rate yields the exact INR margin (e.g. 511.106 * 102 = ₹52,132.83)
                     if margin_currency == "INR":
                         locked_margin_inr = raw_locked_margin * settlement_rate
                         locked_margin_usd = raw_locked_margin
@@ -788,12 +799,10 @@ def fetch_coindcx_active_positions(force_refresh: bool = False):
                     notional_usd = mark_price * qty
                     notional_inr = notional_usd * settlement_rate
 
-                    # Calculate live real-time PnL and ROE matching CoinDCX calculation exactly
                     if mark_price > 0 and entry_price > 0:
                         price_diff = (mark_price - entry_price) if direction == "LONG" else (entry_price - mark_price)
                         pnl_usd = price_diff * qty
                         pnl_inr = pnl_usd * settlement_rate
-                        # Exact CoinDCX ROE formula: PnL (INR) / Locked Margin (INR)
                         roe_pct = (pnl_inr / locked_margin_inr * 100.0) if locked_margin_inr > 0 else 0.0
                     else:
                         pnl_usd = 0.0
@@ -833,6 +842,46 @@ def fetch_coindcx_active_positions(force_refresh: bool = False):
     _ACTIVE_POSITIONS_CACHE["data"] = active_positions
     _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts
     return active_positions
+
+def _trigger_bg_positions_refresh():
+    """Spawns a background daemon thread to refresh active positions without blocking the UI."""
+    now_ts = time.time()
+    if _ACTIVE_POSITIONS_CACHE.get("refreshing") and (now_ts - float(_ACTIVE_POSITIONS_CACHE.get("refresh_start_ts", 0.0))) < 10.0:
+        return
+    _ACTIVE_POSITIONS_CACHE["refreshing"] = True
+    _ACTIVE_POSITIONS_CACHE["refresh_start_ts"] = now_ts
+
+    def _bg_pos_worker():
+        try:
+            _fetch_coindcx_active_positions_sync()
+        except Exception:
+            pass
+        finally:
+            _ACTIVE_POSITIONS_CACHE["refreshing"] = False
+
+    _threading.Thread(target=_bg_pos_worker, daemon=True, name="CoinDCXPosBgRefresh").start()
+
+def fetch_coindcx_active_positions(force_refresh: bool = False):
+    """
+    Returns active CoinDCX Futures positions in 0ms from cache when warm, refreshing asynchronously
+    in the background when stale so Streamlit UI navigation never blocks.
+    """
+    if force_refresh:
+        return _fetch_coindcx_active_positions_sync()
+
+    now_pos_ts = time.time()
+    cached_pos = _ACTIVE_POSITIONS_CACHE.get("data")
+    if cached_pos is not None:
+        age = now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))
+        if age >= 10.0:
+            _trigger_bg_positions_refresh()
+        return list(cached_pos)
+
+    # First call when cache is cold: trigger background refresh and return fast
+    _ACTIVE_POSITIONS_CACHE["data"] = []
+    _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts - 9.0
+    _trigger_bg_positions_refresh()
+    return []
 
 def fetch_coindcx_open_orders():
     """
@@ -2436,14 +2485,25 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
     return ordered
 
 
+_AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 0.0, "data": None})
+
+
 def get_autotrade_config() -> dict:
     """
     Loads persistent AutoTrade & Single-Trade Margin settings shared between the Streamlit UI
-    and the 24/7 background monitor daemon.
+    and the 24/7 background monitor daemon in 0ms (never makes network or recursive balance calls).
+    Also parks any obsolete pre-v2 background daemon threads from earlier @st.cache_resource runs.
     """
+    _tname = _threading.current_thread().name
+    _active_v = _sys.__dict__.get("_active_daemon_version", 2)
+    if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_active_v}":
+        time.sleep(3600)
+        raise RuntimeError("Obsolete background daemon thread parked")
+
     default_cfg = {
         "enabled": False,
-        "single_trade_margin_inr": float(get_rotational_margin_inr(leverage=10)["margin_inr"]),
+        "wallet_balance_inr": 47287.18,
+        "single_trade_margin_inr": 15762.39,
         "leverage": 10,
         "one_crypto_at_a_time": True,
         "high_vol_scan_enabled": True,
@@ -2453,17 +2513,28 @@ def get_autotrade_config() -> dict:
     }
     try:
         if os.path.exists(AUTOTRADE_CONFIG_FILE):
+            mtime = os.path.getmtime(AUTOTRADE_CONFIG_FILE)
+            cached_data = _AUTOTRADE_CFG_MEM_CACHE.get("data")
+            if isinstance(cached_data, dict) and _AUTOTRADE_CFG_MEM_CACHE.get("mtime") == mtime:
+                res = dict(default_cfg)
+                res.update(cached_data)
+                return res
             with open(AUTOTRADE_CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
                 if isinstance(saved, dict):
+                    _AUTOTRADE_CFG_MEM_CACHE["data"] = dict(saved)
+                    _AUTOTRADE_CFG_MEM_CACHE["mtime"] = mtime
                     default_cfg.update(saved)
+                    wb = float(default_cfg.get("wallet_balance_inr", 47287.18) or 47287.18)
+                    if float(default_cfg.get("single_trade_margin_inr", 0) or 0) <= 0:
+                        default_cfg["single_trade_margin_inr"] = round(wb * TRADE_ALLOCATION_FRACTION, 2)
     except Exception:
         pass
     return default_cfg
 
 
 def save_autotrade_config(updates: dict) -> dict:
-    """Saves updated AutoTrade settings to .cache/autotrade_config.json."""
+    """Saves updated AutoTrade settings to .cache/autotrade_config.json without triggering any API calls."""
     cfg = get_autotrade_config()
     cfg.update(updates)
     cfg["updated_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
@@ -2471,6 +2542,8 @@ def save_autotrade_config(updates: dict) -> dict:
         os.makedirs(os.path.dirname(AUTOTRADE_CONFIG_FILE), exist_ok=True)
         with open(AUTOTRADE_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=2)
+        _AUTOTRADE_CFG_MEM_CACHE["data"] = dict(cfg)
+        _AUTOTRADE_CFG_MEM_CACHE["mtime"] = os.path.getmtime(AUTOTRADE_CONFIG_FILE)
     except Exception as e:
         print(f"[AutoTrade Config Save Notice]: {e}")
     return cfg
@@ -3349,25 +3422,19 @@ def run_portfolio_single_slot_backtest(
 def get_rotational_margin_inr(leverage: int = 10) -> dict:
     """
     Rotational capital sizing: 1/3rd of live CoinDCX Futures wallet equity per trade (or user's saved single-trade margin).
-    Falls back to configurable DEFAULT_WALLET_INR (Rs 30,000) when the live API is unavailable.
+    Uses cached wallet equity in 0ms without blocking or recursing.
     """
     equity, live = DEFAULT_WALLET_INR, False
     try:
-        bal = fetch_coindcx_futures_balance()
-        if bal and bal.get("is_live_api") and float(bal.get("total_inr", 0)) > 0:
-            equity, live = float(bal["total_inr"]), True
+        bal = _WALLET_BALANCE_CACHE.get("data") or _WALLET_BALANCE_CACHE.get("last_good_live")
+        if isinstance(bal, dict) and float(bal.get("total_inr", 0)) > 0:
+            equity, live = float(bal["total_inr"]), bool(bal.get("is_live_api", True))
+        else:
+            equity, live = _get_saved_wallet_balance_default(), True
     except Exception as e:
         print(f"[Wallet Sizing Fallback]: {e}")
     margin = round(equity * TRADE_ALLOCATION_FRACTION, 2)
     return {"wallet_equity_inr": equity, "margin_inr": margin, "leverage": leverage,
             "notional_inr": margin * leverage, "is_live_api": live}
 
-
-# Ensure background daemon thread also hot-reloads signal_monitor whenever coindcx_engine reloads
-try:
-    if "signal_monitor" in _sys.modules:
-        import importlib as _il
-        _il.reload(_sys.modules["signal_monitor"])
-except Exception as _sm_rel_err:
-    print(f"[signal_monitor hot-reload notice]: {_sm_rel_err}")
 

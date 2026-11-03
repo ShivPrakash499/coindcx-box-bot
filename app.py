@@ -288,13 +288,13 @@ def get_cached_ticker(pair):
 def get_cached_funding(pair):
     return fetch_futures_funding_rate(pair)
 
-@st.cache_data(ttl=15)
 def get_cached_balance():
-    return fetch_coindcx_futures_balance()
+    return fetch_coindcx_futures_balance(force_refresh=False)
+get_cached_balance.clear = lambda: coindcx_engine._trigger_bg_wallet_refresh()
 
-@st.cache_data(ttl=8)
 def get_cached_positions():
-    return fetch_coindcx_active_positions()
+    return fetch_coindcx_active_positions(force_refresh=False)
+get_cached_positions.clear = lambda: coindcx_engine._trigger_bg_positions_refresh()
 
 @st.cache_data(ttl=15)
 def get_cached_open_orders():
@@ -1310,6 +1310,11 @@ if active_section == "⚡ Signals":
                 )
         with hdr_s2:
             if st.button("🔄 Scan Now", key="btn_force_rescan_signals", use_container_width=True):
+                try:
+                    if signal_monitor and hasattr(signal_monitor, "_LAST_SCAN_CACHE"):
+                        signal_monitor._LAST_SCAN_CACHE["ts"] = 0.0
+                except Exception:
+                    pass
                 get_cached_top_movers.clear()
                 get_cached_signals_scan.clear()
                 st.rerun()
@@ -1331,7 +1336,7 @@ if active_section == "⚡ Signals":
             st.html(f"<div class='movers-grid'>{''.join(cards_html)}</div>")
 
         results = get_cached_signals_scan(
-            tuple(monitor_pairs), float(margin_inr), int(leverage), float(usd_inr),
+            tuple(monitor_pairs), round(float(margin_inr), 0), int(leverage), round(float(usd_inr), 0),
             tuple(monitor_strategy_ids), bool(monitor_on), bool(autotrade_on)
         )
         active_signals = [r for r in results if r.get("signal") and r["signal"].get("signal") not in (None, "NEUTRAL")]
