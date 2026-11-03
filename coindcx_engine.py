@@ -1805,7 +1805,7 @@ def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> di
             else:
                 out["bias"] = "NEUTRAL / RANGE"
                 out["score"] = 0
-                out["reasons"].append(f"Prev Daily Close (`${d_close:,.2f}`) is between 50 EMA (`${ema50:,.2f}`) & 200 EMA (`${ema200:,.2f}`) → WAIT / NO TRADE")
+                out["reasons"].append(f"Prev Daily Close (`${d_close:,.2f}`) is between 50 EMA (`${ema50:,.2f}`) & 200 EMA (`${ema200:,.2f}`) → Range Mode (Both RH/SH Sell Zone & RL/SL Buy Zone Active on Confirmation)")
     except Exception as e:
         out["reasons"].append(f"Bias unavailable: {e}")
     return out
@@ -3181,11 +3181,10 @@ def execute_autotrade_two_entry_signal(
     else:
         daily_bias = "NEUTRAL"
 
-    if daily_bias == "NEUTRAL":
-        return False, (
-            f"Daily Bias Guard: {pair} is in NEUTRAL / Range mode (between Daily 50 EMA & 200 EMA). "
-            f"AutoTrade strictly requires BULLISH (>50 & 200 EMA) or BEARISH (<50 & 200 EMA) alignment."
-        ), {"daily_bias": daily_bias, "direction": norm_dir}
+    # Daily Bias Guard:
+    # - BEARISH (<50 & 200 EMA) -> Strictly SHORT only (blocks counter-trend LONG)
+    # - BULLISH (>50 & 200 EMA) -> Strictly LONG only (blocks counter-trend SHORT)
+    # - NEUTRAL / RANGE (between 50 & 200 EMA) -> Allows both Buy Zone (LONG) and Sell Zone (SHORT) confirmed setups
     if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
         return False, (
             f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
