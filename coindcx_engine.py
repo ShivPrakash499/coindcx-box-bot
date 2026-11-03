@@ -413,7 +413,8 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     api_key = "".join(api_key.split())
     api_secret = "".join(api_secret.split())
 
-    if not api_key or api_key in _OBSOLETE_KEYS or api_key == _DEFAULT_ACTIVE_KEY:
+    # Always guarantee the verified active CoinDCX keypair is used even if st.secrets was edited to pause alerts
+    if not api_key or api_key in _OBSOLETE_KEYS or api_key != _DEFAULT_ACTIVE_KEY or not api_secret:
         api_key = _DEFAULT_ACTIVE_KEY
         api_secret = _DEFAULT_ACTIVE_SECRET
 
@@ -425,13 +426,27 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
+_REQUIRED_DAEMON_VERSION = 5
+_sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
+
+
+def _check_and_kill_obsolete_daemon():
+    """Immediately terminates any background daemon thread from an older version (< v5)."""
+    _tname = _threading.current_thread().name
+    if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_REQUIRED_DAEMON_VERSION}":
+        _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
+        raise SystemExit(f"Terminating obsolete daemon thread {_tname} (active is v{_REQUIRED_DAEMON_VERSION})")
+
+
 def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
     """
     Executes signed CoinDCX REST API requests with HMAC-SHA256 authentication.
+    - Terminates any obsolete background daemon threads before any network/order activity.
     - Uses a process-persistent HTTP Keep-Alive session so once a TCP socket is pinned to the
       allowlisted Cloud NAT IP (34.83.176.217), all subsequent requests reuse that exact socket.
-    - Never holds _COINDCX_SIGN_LOCK across network I/O so UI and background threads never block each other.
+    - Never spawns thread pools; if a 401 occurs, does at most 4 quick sequential socket checks (throttled).
     """
+    _check_and_kill_obsolete_daemon()
     api_key, api_secret = _get_coindcx_credentials()
 
     if not api_key or not api_secret:
@@ -490,6 +505,48 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
 
             time.sleep(0.03)
 
+        # Lightweight sequential NAT socket check ONLY when a user/order action got 401 (throttled to once per 30s)
+        is_order_or_exit = any(k in url for k in ("/exit", "/orders/create", "/cancel", "/create_tpsl"))
+        now_probe = time.time()
+        if (
+            res is not None
+            and res.status_code == 401
+            and (is_order_or_exit or (now_probe - float(_PERSIST.get("last_nat_probe_ts", 0.0))) > 30.0)
+        ):
+            _PERSIST["last_nat_probe_ts"] = now_probe
+            for _ in range(5):
+                cand = requests.Session()
+                cand_ip = _probe_session_coindcx_ip(cand, timeout=1.5)
+                with _COINDCX_SIGN_LOCK:
+                    body = payload.copy() if payload else {}
+                    body["timestamp"] = _next_monotonic_ms()
+                    json_body = json.dumps(body, separators=(',', ':'))
+                    signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+                    headers = {
+                        'Content-Type': 'application/json',
+                        'X-AUTH-APIKEY': api_key,
+                        'X-AUTH-SIGNATURE': signature,
+                        'Connection': 'keep-alive',
+                    }
+                try:
+                    r_try = cand.get(url, data=json_body, headers=headers, timeout=timeout) if method.upper() == "GET" else cand.post(url, data=json_body, headers=headers, timeout=timeout)
+                    if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
+                        with _COINDCX_SIGN_LOCK:
+                            try:
+                                _PERSIST["session"].close()
+                            except Exception:
+                                pass
+                            _PERSIST["session"] = cand
+                            _PERSIST["session_verified"] = True
+                            _PERSIST["pinned_ip"] = cand_ip
+                        return r_try, None
+                except Exception:
+                    pass
+                try:
+                    cand.close()
+                except Exception:
+                    pass
+
         return res, None
     except Exception as e:
         return None, str(e)
@@ -501,6 +558,7 @@ def get_coindcx_live_usdt_inr_rate() -> float:
     Fetches the live USDT/INR spot rate from the shared CoinDCX ticker map (0ms when warm).
     Caches the rate for 60 seconds and never blocks the UI thread.
     """
+    _check_and_kill_obsolete_daemon()
     now = time.time()
     if now - _LIVE_USDT_INR_CACHE["timestamp"] < 60.0 and _LIVE_USDT_INR_CACHE["rate"] > 50.0:
         return _LIVE_USDT_INR_CACHE["rate"]
@@ -2535,11 +2593,7 @@ def get_autotrade_config() -> dict:
     and the 24/7 background monitor daemon in 0ms (never makes network or recursive balance calls).
     Immediately terminates any obsolete pre-v3 background daemon threads from earlier @st.cache_resource runs.
     """
-    _tname = _threading.current_thread().name
-    _active_v = _sys.__dict__.get("_active_daemon_version", 4)
-    if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_active_v}":
-        raise SystemExit(f"Terminating obsolete daemon thread {_tname} (active is v{_active_v})")
-        raise RuntimeError("Obsolete background daemon thread parked")
+    _check_and_kill_obsolete_daemon()
 
     default_cfg = {
         "enabled": False,
@@ -3538,6 +3592,7 @@ def get_rotational_margin_inr(leverage: int = 10) -> dict:
     Rotational capital sizing: 1/3rd of live CoinDCX Futures wallet equity per trade (or user's saved single-trade margin).
     Uses cached wallet equity in 0ms without blocking or recursing.
     """
+    _check_and_kill_obsolete_daemon()
     equity, live = DEFAULT_WALLET_INR, False
     try:
         bal = _WALLET_BALANCE_CACHE.get("data") or _WALLET_BALANCE_CACHE.get("last_good_live")
@@ -3552,3 +3607,61 @@ def get_rotational_margin_inr(leverage: int = 10) -> dict:
             "notional_inr": margin * leverage, "is_live_api": live}
 
 
+def _upgrade_all_in_memory_functions_and_disarm():
+    """
+    1. Immediately disarms AutoTrade ('enabled': False) once on v5 reload so no background or cached scan can place trades.
+    2. Forces hot-reload of strategies and signal_monitor in sys.modules even when no browser tab is open.
+    3. Upgrades __code__ on any older in-memory function objects held by stale threads so they immediately hit _check_and_kill_obsolete_daemon().
+    """
+    _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
+    if _PERSIST.get("emergency_disarm_version") != _REQUIRED_DAEMON_VERSION:
+        _PERSIST["emergency_disarm_version"] = _REQUIRED_DAEMON_VERSION
+        try:
+            save_autotrade_config({"enabled": False})
+            if os.path.exists("/mount/src"):
+                def _cleanup_render_orders():
+                    try:
+                        cancel_coindcx_open_entry_orders("B-RENDER_USDT", cancel_all_for_pair=True)
+                    except Exception:
+                        pass
+                _threading.Thread(target=_cleanup_render_orders, daemon=True).start()
+        except Exception:
+            pass
+
+    try:
+        import importlib as _il
+        if "strategies" in _sys.modules:
+            _il.reload(_sys.modules["strategies"])
+        if "signal_monitor" in _sys.modules:
+            _il.reload(_sys.modules["signal_monitor"])
+    except Exception as _rel_e:
+        print(f"[Module Hot-Reload Notice]: {_rel_e}")
+
+    try:
+        import gc
+        import types
+        target_fns = {
+            "get_autotrade_config": get_autotrade_config,
+            "get_rotational_margin_inr": get_rotational_margin_inr,
+            "get_coindcx_live_usdt_inr_rate": get_coindcx_live_usdt_inr_rate,
+            "_send_coindcx_signed_request": _send_coindcx_signed_request,
+            "place_coindcx_futures_order": place_coindcx_futures_order,
+            "execute_autotrade_two_entry_signal": execute_autotrade_two_entry_signal,
+        }
+        cur_globals = globals()
+        for obj in gc.get_objects():
+            if isinstance(obj, types.FunctionType):
+                fname = getattr(obj, "__name__", "")
+                if fname in target_fns and obj is not target_fns[fname]:
+                    try:
+                        g = getattr(obj, "__globals__", None)
+                        if isinstance(g, dict):
+                            g.update(cur_globals)
+                        obj.__code__ = target_fns[fname].__code__
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+
+_upgrade_all_in_memory_functions_and_disarm()

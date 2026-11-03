@@ -188,7 +188,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 4
+_DAEMON_VERSION = 5
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -196,6 +196,7 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
     """Starts the 24/7 background monitor daemon once per version,
     BEFORE check_authentication() so alerts and AutoTrade run 24/7 even when no browser session is logged in."""
     def _monitor_worker():
+        time.sleep(15)  # Let browser static JS chunks finish loading before first background scan
         while sys.__dict__.get("_active_daemon_version") == daemon_version:
             try:
                 _reload_if_updated(strategy_registry)

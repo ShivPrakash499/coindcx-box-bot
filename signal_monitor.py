@@ -29,26 +29,32 @@ _SCAN_LOCK = sys.__dict__.setdefault("_signal_monitor_scan_lock", threading.Lock
 _LAST_SCAN_CACHE = sys.__dict__.setdefault("_signal_monitor_last_scan", {"ts": 0.0, "results": []})
 
 
+_MEM_STATE = sys.__dict__.setdefault("_signal_monitor_state_mem", {"_schema_version": _STATE_SCHEMA_VERSION})
+
+
 def _load() -> dict:
+    merged = dict(_MEM_STATE)
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
             if isinstance(data, dict):
-                if data.get("_schema_version") != _STATE_SCHEMA_VERSION:
-                    fresh = {"_schema_version": _STATE_SCHEMA_VERSION}
-                    _save(fresh)
-                    return fresh
-                return data
+                merged.update(data)
     except Exception:
         pass
-    return {"_schema_version": _STATE_SCHEMA_VERSION}
+    merged["_schema_version"] = _STATE_SCHEMA_VERSION
+    _MEM_STATE.update(merged)
+    return merged
 
 
 def _save(state: dict) -> None:
     state["_schema_version"] = _STATE_SCHEMA_VERSION
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f)
+    _MEM_STATE.update(state)
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
 
 
 def enabled_strategy_ids() -> list:
@@ -96,6 +102,8 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
       4. When AutoTrade is toggled ON in the Sidebar, automatically executes the 2-Entry + Runner setup
          using the user's configured Single-Trade Margin out of the Futures Wallet.
     """
+    if hasattr(eng, "_check_and_kill_obsolete_daemon"):
+        eng._check_and_kill_obsolete_daemon()
     auto_cfg = eng.get_autotrade_config()
     if margin_inr is None or margin_inr <= 0:
         margin_inr = float(auto_cfg.get("single_trade_margin_inr", 100000.0))
@@ -150,6 +158,8 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
             pass
 
         for pair in pairs:
+            if is_daemon_thread:
+                time.sleep(0.03)  # Yield GIL so Streamlit Tornado serves static JS assets immediately
             pair_lock_key = f"PAIR_LOCK|{pair}"
             pair_last = state.get(pair_lock_key, {})
             email_daily_key = f"EMAIL_COUNT|{pair}|{today_ist}"
