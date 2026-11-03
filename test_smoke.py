@@ -195,27 +195,31 @@ def test_5_daily_bias_enforcement():
     }
 
     # 1. Verify AutoTrade Guard blocks LONG in BEARISH, blocks SHORT in BULLISH, and allows RANGE (NEUTRAL) box trades
-    with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}):
+    with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]):
         bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
-        ok_b, msg_b, _ = eng.execute_autotrade_two_entry_signal(
-            pair="B-RENDER_USDT",
-            sig={"signal": "LONG", "entry": 1.50, "entry2_sweep": 1.49, "tp1": 1.53, "tp2": 1.59, "stop_loss": 1.48, "levels": bear_levels},
-            single_trade_margin_inr=15762.39,
-            leverage=10,
-        )
-        assert not ok_b and "Daily Bias Guard" in msg_b, f"Expected counter-trend LONG in BEARISH block, got: {ok_b} {msg_b}"
+        with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
+            ok_b, msg_b, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-RENDER_USDT",
+                sig={"signal": "LONG", "entry": 1.50, "entry2_sweep": 1.49, "tp1": 1.53, "tp2": 1.59, "stop_loss": 1.48, "levels": bear_levels},
+                single_trade_margin_inr=15762.39,
+                leverage=10,
+            )
+            assert not ok_b and "Daily Bias Guard" in msg_b, f"Expected counter-trend LONG in BEARISH block, got: {ok_b} {msg_b}"
 
         bull_levels = {**neutral_levels, "EMA50": 85.0, "EMA200": 80.0, "daily_close": 92.0, "trend_bias": "BULLISH"}
-        ok_u, msg_u, _ = eng.execute_autotrade_two_entry_signal(
-            pair="B-SOL_USDT",
-            sig={"signal": "SHORT", "entry": 92.0, "entry2_sweep": 92.5, "tp1": 90.5, "tp2": 88.0, "stop_loss": 93.0, "levels": bull_levels},
-            single_trade_margin_inr=15762.39,
-            leverage=10,
-        )
-        assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
+        with patch.object(eng, "compute_market_bias", return_value={"bias": "BULLISH"}):
+            ok_u, msg_u, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-SOL_USDT",
+                sig={"signal": "SHORT", "entry": 92.0, "entry2_sweep": 92.5, "tp1": 90.5, "tp2": 88.0, "stop_loss": 93.0, "levels": bull_levels},
+                single_trade_margin_inr=15762.39,
+                leverage=10,
+            )
+            assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
 
         # In NEUTRAL/RANGE mode, Daily Bias Guard must NOT block confirmed Buy/Sell Zone trades
-        with patch.object(eng, "place_coindcx_futures_order", return_value=(True, "SIMULATED_RANGE_OK", {"id": "sim_1"})), \
+        with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
+             patch.object(eng, "place_coindcx_futures_order", return_value=(True, "SIMULATED_RANGE_OK", {"id": "sim_1"})), \
              patch.object(eng, "save_autotrade_config", return_value={}), \
              patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK", {})):
             ok_r, msg_r, _ = eng.execute_autotrade_two_entry_signal(
@@ -225,6 +229,19 @@ def test_5_daily_bias_enforcement():
                 leverage=10,
             )
             assert ok_r and "Daily Bias Guard" not in msg_r, f"Expected RANGE mode trade allowed, got: {ok_r} {msg_r}"
+
+    # 2. Verify 2nd coin (RENDER) is strictly blocked if CoinDCX has an open position (INJ), even if local lock was cleared!
+    with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{"pair": "B-INJ_USDT", "direction": "SHORT", "id": "pos_inj"}]):
+        ok_2nd, msg_2nd, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-RENDER_USDT",
+            sig={"signal": "SHORT", "entry": 1.51, "entry2_sweep": 1.63, "tp1": 1.48, "tp2": 1.45, "stop_loss": 1.64, "levels": bear_levels},
+            single_trade_margin_inr=15762.39,
+            leverage=10,
+        )
+        assert not ok_2nd and "1-Crypto-at-a-Time Live Exchange Guard" in msg_2nd, (
+            f"Expected 2nd concurrent trade blocked by live exchange guard, got: {ok_2nd} {msg_2nd}"
+        )
 
     # 3. Verify Option B: calculate_daily_box_levels locks Daily Bias to previous completed daily candle
     import pandas as pd

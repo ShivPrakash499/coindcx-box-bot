@@ -188,7 +188,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 2
+_DAEMON_VERSION = 3
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -198,6 +198,7 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
     def _monitor_worker():
         while sys.__dict__.get("_active_daemon_version") == daemon_version:
             try:
+                _reload_if_updated(strategy_registry)
                 _reload_if_updated(coindcx_engine)
                 _reload_if_updated(signal_monitor)
                 if signal_monitor:

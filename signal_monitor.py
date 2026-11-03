@@ -135,9 +135,17 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         if portfolio_occupied and active_Slot_pair:
             open_live_pairs.add(active_Slot_pair)
         try:
-            for pos in (eng.fetch_coindcx_active_positions() or []):
+            live_pos_list = (
+                eng._fetch_coindcx_active_positions_sync(return_none_on_error=False)
+                if is_daemon_thread
+                else (eng.fetch_coindcx_active_positions() or [])
+            ) or []
+            for pos in live_pos_list:
                 if isinstance(pos, dict) and pos.get("pair"):
                     open_live_pairs.add(pos["pair"])
+                    if not portfolio_occupied:
+                        portfolio_occupied = True
+                        active_Slot_pair = pos["pair"]
         except Exception:
             pass
 

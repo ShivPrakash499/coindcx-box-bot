@@ -726,18 +726,20 @@ def fetch_coindcx_futures_balance(force_refresh: bool = False):
     _trigger_bg_wallet_refresh()
     return dict(seeded)
 
-def _fetch_coindcx_active_positions_sync() -> list:
+def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> list | None:
     """Internal synchronous worker that fetches active open positions from CoinDCX Futures API."""
     now_pos_ts = time.time()
     live_usdt_inr = get_coindcx_live_usdt_inr_rate()
     payload = {
         "page": "1",
-        "size": "20",
+        "size": "100",
         "margin_currency_short_name": ["USDT", "INR"]
     }
 
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions", payload)
     if not res or res.status_code != 200:
+        if return_none_on_error:
+            return None
         prev = _ACTIVE_POSITIONS_CACHE.get("data")
         if prev is not None:
             _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts - 5.0
@@ -2503,12 +2505,12 @@ def get_autotrade_config() -> dict:
     """
     Loads persistent AutoTrade & Single-Trade Margin settings shared between the Streamlit UI
     and the 24/7 background monitor daemon in 0ms (never makes network or recursive balance calls).
-    Also parks any obsolete pre-v2 background daemon threads from earlier @st.cache_resource runs.
+    Immediately terminates any obsolete pre-v3 background daemon threads from earlier @st.cache_resource runs.
     """
     _tname = _threading.current_thread().name
-    _active_v = _sys.__dict__.get("_active_daemon_version", 2)
+    _active_v = _sys.__dict__.get("_active_daemon_version", 3)
     if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_active_v}":
-        time.sleep(3600)
+        raise SystemExit(f"Terminating obsolete daemon thread {_tname} (active is v{_active_v})")
         raise RuntimeError("Obsolete background daemon thread parked")
 
     default_cfg = {
@@ -2982,10 +2984,16 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
 
             matched_live_pos = None
             if is_live_ex:
-                live_positions = fetch_coindcx_active_positions()
+                # CRITICAL: Always use synchronous live fetch (_fetch_coindcx_active_positions_sync) here,
+                # NEVER the UI's non-blocking cold-cache fetch_coindcx_active_positions(force_refresh=False),
+                # which returns [] when cold and previously caused active_trade_lock to be falsely cleared!
+                live_positions = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
                 if live_positions is not None:
                     matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
                     if matched_live_pos and matched_live_pos.get("id"):
+                        if lock.get("missing_count", 0) > 0:
+                            lock["missing_count"] = 0
+                            save_autotrade_config({"active_trade_lock": lock})
                         # Auto-heal missing TP or SL on CoinDCX at most once per trade lock
                         if (
                             not lock.get("tpsl_healed")
@@ -3008,10 +3016,28 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             lock["tpsl_healed"] = True
                             save_autotrade_config({"active_trade_lock": lock})
                             update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_sl, pair=l_pair)
-                    elif l_ts > 0 and (time.time() - l_ts) >= 60 and fetch_coindcx_futures_balance().get("is_live_api"):
-                        cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
-                        clear_autotrade_active_lock()
-                        return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
+                    elif len(live_positions) > 0:
+                        # Another position is open on CoinDCX: keep the portfolio slot occupied!
+                        other_p = live_positions[0]
+                        return {
+                            "is_occupied": True,
+                            "active_pair": other_p.get("pair"),
+                            "active_direction": other_p.get("direction", "LONG"),
+                            "entry_price": float(other_p.get("entry_price", 0.0) or 0.0),
+                            "stop_loss": float(other_p.get("stop_loss", 0.0) or 0.0),
+                            "source": "CoinDCX Live Active Position",
+                            "count": len(live_positions),
+                        }
+                    elif l_ts > 0 and (time.time() - l_ts) >= 90 and fetch_coindcx_futures_balance().get("is_live_api"):
+                        # Require 2 consecutive confirmed 200-OK empty position checks before releasing lock
+                        miss_cnt = int(lock.get("missing_count", 0)) + 1
+                        if miss_cnt >= 2:
+                            cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
+                            clear_autotrade_active_lock()
+                            return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
+                        else:
+                            lock["missing_count"] = miss_cnt
+                            save_autotrade_config({"active_trade_lock": lock})
 
             if l_ts > 0 and (time.time() - l_ts) >= 15:
                 tk = fetch_live_ticker(l_pair)
@@ -3119,8 +3145,13 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
         }
 
     # Fallback: if local lock file was cleared or container restarted, check live CoinDCX active positions directly
+    # Use synchronous live fetch when manage_exchange=True so background daemon never misses an open position due to cold cache
     try:
-        live_pos = fetch_coindcx_active_positions() or []
+        live_pos = (
+            _fetch_coindcx_active_positions_sync(return_none_on_error=False)
+            if manage_exchange
+            else (fetch_coindcx_active_positions() or [])
+        ) or []
         if live_pos:
             first_p = live_pos[0]
             return {
@@ -3167,18 +3198,34 @@ def execute_autotrade_two_entry_signal(
             f"Skipping {pair} so 50% margin stays reserved for {act_p} Entry 2."
         ), {"slot_status": slot}
 
+    # Mandatory synchronous live CoinDCX position check so a 2nd trade can NEVER open if any position is live on the exchange
+    live_ex_pos = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
+    if live_ex_pos is None and os.getenv("COINDCX_API_KEY"):
+        return False, (
+            f"1-Crypto-at-a-Time Safety Guard: Could not verify live CoinDCX positions right now; "
+            f"blocking {pair} AutoTrade to prevent opening a 2nd concurrent position."
+        ), {"live_ex_pos": None}
+    if live_ex_pos:
+        open_p = live_ex_pos[0].get("pair", "UNKNOWN")
+        return False, (
+            f"1-Crypto-at-a-Time Live Exchange Guard: CoinDCX already has an open position on {open_p}. "
+            f"Skipping {pair} so only 1 crypto is traded at a time."
+        ), {"live_ex_pos": live_ex_pos}
+
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     norm_dir = "LONG" if direction in ("LONG", "BUY") else "SHORT"
 
     # Hard Daily 50 & 200 EMA Bias Guard before placing any AutoTrade order
+    # Always verify against fresh compute_market_bias(pair) if sig_levels is missing or to prevent stale signals
     sig_levels = sig.get("levels") if isinstance(sig.get("levels"), dict) else {}
     daily_bias = str(sig_levels.get("trend_bias") or sig_levels.get("bias") or "").upper()
-    if not daily_bias:
-        try:
-            mb = compute_market_bias(pair)
-            daily_bias = str(mb.get("bias", "NEUTRAL")).upper()
-        except Exception:
-            daily_bias = "NEUTRAL"
+    try:
+        mb = compute_market_bias(pair)
+        live_mb_bias = str(mb.get("bias", "")).upper()
+        if live_mb_bias:
+            daily_bias = live_mb_bias
+    except Exception:
+        pass
 
     if "BULLISH" in daily_bias:
         daily_bias = "BULLISH"
