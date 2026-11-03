@@ -141,18 +141,97 @@ def round_asset_price(val, ref_price=None):
     else:
         return round(float(val), 2)
 
+import sys as _sys
+import threading as _threading
+
+# Process-wide persistent state that survives importlib.reload(coindcx_engine) across Streamlit reruns
+_PERSIST = _sys.__dict__.setdefault("_coindcx_persistent_state", {
+    "lock": _threading.Lock(),
+    "last_ts_ms": 0,
+    "last_ts_sec": 0,
+    "session": requests.Session(),
+    "session_verified": False,
+    "pinned_ip": "",
+    "seen_coindcx_ips": [],
+    "wallet_cache": {"data": None, "ts": 0.0, "last_good_live": None, "last_good_ts": 0.0},
+    "positions_cache": {"data": None, "ts": 0.0},
+    "ticker_map_cache": {"ts": 0.0, "map": {}},
+    "fapi_blocked": False,
+    "api_key": "",
+    "api_secret": "",
+})
+_PERSIST.setdefault("pinned_ip", "")
+_PERSIST.setdefault("seen_coindcx_ips", [])
+_PERSIST.setdefault("ticker_map_cache", {"ts": 0.0, "map": {}})
+_PERSIST.setdefault("fapi_blocked", False)
+
+_COINDCX_SIGN_LOCK = _PERSIST["lock"]
+_WALLET_BALANCE_CACHE = _PERSIST["wallet_cache"]
+_ACTIVE_POSITIONS_CACHE = _PERSIST["positions_cache"]
+_TICKER_MAP_CACHE = _PERSIST["ticker_map_cache"]
+
+
+def _get_coindcx_ticker_map(ttl: float = 5.0) -> dict:
+    """Returns a 5-second cached dictionary of all CoinDCX markets -> ticker item so UI calls take 0ms."""
+    now = time.time()
+    cached_map = _TICKER_MAP_CACHE.get("map")
+    if cached_map and (now - float(_TICKER_MAP_CACHE.get("ts", 0.0))) < ttl:
+        return cached_map
+    try:
+        r = requests.get("https://api.coindcx.com/exchange/ticker", timeout=3.5)
+        if r.status_code == 200:
+            new_map = {}
+            for item in r.json():
+                mkt = item.get("market")
+                if mkt:
+                    new_map[str(mkt)] = item
+            if new_map:
+                _TICKER_MAP_CACHE["map"] = new_map
+                _TICKER_MAP_CACHE["ts"] = now
+                return new_map
+    except Exception:
+        pass
+    return cached_map or {}
+
+
 def fetch_live_ticker(pair="B-ETH_USDT"):
     """
     Fetches real-time market price, 24h high/low, and 24h price change.
-    Tries Binance 24hr ticker first for low latency, then falls back to CoinDCX.
+    Uses the 5s shared CoinDCX ticker map first for 0ms UI response on Streamlit Cloud.
     """
     clean_pair = pair.replace("B-", "").replace("I-", "").replace("_", "")
     now_str = datetime.now(IST).strftime("%H:%M:%S IST")
 
-    # 1. Binance 24hr Ticker
+    # 1. Fast Shared CoinDCX Ticker Map (0ms when warm, never geo-blocked on US Streamlit Cloud)
     try:
-        url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={clean_pair}"
-        r = requests.get(url, timeout=4)
+        t_map = _get_coindcx_ticker_map(ttl=5.0)
+        item = t_map.get(clean_pair) or t_map.get(pair)
+        if item:
+            raw_p = float(item.get("last_price", 0) or 0)
+            if raw_p > 0:
+                high_p = float(item.get("high", raw_p) or raw_p)
+                low_p = float(item.get("low", raw_p) or raw_p)
+                chg = float(item.get("change_24_hour", 0) or 0)
+                vol = float(item.get("volume", 0) or 0)
+                return {
+                    "pair": pair,
+                    "symbol": clean_pair,
+                    "last_price": round_asset_price(raw_p),
+                    "high_24h": round_asset_price(high_p, raw_p),
+                    "low_24h": round_asset_price(low_p, raw_p),
+                    "change_24h": round(chg, 2),
+                    "volume": round(vol, 2),
+                    "source": "CoinDCX Public Feed",
+                    "timestamp": now_str,
+                    "status": "LIVE"
+                }
+    except Exception as e:
+        print(f"[Live Ticker CoinDCX Error]: {e}")
+
+    # 2. Fallback: Binance Vision 24hr Ticker
+    try:
+        url = f"https://data-api.binance.vision/api/v3/ticker/24hr?symbol={clean_pair}"
+        r = requests.get(url, timeout=2.5)
         if r.status_code == 200:
             data = r.json()
             raw_p = float(data['lastPrice'])
@@ -164,41 +243,12 @@ def fetch_live_ticker(pair="B-ETH_USDT"):
                 "low_24h": round_asset_price(float(data['lowPrice']), raw_p),
                 "change_24h": round(float(data['priceChangePercent']), 2),
                 "volume": round(float(data['volume']), 2),
-                "source": "Binance Public Feed",
+                "source": "Binance Vision Feed",
                 "timestamp": now_str,
                 "status": "LIVE"
             }
-    except Exception as e:
-        print(f"[Live Ticker Binance Notice]: {e}. Trying CoinDCX ticker...")
-
-    # 2. CoinDCX Public Ticker Fallback
-    try:
-        url = "https://api.coindcx.com/exchange/ticker"
-        r = requests.get(url, timeout=5)
-        if r.status_code == 200:
-            items = r.json()
-            for item in items:
-                market = item.get("market", "")
-                if market == clean_pair or market == pair:
-                    raw_p = float(item.get("last_price", 0))
-                    high_p = float(item.get("high", raw_p))
-                    low_p = float(item.get("low", raw_p))
-                    chg = float(item.get("change_24_hour", 0))
-                    vol = float(item.get("volume", 0))
-                    return {
-                        "pair": pair,
-                        "symbol": clean_pair,
-                        "last_price": round_asset_price(raw_p),
-                        "high_24h": round_asset_price(high_p, raw_p),
-                        "low_24h": round_asset_price(low_p, raw_p),
-                        "change_24h": round(chg, 2),
-                        "volume": round(vol, 2),
-                        "source": "CoinDCX Public Feed",
-                        "timestamp": now_str,
-                        "status": "LIVE"
-                    }
-    except Exception as e:
-        print(f"[Live Ticker CoinDCX Error]: {e}")
+    except Exception:
+        pass
 
     return {
         "pair": pair,
@@ -219,38 +269,42 @@ def fetch_futures_funding_rate(pair="B-ETH_USDT"):
     and market sentiment (Positive: Longs pay Shorts / Negative: Shorts pay Longs).
     """
     clean_pair = pair.replace("B-", "").replace("I-", "").replace("_", "")
-    try:
-        url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={clean_pair}"
-        r = requests.get(url, timeout=4).json()
-        if "lastFundingRate" in r:
-            raw_rate = float(r.get("lastFundingRate", 0.0))
-            pct_rate = raw_rate * 100.0
-            next_time_ms = int(r.get("nextFundingTime", 0))
-            
-            # Compute countdown
-            now_ms = int(time.time() * 1000)
-            diff_sec = max(0, (next_time_ms - now_ms) // 1000)
-            hrs = diff_sec // 3600
-            mins = (diff_sec % 3600) // 60
-            countdown_str = f"{hrs}h {mins}m" if next_time_ms > 0 else "N/A"
+    if not _PERSIST.get("fapi_blocked"):
+        try:
+            url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={clean_pair}"
+            resp = requests.get(url, timeout=1.5)
+            if resp.status_code != 200:
+                _PERSIST["fapi_blocked"] = True
+            else:
+                r = resp.json()
+                if "lastFundingRate" in r:
+                    raw_rate = float(r.get("lastFundingRate", 0.0))
+                    pct_rate = raw_rate * 100.0
+                    next_time_ms = int(r.get("nextFundingTime", 0))
 
-            is_pos = pct_rate >= 0
-            sentiment_desc = "Longs Pay Shorts (Bullish Premium)" if is_pos else "Shorts Pay Longs (Bearish Discount)"
+                    now_ms = int(time.time() * 1000)
+                    diff_sec = max(0, (next_time_ms - now_ms) // 1000)
+                    hrs = diff_sec // 3600
+                    mins = (diff_sec % 3600) // 60
+                    countdown_str = f"{hrs}h {mins}m" if next_time_ms > 0 else "N/A"
 
-            return {
-                "pair": pair,
-                "symbol": clean_pair,
-                "funding_rate_pct": round(pct_rate, 4),
-                "funding_rate_str": f"{'+' if is_pos else ''}{pct_rate:.4f}%",
-                "is_positive": is_pos,
-                "sentiment": sentiment_desc,
-                "countdown": countdown_str,
-                "mark_price": float(r.get("markPrice", 0.0)),
-                "index_price": float(r.get("indexPrice", 0.0)),
-                "status": "ACTIVE"
-            }
-    except Exception as e:
-        print(f"[Funding Rate Fetch Error]: {e}")
+                    is_pos = pct_rate >= 0
+                    sentiment_desc = "Longs Pay Shorts (Bullish Premium)" if is_pos else "Shorts Pay Longs (Bearish Discount)"
+
+                    return {
+                        "pair": pair,
+                        "symbol": clean_pair,
+                        "funding_rate_pct": round(pct_rate, 4),
+                        "funding_rate_str": f"{'+' if is_pos else ''}{pct_rate:.4f}%",
+                        "is_positive": is_pos,
+                        "sentiment": sentiment_desc,
+                        "countdown": countdown_str,
+                        "mark_price": float(r.get("markPrice", 0.0)),
+                        "index_price": float(r.get("indexPrice", 0.0)),
+                        "status": "ACTIVE"
+                    }
+        except Exception:
+            _PERSIST["fapi_blocked"] = True
 
     return {
         "pair": pair,
@@ -264,30 +318,6 @@ def fetch_futures_funding_rate(pair="B-ETH_USDT"):
         "index_price": 0.0,
         "status": "DEFAULT"
     }
-
-import sys as _sys
-import threading as _threading
-
-# Process-wide persistent state that survives importlib.reload(coindcx_engine) across Streamlit reruns
-_PERSIST = _sys.__dict__.setdefault("_coindcx_persistent_state", {
-    "lock": _threading.Lock(),
-    "last_ts_ms": 0,
-    "last_ts_sec": 0,
-    "session": requests.Session(),
-    "session_verified": False,
-    "pinned_ip": "",
-    "seen_coindcx_ips": [],
-    "wallet_cache": {"data": None, "ts": 0.0, "last_good_live": None, "last_good_ts": 0.0},
-    "positions_cache": {"data": None, "ts": 0.0},
-    "api_key": "",
-    "api_secret": "",
-})
-_PERSIST.setdefault("pinned_ip", "")
-_PERSIST.setdefault("seen_coindcx_ips", [])
-
-_COINDCX_SIGN_LOCK = _PERSIST["lock"]
-_WALLET_BALANCE_CACHE = _PERSIST["wallet_cache"]
-_ACTIVE_POSITIONS_CACHE = _PERSIST["positions_cache"]
 
 _OBSOLETE_KEYS = {
     "928412b3788b773f668d691062ddee2dd273f021f63d5520",
@@ -683,7 +713,7 @@ def fetch_coindcx_active_positions(force_refresh: bool = False):
     if (
         not force_refresh
         and _ACTIVE_POSITIONS_CACHE.get("data") is not None
-        and (now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) < 4.0
+        and (now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) < 8.0
     ):
         return list(_ACTIVE_POSITIONS_CACHE["data"])
     live_usdt_inr = get_coindcx_live_usdt_inr_rate()
@@ -701,24 +731,14 @@ def fetch_coindcx_active_positions(force_refresh: bool = False):
     try:
         data = res.json()
         if isinstance(data, list):
-            # Fast batch fetch live market prices to guarantee real-time PnL & ROE accuracy
+            # Reuse 5s shared CoinDCX ticker map (0ms when warm) instead of redundant HTTP fetches
             live_prices = {}
             try:
-                r_bin = requests.get("https://api.binance.com/api/v3/ticker/price", timeout=2.5)
-                if r_bin.status_code == 200:
-                    for it in r_bin.json():
-                        live_prices[it["symbol"]] = float(it["price"])
+                t_map = _get_coindcx_ticker_map(ttl=5.0)
+                for mkt, it in t_map.items():
+                    live_prices[mkt] = float(it.get("last_price", 0.0) or 0.0)
             except Exception:
                 pass
-
-            if not live_prices:
-                try:
-                    r_dcx = requests.get("https://public.coindcx.com/exchange/ticker", timeout=2.5)
-                    if r_dcx.status_code == 200:
-                        for it in r_dcx.json():
-                            live_prices[it.get("market", "")] = float(it.get("last_price", 0.0) or 0.0)
-                except Exception:
-                    pass
 
             for item in data:
                 active_pos_qty = float(item.get("active_pos", 0.0) or 0.0)
@@ -2361,64 +2381,31 @@ def fetch_top_volatility_movers(candidate_pairs: list[str] = None, top_n: int = 
     sym_map = {p.replace("B-", "").replace("I-", "").replace("_", ""): p for p in pool}
     movers = []
 
-    # 1. Try Binance 24hr Ticker
+    # 1. Fast Shared CoinDCX Public Ticker Map (0ms when warm, always accessible on Streamlit Cloud)
     try:
-        r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=3.5)
-        if r.status_code == 200:
-            for item in r.json():
-                sym = item.get("symbol", "")
-                if sym in sym_map:
-                    pair = sym_map[sym]
-                    last_p = float(item.get("lastPrice", 0.0) or 0.0)
-                    high_p = float(item.get("highPrice", 0.0) or 0.0)
-                    low_p = float(item.get("lowPrice", 0.0) or 0.0)
-                    chg_pct = float(item.get("priceChangePercent", 0.0) or 0.0)
-                    quote_vol = float(item.get("quoteVolume", 0.0) or 0.0)
-                    if last_p > 0:
-                        range_pct = round(((high_p - low_p) / last_p) * 100.0, 2)
-                        vol_score = round(range_pct * 0.7 + abs(chg_pct) * 0.3, 2)
-                        movers.append({
-                            "pair": pair,
-                            "symbol": sym.replace("USDT", ""),
-                            "last_price": round_asset_price(last_p),
-                            "change_24h_pct": round(chg_pct, 2),
-                            "range_24h_pct": range_pct,
-                            "volatility_score": vol_score,
-                            "quote_volume_usd": round(quote_vol, 0),
-                        })
+        t_map = _get_coindcx_ticker_map(ttl=5.0)
+        for mkt, item in t_map.items():
+            if mkt in sym_map:
+                pair = sym_map[mkt]
+                last_p = float(item.get("last_price", 0.0) or 0.0)
+                high_p = float(item.get("high", last_p) or last_p)
+                low_p = float(item.get("low", last_p) or last_p)
+                chg_pct = float(item.get("change_24_hour", 0.0) or 0.0)
+                vol = float(item.get("volume", 0.0) or 0.0)
+                if last_p > 0:
+                    range_pct = round(((high_p - low_p) / last_p) * 100.0, 2)
+                    vol_score = round(range_pct * 0.7 + abs(chg_pct) * 0.3, 2)
+                    movers.append({
+                        "pair": pair,
+                        "symbol": mkt.replace("USDT", ""),
+                        "last_price": round_asset_price(last_p),
+                        "change_24h_pct": round(chg_pct, 2),
+                        "range_24h_pct": range_pct,
+                        "volatility_score": vol_score,
+                        "quote_volume_usd": round(vol, 0),
+                    })
     except Exception as e:
-        print(f"[Volatility Scanner Binance Notice]: {e}")
-
-    # 2. Fallback to CoinDCX Public Ticker (always accessible on Streamlit Cloud)
-    if not movers:
-        try:
-            r_dcx = requests.get("https://api.coindcx.com/exchange/ticker", timeout=5)
-            if r_dcx.status_code == 200:
-                seen_syms = set()
-                for item in r_dcx.json():
-                    mkt = str(item.get("market", ""))
-                    if mkt in sym_map and mkt not in seen_syms:
-                        seen_syms.add(mkt)
-                        pair = sym_map[mkt]
-                        last_p = float(item.get("last_price", 0.0) or 0.0)
-                        high_p = float(item.get("high", last_p) or last_p)
-                        low_p = float(item.get("low", last_p) or last_p)
-                        chg_pct = float(item.get("change_24_hour", 0.0) or 0.0)
-                        vol = float(item.get("volume", 0.0) or 0.0)
-                        if last_p > 0:
-                            range_pct = round(((high_p - low_p) / last_p) * 100.0, 2)
-                            vol_score = round(range_pct * 0.7 + abs(chg_pct) * 0.3, 2)
-                            movers.append({
-                                "pair": pair,
-                                "symbol": mkt.replace("USDT", ""),
-                                "last_price": round_asset_price(last_p),
-                                "change_24h_pct": round(chg_pct, 2),
-                                "range_24h_pct": range_pct,
-                                "volatility_score": vol_score,
-                                "quote_volume_usd": round(vol, 0),
-                            })
-        except Exception as e:
-            print(f"[Volatility Scanner CoinDCX Notice]: {e}")
+        print(f"[Volatility Scanner CoinDCX Notice]: {e}")
 
     if not movers:
         for idx, p in enumerate(pool):
@@ -2858,10 +2845,10 @@ def register_app_trade_lock(
     return lock_info
 
 
-def get_active_portfolio_trade_status() -> dict:
+def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
     """
     Checks whether an App/API-originated crypto trade is currently open across the portfolio AND
-    automatically manages the 3-stage 50/50 Runner lifecycle when Entry 1 fills (with or without Entry 2):
+    (when manage_exchange=True from the 24/7 daemon) automatically manages the 3-stage 50/50 Runner lifecycle:
       - Stage 1 (Price hits TP1 without hitting Entry 2):
           1. Cancels the unfilled resting Entry 2 limit order at SL/SH.
           2. Books 50% of the open Entry 1 position at TP1 (if not already filled by resting TP1 limit order).
@@ -2885,6 +2872,23 @@ def get_active_portfolio_trade_status() -> dict:
         is_live_ex = bool(lock.get("is_live_exchange", False))
         tp1_already_hit = bool(lock.get("tp1_hit", False))
 
+        # Fast-path for UI rendering: return lock status immediately in <1ms without blocking on exchange API calls
+        if not manage_exchange:
+            return {
+                "is_occupied": True,
+                "active_pair": l_pair,
+                "active_direction": l_dir,
+                "entry_price": l_entry,
+                "entry2_sweep": l_entry2,
+                "tp1": l_tp1,
+                "tp2": l_tp2,
+                "tp1_hit": tp1_already_hit,
+                "entry2_cancelled": bool(lock.get("entry2_cancelled", False)),
+                "stop_loss": l_sl,
+                "source": lock.get("mode", "App/API Active Trade Lock"),
+                "count": 1,
+            }
+
         try:
             if l_ts > 0 and (time.time() - l_ts) > 8 * 3600:
                 if is_live_ex:
@@ -2898,8 +2902,11 @@ def get_active_portfolio_trade_status() -> dict:
                 if live_positions is not None:
                     matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
                     if matched_live_pos and matched_live_pos.get("id"):
-                        # Auto-heal missing TP or SL on CoinDCX immediately (even within the first 60s!)
-                        if matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None:
+                        # Auto-heal missing TP or SL on CoinDCX at most once per trade lock
+                        if (
+                            not lock.get("tpsl_healed")
+                            and (matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None)
+                        ):
                             norm_lvls = normalize_two_entry_runner_levels(
                                 pair=l_pair,
                                 direction=l_dir,
@@ -2914,6 +2921,7 @@ def get_active_portfolio_trade_status() -> dict:
                             l_sl = norm_lvls["stop_loss"]
                             lock["tp2"] = l_tp2
                             lock["stop_loss"] = l_sl
+                            lock["tpsl_healed"] = True
                             save_autotrade_config({"active_trade_lock": lock})
                             update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_sl, pair=l_pair)
                     elif l_ts > 0 and (time.time() - l_ts) >= 60 and fetch_coindcx_futures_balance().get("is_live_api"):

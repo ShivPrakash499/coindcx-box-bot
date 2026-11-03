@@ -239,35 +239,37 @@ def check_authentication():
         return True
 
     required_pin = get_security_pin()
+    pin_slot = st.empty()
+    with pin_slot.container():
+        st.markdown(
+            """
+            <div style="max-width: 400px; margin: 48px auto 16px auto; padding: 28px 24px; background: #0f172a; border-radius: 16px; box-shadow: 0 12px 32px rgba(0,0,0,0.25); text-align: center; border: 1px solid #1e293b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+                <div style="font-size: 38px; margin-bottom: 8px;">⚡</div>
+                <h2 style="margin: 0; color: #f8fafc; font-weight: 800; font-size: 22px; letter-spacing: -0.4px;">Crypto Trade Pro</h2>
+                <div style="display: inline-block; background: rgba(59,130,246,0.15); color: #60a5fa; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.5px;">24/7 Daemon Active</div>
+                <p style="color: #94a3b8; font-size: 12.5px; margin-top: 10px; margin-bottom: 0px;">Enter your PIN to unlock execution & position controls.</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
-    st.markdown(
-        """
-        <div style="max-width: 400px; margin: 48px auto 16px auto; padding: 28px 24px; background: #0f172a; border-radius: 16px; box-shadow: 0 12px 32px rgba(0,0,0,0.25); text-align: center; border: 1px solid #1e293b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
-            <div style="font-size: 38px; margin-bottom: 8px;">⚡</div>
-            <h2 style="margin: 0; color: #f8fafc; font-weight: 800; font-size: 22px; letter-spacing: -0.4px;">Crypto Trade Pro</h2>
-            <div style="display: inline-block; background: rgba(59,130,246,0.15); color: #60a5fa; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.5px;">24/7 Daemon Active</div>
-            <p style="color: #94a3b8; font-size: 12.5px; margin-top: 10px; margin-bottom: 0px;">Enter your PIN to unlock execution & position controls.</p>
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
-
-    _, col_center, _ = st.columns([1, 1.4, 1])
-    with col_center:
-        with st.form("pin_security_form", clear_on_submit=False):
-            entered_pin = st.text_input(
-                "Access PIN",
-                type="password",
-                placeholder="Enter PIN",
-                label_visibility="collapsed"
-            )
-            unlock_clicked = st.form_submit_button("🔓 Unlock Terminal", use_container_width=True, type="primary")
-            if unlock_clicked:
-                if entered_pin.strip() == required_pin:
-                    st.session_state.authenticated = True
-                    st.rerun()
-                else:
-                    st.error("❌ Incorrect PIN.")
+        _, col_center, _ = st.columns([1, 1.4, 1])
+        with col_center:
+            with st.form("pin_security_form", clear_on_submit=False):
+                entered_pin = st.text_input(
+                    "Access PIN",
+                    type="password",
+                    placeholder="Enter PIN",
+                    label_visibility="collapsed"
+                )
+                unlock_clicked = st.form_submit_button("🔓 Unlock Terminal", use_container_width=True, type="primary")
+                if unlock_clicked:
+                    if entered_pin.strip() == required_pin:
+                        st.session_state.authenticated = True
+                        pin_slot.empty()
+                        st.rerun()
+                    else:
+                        st.error("❌ Incorrect PIN.")
 
     st.stop()
 
@@ -278,19 +280,19 @@ check_authentication()
 def get_cached_box_levels(pair):
     return calculate_daily_box_levels(pair)
 
-@st.cache_data(ttl=4)
+@st.cache_data(ttl=8)
 def get_cached_ticker(pair):
     return fetch_live_ticker(pair)
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=120)
 def get_cached_funding(pair):
     return fetch_futures_funding_rate(pair)
 
-@st.cache_data(ttl=6)
+@st.cache_data(ttl=15)
 def get_cached_balance():
     return fetch_coindcx_futures_balance()
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=8)
 def get_cached_positions():
     return fetch_coindcx_active_positions()
 
@@ -306,12 +308,12 @@ def get_cached_bias(pair):
 def get_cached_strategy_levels(strategy_id, pair):
     return strategy_registry.get_strategy(strategy_id).compute_levels(pair)
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=45)
 def get_cached_strategy_signal(strategy_id, pair, m_inr, lev, u_inr):
     s = strategy_registry.get_strategy(strategy_id)
     return s.evaluate_signal(pair, get_cached_strategy_levels(strategy_id, pair), m_inr, lev, u_inr)
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=45)
 def _cached_strategy_plan(strategy_id, pair, live_px, m_inr, lev, u_inr):
     s = strategy_registry.get_strategy(strategy_id)
     return s.plan_setups(pair, get_cached_strategy_levels(strategy_id, pair), live_px, m_inr, lev, u_inr)
@@ -320,11 +322,11 @@ def get_cached_strategy_plan(strategy_id, pair, live_px, m_inr, lev, u_inr):
     lp = float(live_px) if strategy_registry.get_strategy(strategy_id).uses_live_price else 0.0
     return _cached_strategy_plan(strategy_id, pair, lp, m_inr, lev, u_inr)
 
-@st.cache_data(ttl=45)
+@st.cache_data(ttl=60)
 def get_cached_top_movers(watch_tuple: tuple, top_n: int = 6):
     return coindcx_engine.fetch_top_volatility_movers(list(watch_tuple), top_n=top_n)
 
-@st.cache_data(ttl=45)
+@st.cache_data(ttl=60)
 def get_cached_signals_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: float, strat_tuple: tuple, auto_send: bool, auto_trade: bool):
     return _safe_scan_and_alert(
         list(watch_tuple), m_inr, lev, u_inr,
@@ -394,7 +396,7 @@ def _detect_active_trade_pair() -> str | None:
     except Exception:
         pass
     try:
-        slot = coindcx_engine.get_active_portfolio_trade_status()
+        slot = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
         if slot.get("is_occupied") and slot.get("active_pair") in GLOBAL_FUTURES_PAIRS:
             return slot.get("active_pair")
     except Exception:
@@ -591,7 +593,7 @@ if (
     get_cached_signals_scan.clear()
     get_cached_positions.clear()
 
-_slot_status = coindcx_engine.get_active_portfolio_trade_status()
+_slot_status = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
 if _slot_status.get("is_occupied"):
     _act_p = _slot_status.get("active_pair", "")
     _act_d = _slot_status.get("active_direction", "")
@@ -1170,7 +1172,7 @@ with st.container(key="quick_asset_bar"):
             )
 
 # Single Unified Live Header Fragment (Live Price + Selected Asset PnL side-by-side)
-@st.fragment(run_every="10s")
+@st.fragment(run_every="30s")
 def render_unified_live_header(pair: str):
     sym = clean_sym(pair)
     tick = get_cached_ticker(pair)
@@ -1267,7 +1269,6 @@ def render_unified_live_header(pair: str):
 
 render_unified_live_header(selected_pair)
 
-levels = get_cached_box_levels(selected_pair)
 ticker = get_cached_ticker(selected_pair)
 live_price = float(ticker.get("last_price", 0.0))
 
@@ -1284,6 +1285,8 @@ active_section = st.radio(
     label_visibility="collapsed",
     key="active_nav_section",
 )
+
+levels = get_cached_box_levels(selected_pair) if active_section in ("🎯 Execute", "📈 Chart & Levels") else None
 
 # ==============================================================================
 # SECTION 1: HIGH-VOLATILITY SIGNALS & WATCHLIST MATRIX
@@ -2060,28 +2063,6 @@ elif active_section == "📊 Positions":
         tp2 = float(pos_norm["tp2"])
         e2_target = float(pos_norm["entry2_sweep"])
         sl_target = float(pos_norm["stop_loss"])
-
-        # Auto-sync missing or un-upgraded TP2, SL, TP1 Limit & Entry 2 Limit onto active CoinDCX position once per session
-        if pid not in auto_synced_pids:
-            auto_synced_pids.add(pid)
-            s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
-                pair=pr,
-                direction=p["direction"],
-                entry1_px=entry_p,
-                entry2_px=e2_target,
-                tp1_px=tp1,
-                tp2_px=tp2,
-                sl_px=sl_target,
-                total_margin_inr=float(plan.get("margin_inr") or margin_inr),
-                leverage=int(round(float(p.get("leverage") or leverage))),
-                usd_inr=float(usd_inr),
-            )
-            if s_ok:
-                cur_sl = sl_target
-                cur_tp = tp2
-                get_cached_positions.clear()
-                get_cached_open_orders.clear()
-                live_open_orders = fetch_coindcx_open_orders() or []
 
         ratchet, target_sl = "⏳ Waiting for TP1", None
         if tp1 and tp2:
