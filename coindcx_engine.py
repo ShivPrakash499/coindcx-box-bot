@@ -275,15 +275,26 @@ _PERSIST = _sys.__dict__.setdefault("_coindcx_persistent_state", {
     "last_ts_sec": 0,
     "session": requests.Session(),
     "session_verified": False,
+    "pinned_ip": "",
+    "seen_coindcx_ips": [],
     "wallet_cache": {"data": None, "ts": 0.0, "last_good_live": None, "last_good_ts": 0.0},
     "positions_cache": {"data": None, "ts": 0.0},
     "api_key": "",
     "api_secret": "",
 })
+_PERSIST.setdefault("pinned_ip", "")
+_PERSIST.setdefault("seen_coindcx_ips", [])
 
 _COINDCX_SIGN_LOCK = _PERSIST["lock"]
 _WALLET_BALANCE_CACHE = _PERSIST["wallet_cache"]
 _ACTIVE_POSITIONS_CACHE = _PERSIST["positions_cache"]
+
+_OBSOLETE_KEYS = {
+    "928412b3788b773f668d691062ddee2dd273f021f63d5520",
+    "23a6860f2262b2dc629f4533505ab436573f91ecf6a9473b",
+}
+_DEFAULT_ACTIVE_KEY = "d18ac02afefd234af117dba1f0e232199636c719ae5437cd"
+_DEFAULT_ACTIVE_SECRET = "47f08c2c0bcfd75a55ab6e898dcff690bf295ce82d465203badc3743a3fa6ca8"
 
 
 def _next_monotonic_ms() -> int:
@@ -295,8 +306,51 @@ def _next_monotonic_ms() -> int:
     return now_ms
 
 
+def _probe_session_coindcx_ip(sess: requests.Session, timeout: float = 2.5) -> str:
+    """Queries https://api.coindcx.com/cdn-cgi/trace on the exact Keep-Alive session to return
+    the true outbound IP address that api.coindcx.com sees for this TCP socket."""
+    try:
+        r = sess.get(
+            "https://api.coindcx.com/cdn-cgi/trace",
+            headers={"Connection": "keep-alive"},
+            timeout=timeout,
+        )
+        if r.status_code == 200:
+            for line in r.text.splitlines():
+                if line.startswith("ip="):
+                    ip_val = line.split("=", 1)[1].strip()
+                    if ip_val and ip_val not in _PERSIST["seen_coindcx_ips"]:
+                        _PERSIST["seen_coindcx_ips"].append(ip_val)
+                    return ip_val
+    except Exception:
+        pass
+    return ""
+
+
+def get_coindcx_outbound_ip_info(scan_extra_sockets: int = 0) -> dict:
+    """Returns the exact outbound IP seen by api.coindcx.com on the active session plus any other NAT pool IPs."""
+    cur_ip = _PERSIST.get("pinned_ip") or _probe_session_coindcx_ip(_PERSIST["session"], timeout=2.5)
+    if scan_extra_sockets > 0:
+        for _ in range(scan_extra_sockets):
+            s = requests.Session()
+            try:
+                _probe_session_coindcx_ip(s, timeout=2.0)
+            finally:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+    all_ips = list(_PERSIST.get("seen_coindcx_ips") or ([] if not cur_ip else [cur_ip]))
+    return {
+        "active_ip": cur_ip,
+        "all_coindcx_ips": all_ips,
+        "comma_separated": ", ".join(all_ips) if all_ips else cur_ip,
+        "session_verified": bool(_PERSIST.get("session_verified", False)),
+    }
+
+
 def _get_coindcx_credentials() -> tuple[str, str]:
-    """Reads CoinDCX API Key & Secret dynamically from Streamlit Secrets, os.environ, or process-wide cache."""
+    """Reads CoinDCX API Key & Secret dynamically from Streamlit Secrets, os.environ, or active fallback."""
     api_key = ""
     api_secret = ""
     try:
@@ -313,29 +367,29 @@ def _get_coindcx_credentials() -> tuple[str, str]:
                             api_key = str(_v["COINDCX_API_KEY"]).strip().strip('"').strip("'")
                         if not api_secret and "COINDCX_API_SECRET" in _v:
                             api_secret = str(_v["COINDCX_API_SECRET"]).strip().strip('"').strip("'")
-            if api_key:
-                os.environ["COINDCX_API_KEY"] = api_key
-            if api_secret:
-                os.environ["COINDCX_API_SECRET"] = api_secret
     except Exception:
         pass
 
-    if not api_key:
-        api_key = os.getenv("COINDCX_API_KEY", "").strip().strip('"').strip("'")
-    if not api_secret:
-        api_secret = os.getenv("COINDCX_API_SECRET", "").strip().strip('"').strip("'")
-    if api_secret == "your_coindcx_secret_key_here":
-        api_secret = ""
+    if not api_key or api_key in _OBSOLETE_KEYS:
+        env_k = os.getenv("COINDCX_API_KEY", "").strip().strip('"').strip("'")
+        if env_k and env_k not in _OBSOLETE_KEYS:
+            api_key = env_k
+    if not api_secret or api_key in _OBSOLETE_KEYS:
+        env_s = os.getenv("COINDCX_API_SECRET", "").strip().strip('"').strip("'")
+        if env_s and env_s != "your_coindcx_secret_key_here":
+            api_secret = env_s
 
     api_key = "".join(api_key.split())
     api_secret = "".join(api_secret.split())
 
-    if api_key and api_secret:
-        _PERSIST["api_key"] = api_key
-        _PERSIST["api_secret"] = api_secret
-    elif _PERSIST.get("api_key") and _PERSIST.get("api_secret"):
-        api_key = _PERSIST["api_key"]
-        api_secret = _PERSIST["api_secret"]
+    if not api_key or api_key in _OBSOLETE_KEYS:
+        api_key = _DEFAULT_ACTIVE_KEY
+        api_secret = _DEFAULT_ACTIVE_SECRET
+
+    os.environ["COINDCX_API_KEY"] = api_key
+    os.environ["COINDCX_API_SECRET"] = api_secret
+    _PERSIST["api_key"] = api_key
+    _PERSIST["api_secret"] = api_secret
 
     return api_key, api_secret
 
@@ -344,9 +398,10 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
     """
     Executes signed CoinDCX REST API requests with HMAC-SHA256 authentication.
     - Uses a process-persistent HTTP Keep-Alive session so once a TCP socket is pinned to the
-      allowlisted Cloud NAT IP (e.g. 34.127.33.101), all subsequent requests reuse that exact socket.
-    - If a socket ever hits a non-allowlisted NAT IP or timestamp mismatch (HTTP 401/400), automatically
-      cycles to a fresh TCP socket and alternates seconds/milliseconds timestamps up to 6 attempts.
+      allowlisted Cloud NAT IP, all subsequent requests reuse that exact socket.
+    - If a socket hits a non-allowlisted NAT IP (HTTP 401 Invalid credentials), uses
+      https://api.coindcx.com/cdn-cgi/trace to inspect the exact NAT IP of each candidate socket
+      and scans up to 18 fresh TCP sockets to find and pin the allowlisted NAT IP.
     """
     api_key, api_secret = _get_coindcx_credentials()
 
@@ -355,58 +410,95 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
 
     has_explicit_ms = isinstance(payload, dict) and int(payload.get("timestamp", 0) or 0) > 100000000000
 
+    def _exec_on_session(sess: requests.Session, use_ms: bool):
+        body = payload.copy() if payload else {}
+        body["timestamp"] = _next_monotonic_ms() if use_ms else int(time.time())
+        json_body = json.dumps(body, separators=(',', ':'))
+        signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
+        headers = {
+            'Content-Type': 'application/json',
+            'X-AUTH-APIKEY': api_key,
+            'X-AUTH-SIGNATURE': signature,
+            'Connection': 'keep-alive',
+        }
+        if method.upper() == "GET":
+            return sess.get(url, data=json_body, headers=headers, timeout=timeout)
+        return sess.post(url, data=json_body, headers=headers, timeout=timeout)
+
     try:
         res = None
-        for attempt in range(6):
-            with _COINDCX_SIGN_LOCK:
-                body = payload.copy() if payload else {}
-                # Alternate between seconds and milliseconds across attempts
-                use_ms = (attempt % 2 == 0) if has_explicit_ms else (attempt % 2 == 1)
-                body["timestamp"] = _next_monotonic_ms() if use_ms else int(time.time())
+        rejected_ips = set()
 
-                json_body = json.dumps(body, separators=(',', ':'))
-                signature = hmac.new(api_secret.encode('utf-8'), json_body.encode('utf-8'), hashlib.sha256).hexdigest()
-                headers = {
-                    'Content-Type': 'application/json',
-                    'X-AUTH-APIKEY': api_key,
-                    'X-AUTH-SIGNATURE': signature,
-                    'Connection': 'keep-alive',
-                }
-                sess = _PERSIST["session"]
+        with _COINDCX_SIGN_LOCK:
+            # Step 1: Test current persistent session (both ms and sec timestamps)
+            sess = _PERSIST["session"]
+            for attempt in range(2):
+                use_ms = (attempt == 0) if has_explicit_ms else (attempt == 1)
                 try:
-                    if method.upper() == "GET":
-                        res = sess.get(url, data=json_body, headers=headers, timeout=timeout)
-                    else:
-                        res = sess.post(url, data=json_body, headers=headers, timeout=timeout)
+                    res = _exec_on_session(sess, use_ms)
                 except Exception:
-                    try:
-                        sess.close()
-                    except Exception:
-                        pass
-                    _PERSIST["session"] = requests.Session()
-                    _PERSIST["session_verified"] = False
-                    continue
+                    res = None
+                    break
 
-                if res.status_code == 200:
+                if res is not None and res.status_code == 200:
+                    _PERSIST["session_verified"] = True
+                    if not _PERSIST.get("pinned_ip"):
+                        _PERSIST["pinned_ip"] = _probe_session_coindcx_ip(sess, timeout=2.0)
+                    return res, None
+
+                if res is not None and res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
                     _PERSIST["session_verified"] = True
                     return res, None
 
-                # Non-auth business logic error (e.g. 422 min order size) means auth & IP succeeded!
-                if res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
-                    _PERSIST["session_verified"] = True
-                    return res, None
+            # Step 2: If HTTP 401 Invalid credentials occurred, check which NAT IP this socket used
+            # and scan fresh TCP sockets across the Cloud NAT pool to find the allowlisted IP!
+            if res is None or res.status_code == 401:
+                cur_ip = _probe_session_coindcx_ip(sess, timeout=2.0)
+                if cur_ip:
+                    rejected_ips.add(cur_ip)
 
-                # If 401 Invalid credentials occurred (e.g. Cloud NAT picked a secondary egress IP),
-                # cycle to a brand-new TCP session (new ephemeral port -> re-hashes NAT IP) after testing both ts formats
-                if res.status_code == 401 and attempt >= 1:
-                    try:
-                        sess.close()
-                    except Exception:
-                        pass
-                    _PERSIST["session"] = requests.Session()
-                    _PERSIST["session_verified"] = False
+                for _ in range(16):
+                    cand_sess = requests.Session()
+                    cand_ip = _probe_session_coindcx_ip(cand_sess, timeout=2.0)
+                    if cand_ip and cand_ip in rejected_ips:
+                        try:
+                            cand_sess.close()
+                        except Exception:
+                            pass
+                        continue
 
-            time.sleep(0.08)
+                    # Found a new, untested NAT IP (or trace unavailable) -> test signed request
+                    cand_ok = False
+                    for attempt in range(2):
+                        use_ms = (attempt == 0) if has_explicit_ms else (attempt == 1)
+                        try:
+                            res = _exec_on_session(cand_sess, use_ms)
+                        except Exception:
+                            res = None
+                            break
+                        if res is not None and res.status_code == 200:
+                            cand_ok = True
+                            break
+                        if res is not None and res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
+                            cand_ok = True
+                            break
+
+                    if cand_ok:
+                        try:
+                            _PERSIST["session"].close()
+                        except Exception:
+                            pass
+                        _PERSIST["session"] = cand_sess
+                        _PERSIST["session_verified"] = True
+                        _PERSIST["pinned_ip"] = cand_ip
+                        return res, None
+                    else:
+                        if cand_ip:
+                            rejected_ips.add(cand_ip)
+                        try:
+                            cand_sess.close()
+                        except Exception:
+                            pass
 
         return res, None
     except Exception as e:
@@ -589,6 +681,11 @@ def fetch_coindcx_futures_balance():
     ):
         return dict(last_good)
 
+    seen_ips = _PERSIST.get("seen_coindcx_ips") or []
+    ip_hint = f" | CoinDCX sees IP: {', '.join(seen_ips)}" if seen_ips else ""
+    key_hint = f" | Key: {api_key[:6]}..{api_key[-4:]}" if len(api_key) >= 12 else ""
+    detailed_err = f"{api_err_msg}{ip_hint}{key_hint}" if api_err_msg else ""
+
     return {
         "total_inr": round(default_balance, 2),
         "available_inr": round(default_balance, 2),
@@ -598,7 +695,7 @@ def fetch_coindcx_futures_balance():
         "locked_margin_usd": 0.0,
         "cross_user_margin_usd": 0.0,
         "is_live_api": False,
-        "api_error": api_err_msg,
+        "api_error": detailed_err,
         "source": f"Wallet Balance ({api_err_msg})" if api_err_msg else "Synced Wallet Balance"
     }
 
