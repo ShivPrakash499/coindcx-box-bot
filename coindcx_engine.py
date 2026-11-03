@@ -3157,7 +3157,36 @@ def execute_autotrade_two_entry_signal(
         ), {"slot_status": slot}
 
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
-    side = "BUY" if direction in ("LONG", "BUY") else "SELL"
+    norm_dir = "LONG" if direction in ("LONG", "BUY") else "SHORT"
+
+    # Hard Daily 50 & 200 EMA Bias Guard before placing any AutoTrade order
+    sig_levels = sig.get("levels") if isinstance(sig.get("levels"), dict) else {}
+    daily_bias = str(sig_levels.get("trend_bias") or sig_levels.get("bias") or "").upper()
+    if not daily_bias:
+        try:
+            mb = compute_market_bias(pair)
+            daily_bias = str(mb.get("bias", "NEUTRAL")).upper()
+        except Exception:
+            daily_bias = "NEUTRAL"
+
+    if "BULLISH" in daily_bias:
+        daily_bias = "BULLISH"
+    elif "BEARISH" in daily_bias:
+        daily_bias = "BEARISH"
+    else:
+        daily_bias = "NEUTRAL"
+
+    if daily_bias == "NEUTRAL":
+        return False, (
+            f"Daily Bias Guard: {pair} is in NEUTRAL / Range mode (between Daily 50 EMA & 200 EMA). "
+            f"AutoTrade strictly requires BULLISH (>50 & 200 EMA) or BEARISH (<50 & 200 EMA) alignment."
+        ), {"daily_bias": daily_bias, "direction": norm_dir}
+    if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
+        return False, (
+            f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
+        ), {"daily_bias": daily_bias, "direction": norm_dir}
+
+    side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
     live_tk_px = float(fetch_live_ticker(pair).get("last_price", 0.0) or 0.0)
     norm = normalize_two_entry_runner_levels(

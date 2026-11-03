@@ -176,9 +176,56 @@ def test_4_strategy_and_two_entry_levels():
     print(f"  -> PASS: LONG ({long_lvls}) & SHORT ({short_lvls}) level invariants verified.")
 
 
+def test_5_daily_bias_enforcement():
+    print("[5/5] Verifying strict Daily 50 & 200 EMA Bias enforcement (BoxTheorySweep + AutoTrade Guard)...")
+    import coindcx_engine as eng
+    import strategies as strat
+
+    # 1. Verify BoxTheorySweep returns NEUTRAL (NO TRADE) when trend_bias is NEUTRAL (e.g. INJ between 50 & 200 EMA)
+    neutral_levels = {
+        "RH": 7.31, "RL": 6.89, "SH": 7.43, "SL": 6.86, "MID": 7.10,
+        "EMA50": 7.38, "EMA200": 6.10, "daily_close": 7.29, "trend_bias": "NEUTRAL"
+    }
+    box_sig = strat.get_strategy("box_theory").evaluate_signal("B-INJ_USDT", levels=neutral_levels)
+    assert box_sig is not None and box_sig.get("signal") == "NEUTRAL", (
+        f"Expected NEUTRAL (WAIT/NO TRADE) when trend_bias is NEUTRAL, got: {box_sig}"
+    )
+
+    # 2. Verify AutoTrade Guard blocks NEUTRAL bias, blocks LONG in BEARISH, and blocks SHORT in BULLISH
+    with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}):
+        ok_n, msg_n, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-INJ_USDT",
+            sig={"signal": "SHORT", "entry": 7.30, "entry2_sweep": 7.34, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.37, "levels": neutral_levels},
+            single_trade_margin_inr=15762.39,
+            leverage=10,
+        )
+        assert not ok_n and "Daily Bias Guard" in msg_n, f"Expected NEUTRAL bias block, got: {ok_n} {msg_n}"
+
+        bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.50, "trend_bias": "BEARISH"}
+        ok_b, msg_b, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-RENDER_USDT",
+            sig={"signal": "LONG", "entry": 1.50, "entry2_sweep": 1.49, "tp1": 1.53, "tp2": 1.59, "stop_loss": 1.48, "levels": bear_levels},
+            single_trade_margin_inr=15762.39,
+            leverage=10,
+        )
+        assert not ok_b and "Daily Bias Guard" in msg_b, f"Expected counter-trend LONG in BEARISH block, got: {ok_b} {msg_b}"
+
+        bull_levels = {**neutral_levels, "EMA50": 85.0, "EMA200": 80.0, "daily_close": 92.0, "trend_bias": "BULLISH"}
+        ok_u, msg_u, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-SOL_USDT",
+            sig={"signal": "SHORT", "entry": 92.0, "entry2_sweep": 92.5, "tp1": 90.5, "tp2": 88.0, "stop_loss": 93.0, "levels": bull_levels},
+            single_trade_margin_inr=15762.39,
+            leverage=10,
+        )
+        assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
+
+    print("  -> PASS: NEUTRAL bias (INJ), LONG-in-BEARISH (RENDER), and SHORT-in-BULLISH strictly blocked.")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
     test_3_ui_non_blocking_latency_gate()
     test_4_strategy_and_two_entry_levels()
+    test_5_daily_bias_enforcement()
     print("\nALL STAGING PRE-MERGE CHECKS PASSED!")

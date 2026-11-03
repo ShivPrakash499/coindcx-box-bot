@@ -383,17 +383,26 @@ class BoxTheorySweep(Strategy):
             f"Daily Bearish (<50 EMA ${daily_ema50:,.2f} & <200 EMA ${daily_ema200:,.2f})" if trend_bias == "BEARISH"
             else (
                 f"Daily Bullish (>50 EMA ${daily_ema50:,.2f} & >200 EMA ${daily_ema200:,.2f})" if trend_bias == "BULLISH"
-                else f"Daily Range Mode (Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f})"
+                else f"Daily Neutral/Range (Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f} — NO TRADE)"
             )
         )
         out["daily_trend_summary"] = bias_label
 
+        # Strict Daily Trend Bias Gate: No trades when Daily Close is between 50 EMA and 200 EMA (NEUTRAL)
+        if trend_bias not in ("BULLISH", "BEARISH"):
+            out["setup"] = (
+                f"WAIT / NO TRADE — Daily Close (${daily_close:,.2f}) is between "
+                f"50 EMA (${daily_ema50:,.2f}) and 200 EMA (${daily_ema200:,.2f})"
+            )
+            out["trigger_reason"] = f"{bias_label}: Strict Daily Bias Filter blocks trades until price is clearly above or below both 50 & 200 EMA"
+            return self._stamp(out)
+
         recent_15m = recs_15m[-3:]
 
         # ------------------------------------------------------------------
-        # 1. SHORT SETUPS:
-        #    - Outer Box RH or SH Liquidity Sweep + Rejection (active in all regimes; tagged with Daily Bias)
-        #    - Daily 50 EMA Touch + Next-Candle Rejection (strictly when Daily Bias == BEARISH)
+        # 1. SHORT SETUPS (STRICTLY WHEN DAILY BIAS == BEARISH: < 50 EMA & < 200 EMA):
+        #    - Outer Box RH or SH Liquidity Sweep + Rejection
+        #    - Daily 50 EMA Touch + Next-Candle Rejection
         # ------------------------------------------------------------------
         swept_rh_prior = any(float(r["high"]) >= rh or float(r["open"]) >= rh for r in recent_15m)
         swept_rh_curr15 = (c15_high >= rh) or (float(prev_c15["high"]) >= rh)
@@ -405,7 +414,7 @@ class BoxTheorySweep(Strategy):
         rejected_sh_5m = swept_sh_prior and (c5_close < sh) and (c5_close <= c5_open or c5_close < prev_c5_close)
         rejected_sh_15m = swept_sh_curr15 and (c15_close < sh) and (c15_close <= c15_open or c15_close < prev_c15_close)
 
-        if rejected_rh_5m or rejected_rh_15m or rejected_sh_5m or rejected_sh_15m:
+        if trend_bias == "BEARISH" and (rejected_rh_5m or rejected_rh_15m or rejected_sh_5m or rejected_sh_15m):
             use_5m = rejected_rh_5m or rejected_sh_5m
             raw_entry = c5_close if use_5m else c15_close
             entry = eng.round_asset_price(raw_entry, rh)
@@ -475,9 +484,9 @@ class BoxTheorySweep(Strategy):
                         return self._stamp(out)
 
         # ------------------------------------------------------------------
-        # 2. LONG SETUPS:
-        #    - Outer Box RL or SL Liquidity Sweep + Rejection (active in all regimes; tagged with Daily Bias)
-        #    - Daily 50 EMA Touch + Next-Candle Rejection (strictly when Daily Bias == BULLISH)
+        # 2. LONG SETUPS (STRICTLY WHEN DAILY BIAS == BULLISH: > 50 EMA & > 200 EMA):
+        #    - Outer Box RL or SL Liquidity Sweep + Rejection
+        #    - Daily 50 EMA Touch + Next-Candle Rejection
         # ------------------------------------------------------------------
         swept_rl_prior = any(float(r["low"]) <= rl or float(r["open"]) <= rl for r in recent_15m)
         swept_rl_curr15 = (c15_low <= rl) or (float(prev_c15["low"]) <= rl)
@@ -489,7 +498,7 @@ class BoxTheorySweep(Strategy):
         rejected_sl_5m = swept_sl_prior and (c5_close > sl) and (c5_close >= c5_open or c5_close > prev_c5_close)
         rejected_sl_15m = swept_sl_curr15 and (c15_close > sl) and (c15_close >= c15_open or c15_close > prev_c15_close)
 
-        if rejected_rl_5m or rejected_rl_15m or rejected_sl_5m or rejected_sl_15m:
+        if trend_bias == "BULLISH" and (rejected_rl_5m or rejected_rl_15m or rejected_sl_5m or rejected_sl_15m):
             use_5m = rejected_rl_5m or rejected_sl_5m
             raw_entry = c5_close if use_5m else c15_close
             entry = eng.round_asset_price(raw_entry, rl)
@@ -678,14 +687,12 @@ class BoxTheorySweep(Strategy):
         p_low = float(prev["low"])
         p_close = float(prev["close"])
 
-        tag = (
-            "Daily <50/200 EMA" if bias == "BEARISH"
-            else ("Daily >50/200 EMA" if bias == "BULLISH" else "Daily Range (Between 50/200 EMA)")
-        )
+        if bias not in ("BULLISH", "BEARISH"):
+            return None
 
-        # 1. SHORT SETUPS:
-        #    - In BEARISH or NEUTRAL (Range) bias: RH or SH Sweep + Next-Candle Bearish Confirmation
-        #    - In BULLISH bias: only take counter-trend Short when outer SH Swing High is swept with bearish engulfing close (< prev low)
+        tag = "Daily <50/200 EMA" if bias == "BEARISH" else "Daily >50/200 EMA"
+
+        # 1. SHORT SETUPS (STRICTLY WHEN DAILY BIAS == BEARISH: < 50 EMA & < 200 EMA):
         upper_wick = c_high - max(c_open, c_close)
         has_bear_confirm = (c_close < c_open and c_close < p_close) or (
             c_close < c_open and candle_range > 0 and (upper_wick / candle_range) >= 0.30
@@ -693,12 +700,8 @@ class BoxTheorySweep(Strategy):
         swept_rh_seq = (p_high >= rh or c_high >= rh) and (c_close < rh) and (max(p_high, c_high) <= sh * 1.005)
         swept_sh_seq = (p_high >= sh or c_high >= sh) and (c_close < sh) and (max(p_high, c_high) <= sh * 1.012)
 
-        swept_rh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_rh_seq and has_bear_confirm
-        swept_sh_rej = (
-            (bias in ("BEARISH", "NEUTRAL") or (c_close < c_open and c_close < p_low))
-            and swept_sh_seq
-            and has_bear_confirm
-        )
+        swept_rh_rej = (bias == "BEARISH") and swept_rh_seq and has_bear_confirm
+        swept_sh_rej = (bias == "BEARISH") and swept_sh_seq and has_bear_confirm
 
         if swept_rh_rej or swept_sh_rej:
             scale_in_lvl = max(sh, p_high, c_high)
@@ -730,9 +733,7 @@ class BoxTheorySweep(Strategy):
                         "reason": "Daily <50/200 EMA + Daily 50 EMA Rejection"
                     }
 
-        # 2. LONG SETUPS:
-        #    - In BULLISH or NEUTRAL (Range) bias: RL or SL Sweep + Next-Candle Bullish Confirmation
-        #    - In BEARISH bias: only take counter-trend Long when outer SL Swing Low is swept with bullish engulfing close (> prev high)
+        # 2. LONG SETUPS (STRICTLY WHEN DAILY BIAS == BULLISH: > 50 EMA & > 200 EMA):
         lower_wick = min(c_open, c_close) - c_low
         has_bull_confirm = (c_close > c_open and c_close > p_close) or (
             c_close > c_open and candle_range > 0 and (lower_wick / candle_range) >= 0.30
@@ -740,12 +741,8 @@ class BoxTheorySweep(Strategy):
         swept_rl_seq = (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
         swept_sl_seq = (p_low <= sl or c_low <= sl) and (c_close > sl) and (min(p_low, c_low) >= sl * 0.988)
 
-        swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
-        swept_sl_rej = (
-            (bias in ("BULLISH", "NEUTRAL") or (c_close > c_open and c_close > p_high))
-            and swept_sl_seq
-            and has_bull_confirm
-        )
+        swept_rl_rej = (bias == "BULLISH") and swept_rl_seq and has_bull_confirm
+        swept_sl_rej = (bias == "BULLISH") and swept_sl_seq and has_bull_confirm
 
         if swept_rl_rej or swept_sl_rej:
             scale_in_lvl = min(sl, p_low, c_low)
