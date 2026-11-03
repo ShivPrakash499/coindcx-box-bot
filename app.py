@@ -195,6 +195,7 @@ def _ensure_background_monitor():
     def _monitor_worker():
         while True:
             try:
+                _reload_if_updated(coindcx_engine)
                 if signal_monitor:
                     auto_cfg = coindcx_engine.get_autotrade_config()
                     rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
@@ -219,6 +220,13 @@ def _ensure_background_monitor():
     return True
 
 _ensure_background_monitor()
+
+if not coindcx_engine._PERSIST.get("session_verified"):
+    try:
+        coindcx_engine._WALLET_BALANCE_CACHE["data"] = None
+        coindcx_engine.fetch_coindcx_futures_balance()
+    except Exception:
+        pass
 
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
 def get_security_pin():

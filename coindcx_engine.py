@@ -424,7 +424,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
 
     try:
         res = None
-        ip_fail_counts = {}
+        ip_status_map = {}
 
         with _COINDCX_SIGN_LOCK:
             # Step 1: Test current persistent session (always 13-digit ms timestamp FIRST!)
@@ -448,55 +448,78 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
                     _PERSIST["session_verified"] = True
                     return res, None
 
-                time.sleep(0.06)
+                time.sleep(0.05)
 
-            # Step 2: If HTTP 401 Invalid credentials occurred, scan fresh TCP sockets across the Cloud NAT pool!
+            if cur_ip and res is not None:
+                ip_status_map[cur_ip] = res.status_code
+
+            # Step 2: Open 20 CONCURRENT TCP sockets so Google Cloud NAT allocates across all pool IPs (incl. 34.83.176.217)
             if res is None or res.status_code == 401:
-                if cur_ip:
-                    ip_fail_counts[cur_ip] = ip_fail_counts.get(cur_ip, 0) + 1
+                from concurrent.futures import ThreadPoolExecutor
 
-                for _ in range(18):
-                    cand_sess = requests.Session()
-                    cand_ip = _probe_session_coindcx_ip(cand_sess, timeout=2.0)
-                    if cand_ip and ip_fail_counts.get(cand_ip, 0) >= 2:
-                        try:
-                            cand_sess.close()
-                        except Exception:
-                            pass
-                        continue
+                def _open_and_probe(_idx: int):
+                    s = requests.Session()
+                    ip = _probe_session_coindcx_ip(s, timeout=2.2)
+                    return s, ip
 
-                    cand_ok = False
-                    for attempt in range(2):
-                        use_ms = (attempt == 0)
-                        try:
-                            res = _exec_on_session(cand_sess, use_ms)
-                        except Exception:
-                            res = None
-                            break
-                        if res is not None and res.status_code == 200:
-                            cand_ok = True
-                            break
-                        if res is not None and res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
-                            cand_ok = True
-                            break
-                        time.sleep(0.06)
+                concurrent_pool = []
+                try:
+                    with ThreadPoolExecutor(max_workers=10) as ex:
+                        concurrent_pool = list(ex.map(_open_and_probe, range(20)))
 
-                    if cand_ok:
-                        try:
-                            _PERSIST["session"].close()
-                        except Exception:
-                            pass
-                        _PERSIST["session"] = cand_sess
-                        _PERSIST["session_verified"] = True
-                        _PERSIST["pinned_ip"] = cand_ip
-                        return res, None
-                    else:
+                    # Sort so 34.83.176.217 (or 34.127.*) is tested FIRST, then one socket per unique NAT IP
+                    concurrent_pool.sort(key=lambda item: (0 if item[1] == "34.83.176.217" else (1 if str(item[1]).startswith("34.") else 2)))
+
+                    tested_ips_in_batch = set()
+                    for cand_sess, cand_ip in concurrent_pool:
+                        if cand_ip and cand_ip in tested_ips_in_batch and cand_ip != "34.83.176.217":
+                            continue
                         if cand_ip:
-                            ip_fail_counts[cand_ip] = ip_fail_counts.get(cand_ip, 0) + 1
-                        try:
-                            cand_sess.close()
-                        except Exception:
-                            pass
+                            tested_ips_in_batch.add(cand_ip)
+
+                        cand_ok = False
+                        for attempt in range(2):
+                            use_ms = (attempt == 0)
+                            try:
+                                res = _exec_on_session(cand_sess, use_ms)
+                            except Exception:
+                                res = None
+                                break
+                            if res is not None:
+                                ip_status_map[cand_ip or "unknown"] = res.status_code
+                            if res is not None and res.status_code == 200:
+                                cand_ok = True
+                                break
+                            if res is not None and res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
+                                cand_ok = True
+                                break
+                            time.sleep(0.05)
+
+                        if cand_ok:
+                            try:
+                                _PERSIST["session"].close()
+                            except Exception:
+                                pass
+                            _PERSIST["session"] = cand_sess
+                            _PERSIST["session_verified"] = True
+                            _PERSIST["pinned_ip"] = cand_ip
+                            _PERSIST["last_ip_status_map"] = ip_status_map
+                            # Close all other unused sessions in concurrent_pool
+                            for other_s, _ in concurrent_pool:
+                                if other_s is not cand_sess:
+                                    try:
+                                        other_s.close()
+                                    except Exception:
+                                        pass
+                            return res, None
+                finally:
+                    _PERSIST["last_ip_status_map"] = ip_status_map
+                    for other_s, _ in concurrent_pool:
+                        if other_s is not _PERSIST.get("session"):
+                            try:
+                                other_s.close()
+                            except Exception:
+                                pass
 
         return res, None
     except Exception as e:
@@ -642,6 +665,33 @@ def fetch_coindcx_futures_balance():
             except Exception:
                 api_err_msg = f"HTTP {res_spot.status_code}"
 
+    def _emit_cloud_diag(is_ok: bool, tot_val: float, err_str: str):
+        last_d = float(_PERSIST.get("last_diag_ts", 0.0) or 0.0)
+        if (time.time() - last_d) < 20.0:
+            return
+        _PERSIST["last_diag_ts"] = time.time()
+
+        def _bg():
+            try:
+                import sheets_logger
+                book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
+                ws = sheets_logger._get_ws(book, "_Cloud_Diag")
+                ws.append_row([
+                    datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                    "LIVE_OK" if is_ok else "FAIL",
+                    round(float(tot_val), 2),
+                    str(_PERSIST.get("pinned_ip", "")),
+                    json.dumps(_PERSIST.get("last_ip_status_map", {})),
+                    ", ".join(_PERSIST.get("seen_coindcx_ips") or []),
+                    f"{api_key[:6]}..{api_key[-4:]}",
+                    f"{api_secret[:4]}..{api_secret[-4:]}",
+                    str(err_str),
+                ])
+            except Exception:
+                pass
+
+        _threading.Thread(target=_bg, daemon=True).start()
+
     if is_live:
         total_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
         avail_usdt = max(0.0, usdt_balance - locked_margin_usd - cross_margin_usd)
@@ -667,6 +717,7 @@ def fetch_coindcx_futures_balance():
         _WALLET_BALANCE_CACHE["ts"] = now_ts
         _WALLET_BALANCE_CACHE["last_good_live"] = live_res
         _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+        _emit_cloud_diag(True, total_inr, "OK")
         return dict(live_res)
 
     # If this same API key succeeded recently (< 30 mins ago), preserve the live connection state across transient hiccups
@@ -680,10 +731,13 @@ def fetch_coindcx_futures_balance():
         return dict(last_good)
 
     seen_ips = _PERSIST.get("seen_coindcx_ips") or []
-    ip_hint = f" | CoinDCX sees IP: {', '.join(seen_ips)}" if seen_ips else ""
+    status_map = _PERSIST.get("last_ip_status_map") or {}
+    map_str = ", ".join(f"{k}:{v}" for k, v in status_map.items()) if status_map else ", ".join(seen_ips)
+    ip_hint = f" | Tested IPs: {map_str}" if map_str else ""
     key_hint = f" | Key: {api_key[:6]}..{api_key[-4:]}" if len(api_key) >= 12 else ""
     sec_hint = f" | Sec: {api_secret[:4]}..{api_secret[-4:]}" if len(api_secret) >= 12 else ""
     detailed_err = f"{api_err_msg}{ip_hint}{key_hint}{sec_hint}" if api_err_msg else ""
+    _emit_cloud_diag(False, default_balance, detailed_err)
 
     return {
         "total_inr": round(default_balance, 2),
