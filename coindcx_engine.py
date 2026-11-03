@@ -111,6 +111,22 @@ def format_order_quantity(pair: str, raw_qty: float) -> float:
         return float(int(quantized))
     return round(quantized, decimals)
 
+def format_order_price(pair: str, raw_price: float) -> float:
+    """
+    Quantizes order/trigger price strictly to the exchange tick_size precision.
+    """
+    if raw_price is None or raw_price <= 0:
+        return 0.0
+    spec = get_pair_lot_spec(pair)
+    tick = float(spec.get("tick_size", 0.01) or 0.01)
+    if tick <= 0:
+        return round_asset_price(raw_price)
+    steps = int(round(float(raw_price) / tick, 8))
+    quantized = steps * tick
+    tick_str = f"{tick:.8f}".rstrip("0")
+    decimals = len(tick_str.split(".")[1]) if "." in tick_str else 0
+    return round(quantized, decimals)
+
 def round_asset_price(val, ref_price=None):
     """
     Rounds price dynamically based on asset magnitude (handles low-cost tokens like DOGE/PEPE).
@@ -586,7 +602,7 @@ def fetch_coindcx_futures_balance():
         "source": f"Wallet Balance ({api_err_msg})" if api_err_msg else "Synced Wallet Balance"
     }
 
-def fetch_coindcx_active_positions():
+def fetch_coindcx_active_positions(force_refresh: bool = False):
     """
     Fetches real-time active open trades/positions from CoinDCX Futures API.
     Filters positions where active_pos != 0 and computes live PnL and ROE metrics
@@ -594,7 +610,11 @@ def fetch_coindcx_active_positions():
     conversion price (settlement_currency_avg_price).
     """
     now_pos_ts = time.time()
-    if _ACTIVE_POSITIONS_CACHE.get("data") is not None and (now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) < 4.0:
+    if (
+        not force_refresh
+        and _ACTIVE_POSITIONS_CACHE.get("data") is not None
+        and (now_pos_ts - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) < 4.0
+    ):
         return list(_ACTIVE_POSITIONS_CACHE["data"])
     live_usdt_inr = get_coindcx_live_usdt_inr_rate()
     payload = {
@@ -826,6 +846,9 @@ def update_coindcx_position_tpsl(position_id: str, tp_price: float = None, sl_pr
     if not position_id:
         return False, "Missing position ID"
 
+    tp_val = format_order_price(pair, float(tp_price)) if (pair and tp_price and tp_price > 0) else (round_asset_price(tp_price) if (tp_price and tp_price > 0) else None)
+    sl_val = format_order_price(pair, float(sl_price)) if (pair and sl_price and sl_price > 0) else (round_asset_price(sl_price) if (sl_price and sl_price > 0) else None)
+
     # Step 1: Pre-cancel existing TP/SL triggers for this pair if open
     try:
         open_orders = fetch_coindcx_open_orders()
@@ -835,32 +858,55 @@ def update_coindcx_position_tpsl(position_id: str, tp_price: float = None, sl_pr
             o_type = o.get("order_type", "")
             o_id = o.get("id")
             if o_id and (not pair or o_pair == pair) and o_stage == "tpsl_exit":
-                if tp_price is not None and "take_profit" in o_type:
+                if tp_val is not None and "take_profit" in o_type:
                     _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(round(time.time() * 1000))})
-                if sl_price is not None and "stop" in o_type:
+                if sl_val is not None and "stop" in o_type:
                     _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel", {"id": o_id, "timestamp": int(round(time.time() * 1000))})
     except Exception as e:
         print(f"[TP/SL Pre-Cancel Notice]: {e}")
 
-    # Step 2: Create new TP/SL triggers
-    payload = {
-        "timestamp": int(round(time.time() * 1000)),
-        "id": str(position_id).strip()
-    }
-    if tp_price is not None and tp_price > 0:
-        payload["take_profit"] = {
-            "stop_price": str(tp_price),
-            "order_type": "take_profit_market"
+    def _call_create_tpsl(tp_p, sl_p, as_float: bool = False):
+        pl = {
+            "timestamp": int(round(time.time() * 1000)),
+            "id": str(position_id).strip(),
         }
-    if sl_price is not None and sl_price > 0:
-        payload["stop_loss"] = {
-            "stop_price": str(sl_price),
-            "order_type": "stop_market"
-        }
+        if tp_p is not None and tp_p > 0:
+            pl["take_profit"] = {
+                "stop_price": float(tp_p) if as_float else str(tp_p),
+                "order_type": "take_profit_market",
+            }
+        if sl_p is not None and sl_p > 0:
+            pl["stop_loss"] = {
+                "stop_price": float(sl_p) if as_float else str(sl_p),
+                "order_type": "stop_market",
+            }
+        return _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/create_tpsl", pl)
 
-    res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions/create_tpsl", payload)
+    # Step 2: Create new TP/SL triggers (try string stop_price, then numeric float fallback, then individual fallback)
+    res, err = _call_create_tpsl(tp_val, sl_val, as_float=False)
+    if (res is None or res.status_code != 200) and (tp_val or sl_val):
+        res2, err2 = _call_create_tpsl(tp_val, sl_val, as_float=True)
+        if res2 is not None and res2.status_code == 200:
+            res, err = res2, err2
+
     if res is not None and res.status_code == 200:
-        return True, "Take Profit and Stop Loss successfully updated on CoinDCX!"
+        _ACTIVE_POSITIONS_CACHE["data"] = None
+        return True, f"Position TP ({tp_val}) & SL ({sl_val}) set on CoinDCX!"
+
+    # If combined TP+SL failed because one side violated mark price, try setting TP and SL individually
+    if tp_val and sl_val:
+        r_tp, _ = _call_create_tpsl(tp_val, None, as_float=False)
+        r_sl, _ = _call_create_tpsl(None, sl_val, as_float=False)
+        tp_ok = bool(r_tp is not None and r_tp.status_code == 200)
+        sl_ok = bool(r_sl is not None and r_sl.status_code == 200)
+        if tp_ok or sl_ok:
+            _ACTIVE_POSITIONS_CACHE["data"] = None
+            parts = []
+            if tp_ok:
+                parts.append(f"TP={tp_val}")
+            if sl_ok:
+                parts.append(f"SL={sl_val}")
+            return True, f"Position {', '.join(parts)} attached on CoinDCX!"
 
     msg = res.text if res is not None else (err or "Failed to update TP/SL on exchange")
     try:
@@ -915,7 +961,7 @@ def place_coindcx_futures_order(
 
     # Step 3: Check CoinDCX minimum order value (strictly 2,448 INR)
     usd_inr = get_coindcx_live_usdt_inr_rate()
-    ref_p = float(price) if (price and price > 0) else 0.0
+    ref_p = format_order_price(pair, float(price)) if (price and price > 0) else 0.0
     if ref_p <= 0:
         try:
             t = fetch_live_ticker(pair)
@@ -953,7 +999,7 @@ def place_coindcx_futures_order(
     if order_type == "limit_order":
         if price is None or price <= 0:
             return False, "Limit order requires a valid price", {}
-        order_payload["price"] = float(price)
+        order_payload["price"] = format_order_price(pair, float(price))
         order_payload["time_in_force"] = "good_till_cancel"
 
     body = {
@@ -970,23 +1016,34 @@ def place_coindcx_futures_order(
         }
 
     if res.status_code == 200:
+        _ACTIVE_POSITIONS_CACHE["data"] = None
         data = res.json()
         order_info = data[0] if (isinstance(data, list) and len(data) > 0) else (data if isinstance(data, dict) else {})
         order_id = order_info.get("id", "CONFIRMED")
 
-        # If TP or SL specified, attach them once order is registered
+        tpsl_attached = False
+        tpsl_msg = ""
+        # If TP or SL specified, poll fresh active positions (bypassing cache!) and attach TP/SL
         if tp_price or sl_price:
-            time.sleep(1.0)
-            try:
-                positions = fetch_coindcx_active_positions()
-                matched_pos = next((p for p in positions if p["pair"] == pair), None)
-                if matched_pos and matched_pos.get("id"):
-                    update_coindcx_position_tpsl(matched_pos["id"], tp_price=tp_price, sl_price=sl_price, pair=pair)
-            except Exception as e:
-                print(f"[Auto TP/SL Notice]: {e}")
+            for wait_s in (0.6, 1.0, 1.4):
+                time.sleep(wait_s)
+                try:
+                    positions = fetch_coindcx_active_positions(force_refresh=True)
+                    matched_pos = next((p for p in positions if p["pair"] == pair), None)
+                    if matched_pos and matched_pos.get("id"):
+                        tpsl_attached, tpsl_msg = update_coindcx_position_tpsl(
+                            matched_pos["id"], tp_price=tp_price, sl_price=sl_price, pair=pair
+                        )
+                        if tpsl_attached:
+                            break
+                except Exception as e:
+                    print(f"[Auto TP/SL Notice]: {e}")
 
-        return True, f"Successfully placed {order_side.upper()} order for {formatted_qty} {pair} on CoinDCX! (Order ID: {order_id})", {
+        tpsl_suffix = f" | {tpsl_msg}" if tpsl_msg else ""
+        return True, f"Successfully placed {order_side.upper()} order for {formatted_qty} {pair} on CoinDCX! (Order ID: {order_id}){tpsl_suffix}", {
             "order_id": order_id,
+            "tpsl_attached": tpsl_attached,
+            "tpsl_message": tpsl_msg,
             "raw_response": data,
             "request_payload": order_payload
         }
@@ -1152,54 +1209,107 @@ def calculate_trade_costs_and_safe_tp(direction="BUY", entry_price=0.0, margin_i
 
 def fetch_coindcx_candles(pair="B-ETH_USDT", interval="15m", limit=100, sync_live_price=True):
     """
-    Fetches historical candlestick data for any timeframe (1m, 5m, 15m, 1h, 4h, 1d)
-    from CoinDCX / Binance public APIs. Guarantees ascending order and syncs with live price.
+    Fetches historical candlestick data for any timeframe (1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d)
+    from CoinDCX Futures Candlesticks API (`pcode=f`), CoinDCX Public Candles API, and
+    Binance Vision / Binance public APIs. Guarantees ascending order and syncs with live price.
     """
     df = pd.DataFrame()
-    intv = interval.lower()
+    intv = str(interval).lower().strip()
+    lim = max(10, int(limit or 100))
 
-    # 1. Try CoinDCX Public API
-    url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={intv}&limit={limit}"
-    try:
-        response = requests.get(url, timeout=8)
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, list) and len(data) > 0:
-                raw_df = pd.DataFrame(data)
-                if 'time' in raw_df.columns:
-                    raw_df = raw_df.rename(columns={'time': 'timestamp'})
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    if col in raw_df.columns:
-                        raw_df[col] = raw_df[col].astype(float)
-                if 'timestamp' in raw_df.columns:
-                    raw_df['timestamp'] = pd.to_numeric(raw_df['timestamp'], errors='coerce')
-                    if len(raw_df) > 0 and raw_df['timestamp'].iloc[0] < 1e11:
-                        raw_df['timestamp'] = raw_df['timestamp'] * 1000
-                    df = raw_df.sort_values('timestamp').reset_index(drop=True)
-                    df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
-    except Exception as e:
-        print(f"[CoinDCX Candles Notice]: {e}. Attempting Binance fallback...")
+    intv_minutes_map = {
+        "1m": 1, "5m": 5, "15m": 15, "30m": 30,
+        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
+    }
+    dcx_res_map = {
+        "1m": "1", "5m": "5", "15m": "15", "30m": "30",
+        "1h": "60", "2h": "120", "4h": "240", "6h": "360", "1d": "1D",
+    }
 
-    # 2. Fallback to Binance Public API
-    if df.empty:
+    # 1. Primary: CoinDCX Native Futures Candlesticks API (supports 1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d!)
+    if intv in dcx_res_map:
         try:
-            clean_pair = pair.replace("B-", "").replace("I-", "").replace("_", "")
-            url_binance = f"https://api.binance.com/api/v3/klines?symbol={clean_pair}&interval={intv}&limit={limit}"
-            r = requests.get(url_binance, timeout=8).json()
-            if isinstance(r, list) and len(r) > 0 and isinstance(r[0], list):
-                b_df = pd.DataFrame(r, columns=[
-                    'timestamp', 'open', 'high', 'low', 'close', 'volume',
-                    'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
-                ])
-                for col in ['open', 'high', 'low', 'close', 'volume']:
-                    b_df[col] = b_df[col].astype(float)
-                b_df['timestamp'] = pd.to_numeric(b_df['timestamp'], errors='coerce')
-                df = b_df.sort_values('timestamp').reset_index(drop=True)
-                df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            now_sec = int(time.time())
+            mins = intv_minutes_map.get(intv, 15)
+            from_sec = now_sec - int((lim + 15) * mins * 60)
+            r_fut = requests.get(
+                "https://public.coindcx.com/market_data/candlesticks",
+                params={
+                    "pair": pair,
+                    "from": from_sec,
+                    "to": now_sec,
+                    "resolution": dcx_res_map[intv],
+                    "pcode": "f",
+                },
+                timeout=7,
+            )
+            if r_fut.status_code == 200:
+                payload = r_fut.json()
+                data = payload.get("data", []) if isinstance(payload, dict) else []
+                if isinstance(data, list) and len(data) > 0:
+                    raw_df = pd.DataFrame(data)
+                    if "time" in raw_df.columns:
+                        raw_df = raw_df.rename(columns={"time": "timestamp"})
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        if col in raw_df.columns:
+                            raw_df[col] = pd.to_numeric(raw_df[col], errors="coerce").astype(float)
+                    if "timestamp" in raw_df.columns:
+                        raw_df["timestamp"] = pd.to_numeric(raw_df["timestamp"], errors="coerce")
+                        if len(raw_df) > 0 and raw_df["timestamp"].iloc[0] < 1e11:
+                            raw_df["timestamp"] = raw_df["timestamp"] * 1000
+                        raw_df = raw_df.dropna(subset=["timestamp", "open", "high", "low", "close"])
+                        df = raw_df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).tail(lim).reset_index(drop=True)
+                        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
         except Exception as e:
-            print(f"[Binance Fallback Error]: {e}")
+            print(f"[CoinDCX Futures Candlesticks Notice ({pair} {intv})]: {e}")
 
-    # 3. Synchronize the active (last) candle's close with the real-time ticker
+    # 2. Secondary: CoinDCX Public Market Data Candles API (supports [1m, 15m, 1h, 1d])
+    if df.empty and intv in ("1m", "15m", "1h", "1d"):
+        url = f"https://public.coindcx.com/market_data/candles?pair={pair}&interval={intv}&limit={lim}"
+        try:
+            response = requests.get(url, timeout=7)
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    raw_df = pd.DataFrame(data)
+                    if 'time' in raw_df.columns:
+                        raw_df = raw_df.rename(columns={'time': 'timestamp'})
+                    for col in ['open', 'high', 'low', 'close', 'volume']:
+                        if col in raw_df.columns:
+                            raw_df[col] = raw_df[col].astype(float)
+                    if 'timestamp' in raw_df.columns:
+                        raw_df['timestamp'] = pd.to_numeric(raw_df['timestamp'], errors='coerce')
+                        if len(raw_df) > 0 and raw_df['timestamp'].iloc[0] < 1e11:
+                            raw_df['timestamp'] = raw_df['timestamp'] * 1000
+                        df = raw_df.sort_values('timestamp').reset_index(drop=True)
+                        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+        except Exception as e:
+            print(f"[CoinDCX Candles Notice]: {e}")
+
+    # 3. Fallback to Binance Vision (US-accessible global mirror) & Binance Public API
+    if df.empty:
+        clean_pair = pair.replace("B-", "").replace("I-", "").replace("_", "")
+        for base_host in ("https://data-api.binance.vision", "https://api.binance.com"):
+            try:
+                url_binance = f"{base_host}/api/v3/klines?symbol={clean_pair}&interval={intv}&limit={lim}"
+                resp_b = requests.get(url_binance, timeout=7)
+                if resp_b.status_code == 200:
+                    r = resp_b.json()
+                    if isinstance(r, list) and len(r) > 0 and isinstance(r[0], list):
+                        b_df = pd.DataFrame(r, columns=[
+                            'timestamp', 'open', 'high', 'low', 'close', 'volume',
+                            'close_time', 'qav', 'num_trades', 'taker_base_vol', 'taker_quote_vol', 'ignore'
+                        ])
+                        for col in ['open', 'high', 'low', 'close', 'volume']:
+                            b_df[col] = b_df[col].astype(float)
+                        b_df['timestamp'] = pd.to_numeric(b_df['timestamp'], errors='coerce')
+                        df = b_df.sort_values('timestamp').reset_index(drop=True)
+                        df = df[['timestamp', 'open', 'high', 'low', 'close', 'volume']]
+                        break
+            except Exception as e:
+                print(f"[Binance Fallback Error ({base_host})]: {e}")
+
+    # 4. Synchronize the active (last) candle's close with the real-time ticker
     if sync_live_price and not df.empty:
         try:
             ticker = fetch_live_ticker(pair)
@@ -1260,9 +1370,9 @@ def fetch_historical_candles_paginated(
     batch_size = 1000
     batches_needed = (total_candles_needed + batch_size - 1) // batch_size
 
-    # Multi-batch fetching loop
+    # Multi-batch fetching loop (uses US-accessible data-api.binance.vision first, then api.binance.com)
     for b_idx in range(batches_needed):
-        url = f"https://api.binance.com/api/v3/klines?symbol={clean_pair}&interval={interval}&limit={batch_size}"
+        url = f"https://data-api.binance.vision/api/v3/klines?symbol={clean_pair}&interval={interval}&limit={batch_size}"
         if end_time:
             url += f"&endTime={end_time}"
 
@@ -1543,15 +1653,15 @@ def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> di
             if d_close < ema50 and d_close < ema200:
                 out["bias"] = "BEARISH"
                 out["score"] = -2
-                out["reasons"].append(f"Daily Price (${d_close:,.2f}) < 50 EMA (${ema50:,.2f}) & < 200 EMA (${ema200:,.2f}) → SHORT setups only")
+                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) < 50 EMA (`${ema50:,.2f}`) & < 200 EMA (`${ema200:,.2f}`) → SHORT setups only")
             elif d_close > ema50 and d_close > ema200:
                 out["bias"] = "BULLISH"
                 out["score"] = 2
-                out["reasons"].append(f"Daily Price (${d_close:,.2f}) > 50 EMA (${ema50:,.2f}) & > 200 EMA (${ema200:,.2f}) → LONG setups only")
+                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) > 50 EMA (`${ema50:,.2f}`) & > 200 EMA (`${ema200:,.2f}`) → LONG setups only")
             else:
                 out["bias"] = "NEUTRAL / RANGE"
                 out["score"] = 0
-                out["reasons"].append(f"Daily Price (${d_close:,.2f}) is between 50 EMA (${ema50:,.2f}) & 200 EMA (${ema200:,.2f}) → Range Mode (Both RH & RL Box Edges Active)")
+                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) is between 50 EMA (`${ema50:,.2f}`) & 200 EMA (`${ema200:,.2f}`) → Range Mode (Both RH & RL Box Edges Active)")
     except Exception as e:
         out["reasons"].append(f"Bias unavailable: {e}")
     return out
@@ -2314,14 +2424,16 @@ def clear_autotrade_active_lock() -> dict:
     return save_autotrade_config({"active_trade_lock": None})
 
 
-def cancel_coindcx_open_entry_orders(pair: str, order_id: str = None) -> int:
+def cancel_coindcx_open_entry_orders(pair: str, order_id: str = None, side: str = None) -> int:
     """
     Cancels any unfilled resting limit orders (such as an unfilled Entry 2 @ Sweep order)
     for `pair` once TP1 is reached or the trade closes.
+    If `side` ('buy' or 'sell') is provided, only cancels limit orders on that side.
     """
     cancelled = 0
+    side_filter = str(side).lower().strip() if side else None
     try:
-        if order_id and order_id != "CONFIRMED":
+        if order_id and order_id not in ("CONFIRMED", "DAEMON_50PCT_REDUCE_AT_TP1"):
             res, _ = _send_coindcx_signed_request(
                 "POST",
                 "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel",
@@ -2334,8 +2446,11 @@ def cancel_coindcx_open_entry_orders(pair: str, order_id: str = None) -> int:
             o_id = o.get("id")
             o_pair = o.get("pair")
             o_stage = o.get("stage", "")
+            o_side = str(o.get("side", "")).lower().strip()
             o_type = str(o.get("order_type", "")).lower()
             if o_id and o_pair == pair and o_stage != "tpsl_exit" and "limit" in o_type:
+                if side_filter and o_side and o_side != side_filter:
+                    continue
                 res, _ = _send_coindcx_signed_request(
                     "POST",
                     "https://api.coindcx.com/exchange/v1/derivatives/futures/orders/cancel",
@@ -2346,6 +2461,237 @@ def cancel_coindcx_open_entry_orders(pair: str, order_id: str = None) -> int:
     except Exception as e:
         print(f"[Cancel Unfilled Entry 2 Notice]: {e}")
     return cancelled
+
+
+def normalize_two_entry_runner_levels(
+    pair: str,
+    direction: str,
+    entry1_px: float,
+    entry2_px: float = None,
+    tp1_px: float = None,
+    tp2_px: float = None,
+    sl_px: float = None,
+    live_px: float = None,
+    levels: dict = None,
+) -> dict:
+    """
+    Guarantees that Entry 1, Entry 2 @ Sweep, TP1 (50% Book), TP2 (50% Runner), and Catastrophe SL
+    are strictly on the valid side of both Entry 1 and current live market price so CoinDCX
+    never rejects `create_tpsl` or resting Limit Orders when price is outside prior-day [SL, SH].
+    """
+    is_long = str(direction).upper() in ("BUY", "LONG")
+    e1 = float(entry1_px or live_px or 0.0)
+    cur_p = float(live_px or e1)
+    if e1 <= 0:
+        e1 = cur_p
+
+    if is_long:
+        high_ref = max(e1, cur_p) if cur_p > 0 else e1
+        low_ref = min(e1, cur_p) if cur_p > 0 else e1
+
+        cand_e2 = float(entry2_px or (levels.get("SL") if levels else 0.0) or 0.0)
+        if cand_e2 <= 0 or cand_e2 >= low_ref * 0.9992:
+            cand_e2 = low_ref * 0.992
+
+        cand_sl = float(sl_px or 0.0)
+        min_long_anchor = min(low_ref, cand_e2)
+        if cand_sl <= 0 or cand_sl >= min_long_anchor * 0.999:
+            cand_sl = min_long_anchor * 0.995
+
+        cand_tp1 = float(tp1_px or (levels.get("MID") if levels else 0.0) or 0.0)
+        if cand_tp1 <= high_ref * 1.002:
+            cand_tp1 = high_ref * 1.012
+
+        cand_tp2 = float(tp2_px or (levels.get("RH") if levels else 0.0) or 0.0)
+        if cand_tp2 <= cand_tp1 * 1.002:
+            cand_tp2 = max(cand_tp1 * 1.012, high_ref * 1.024)
+    else:
+        low_ref = min(e1, cur_p) if cur_p > 0 else e1
+        high_ref = max(e1, cur_p) if cur_p > 0 else e1
+
+        cand_e2 = float(entry2_px or (levels.get("SH") if levels else 0.0) or 0.0)
+        if cand_e2 <= 0 or cand_e2 <= high_ref * 1.0008:
+            cand_e2 = high_ref * 1.008
+
+        cand_sl = float(sl_px or 0.0)
+        max_short_anchor = max(high_ref, cand_e2)
+        if cand_sl <= 0 or cand_sl <= max_short_anchor * 1.001:
+            cand_sl = max_short_anchor * 1.005
+
+        cand_tp1 = float(tp1_px or (levels.get("MID") if levels else 0.0) or 0.0)
+        if cand_tp1 <= 0 or cand_tp1 >= low_ref * 0.998:
+            cand_tp1 = low_ref * 0.988
+
+        cand_tp2 = float(tp2_px or (levels.get("RL") if levels else 0.0) or 0.0)
+        if cand_tp2 <= 0 or cand_tp2 >= cand_tp1 * 0.998:
+            cand_tp2 = min(cand_tp1 * 0.988, low_ref * 0.976)
+
+    return {
+        "entry": format_order_price(pair, e1),
+        "entry2_sweep": format_order_price(pair, cand_e2),
+        "tp1": format_order_price(pair, cand_tp1),
+        "tp2": format_order_price(pair, cand_tp2),
+        "stop_loss": format_order_price(pair, cand_sl),
+    }
+
+
+def sync_full_2entry_runner_to_position(
+    pair: str,
+    direction: str = None,
+    entry1_px: float = None,
+    entry2_px: float = None,
+    tp1_px: float = None,
+    tp2_px: float = None,
+    sl_px: float = None,
+    total_margin_inr: float = 20000.0,
+    leverage: int = 10,
+    usd_inr: float = None,
+) -> tuple[bool, str, dict]:
+    """
+    Synchronizes all 4 components of the 2-Entry + 50/50 Runner setup onto an active CoinDCX position:
+      1. Position Bracket TP = TP2 (Runner) & SL = Catastrophe SL via `update_coindcx_position_tpsl`.
+      2. TP1 50% Partial Book resting opposite-side Limit Order (`0.5 * pos_qty` @ `tp1_px`) in Open Orders.
+      3. Entry 2 / Trade 2 resting same-side Limit Order (`50%` of `total_margin_inr` @ `entry2_px`) in Open Orders.
+      4. App Trade Lock registration so the 24/7 daemon manages TP1 -> Cancel Entry 2 -> Ratchet SL -> TP2.
+    """
+    u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
+    positions = fetch_coindcx_active_positions(force_refresh=True)
+    matched_pos = next((p for p in positions if p.get("pair") == pair), None)
+    if not matched_pos or not matched_pos.get("id"):
+        return False, f"No active position found on CoinDCX for {pair} yet.", {}
+
+    pos_id = matched_pos["id"]
+    pos_dir = str(direction or matched_pos.get("direction", "LONG")).upper()
+    is_long = pos_dir in ("LONG", "BUY")
+    side = "BUY" if is_long else "SELL"
+    opp_side = "SELL" if is_long else "BUY"
+    pos_qty = float(matched_pos.get("quantity", 0.0) or 0.0)
+    pos_entry = float(entry1_px or matched_pos.get("entry_price", 0.0) or 0.0)
+    pos_mark = float(matched_pos.get("mark_price", pos_entry) or pos_entry)
+    pos_lev = int(round(float(matched_pos.get("leverage") or leverage or 10)))
+
+    levels = None
+    try:
+        levels = calculate_daily_box_levels(pair)
+    except Exception:
+        pass
+
+    norm = normalize_two_entry_runner_levels(
+        pair=pair,
+        direction=pos_dir,
+        entry1_px=pos_entry,
+        entry2_px=entry2_px,
+        tp1_px=tp1_px,
+        tp2_px=tp2_px,
+        sl_px=sl_px,
+        live_px=pos_mark,
+        levels=levels,
+    )
+    e1_val = norm["entry"]
+    e2_val = norm["entry2_sweep"]
+    tp1_val = norm["tp1"]
+    tp2_val = norm["tp2"]
+    sl_val = norm["stop_loss"]
+
+    status_parts = []
+    details = {"normalized_levels": norm}
+
+    # 1. Attach Position TP (TP2 Runner) and SL (Catastrophe SL) on the active position
+    tpsl_ok, tpsl_msg = update_coindcx_position_tpsl(pos_id, tp_price=tp2_val, sl_price=sl_val, pair=pair)
+    details["tpsl_ok"] = tpsl_ok
+    details["tpsl_msg"] = tpsl_msg
+    status_parts.append(f"Bracket TP2=${tp2_val} & SL=${sl_val}: {'Set' if tpsl_ok else tpsl_msg}")
+
+    # Inspect existing open limit orders for this pair so we don't duplicate
+    open_orders = fetch_coindcx_open_orders() or []
+    existing_same_side_limit = None
+    existing_opp_side_limit = None
+    for o in open_orders:
+        if o.get("pair") == pair and o.get("stage") != "tpsl_exit" and "limit" in str(o.get("order_type", "")).lower():
+            o_side = str(o.get("side", "")).upper()
+            if o_side == side and not existing_same_side_limit:
+                existing_same_side_limit = o
+            elif o_side == opp_side and not existing_opp_side_limit:
+                existing_opp_side_limit = o
+
+    # 2. Place TP1 (50% Partial Book) opposite-side Limit Order if not already open
+    tp1_order_id = ""
+    tp1_qty = format_order_quantity(pair, pos_qty * 0.5)
+    if (tp1_qty * tp1_val * u_inr) < 2448.0 and (pos_qty * tp1_val * u_inr) >= 2448.0:
+        tp1_qty = min(pos_qty, format_order_quantity(pair, (2500.0 / u_inr) / tp1_val))
+
+    if existing_opp_side_limit:
+        tp1_order_id = str(existing_opp_side_limit.get("id", ""))
+        status_parts.append(f"TP1 Limit ({existing_opp_side_limit.get('total_quantity')} @ ${existing_opp_side_limit.get('price')}): Already Open")
+    elif tp1_qty > 0 and (tp1_qty * tp1_val * u_inr) >= 2448.0:
+        ok_tp1, msg_tp1, extra_tp1 = place_coindcx_futures_order(
+            pair=pair,
+            side=opp_side,
+            quantity=tp1_qty,
+            leverage=pos_lev,
+            order_type="limit_order",
+            price=tp1_val,
+            margin_currency="INR",
+            post_only=False,
+        )
+        details["tp1_order"] = extra_tp1
+        if ok_tp1:
+            tp1_order_id = str((extra_tp1 or {}).get("order_id", ""))
+            status_parts.append(f"TP1 50% Limit ({opp_side} {tp1_qty} @ ${tp1_val}): Placed")
+        else:
+            tp1_order_id = "DAEMON_50PCT_REDUCE_AT_TP1"
+            status_parts.append(f"TP1 Limit (Daemon 50% Market Reduce Armed @ ${tp1_val})")
+    else:
+        tp1_order_id = "DAEMON_50PCT_REDUCE_AT_TP1"
+        status_parts.append(f"TP1 (Daemon 50% Reduce Armed @ ${tp1_val})")
+
+    # 3. Place Entry 2 / Trade 2 (50% Sweep Scale-In) same-side Limit Order if not already open
+    e2_order_id = ""
+    tranche_m_inr = max(float(total_margin_inr or 20000.0) * 0.5, float(matched_pos.get("locked_margin_inr", 10000.0) or 10000.0))
+    qty2 = format_order_quantity(pair, ((tranche_m_inr * pos_lev) / u_inr) / e2_val) if e2_val > 0 else 0.0
+
+    if existing_same_side_limit:
+        e2_order_id = str(existing_same_side_limit.get("id", ""))
+        status_parts.append(f"Entry 2 Limit ({existing_same_side_limit.get('total_quantity')} @ ${existing_same_side_limit.get('price')}): Already Open")
+    elif qty2 > 0 and (qty2 * e2_val * u_inr) >= 2448.0:
+        ok_e2, msg_e2, extra_e2 = place_coindcx_futures_order(
+            pair=pair,
+            side=side,
+            quantity=qty2,
+            leverage=pos_lev,
+            order_type="limit_order",
+            price=e2_val,
+            margin_currency="INR",
+            post_only=False,
+        )
+        details["entry2_order"] = extra_e2
+        if ok_e2:
+            e2_order_id = str((extra_e2 or {}).get("order_id", ""))
+            status_parts.append(f"Entry 2 Sweep Limit ({side} {qty2} @ ${e2_val}): Placed")
+        else:
+            status_parts.append(f"Entry 2 Notice: {msg_e2}")
+
+    # 4. Register/Update App Trade Lock so the 24/7 daemon monitors TP1 -> Cancel Entry 2 -> Ratchet SL -> TP2
+    lock_info = register_app_trade_lock(
+        pair=pair,
+        direction="LONG" if is_long else "SHORT",
+        entry=e1_val,
+        stop_loss=sl_val,
+        tp1=tp1_val,
+        tp2=tp2_val,
+        entry2_sweep=e2_val,
+        margin_inr=float(total_margin_inr or tranche_m_inr * 2.0),
+        leverage=pos_lev,
+        qty1=pos_qty,
+        qty2=qty2,
+        mode="App/API Live Execution (2-Entry + TP1/TP2/SL Synced)",
+        is_live_exchange=True,
+        entry2_order_id=e2_order_id,
+        tp1_order_id=tp1_order_id or "DAEMON_50PCT_REDUCE_AT_TP1",
+    )
+    details["lock"] = lock_info
+    _ACTIVE_POSITIONS_CACHE["data"] = None
+    return True, " | ".join(status_parts), details
 
 
 def register_app_trade_lock(
@@ -2406,7 +2752,7 @@ def get_active_portfolio_trade_status() -> dict:
     automatically manages the 3-stage 50/50 Runner lifecycle when Entry 1 fills (with or without Entry 2):
       - Stage 1 (Price hits TP1 without hitting Entry 2):
           1. Cancels the unfilled resting Entry 2 limit order at SL/SH.
-          2. Books 50% of the open Entry 1 position at TP1.
+          2. Books 50% of the open Entry 1 position at TP1 (if not already filled by resting TP1 limit order).
           3. Ratchets Stop Loss into profit (Entry 1 +/- 50% of TP1 distance) while holding the remaining 50% for TP2.
       - Stage 2 (Price reaches halfway between TP1 and TP2):
           Ratchets Stop Loss to TP1 (MID).
@@ -2434,21 +2780,41 @@ def get_active_portfolio_trade_status() -> dict:
                 clear_autotrade_active_lock()
                 return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
 
-            if l_ts > 0 and (time.time() - l_ts) >= 60:
-                matched_live_pos = None
-                if is_live_ex:
-                    live_positions = fetch_coindcx_active_positions()
-                    if live_positions is not None:
-                        matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
-                        if not matched_live_pos and fetch_coindcx_futures_balance().get("is_live_api"):
-                            cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
-                            clear_autotrade_active_lock()
-                            return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
+            matched_live_pos = None
+            if is_live_ex:
+                live_positions = fetch_coindcx_active_positions()
+                if live_positions is not None:
+                    matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
+                    if matched_live_pos and matched_live_pos.get("id"):
+                        # Auto-heal missing TP or SL on CoinDCX immediately (even within the first 60s!)
+                        if matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None:
+                            norm_lvls = normalize_two_entry_runner_levels(
+                                pair=l_pair,
+                                direction=l_dir,
+                                entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
+                                entry2_px=l_entry2,
+                                tp1_px=l_tp1,
+                                tp2_px=l_tp2,
+                                sl_px=l_sl,
+                                live_px=float(matched_live_pos.get("mark_price") or l_entry),
+                            )
+                            l_tp2 = norm_lvls["tp2"]
+                            l_sl = norm_lvls["stop_loss"]
+                            lock["tp2"] = l_tp2
+                            lock["stop_loss"] = l_sl
+                            save_autotrade_config({"active_trade_lock": lock})
+                            update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_sl, pair=l_pair)
+                    elif l_ts > 0 and (time.time() - l_ts) >= 60 and fetch_coindcx_futures_balance().get("is_live_api"):
+                        cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
+                        clear_autotrade_active_lock()
+                        return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
 
+            if l_ts > 0 and (time.time() - l_ts) >= 15:
                 tk = fetch_live_ticker(l_pair)
                 px = float(tk.get("last_price", 0.0) or 0.0)
                 if px > 0:
                     is_long = l_dir in ("LONG", "BUY")
+                    entry_side = "buy" if is_long else "sell"
 
                     # Check if Entry 2 @ Sweep filled before TP1 was reached
                     if not tp1_already_hit and not lock.get("entry2_filled") and l_entry2 > 0:
@@ -2477,31 +2843,37 @@ def get_active_portfolio_trade_status() -> dict:
                     # Stage 1: Price reaches TP1 (without hitting Entry 2) -> Book 50%, Cancel Entry 2, Ratchet SL!
                     hit_tp1 = (px >= l_tp1) if (is_long and l_tp1 > 0) else ((px <= l_tp1) if (not is_long and l_tp1 > 0) else False)
                     if hit_tp1 and not tp1_already_hit:
-                        # 1. Cancel unfilled Entry 2 limit order so it never fills late
+                        # 1. Cancel unfilled Entry 2 limit order (same-side only) so it never fills late
                         if is_live_ex and not lock.get("entry2_filled"):
-                            cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
+                            cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""), side=entry_side)
                             lock["entry2_cancelled"] = True
 
-                        # 2. Book 50% of the open CoinDCX position at TP1 via opposite-side Market Reduce order
+                        # 2. Book 50% of the open CoinDCX position at TP1 if resting TP1 limit order hasn't already reduced it
                         if is_live_ex and matched_live_pos:
                             open_pos_qty = float(matched_live_pos.get("quantity", 0.0) or 0.0)
-                            half_pos_qty = format_order_quantity(l_pair, open_pos_qty * 0.5)
-                            pos_lev = int(round(float(matched_live_pos.get("leverage", lock.get("leverage", 10)) or 10)))
-                            opp_side = "SELL" if is_long else "BUY"
-                            if half_pos_qty > 0:
-                                place_coindcx_futures_order(
-                                    pair=l_pair,
-                                    side=opp_side,
-                                    quantity=half_pos_qty,
-                                    leverage=pos_lev,
-                                    order_type="market_order",
-                                    margin_currency="INR",
-                                )
+                            init_qty1 = float(lock.get("qty1", open_pos_qty) or open_pos_qty)
+                            tp1_oid = str(lock.get("tp1_order_id", ""))
+                            # If open_pos_qty is still >= 75% of init_qty1, the resting TP1 limit order hasn't filled yet
+                            if open_pos_qty >= init_qty1 * 0.75:
+                                if tp1_oid and tp1_oid != "DAEMON_50PCT_REDUCE_AT_TP1":
+                                    cancel_coindcx_open_entry_orders(l_pair, tp1_oid, side="sell" if is_long else "buy")
+                                half_pos_qty = format_order_quantity(l_pair, open_pos_qty * 0.5)
+                                pos_lev = int(round(float(matched_live_pos.get("leverage", lock.get("leverage", 10)) or 10)))
+                                opp_side = "SELL" if is_long else "BUY"
+                                if half_pos_qty > 0:
+                                    place_coindcx_futures_order(
+                                        pair=l_pair,
+                                        side=opp_side,
+                                        quantity=half_pos_qty,
+                                        leverage=pos_lev,
+                                        order_type="market_order",
+                                        margin_currency="INR",
+                                    )
 
                         # 3. Ratchet Stop Loss into profit (Entry 1 + 50% of TP1 distance) for the 50% TP2 Runner
-                        ratcheted_sl = round_asset_price(
+                        ratcheted_sl = format_order_price(
+                            l_pair,
                             (l_entry + 0.5 * (l_tp1 - l_entry)) if is_long else (l_entry - 0.5 * (l_entry - l_tp1)),
-                            l_entry,
                         )
                         lock["tp1_hit"] = True
                         lock["stop_loss"] = ratcheted_sl
@@ -2542,6 +2914,23 @@ def get_active_portfolio_trade_status() -> dict:
             "count": 1,
         }
 
+    # Fallback: if local lock file was cleared or container restarted, check live CoinDCX active positions directly
+    try:
+        live_pos = fetch_coindcx_active_positions() or []
+        if live_pos:
+            first_p = live_pos[0]
+            return {
+                "is_occupied": True,
+                "active_pair": first_p.get("pair"),
+                "active_direction": first_p.get("direction", "LONG"),
+                "entry_price": float(first_p.get("entry_price", 0.0) or 0.0),
+                "stop_loss": float(first_p.get("stop_loss", 0.0) or 0.0),
+                "source": "CoinDCX Live Active Position",
+                "count": len(live_pos),
+            }
+    except Exception:
+        pass
+
     return {"is_occupied": False, "active_pair": None, "source": "Slot Free (0/1 App Trades Active)"}
 
 
@@ -2577,11 +2966,23 @@ def execute_autotrade_two_entry_signal(
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     side = "BUY" if direction in ("LONG", "BUY") else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
-    entry1_px = round_asset_price(float(sig["entry"]), float(sig["entry"]))
-    entry2_px = round_asset_price(float(sig.get("entry2_sweep") or sig["entry"]), entry1_px)
-    tp1_px = round_asset_price(float(sig["tp1"]), entry1_px)
-    tp2_px = round_asset_price(float(sig["tp2"]), entry1_px)
-    sl_px = round_asset_price(float(sig["stop_loss"]), entry1_px)
+    live_tk_px = float(fetch_live_ticker(pair).get("last_price", 0.0) or 0.0)
+    norm = normalize_two_entry_runner_levels(
+        pair=pair,
+        direction=direction,
+        entry1_px=float(sig["entry"]),
+        entry2_px=float(sig.get("entry2_sweep") or sig["entry"]),
+        tp1_px=float(sig["tp1"]),
+        tp2_px=float(sig["tp2"]),
+        sl_px=float(sig["stop_loss"]),
+        live_px=live_tk_px if live_tk_px > 0 else float(sig["entry"]),
+        levels=sig.get("levels"),
+    )
+    entry1_px = norm["entry"]
+    entry2_px = norm["entry2_sweep"]
+    tp1_px = norm["tp1"]
+    tp2_px = norm["tp2"]
+    sl_px = norm["stop_loss"]
 
     # Split single-trade margin 50% for Entry 1 and 50% for Entry 2 @ Sweep
     tranche_margin_inr = margin_inr * 0.5
@@ -2613,34 +3014,26 @@ def execute_autotrade_two_entry_signal(
             sl_price=sl_px,
             post_only=False,
         )
-        # Leg 2: Resting Limit Order for Entry 2 @ Sweep (50% Margin = qty2, post_only=False)
-        ok2, msg2, extra2 = False, "Skipped (Entry 1 failed)", {}
-        if ok1 and qty2 > 0 and (qty2 * entry2_px * u_inr) >= 2448.0 and abs(entry2_px - entry1_px) > 0:
-            ok2, msg2, extra2 = place_coindcx_futures_order(
-                pair=pair,
-                side=side,
-                quantity=qty2,
-                leverage=lev,
-                order_type="limit_order",
-                price=entry2_px,
-                margin_currency="INR",
-                post_only=False,
-            )
         if ok1:
-            lock_info = register_app_trade_lock(
-                pair=pair, direction=direction, entry=entry1_px, stop_loss=sl_px,
-                tp1=tp1_px, tp2=tp2_px, entry2_sweep=entry2_px, margin_inr=margin_inr,
-                leverage=lev, qty1=qty1, qty2=qty2,
-                mode="App/API Live AutoTrade (2-Entry + Runner)", is_live_exchange=True,
-                entry2_order_id=str(extra2.get("order_id", "")),
-                tp1_order_id="DAEMON_50PCT_REDUCE_AT_TP1",
+            # Synchronize Position TP2/SL + TP1 50% Limit Order + Entry 2 Sweep Limit Order onto the live position
+            sync_ok, sync_msg, sync_details = sync_full_2entry_runner_to_position(
+                pair=pair,
+                direction=direction,
+                entry1_px=entry1_px,
+                entry2_px=entry2_px,
+                tp1_px=tp1_px,
+                tp2_px=tp2_px,
+                sl_px=sl_px,
+                total_margin_inr=margin_inr,
+                leverage=lev,
+                usd_inr=u_inr,
             )
             return True, (
-                f"Live 2-Entry + Runner Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | "
-                f"Auto 50% Reduce Armed at TP1 (${tp1_px}) -> 50% Runner to CoinDCX TP (${tp2_px}) | "
-                f"Entry 2 Sweep Limit ({qty2} @ ${entry2_px})"
+                f"Live 2-Entry + Runner Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | {sync_msg}"
             ), {
-                "entry1_order": extra1, "entry2_order": extra2, "lock": lock_info
+                "entry1_order": extra1,
+                "sync_details": sync_details,
+                "lock": sync_details.get("lock"),
             }
         return False, f"CoinDCX Live AutoTrade Error on {pair}: {msg1}", {"entry1_order": extra1}
     else:
@@ -2673,14 +3066,34 @@ def run_portfolio_single_slot_backtest(
       - Strictly allows ONLY 1 active trade across the entire portfolio at any time (so 50% margin
         is always reserved for Entry 2 @ Sweep on the active coin).
       - Enforces daily discipline (max 3 portfolio trades/day; done for the day after a >=10% ROE win).
+      - Also returns `standalone_summary_df` so the user can compare the 1-Slot Shared Portfolio
+        breakdown against each coin's Standalone 30-Day Backtest.
     """
-    universe = pairs or HIGH_VOL_FUTURES_UNIVERSE
+    universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
     all_candidates = []
+    standalone_rows = []
     for rank, p in enumerate(universe):
         res = run_strategy_backtest(
             pair=p, duration_days=duration_days, interval="15m",
             margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr, strategy_id=strategy_id
         )
+        st_tot = int(res.get("total_trades", 0) or 0)
+        st_wins = int(res.get("win_count", 0) or 0)
+        st_losses = int(res.get("loss_count", 0) or 0)
+        st_wr = float(res.get("win_rate_pct", 0.0) or 0.0)
+        st_net = round(float(res.get("net_profit_inr", 0.0) or 0.0), 2)
+        st_roi = round((st_net / margin_inr) * 100.0, 2) if margin_inr > 0 else 0.0
+        st_pf = float(res.get("profit_factor", 0.0) or 0.0)
+        standalone_rows.append({
+            "pair": p,
+            "Trades": st_tot,
+            "Wins": st_wins,
+            "Losses": st_losses,
+            "Win_Rate_%": round(st_wr, 1),
+            "Net_Profit_INR": st_net,
+            "ROI_Pct": st_roi,
+            "Profit_Factor": round(st_pf, 2),
+        })
         tdf = res.get("trades_df")
         if tdf is not None and not tdf.empty:
             for _, row in tdf.iterrows():
@@ -2688,11 +3101,16 @@ def run_portfolio_single_slot_backtest(
                 d["vol_rank"] = rank
                 all_candidates.append(d)
 
+    standalone_df = pd.DataFrame(standalone_rows)
+    if not standalone_df.empty:
+        standalone_df = standalone_df.sort_values(by="Net_Profit_INR", ascending=False).reset_index(drop=True)
+
     if not all_candidates:
         return {
             "total_trades": 0, "win_count": 0, "loss_count": 0, "win_rate_pct": 0.0,
             "net_profit_inr": 0.0, "total_roi_pct": 0.0, "profit_factor": 0.0,
-            "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(), "coin_Summary_df": pd.DataFrame(),
+            "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(),
+            "coin_summary_df": pd.DataFrame(), "standalone_summary_df": standalone_df,
         }
 
     df_all = pd.DataFrame(all_candidates).sort_values(by=["entry_time", "vol_rank"]).reset_index(drop=True)
@@ -2732,13 +3150,30 @@ def run_portfolio_single_slot_backtest(
         pdf.groupby("pair", as_index=False)
         .agg(
             Trades=("is_win", "count"),
-            Wins=("is_win", "sum"),
+            Wins=("is_win", lambda s: int(s.sum())),
             Net_Profit_INR=("net_pnl_inr", lambda s: round(float(s.sum()), 2)),
             Avg_ROE_Pct=("roe_pct", lambda s: round(float(s.mean()), 2)),
         )
-        .sort_values(by="Net_Profit_INR", ascending=False)
     )
-    coin_grp["Win_Rate_%"] = (coin_grp["Wins"] / coin_grp["Trades"] * 100.0).round(1)
+    # Ensure all pairs in universe are represented so no coin is silently omitted
+    existing_pairs = set(coin_grp["pair"].tolist()) if not coin_grp.empty else set()
+    missing_rows = [
+        {"pair": p, "Trades": 0, "Wins": 0, "Net_Profit_INR": 0.0, "Avg_ROE_Pct": 0.0}
+        for p in universe if p not in existing_pairs
+    ]
+    if missing_rows:
+        coin_grp = pd.concat([coin_grp, pd.DataFrame(missing_rows)], ignore_index=True)
+
+    coin_grp["Losses"] = (coin_grp["Trades"] - coin_grp["Wins"]).astype(int)
+    coin_grp["Win_Rate_%"] = coin_grp.apply(
+        lambda r: round((float(r["Wins"]) / float(r["Trades"])) * 100.0, 1) if r["Trades"] > 0 else 0.0,
+        axis=1,
+    )
+    coin_grp["ROI_Pct"] = coin_grp["Net_Profit_INR"].apply(
+        lambda x: round((float(x) / margin_inr) * 100.0, 2) if margin_inr > 0 else 0.0
+    )
+    coin_grp = coin_grp.sort_values(by=["Net_Profit_INR", "Trades"], ascending=[False, False]).reset_index(drop=True)
+    coin_grp = coin_grp[["pair", "Trades", "Wins", "Losses", "Win_Rate_%", "Net_Profit_INR", "ROI_Pct", "Avg_ROE_Pct"]]
 
     return {
         "total_trades": tot,
@@ -2753,6 +3188,10 @@ def run_portfolio_single_slot_backtest(
         "total_gross_loss": round(gl, 2),
         "trades_df": pdf,
         "coin_summary_df": coin_grp,
+        "standalone_summary_df": standalone_df,
+        "margin_inr": margin_inr,
+        "leverage": leverage,
+        "duration_days": duration_days,
     }
 
 

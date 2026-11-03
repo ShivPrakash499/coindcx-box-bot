@@ -2,7 +2,7 @@
 Signal monitor: scans the watchlist with EVERY registered strategy (see strategies.py) on the last
 CLOSED candle and e-mails each NEW signal once, tagged with the strategy name. Used by the app
 (while it is open, plus its 24/7 background thread) and by signal_scanner.py (standalone loop).
-It never places orders.
+It never places orders unless AutoTrade is explicitly enabled.
 """
 from __future__ import annotations
 
@@ -19,21 +19,31 @@ import strategies as strat_registry
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", "alert_state.json")
 DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
-COOLDOWN_MIN = 60   # per strategy + pair + direction, plus pair-level anti-spam guard
+COOLDOWN_MIN = 60          # per strategy + pair + direction, plus pair-level anti-spam guard
+SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zone in the same direction
 MAX_DAILY_ALERTS_PER_PAIR = 2
 MAX_DAILY_PORTFOLIO_TRADES = 3
+_STATE_SCHEMA_VERSION = 2
 _SCAN_LOCK = threading.Lock()
 
 
 def _load() -> dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                if data.get("_schema_version") != _STATE_SCHEMA_VERSION:
+                    fresh = {"_schema_version": _STATE_SCHEMA_VERSION}
+                    _save(fresh)
+                    return fresh
+                return data
     except Exception:
-        return {}
+        pass
+    return {"_schema_version": _STATE_SCHEMA_VERSION}
 
 
 def _save(state: dict) -> None:
+    state["_schema_version"] = _STATE_SCHEMA_VERSION
     os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
@@ -78,9 +88,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                    send: bool = True, strategy_ids=None, autotrade: bool = None) -> list:
     """
     Scans high-volatility crypto futures pairs (ordered by live 24h volatility) at 10x leverage:
-      1. Enforces '1 Crypto at a Time' so 50% of the single-trade margin is always reserved for Entry 2 @ Sweep.
-      2. Sends email alert for the highest-priority confirmed signal when the portfolio slot is free.
-      3. When AutoTrade is toggled ON in the Sidebar, automatically executes the 2-Entry + Runner setup
+      1. Suppresses alerts and trades for any asset ALREADY in an active Live CoinDCX trade (`open_live_pairs`).
+      2. Enforces '1 Crypto at a Time' so 50% of the single-trade margin is always reserved for Entry 2 @ Sweep.
+      3. Sends email alert for the highest-priority confirmed signal when the portfolio slot is free.
+      4. When AutoTrade is toggled ON in the Sidebar, automatically executes the 2-Entry + Runner setup
          using the user's configured Single-Trade Margin out of the Futures Wallet.
     """
     auto_cfg = eng.get_autotrade_config()
@@ -109,6 +120,17 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         portfolio_daily_key = f"PORTFOLIO_DAILY_COUNT|{today_ist}"
         portfolio_daily_count = int(state.get(portfolio_daily_key, 0))
 
+        # Collect all pairs currently in a Live CoinDCX position or active App Trade Lock
+        open_live_pairs = set()
+        if portfolio_occupied and active_Slot_pair:
+            open_live_pairs.add(active_Slot_pair)
+        try:
+            for pos in (eng.fetch_coindcx_active_positions() or []):
+                if isinstance(pos, dict) and pos.get("pair"):
+                    open_live_pairs.add(pos["pair"])
+        except Exception:
+            pass
+
         for pair in pairs:
             pair_lock_key = f"PAIR_LOCK|{pair}"
             pair_last = state.get(pair_lock_key, {})
@@ -133,6 +155,14 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
                 if float(sig.get("roe_tp1", 0.0)) < 3.0:
                     results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})
+                    continue
+
+                # Skip sending duplicate setup alerts or opening trades on assets ALREADY in a Live Trade
+                if pair in open_live_pairs:
+                    results.append({
+                        **row,
+                        "message": f"skipped: {pair} is already in an active Live Trade"
+                    })
                     continue
 
                 # 1-Crypto-at-a-Time Guard: If another crypto is already active, do not alert/open a 2nd crypto
@@ -161,8 +191,21 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 cooled = (now_ts - last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
                 pair_cooled = (now_ts - pair_last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
 
+                # Same-setup deduplication: if same direction & entry within 0.8%, suppress for 4 hours
+                last_entry = float(last.get("entry", 0.0) or 0.0)
+                cur_entry = float(sig.get("entry", 0.0) or 0.0)
+                same_price_zone = (
+                    last.get("direction") == sig["signal"]
+                    and last_entry > 0
+                    and cur_entry > 0
+                    and (abs(cur_entry - last_entry) / cur_entry) < 0.008
+                )
+                same_setup_locked = same_price_zone and ((now_ts - last.get("sent_at", 0)) < SAME_SETUP_LOCK_MIN * 60)
+
                 if not is_new_candle:
                     msg = "already alerted for this candle"
+                elif same_setup_locked:
+                    msg = "already alerted for this setup zone"
                 elif not (cooled and pair_cooled):
                     msg = "on cooldown"
                 else:
@@ -174,7 +217,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     last.get("candle_ts") == sig["candle_ts"] and bool(last.get("autotraded", False))
                 )
 
-                if send and is_new_candle and cooled and pair_cooled:
+                if send and is_new_candle and cooled and pair_cooled and not same_setup_locked:
                     emailed, msg = email_notifier.send_trade_email(
                         pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
                         tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=sig["margin_inr"], leverage=sig["leverage"],
@@ -187,9 +230,17 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             "candle_ts": sig["candle_ts"],
                             "sent_at": now_sent,
                             "direction": sig["signal"],
+                            "entry": cur_entry,
+                            "tp1": float(sig.get("tp1", 0.0) or 0.0),
                             "autotraded": already_autotraded_candle,
                         }
-                        pair_last = {"candle_ts": sig["candle_ts"], "sent_at": now_sent, "direction": sig["signal"], "strategy_id": s.id}
+                        pair_last = {
+                            "candle_ts": sig["candle_ts"],
+                            "sent_at": now_sent,
+                            "direction": sig["signal"],
+                            "entry": cur_entry,
+                            "strategy_id": s.id,
+                        }
                         state[pair_lock_key] = pair_last
                         daily_count += 1
                         portfolio_daily_count += 1
@@ -198,7 +249,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         _save(state)
 
                 # If AutoTrade is toggled ON in Sidebar and no other coin is active, place the 2-Entry + Runner trade!
-                if autotrade and not portfolio_occupied and not already_autotraded_candle and ((is_new_candle and cooled and pair_cooled) or emailed or last.get("candle_ts") == sig["candle_ts"]):
+                if autotrade and not portfolio_occupied and not already_autotraded_candle and not same_setup_locked and ((is_new_candle and cooled and pair_cooled) or emailed or last.get("candle_ts") == sig["candle_ts"]):
                     ok_auto, auto_msg, _ = eng.execute_autotrade_two_entry_signal(
                         pair=pair, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
                     )
@@ -208,10 +259,13 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     if ok_auto:
                         portfolio_occupied = True
                         active_Slot_pair = pair
+                        open_live_pairs.add(pair)
                         state[key] = {
                             "candle_ts": sig["candle_ts"],
                             "sent_at": state.get(key, {}).get("sent_at", now_exec),
                             "direction": sig["signal"],
+                            "entry": cur_entry,
+                            "tp1": float(sig.get("tp1", 0.0) or 0.0),
                             "autotraded": True,
                         }
                         if not emailed:
