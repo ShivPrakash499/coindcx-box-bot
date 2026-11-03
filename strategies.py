@@ -916,15 +916,13 @@ class AtrReversal(Strategy):
         d = eng.fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
         if d.empty or len(d) < SMA_PERIOD + 2:
             return None
-        d_full = daily_sma_atr(d.reset_index(drop=True))
-        d_comp = daily_sma_atr(d.iloc[:-1].reset_index(drop=True))   # completed days for ATR
-        last = d_full.iloc[-1]
+        d_comp = daily_sma_atr(d.iloc[:-1].reset_index(drop=True))   # completed days for ATR & fixed Daily Bias
         last_comp = d_comp.iloc[-1]
-        if pd.isna(last["EMA50"]) or pd.isna(last_comp["ATR"]):
+        if pd.isna(last_comp["EMA50"]) or pd.isna(last_comp["ATR"]):
             return None
-        close = float(last["close"])
-        ema50 = float(last["EMA50"])
-        ema200 = float(last["EMA200"])
+        close = float(last_comp["close"])
+        ema50 = float(last_comp["EMA50"])
+        ema200 = float(last_comp["EMA200"])
         atr = float(last_comp["ATR"])
         bias = classify_daily_ema_bias(close, ema50, ema200)
         return {
@@ -932,7 +930,7 @@ class AtrReversal(Strategy):
             "EMA50": eng.round_asset_price(ema50, close),
             "EMA200": eng.round_asset_price(ema200, close),
             "ATR": round(atr, 6), "ATR25": round(ATR_FRACTION * atr, 6),
-            "daily_close": close, "bias": bias,
+            "daily_close": eng.round_asset_price(close, close), "bias": bias,
             "prev_day_date": datetime.fromtimestamp(last_comp["timestamp"] / 1000, tz=IST).strftime("%Y-%m-%d"),
         }
 

@@ -1569,17 +1569,21 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
     if df_daily.empty or len(df_daily) < 2:
         return None
 
-    ema50_val = float(df_daily['close'].ewm(span=50, adjust=False).mean().iloc[-1])
-    ema200_val = float(df_daily['close'].ewm(span=200, adjust=False).mean().iloc[-1])
-    current_daily_close = float(df_daily['close'].iloc[-1])
-
     df_all_completed = df_daily.iloc[:-1].reset_index(drop=True)
+    if df_all_completed.empty:
+        return None
+
+    # Lock Daily 50 EMA, 200 EMA, and Trend Bias to the previous completed daily candle close
+    # so Daily Bias stays fixed for the entire 24h day (matching prepare_backtest() and never flickering intrabar)
+    ema50_val = float(df_all_completed['close'].ewm(span=50, adjust=False).mean().iloc[-1])
+    ema200_val = float(df_all_completed['close'].ewm(span=200, adjust=False).mean().iloc[-1])
+
     # Limit search strictly to maximum 30 completed daily candles (never go beyond 30 days)
     df_completed = df_all_completed.tail(30)
     prev_day = df_completed.iloc[-1]
     rh = float(prev_day['high'])
     rl = float(prev_day['low'])
-    daily_close = current_daily_close
+    daily_close = float(prev_day['close'])
     mid = (rh + rl) / 2.0
 
     if daily_close < ema50_val and daily_close < ema200_val:
@@ -1773,18 +1777,19 @@ def detect_zone_signal(levels: dict, o: float, h: float, l: float, c: float):
 
 def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> dict:
     """
-    Daily 50 EMA & 200 EMA Trend Bias Filter:
-      - BEARISH: Daily Price < 50 EMA AND Daily Price < 200 EMA (SHORT setups only)
-      - BULLISH: Daily Price > 50 EMA AND Daily Price > 200 EMA (LONG setups only)
-      - NEUTRAL / RANGE: Daily Price is between 50 EMA and 200 EMA (Range Mode — Both Box Edges Active)
+    Daily 50 EMA & 200 EMA Trend Bias Filter (locked to Previous Completed Daily Candle Close):
+      - BEARISH: Prev Completed Daily Close < 50 EMA AND < 200 EMA (SHORT setups only)
+      - BULLISH: Prev Completed Daily Close > 50 EMA AND > 200 EMA (LONG setups only)
+      - NEUTRAL / RANGE: Prev Completed Daily Close is between 50 EMA and 200 EMA (WAIT / NO TRADE)
     """
     out = {"bias": "NEUTRAL / RANGE", "score": 0, "reasons": []}
     try:
         d = fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
         if len(d) >= 52:
-            ema50 = float(d["close"].ewm(span=50, adjust=False).mean().iloc[-1])
-            ema200 = float(d["close"].ewm(span=200, adjust=False).mean().iloc[-1])
-            d_close = float(live_price) if (live_price and live_price > 0) else float(d["close"].iloc[-1])
+            d_comp = d.iloc[:-1].reset_index(drop=True)
+            ema50 = float(d_comp["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            ema200 = float(d_comp["close"].ewm(span=200, adjust=False).mean().iloc[-1])
+            d_close = float(d_comp["close"].iloc[-1])
             out["ema50"] = round_asset_price(ema50, d_close)
             out["ema200"] = round_asset_price(ema200, d_close)
             out["daily_close"] = round_asset_price(d_close, d_close)
@@ -1792,15 +1797,15 @@ def compute_market_bias(pair: str = "B-ETH_USDT", live_price: float = 0.0) -> di
             if d_close < ema50 and d_close < ema200:
                 out["bias"] = "BEARISH"
                 out["score"] = -2
-                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) < 50 EMA (`${ema50:,.2f}`) & < 200 EMA (`${ema200:,.2f}`) → SHORT setups only")
+                out["reasons"].append(f"Prev Daily Close (`${d_close:,.2f}`) < 50 EMA (`${ema50:,.2f}`) & < 200 EMA (`${ema200:,.2f}`) → SHORT setups only")
             elif d_close > ema50 and d_close > ema200:
                 out["bias"] = "BULLISH"
                 out["score"] = 2
-                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) > 50 EMA (`${ema50:,.2f}`) & > 200 EMA (`${ema200:,.2f}`) → LONG setups only")
+                out["reasons"].append(f"Prev Daily Close (`${d_close:,.2f}`) > 50 EMA (`${ema50:,.2f}`) & > 200 EMA (`${ema200:,.2f}`) → LONG setups only")
             else:
                 out["bias"] = "NEUTRAL / RANGE"
                 out["score"] = 0
-                out["reasons"].append(f"Daily Price (`${d_close:,.2f}`) is between 50 EMA (`${ema50:,.2f}`) & 200 EMA (`${ema200:,.2f}`) → Range Mode (Both RH & RL Box Edges Active)")
+                out["reasons"].append(f"Prev Daily Close (`${d_close:,.2f}`) is between 50 EMA (`${ema50:,.2f}`) & 200 EMA (`${ema200:,.2f}`) → WAIT / NO TRADE")
     except Exception as e:
         out["reasons"].append(f"Bias unavailable: {e}")
     return out

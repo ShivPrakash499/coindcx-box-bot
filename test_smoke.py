@@ -219,7 +219,31 @@ def test_5_daily_bias_enforcement():
         )
         assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
 
-    print("  -> PASS: NEUTRAL bias (INJ), LONG-in-BEARISH (RENDER), and SHORT-in-BULLISH strictly blocked.")
+    # 3. Verify Option B: calculate_daily_box_levels locks Daily Bias to previous completed daily candle
+    import pandas as pd
+    base_closes = [6.0] * 250 + [7.20]  # 251 completed daily candles ending at $7.20
+    df_low_today = pd.DataFrame({
+        "timestamp": [1700000000000 + i * 86400000 for i in range(252)],
+        "open": base_closes + [7.20],
+        "high": [c + 0.15 for c in base_closes] + [7.50],
+        "low": [c - 0.15 for c in base_closes] + [7.00],
+        "close": base_closes + [5.50],  # Forming today candle drops to $5.50
+        "volume": [1000.0] * 252,
+    })
+    df_high_today = df_low_today.copy()
+    df_high_today.loc[251, "close"] = 9.50  # Forming today candle spikes to $9.50
+
+    with patch.object(eng, "fetch_coindcx_candles", return_value=df_low_today):
+        lv_low = eng.calculate_daily_box_levels("B-INJ_USDT")
+    with patch.object(eng, "fetch_coindcx_candles", return_value=df_high_today):
+        lv_high = eng.calculate_daily_box_levels("B-INJ_USDT")
+
+    assert lv_low["trend_bias"] == lv_high["trend_bias"] == "BULLISH", (
+        f"Expected locked completed-candle Daily Bias regardless of intraday forming candle, got {lv_low['trend_bias']} vs {lv_high['trend_bias']}"
+    )
+    assert lv_low["daily_close"] == lv_high["daily_close"] == 7.20
+
+    print("  -> PASS: Completed-Candle Daily Bias lock + NEUTRAL/counter-trend blocks verified.")
 
 
 if __name__ == "__main__":
