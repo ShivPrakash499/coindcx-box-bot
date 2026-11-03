@@ -125,12 +125,27 @@ except Exception as _em_err:
         return {"sender": "", "receiver": "", "configured": False}
 
 try:
-    from sheets_logger import log_trade_closed, log_failed_trade_diagnostic
+    from sheets_logger import (
+        log_trade_closed,
+        log_failed_trade_diagnostic,
+        fetch_all_sheet_trades,
+        sync_historical_app_trades_to_sheet,
+    )
 except Exception:
     def log_trade_closed(*args, **kwargs):
         return False
     def log_failed_trade_diagnostic(*args, **kwargs):
         return False
+    def fetch_all_sheet_trades(*args, **kwargs):
+        return {"ok": False, "error": "sheets_logger unavailable", "live_trades": [], "closed_trades": [], "markdown_summary": ""}
+    def sync_historical_app_trades_to_sheet(*args, **kwargs):
+        return False, "sheets_logger unavailable"
+
+try:
+    import gemini_advisor
+    _reload_if_updated(gemini_advisor)
+except Exception as _gem_err:
+    gemini_advisor = None
 
 st.set_page_config(
     page_title="Crypto Trade Pro Terminal",
@@ -322,12 +337,17 @@ def fmt_px(p):
 def clean_sym(pair: str) -> str:
     return str(pair).replace("B-", "").replace("_USDT", "")
 
+@st.cache_data(ttl=20)
+def get_cached_sheet_trades():
+    return fetch_all_sheet_trades()
+
 NAV_SECTIONS = [
     "⚡ Signals",
     "🎯 Execute",
     "📊 Positions",
     "📈 Chart & Levels",
     "🧪 Backtest",
+    "🤖 AI Advisor",
 ]
 
 # ----------------- SESSION STATE & AUTO-SYNC ACTIVE ASSET ON LOAD -----------------
@@ -2440,3 +2460,271 @@ elif active_section == "🧪 Backtest":
                     f"<th>Entry</th><th>Exit</th><th>ROE %</th><th>Net PnL (₹)</th><th>Exit Reason</th></tr></thead>"
                     f"<tbody>{''.join(_tr_rows)}</tbody></table></div>"
                 )
+
+# ==============================================================================
+# SECTION 6: GEMINI AI TRADE ADVISOR & GOOGLE SHEET JOURNAL READER
+# ==============================================================================
+elif active_section == "🤖 AI Advisor":
+    st.markdown("### 🤖 Gemini AI Trade Recommendation Bot & Google Sheet Reader")
+    st.caption(
+        "Reads all App-executed trades directly from your **`Crypto_Trades_Journal` Google Sheet** (`Live_Trades` & `Closed_Trades`) "
+        "plus live CoinDCX Futures positions, Daily Box Levels (`SH`, `RH`, `MID`, `RL`, `SL`), and `50/200 EMA` trend bias to deliver "
+        "personalized trade audits and real-time setup recommendations."
+    )
+
+    # 1. Fetch Google Sheet Trades
+    sheet_data = get_cached_sheet_trades()
+    if sheet_data.get("ok") and int(sheet_data.get("total_logged", 0)) == 0:
+        # Auto-seed historical app-executed trades on first load if sheet is empty
+        sync_historical_app_trades_to_sheet()
+        get_cached_sheet_trades.clear()
+        sheet_data = get_cached_sheet_trades()
+
+    sh_col1, sh_col2, sh_col3, sh_col4 = st.columns(4)
+    _tot_log = int(sheet_data.get("total_logged", 0))
+    _tot_cls = int(sheet_data.get("total_closed", 0))
+    _w_cnt = int(sheet_data.get("win_count", 0))
+    _l_cnt = int(sheet_data.get("loss_count", 0))
+    _wr_sh = round((_w_cnt / _tot_cls) * 100.0, 1) if _tot_cls > 0 else 0.0
+    _net_sh = float(sheet_data.get("net_realized_pnl_inr", 0.0))
+
+    sh_col1.metric("📄 Sheet Logged Trades", f"{_tot_log}", delta="Live_Trades Tab")
+    sh_col2.metric("✅ Audited Closed Trades", f"{_tot_cls}", delta=f"{_w_cnt}W / {_l_cnt}L ({_wr_sh}% WR)")
+    sh_col3.metric(
+        "💰 Sheet Realized PnL",
+        f"{'+' if _net_sh >= 0 else ''}₹{_net_sh:,.2f}",
+        delta="Closed_Trades Tab",
+        delta_color="normal" if _net_sh >= 0 else "inverse",
+    )
+    sh_col4.metric("🪙 Active Terminal Pair", f"{asset_name}/USDT", delta=fmt_px(live_price))
+
+    btn_sc1, btn_sc2, btn_sc3 = st.columns([1.2, 1.5, 2.3])
+    if btn_sc1.button("🔄 Refresh Google Sheet", use_container_width=True):
+        get_cached_sheet_trades.clear()
+        st.rerun()
+    if btn_sc2.button("📥 Sync App Trades to Sheet", use_container_width=True):
+        ok_sync, msg_sync = sync_historical_app_trades_to_sheet()
+        get_cached_sheet_trades.clear()
+        if ok_sync:
+            st.success(msg_sync)
+        else:
+            st.error(msg_sync)
+        st.rerun()
+    with btn_sc3:
+        if sheet_data.get("ok"):
+            st.success(f"🟢 Connected to Google Sheet **`{sheet_data.get('sheet_name', 'Crypto_Trades_Journal')}`**")
+        else:
+            st.error(f"🔴 Sheet Read Error: {sheet_data.get('error')}")
+
+    with st.expander(f"📋 View All Trades Read from Google Sheet (`Crypto_Trades_Journal` — {_tot_log} Logged, {_tot_cls} Closed)", expanded=False):
+        live_list = sheet_data.get("live_trades", [])
+        closed_list = sheet_data.get("closed_trades", [])
+        if live_list:
+            st.markdown("#### 1. `Live_Trades` Worksheet (Executed App Orders & Signals)")
+            _lt_rows = []
+            for idx_lt, r_lt in enumerate(reversed(live_list), 1):
+                _st_txt = str(r_lt.get("Status", ""))
+                _st_col = "#10b981" if "WIN" in _st_txt.upper() else ("#ef4444" if "LOSS" in _st_txt.upper() else "#3b82f6")
+                _dir_lt = str(r_lt.get("Direction", ""))
+                _b_cls = "badge-buy" if _dir_lt in ("LONG", "BUY") else "badge-sell"
+                _lt_rows.append(
+                    f"<tr>"
+                    f"<td>{idx_lt}</td>"
+                    f"<td>{r_lt.get('Timestamp (IST)', '')}</td>"
+                    f"<td style='font-weight:800;'>{r_lt.get('Pair', '')}</td>"
+                    f"<td><span class='{_b_cls}'>{_dir_lt}</span></td>"
+                    f"<td>${r_lt.get('Entry ($)', '')}</td>"
+                    f"<td>${r_lt.get('TP1 Mid ($)', '')}</td>"
+                    f"<td>${r_lt.get('TP2 Target ($)', '')}</td>"
+                    f"<td>${r_lt.get('Stop Loss ($)', '')}</td>"
+                    f"<td>₹{r_lt.get('Margin (INR)', '')} ({r_lt.get('Leverage', '')})</td>"
+                    f"<td style='color:{_st_col};font-weight:800;'>{_st_txt}</td>"
+                    f"<td>{r_lt.get('Trigger Reason', '')}</td>"
+                    f"</tr>"
+                )
+            st.html(
+                f"<div class='pro-table-wrap'><table class='pro-table'>"
+                f"<thead><tr><th>#</th><th>Timestamp (IST)</th><th>Pair</th><th>Side</th><th>Entry ($)</th>"
+                f"<th>TP1 ($)</th><th>TP2 ($)</th><th>SL ($)</th><th>Margin (Lev)</th><th>Status / Outcome</th><th>Trigger / Audit Notes</th></tr></thead>"
+                f"<tbody>{''.join(_lt_rows)}</tbody></table></div>"
+            )
+        if closed_list:
+            st.markdown("#### 2. `Closed_Trades` Worksheet (Realized PnL Ledger)")
+            _ct_rows = []
+            for idx_ct, r_ct in enumerate(reversed(closed_list), 1):
+                _pnl_raw = str(r_ct.get("Net PnL (INR)", "0")).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
+                try:
+                    _pnl_f = float(_pnl_raw)
+                except Exception:
+                    _pnl_f = 0.0
+                _p_col = "#10b981" if _pnl_f >= 0 else "#ef4444"
+                _p_sgn = "+" if _pnl_f >= 0 else ""
+                _dir_ct = str(r_ct.get("Direction", ""))
+                _b_cls = "badge-buy" if _dir_ct in ("LONG", "BUY") else "badge-sell"
+                _ct_rows.append(
+                    f"<tr>"
+                    f"<td>{idx_ct}</td>"
+                    f"<td>{r_ct.get('Exit Time', '')}</td>"
+                    f"<td style='font-weight:800;'>{r_ct.get('Pair', '')}</td>"
+                    f"<td><span class='{_b_cls}'>{_dir_ct}</span></td>"
+                    f"<td>${r_ct.get('Entry', '')}</td>"
+                    f"<td>${r_ct.get('Exit', '')}</td>"
+                    f"<td>${r_ct.get('Stop Loss', '')}</td>"
+                    f"<td style='color:{_p_col};font-weight:800;'>{_p_sgn}₹{_pnl_f:,.2f}</td>"
+                    f"<td>{r_ct.get('Exit Reason', '')}</td>"
+                    f"</tr>"
+                )
+            st.html(
+                f"<div class='pro-table-wrap'><table class='pro-table'>"
+                f"<thead><tr><th>#</th><th>Exit Time</th><th>Pair</th><th>Side</th><th>Entry ($)</th>"
+                f"<th>Exit ($)</th><th>SL ($)</th><th>Net PnL (₹)</th><th>Outcome & Diagnostic</th></tr></thead>"
+                f"<tbody>{''.join(_ct_rows)}</tbody></table></div>"
+            )
+
+    st.markdown("---")
+
+    # 2. Gemini Model & API Key Configuration Bar
+    if gemini_advisor is None:
+        st.error("Gemini Advisor module (`gemini_advisor.py` / `google-genai`) could not be loaded.")
+    else:
+        current_gem_key = gemini_advisor.get_gemini_api_key()
+        cfg_c1, cfg_c2, cfg_c3 = st.columns([1.6, 1.8, 0.8])
+        with cfg_c1:
+            model_options = [m[0] for m in gemini_advisor.AVAILABLE_GEMINI_MODELS]
+            model_labels = {m[0]: m[1] for m in gemini_advisor.AVAILABLE_GEMINI_MODELS}
+            selected_gemini_model = st.selectbox(
+                "🧠 Select Best Gemini Model (Auto-Fallbacks if Tier Locked)",
+                options=model_options,
+                index=0,
+                format_func=lambda m: model_labels.get(m, m),
+                key="gemini_model_selector",
+            )
+        with cfg_c2:
+            entered_gem_key = st.text_input(
+                "🔑 Gemini API Key (`GEMINI_API_KEY` — from your Google Cloud / AI Studio Subscription)",
+                value=current_gem_key,
+                type="password",
+                placeholder="Paste AIza... key from '+ Create Gemini API key'",
+                key="gemini_api_key_input_widget",
+            )
+        with cfg_c3:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            if st.button("💾 Save Key", use_container_width=True, type="primary"):
+                if entered_gem_key.strip():
+                    gemini_advisor.save_gemini_api_key(entered_gem_key.strip())
+                    st.success("✅ Saved!")
+                    st.rerun()
+                else:
+                    st.warning("Paste a valid key first.")
+
+        if not current_gem_key and not entered_gem_key:
+            st.info(
+                "💡 **1-Click Setup for Your Google Subscription (`Default Gemini Project` `gen-lang-client-0777980903`)**:\n"
+                "1. On your Google Cloud Console Welcome tab (where you have `₹28,569` free credits), click the **`+ Create Gemini API key`** button "
+                "(or open [Google AI Studio API Keys](https://aistudio.google.com/apikey) and click **Create API key** in `Default Gemini Project`).\n"
+                "2. Copy the `AIza...` key, paste it into the **🔑 Gemini API Key** box above, and click **💾 Save Key** (or add `GEMINI_API_KEY = \"AIza...\"` in Streamlit Cloud Secrets)."
+            )
+
+        # Initialize Chat History in Session State
+        if "gemini_chat_messages" not in st.session_state:
+            st.session_state.gemini_chat_messages = [
+                {
+                    "role": "assistant",
+                    "content": (
+                        f"👋 **Hello! I am connected to your `Crypto_Trades_Journal` Google Sheet** "
+                        f"(`{_tot_log}` logged trades, `{_tot_cls}` audited closed trades: `{_w_cnt}W / {_l_cnt}L`) "
+                        f"and live CoinDCX Futures data for **`{asset_name}/USDT`** (`{fmt_px(live_price)}`).\n\n"
+                        f"Click any quick action below or type a prompt to get trade audits, risk checks, and high-probability setup recommendations!"
+                    ),
+                    "model": "system",
+                }
+            ]
+        if "gemini_last_interaction_id" not in st.session_state:
+            st.session_state.gemini_last_interaction_id = None
+
+        # 3. Quick-Action Recommendation Prompts
+        st.markdown("##### ⚡ 1-Click AI Trade Recommendations & Sheet Audits")
+        qa_c1, qa_c2, qa_c3, qa_c4, qa_c5 = st.columns([1.25, 1.25, 1.25, 1.25, 0.7])
+        quick_prompt = None
+        if qa_c1.button("📊 Audit All Sheet Trades", use_container_width=True):
+            quick_prompt = (
+                "Audit all of my App-executed trades from the Crypto_Trades_Journal Google Sheet (`Live_Trades` and `Closed_Trades`). "
+                "Break down: (1) Why my winning trades (`B-INJ_USDT LONG` and `B-FET_USDT LONG`) succeeded, "
+                "(2) The exact root causes of the losing trades (`B-SOL_USDT`, `B-ETH_USDT`, `B-AVAX_USDT`, `B-RENDER_USDT`, `B-FET_USDT`), "
+                "and (3) Concrete checklist rules I should follow today so I only take A+ setups."
+            )
+        if qa_c2.button(f"🎯 Best Setup on {asset_name} Now", use_container_width=True):
+            quick_prompt = (
+                f"Analyze `{selected_pair}` right now using its live price, Daily Box Levels (`SH`, `RH`, `MID`, `RL`, `SL`), "
+                f"active signal status, and our historical Google Sheet trades. Should I enter `LONG`, `SHORT`, or `WAIT`? "
+                f"Give exact Entry 1, Entry 2 @ Sweep, TP1 (50% book), TP2 (50% runner), and Stop Loss levels."
+            )
+        if qa_c3.button("🛡️ Review Open Position Risk", use_container_width=True):
+            quick_prompt = (
+                "Check my currently open CoinDCX Futures positions and 1-Crypto-at-a-Time App Trade Lock. "
+                "Evaluate my current unrealized PnL, distance to TP1/TP2/SL, and recommend whether I should hold, "
+                "ratchet my Stop Loss, or close the trade based on lessons from our Google Sheet journal."
+            )
+        if qa_c4.button("🏆 Top Coins to Trade Today", use_container_width=True):
+            quick_prompt = (
+                "Based on our Google Sheet trade history (`Crypto_Trades_Journal`) and our 10x Box Theory Sweep + 2-Entry Runner strategy, "
+                "which coins have performed best for us, which coins/conditions caused drawdowns, and what is the optimal single-trade margin "
+                "and execution gameplan for today's sessions?"
+            )
+        if qa_c5.button("🗑️ Clear Chat", use_container_width=True):
+            st.session_state.gemini_chat_messages = st.session_state.gemini_chat_messages[:1]
+            st.session_state.gemini_last_interaction_id = None
+            st.rerun()
+
+        # Render existing chat messages
+        for msg in st.session_state.gemini_chat_messages:
+            with st.chat_message(msg.get("role", "assistant")):
+                if msg.get("model") and msg.get("model") != "system":
+                    st.caption(f"🧠 Model: `{msg['model']}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed")
+                st.markdown(msg.get("content", ""))
+
+        # Chat Input box
+        typed_prompt = st.chat_input(
+            f"Ask Gemini about your Google Sheet trades, {asset_name}/USDT levels, or what trade to take next..."
+        )
+        active_prompt = quick_prompt or typed_prompt
+
+        if active_prompt:
+            active_key = (entered_gem_key or current_gem_key or "").strip()
+            if active_key and active_key != current_gem_key:
+                gemini_advisor.save_gemini_api_key(active_key)
+
+            st.session_state.gemini_chat_messages.append({"role": "user", "content": active_prompt})
+            with st.chat_message("user"):
+                st.markdown(active_prompt)
+
+            with st.chat_message("assistant"):
+                with st.spinner(f"🤖 Consulting `{selected_gemini_model}` with live `Crypto_Trades_Journal` Sheet + `{selected_pair}` market data..."):
+                    live_mkt_ctx = gemini_advisor.build_live_market_context(selected_pair=selected_pair)
+                    resp = gemini_advisor.ask_gemini_trade_advisor(
+                        user_prompt=active_prompt,
+                        preferred_model=selected_gemini_model,
+                        previous_interaction_id=st.session_state.get("gemini_last_interaction_id"),
+                        sheet_markdown_context=sheet_data.get("markdown_summary", ""),
+                        market_context=live_mkt_ctx,
+                        api_key=active_key,
+                    )
+                if resp.get("ok"):
+                    used_m = resp.get("model_used") or selected_gemini_model
+                    st.session_state.gemini_last_interaction_id = resp.get("interaction_id")
+                    st.caption(f"🧠 Model: `{used_m}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed")
+                    st.markdown(resp.get("text", ""))
+                    st.session_state.gemini_chat_messages.append({
+                        "role": "assistant",
+                        "content": resp.get("text", ""),
+                        "model": used_m,
+                    })
+                else:
+                    err_msg = f"⚠️ **{resp.get('error', 'Failed to generate recommendation.')}**"
+                    st.error(err_msg)
+                    st.session_state.gemini_chat_messages.append({
+                        "role": "assistant",
+                        "content": err_msg,
+                        "model": "error",
+                    })
+

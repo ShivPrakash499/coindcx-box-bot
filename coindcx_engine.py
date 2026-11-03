@@ -2740,9 +2740,51 @@ def register_app_trade_lock(
         "is_live_exchange": bool(is_live_exchange),
     }
     cfg = get_autotrade_config()
+    prev_lock = cfg.get("active_trade_lock") or {}
+    is_new_live_lock = bool(
+        is_live_exchange
+        and (
+            prev_lock.get("pair") != pair
+            or str(prev_lock.get("direction", "")).upper() != str(direction).upper()
+            or (time.time() - float(prev_lock.get("opened_ts", 0.0) or 0.0)) > 600
+        )
+    )
     hist = cfg.get("history", [])
     hist.insert(0, {**lock_info, "status": "APP_API_LOCK_SET"})
     save_autotrade_config({"active_trade_lock": lock_info, "history": hist[:30]})
+
+    if is_new_live_lock:
+        def _async_sheet_log():
+            try:
+                import sheets_logger
+                e_f = float(entry or 0.0)
+                tp1_f = float(tp1 or 0.0)
+                sl_f = float(stop_loss or 0.0)
+                m_f = float(margin_inr or 20000.0)
+                lev_f = int(leverage or 10)
+                proj_tp1 = round(abs(tp1_f - e_f) / e_f * m_f * lev_f, 2) if e_f > 0 else 0.0
+                proj_sl = round(-abs(e_f - sl_f) / e_f * m_f * lev_f, 2) if e_f > 0 else 0.0
+                sheets_logger.log_trade_to_google_sheet({
+                    "timestamp": now_str,
+                    "pair": pair,
+                    "signal": str(direction).upper(),
+                    "entry": e_f,
+                    "stop_loss": sl_f,
+                    "tp1": tp1_f,
+                    "tp2": float(tp2 or tp1 or 0.0),
+                    "crypto_qty": round(float(qty1 or 0.0) + float(qty2 or 0.0), 4),
+                    "margin_inr": m_f,
+                    "leverage": lev_f,
+                    "profit_tp1_inr": proj_tp1,
+                    "loss_sl_inr": proj_sl,
+                    "strategy_name": "Box Theory Sweep (App Live Order)",
+                    "trigger_reason": f"{mode} | E1: ${e_f}, E2: ${float(entry2_sweep or 0.0)}",
+                })
+            except Exception as _se:
+                print(f"[Auto Sheet Log Notice]: {_se}")
+
+        threading.Thread(target=_async_sheet_log, daemon=True).start()
+
     return lock_info
 
 
