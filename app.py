@@ -188,19 +188,22 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
+_DAEMON_VERSION = 2
+sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
+
 @st.cache_resource
-def _ensure_background_monitor():
-    """Starts the 24/7 background monitor daemon exactly once per Streamlit server process,
+def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
+    """Starts the 24/7 background monitor daemon once per version,
     BEFORE check_authentication() so alerts and AutoTrade run 24/7 even when no browser session is logged in."""
     def _monitor_worker():
-        while True:
+        while sys.__dict__.get("_active_daemon_version") == daemon_version:
             try:
                 _reload_if_updated(coindcx_engine)
                 _reload_if_updated(signal_monitor)
                 if signal_monitor:
                     auto_cfg = coindcx_engine.get_autotrade_config()
                     rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
-                    m_inr = float(auto_cfg.get("single_trade_margin_inr") or rot.get("margin_inr", 100000.0))
+                    m_inr = float(auto_cfg.get("single_trade_margin_inr") or rot.get("margin_inr", 15762.39))
                     lev = int(auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
                     u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
                     watch_pairs = coindcx_engine.get_high_volatility_watchlist(top_n=12)
@@ -216,11 +219,11 @@ def _ensure_background_monitor():
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
             time.sleep(60)
 
-    th = threading.Thread(target=_monitor_worker, daemon=True, name="CryptoTradeAssistantDaemon")
+    th = threading.Thread(target=_monitor_worker, daemon=True, name=f"CryptoTradeAssistantDaemon_v{daemon_version}")
     th.start()
-    return True
+    return daemon_version
 
-_ensure_background_monitor()
+_ensure_background_monitor(_DAEMON_VERSION)
 
 # ----------------- SECURITY & AUTHENTICATION GATE -----------------
 def get_security_pin():
