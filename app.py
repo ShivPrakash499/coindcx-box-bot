@@ -188,7 +188,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 3
+_DAEMON_VERSION = 4
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -2136,7 +2136,7 @@ elif active_section == "📊 Positions":
                     (st.success if ok else st.error)(m)
             if b4.button(f"❌ Close {sym_p}", key=f"lt_close_{pid}", use_container_width=True):
                 with st.spinner(f"Closing {sym_p}..."):
-                    ok, m = exit_coindcx_position(pid)
+                    ok, m = exit_coindcx_position(pid, pair=pr)
                 if ok:
                     _lt_finish_close(p, pnl_inr, "Manual close")
                     coindcx_engine.clear_autotrade_active_lock()
