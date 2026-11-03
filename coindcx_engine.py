@@ -3353,3 +3353,13 @@ def get_rotational_margin_inr(leverage: int = 10) -> dict:
     margin = round(equity * TRADE_ALLOCATION_FRACTION, 2)
     return {"wallet_equity_inr": equity, "margin_inr": margin, "leverage": leverage,
             "notional_inr": margin * leverage, "is_live_api": live}
+
+
+# Ensure background daemon thread also hot-reloads signal_monitor whenever coindcx_engine reloads
+try:
+    if "signal_monitor" in _sys.modules:
+        import importlib as _il
+        _il.reload(_sys.modules["signal_monitor"])
+except Exception as _sm_rel_err:
+    print(f"[signal_monitor hot-reload notice]: {_sm_rel_err}")
+
