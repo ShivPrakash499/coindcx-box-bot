@@ -560,13 +560,12 @@ def fetch_coindcx_futures_balance():
     """
     Fetches real-time futures wallet balance directly from CoinDCX Futures API.
     Combines USDT Futures Wallet, INR Wallet, locked margin, and calculates total INR equivalent.
-    Falls back to saved wallet_balance_inr (₹40,569.80) if credentials are offline or expired.
+    Falls back to saved wallet_balance_inr (₹47,287.18) if credentials are offline or expired.
     """
     usd_inr = get_coindcx_live_usdt_inr_rate()
-    raw_env_bal = float(os.getenv("TOTAL_WALLET_INR", 40569.80))
-    # Replace legacy 30000 / 250000 placeholder defaults with actual 40569.80 wallet balance
-    if raw_env_bal in (30000.0, 250000.0):
-        default_balance = 40569.80
+    raw_env_bal = float(os.getenv("TOTAL_WALLET_INR", 47287.18))
+    if raw_env_bal in (30000.0, 250000.0, 40569.80):
+        default_balance = 47287.18
     else:
         default_balance = raw_env_bal
 
@@ -574,8 +573,10 @@ def fetch_coindcx_futures_balance():
         if os.path.exists(AUTOTRADE_CONFIG_FILE):
             with open(AUTOTRADE_CONFIG_FILE, "r", encoding="utf-8") as _f:
                 _saved_cfg = json.load(_f)
-                if isinstance(_saved_cfg, dict) and float(_saved_cfg.get("wallet_balance_inr", 0) or 0) > 0:
-                    default_balance = float(_saved_cfg["wallet_balance_inr"])
+                if isinstance(_saved_cfg, dict):
+                    _sb = float(_saved_cfg.get("wallet_balance_inr", 0) or 0)
+                    if _sb > 0 and _sb not in (30000.0, 250000.0, 40569.80):
+                        default_balance = _sb
     except Exception:
         pass
 
@@ -591,13 +592,18 @@ def fetch_coindcx_futures_balance():
             "locked_margin_usd": 0.0,
             "cross_user_margin_usd": 0.0,
             "is_live_api": False,
-            "source": "Synced Wallet Balance (₹40,569.80)"
+            "source": f"Synced Wallet Balance (₹{default_balance:,.2f})"
         }
 
     # Return fresh cached live balance if queried within the last 12 seconds to prevent parallel nonce bursts
     now_ts = time.time()
     cached_bal = _WALLET_BALANCE_CACHE.get("data")
-    if cached_bal and (now_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))) < 12.0 and cached_bal.get("_key_prefix") == api_key[:8]:
+    if (
+        cached_bal
+        and cached_bal.get("is_live_api")
+        and (now_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))) < 12.0
+        and cached_bal.get("_key_prefix") == api_key[:8]
+    ):
         return dict(cached_bal)
 
     usdt_balance = 0.0
@@ -608,12 +614,10 @@ def fetch_coindcx_futures_balance():
     is_live = False
     api_err_msg = ""
 
-    # 1. Primary: CoinDCX Futures Wallet Endpoint (/exchange/v1/derivatives/futures/wallets)
-    res_fut, err_fut = _send_coindcx_signed_request("GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets")
-    raw_fut_txt = res_fut.text[:500] if res_fut is not None else f"None:{err_fut}"
-    if res_fut is not None and res_fut.status_code == 200:
+    def _parse_futures_wallets(resp_obj) -> bool:
+        nonlocal usdt_balance, inr_balance, locked_inr, locked_margin_usd, cross_margin_usd
         try:
-            wallets = res_fut.json()
+            wallets = resp_obj.json()
             wallet_list = wallets if isinstance(wallets, list) else (wallets.get("wallets") or wallets.get("data") or []) if isinstance(wallets, dict) else []
             for w in wallet_list:
                 if not isinstance(w, dict):
@@ -629,9 +633,15 @@ def fetch_coindcx_futures_balance():
                 elif curr == "INR":
                     inr_balance += bal
                     locked_inr += (locked + cross)
-            is_live = True
+            return True
         except Exception as e:
             print(f"[Futures Wallet Parse Error]: {e}")
+            return False
+
+    # 1. Primary: CoinDCX Futures Wallet Endpoint (/exchange/v1/derivatives/futures/wallets)
+    res_fut, err_fut = _send_coindcx_signed_request("GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets")
+    if res_fut is not None and res_fut.status_code == 200:
+        is_live = _parse_futures_wallets(res_fut)
     elif res_fut is not None:
         try:
             api_err_msg = res_fut.json().get("message", f"HTTP {res_fut.status_code}")
@@ -646,21 +656,26 @@ def fetch_coindcx_futures_balance():
             {},
         )
         if res_spot is not None and res_spot.status_code == 200:
-            try:
-                balances = res_spot.json()
-                if isinstance(balances, list):
-                    for item in balances:
-                        curr = str(item.get("currency") or item.get("currency_short_name") or "").upper()
-                        bal = float(item.get("balance", 0.0) or 0.0)
-                        locked_s = float(item.get("locked_balance", 0.0) or 0.0)
-                        if curr == "INR":
-                            inr_balance = max(inr_balance, bal)
-                            locked_inr = max(locked_inr, locked_s)
-                        elif curr == "USDT":
-                            usdt_balance = max(usdt_balance, bal)
-                    is_live = True
-            except Exception as e:
-                print(f"[Spot Balance Parse Error]: {e}")
+            # Now that the session is pinned to the allowlisted NAT IP, re-query Futures Wallets immediately!
+            res_fut_retry, _ = _send_coindcx_signed_request("GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets")
+            if res_fut_retry is not None and res_fut_retry.status_code == 200:
+                is_live = _parse_futures_wallets(res_fut_retry)
+            if not is_live:
+                try:
+                    balances = res_spot.json()
+                    if isinstance(balances, list):
+                        for item in balances:
+                            curr = str(item.get("currency") or item.get("currency_short_name") or "").upper()
+                            bal = float(item.get("balance", 0.0) or 0.0)
+                            locked_s = float(item.get("locked_balance", 0.0) or 0.0)
+                            if curr == "INR":
+                                inr_balance = max(inr_balance, bal)
+                                locked_inr = max(locked_inr, locked_s)
+                            elif curr == "USDT":
+                                usdt_balance = max(usdt_balance, bal)
+                        is_live = True
+                except Exception as e:
+                    print(f"[Spot Balance Parse Error]: {e}")
         elif not api_err_msg and res_spot is not None:
             try:
                 api_err_msg = res_spot.json().get("message", f"HTTP {res_spot.status_code}")
@@ -675,24 +690,11 @@ def fetch_coindcx_futures_balance():
         if total_inr <= 0:
             total_inr = default_balance
             avail_inr = default_balance
-        if not _PERSIST.get("logged_wallet_json_v1"):
-            _PERSIST["logged_wallet_json_v1"] = True
-            def _log_w():
-                try:
-                    import sheets_logger
-                    book = sheets_logger._client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
-                    ws = sheets_logger._get_ws(book, "_Cloud_Diag")
-                    ws.append_row([
-                        datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-                        "WALLET_DUMP",
-                        f"fut_code={res_fut.status_code if res_fut is not None else 'None'}",
-                        f"raw_calc={raw_calc_inr}",
-                        f"inr={inr_balance}, locked={locked_inr}, usdt={usdt_balance}",
-                        raw_fut_txt,
-                    ])
-                except Exception:
-                    pass
-            _threading.Thread(target=_log_w, daemon=True).start()
+        else:
+            try:
+                save_autotrade_config({"wallet_balance_inr": round(total_inr, 2)})
+            except Exception:
+                pass
         live_res = {
             "total_inr": round(total_inr, 2),
             "available_inr": round(avail_inr, 2),
@@ -2386,8 +2388,8 @@ def run_strategy_backtest(
 
 
 
-_raw_def_wallet = float(os.getenv("DEFAULT_WALLET_INR", 40569.80))
-DEFAULT_WALLET_INR = 40569.80 if _raw_def_wallet in (30000.0, 250000.0) else _raw_def_wallet
+_raw_def_wallet = float(os.getenv("DEFAULT_WALLET_INR", 47287.18))
+DEFAULT_WALLET_INR = 47287.18 if _raw_def_wallet in (30000.0, 250000.0, 40569.80) else _raw_def_wallet
 TRADE_ALLOCATION_FRACTION = 1.0 / 3.0
 
 # High-Volatility / High-Movement Crypto Futures Universe (Verified Profitable at 10x Leverage: 67.2% WR, +407% 30d ROI)
@@ -3388,8 +3390,36 @@ def get_rotational_margin_inr(leverage: int = 10) -> dict:
             "notional_inr": margin * leverage, "is_live_api": live}
 
 
-if _PERSIST.get("boot_tested_key") != "dump_v1":
-    _PERSIST["boot_tested_key"] = "dump_v1"
+def _sync_all_in_memory_module_instances():
+    """Upgrades any older in-memory coindcx_engine module dicts held by background threads across Streamlit hot-reloads."""
+    try:
+        import gc
+        import types
+        cur_globals = globals()
+        for obj in gc.get_objects():
+            if isinstance(obj, types.FunctionType) and getattr(obj, "__name__", "") in (
+                "fetch_coindcx_futures_balance",
+                "_get_coindcx_credentials",
+                "_send_coindcx_signed_request",
+                "get_rotational_margin_inr",
+            ):
+                g = getattr(obj, "__globals__", None)
+                if isinstance(g, dict) and g is not cur_globals and "_DEFAULT_ACTIVE_KEY" in g:
+                    g["_DEFAULT_ACTIVE_KEY"] = _DEFAULT_ACTIVE_KEY
+                    g["_DEFAULT_ACTIVE_SECRET"] = _DEFAULT_ACTIVE_SECRET
+                    g["_OBSOLETE_KEYS"] = _OBSOLETE_KEYS
+                    g["_get_coindcx_credentials"] = _get_coindcx_credentials
+                    g["_send_coindcx_signed_request"] = _send_coindcx_signed_request
+                    g["fetch_coindcx_futures_balance"] = fetch_coindcx_futures_balance
+    except Exception:
+        pass
+
+
+_sync_all_in_memory_module_instances()
+
+if _PERSIST.get("boot_tested_key") != "live_47287_v2":
+    _PERSIST["boot_tested_key"] = "live_47287_v2"
     _WALLET_BALANCE_CACHE["data"] = None
     _WALLET_BALANCE_CACHE["ts"] = 0.0
+    _WALLET_BALANCE_CACHE["last_good_live"] = None
     _threading.Thread(target=fetch_coindcx_futures_balance, daemon=True).start()

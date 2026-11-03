@@ -518,14 +518,18 @@ check_and_update_paper_orders()
 st.sidebar.markdown("### ⚡ Pro Terminal Setup")
 
 wallet_data = dict(get_cached_balance() or {})
+if not wallet_data.get("is_live_api") or float(wallet_data.get("total_inr", 0) or 0) in (0.0, 30000.0, 250000.0, 40569.80):
+    _fresh_w = fetch_coindcx_futures_balance()
+    if isinstance(_fresh_w, dict) and _fresh_w.get("is_live_api"):
+        wallet_data = dict(_fresh_w)
 _auto_cfg = coindcx_engine.get_autotrade_config()
 
-# Allow live sync or manual override of Futures Wallet Balance (defaults to ₹40,569.80 if API is offline/expired)
-_init_wallet_inr = float(wallet_data.get("total_inr", 40569.80) or 40569.80)
-if _init_wallet_inr in (30000.0, 250000.0):
-    _init_wallet_inr = 40569.80
+# Allow live sync or manual override of Futures Wallet Balance (defaults to ₹47,287.18 if API is offline/expired)
+_init_wallet_inr = float(wallet_data.get("total_inr", 47287.18) or 47287.18)
+if _init_wallet_inr in (30000.0, 250000.0, 40569.80):
+    _init_wallet_inr = 47287.18
 wallet_data["total_inr"] = _init_wallet_inr
-if float(wallet_data.get("available_inr", 0.0) or 0.0) in (0.0, 30000.0, 250000.0):
+if float(wallet_data.get("available_inr", 0.0) or 0.0) in (0.0, 30000.0, 250000.0, 40569.80):
     wallet_data["available_inr"] = _init_wallet_inr
 
 st.sidebar.metric(
