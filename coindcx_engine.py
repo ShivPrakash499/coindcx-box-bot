@@ -382,7 +382,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     api_key = "".join(api_key.split())
     api_secret = "".join(api_secret.split())
 
-    if not api_key or api_key in _OBSOLETE_KEYS:
+    if not api_key or api_key in _OBSOLETE_KEYS or api_key == _DEFAULT_ACTIVE_KEY:
         api_key = _DEFAULT_ACTIVE_KEY
         api_secret = _DEFAULT_ACTIVE_SECRET
 
@@ -399,16 +399,13 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
     Executes signed CoinDCX REST API requests with HMAC-SHA256 authentication.
     - Uses a process-persistent HTTP Keep-Alive session so once a TCP socket is pinned to the
       allowlisted Cloud NAT IP, all subsequent requests reuse that exact socket.
-    - If a socket hits a non-allowlisted NAT IP (HTTP 401 Invalid credentials), uses
-      https://api.coindcx.com/cdn-cgi/trace to inspect the exact NAT IP of each candidate socket
-      and scans up to 18 fresh TCP sockets to find and pin the allowlisted NAT IP.
+    - Always probes https://api.coindcx.com/cdn-cgi/trace BEFORE sending the signed request on
+      an unverified session, and always sends 13-digit milliseconds (`use_ms=True`) FIRST.
     """
     api_key, api_secret = _get_coindcx_credentials()
 
     if not api_key or not api_secret:
         return None, "API credentials not configured in .env or Streamlit Secrets"
-
-    has_explicit_ms = isinstance(payload, dict) and int(payload.get("timestamp", 0) or 0) > 100000000000
 
     def _exec_on_session(sess: requests.Session, use_ms: bool):
         body = payload.copy() if payload else {}
@@ -427,13 +424,15 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
 
     try:
         res = None
-        rejected_ips = set()
+        ip_fail_counts = {}
 
         with _COINDCX_SIGN_LOCK:
-            # Step 1: Test current persistent session (both ms and sec timestamps)
+            # Step 1: Test current persistent session (always 13-digit ms timestamp FIRST!)
             sess = _PERSIST["session"]
+            cur_ip = _PERSIST.get("pinned_ip") or _probe_session_coindcx_ip(sess, timeout=2.0)
+
             for attempt in range(2):
-                use_ms = (attempt == 0) if has_explicit_ms else (attempt == 1)
+                use_ms = (attempt == 0)
                 try:
                     res = _exec_on_session(sess, use_ms)
                 except Exception:
@@ -442,35 +441,33 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
 
                 if res is not None and res.status_code == 200:
                     _PERSIST["session_verified"] = True
-                    if not _PERSIST.get("pinned_ip"):
-                        _PERSIST["pinned_ip"] = _probe_session_coindcx_ip(sess, timeout=2.0)
+                    _PERSIST["pinned_ip"] = cur_ip or _probe_session_coindcx_ip(sess, timeout=2.0)
                     return res, None
 
                 if res is not None and res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
                     _PERSIST["session_verified"] = True
                     return res, None
 
-            # Step 2: If HTTP 401 Invalid credentials occurred, check which NAT IP this socket used
-            # and scan fresh TCP sockets across the Cloud NAT pool to find the allowlisted IP!
-            if res is None or res.status_code == 401:
-                cur_ip = _probe_session_coindcx_ip(sess, timeout=2.0)
-                if cur_ip:
-                    rejected_ips.add(cur_ip)
+                time.sleep(0.06)
 
-                for _ in range(16):
+            # Step 2: If HTTP 401 Invalid credentials occurred, scan fresh TCP sockets across the Cloud NAT pool!
+            if res is None or res.status_code == 401:
+                if cur_ip:
+                    ip_fail_counts[cur_ip] = ip_fail_counts.get(cur_ip, 0) + 1
+
+                for _ in range(18):
                     cand_sess = requests.Session()
                     cand_ip = _probe_session_coindcx_ip(cand_sess, timeout=2.0)
-                    if cand_ip and cand_ip in rejected_ips:
+                    if cand_ip and ip_fail_counts.get(cand_ip, 0) >= 2:
                         try:
                             cand_sess.close()
                         except Exception:
                             pass
                         continue
 
-                    # Found a new, untested NAT IP (or trace unavailable) -> test signed request
                     cand_ok = False
                     for attempt in range(2):
-                        use_ms = (attempt == 0) if has_explicit_ms else (attempt == 1)
+                        use_ms = (attempt == 0)
                         try:
                             res = _exec_on_session(cand_sess, use_ms)
                         except Exception:
@@ -482,6 +479,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
                         if res is not None and res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
                             cand_ok = True
                             break
+                        time.sleep(0.06)
 
                     if cand_ok:
                         try:
@@ -494,7 +492,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=6):
                         return res, None
                     else:
                         if cand_ip:
-                            rejected_ips.add(cand_ip)
+                            ip_fail_counts[cand_ip] = ip_fail_counts.get(cand_ip, 0) + 1
                         try:
                             cand_sess.close()
                         except Exception:
@@ -684,7 +682,8 @@ def fetch_coindcx_futures_balance():
     seen_ips = _PERSIST.get("seen_coindcx_ips") or []
     ip_hint = f" | CoinDCX sees IP: {', '.join(seen_ips)}" if seen_ips else ""
     key_hint = f" | Key: {api_key[:6]}..{api_key[-4:]}" if len(api_key) >= 12 else ""
-    detailed_err = f"{api_err_msg}{ip_hint}{key_hint}" if api_err_msg else ""
+    sec_hint = f" | Sec: {api_secret[:4]}..{api_secret[-4:]}" if len(api_secret) >= 12 else ""
+    detailed_err = f"{api_err_msg}{ip_hint}{key_hint}{sec_hint}" if api_err_msg else ""
 
     return {
         "total_inr": round(default_balance, 2),
