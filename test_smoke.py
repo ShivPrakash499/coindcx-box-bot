@@ -145,6 +145,7 @@ def test_3_ui_non_blocking_latency_gate():
 def test_4_strategy_and_two_entry_levels():
     print("[4/4] Verifying 2-Entry + Runner level normalization (LONG & SHORT)...")
     import coindcx_engine as eng
+    import strategies as strat
 
     long_lvls = eng.normalize_two_entry_runner_levels(
         pair="B-NEAR_USDT",
