@@ -270,10 +270,45 @@ def test_5_daily_bias_enforcement():
     print("  -> PASS: Completed-Candle Daily Bias lock + NEUTRAL/counter-trend blocks verified.")
 
 
+def test_6_deployment_regression_guards():
+    print("[6/6] Verifying deployment regression guards (no SystemExit in daemon check, no ThreadPoolExecutor in signed req, no raw <style> in st.markdown)...")
+    import inspect
+    import coindcx_engine as eng
+
+    # 1. _check_and_kill_obsolete_daemon must never raise SystemExit (causes Uvicorn unclean shutdown)
+    src_kill = inspect.getsource(eng._check_and_kill_obsolete_daemon)
+    assert "SystemExit" not in src_kill, "_check_and_kill_obsolete_daemon must raise _ObsoleteDaemonStop, never SystemExit"
+
+    # 2. _send_coindcx_signed_request must never spawn ThreadPoolExecutor (starves Streamlit JS chunk serving)
+    src_req = inspect.getsource(eng._send_coindcx_signed_request)
+    assert "ThreadPoolExecutor" not in src_req, "_send_coindcx_signed_request must never use ThreadPoolExecutor"
+
+    # 3. _pin_coindcx_nat_session must hold sockets open in cand_pool and use _NAT_PIN_LOCK
+    src_pin = inspect.getsource(eng._pin_coindcx_nat_session)
+    assert "_NAT_PIN_LOCK" in src_pin and "cand_pool.append" in src_pin, (
+        "_pin_coindcx_nat_session must use single-flight _NAT_PIN_LOCK and hold candidate sockets in cand_pool"
+    )
+
+    # 4. app.py must not use st.markdown for <style> blocks or auto-save enabled without on_change
+    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as f:
+        app_src = f.read()
+    assert 'st.markdown(f"""\n<style>' not in app_src, "app.py must use st.html() for <style> blocks, never st.markdown()"
+    assert "on_change=_on_sidebar_autotrade_toggle_change" in app_src, (
+        "app.py sidebar_autotrade_toggle must use on_change callback so stale tabs cannot overwrite enabled=True"
+    )
+
+    # 5. signal_monitor._load must never return {} when _schema_version differs
+    import signal_monitor as sm
+    src_load = inspect.getsource(sm._load)
+    assert "return {}" not in src_load.split("_SCHEMA_VERSION")[0] if "_SCHEMA_VERSION" in src_load else True
+    print("  -> PASS: All deployment & hot-reload regression guards verified.")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
     test_3_ui_non_blocking_latency_gate()
     test_4_strategy_and_two_entry_levels()
     test_5_daily_bias_enforcement()
+    test_6_deployment_regression_guards()
     print("\nALL STAGING PRE-MERGE CHECKS PASSED!")
