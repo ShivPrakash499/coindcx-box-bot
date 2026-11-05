@@ -301,7 +301,19 @@ def test_6_deployment_regression_guards():
     import signal_monitor as sm
     src_load = inspect.getsource(sm._load)
     assert "return {}" not in src_load.split("_SCHEMA_VERSION")[0] if "_SCHEMA_VERSION" in src_load else True
-    print("  -> PASS: All deployment & hot-reload regression guards verified.")
+
+    # 6. Verify TP1 profit-preservation SL computation & partial-fill / 15m-wick detection
+    sl_short_base = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10)
+    assert abs(sl_short_base - 7.20) < 1e-4, f"Expected SHORT base profit-lock SL at $7.20, got {sl_short_base}"
+    sl_short_prev15m = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10, prev_candle_high=7.16)
+    assert abs(sl_short_prev15m - 7.16) < 1e-4, f"Expected tighter prev 15m high SL at $7.16, got {sl_short_prev15m}"
+
+    sl_long_base = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00)
+    assert abs(sl_long_base - 3.90) < 1e-4, f"Expected LONG base profit-lock SL at $3.90, got {sl_long_base}"
+    sl_long_prev15m = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00, prev_candle_low=3.94)
+    assert abs(sl_long_prev15m - 3.94) < 1e-4, f"Expected tighter prev 15m low SL at $3.94, got {sl_long_prev15m}"
+
+    print("  -> PASS: All deployment & hot-reload regression guards + TP1 profit-lock SL verified.")
 
 
 if __name__ == "__main__":

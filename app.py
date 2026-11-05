@@ -188,7 +188,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 5
+_DAEMON_VERSION = 7
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -578,10 +578,10 @@ usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (1-Slot)")
-# Sync stale browser session toggle state if v6 disarmed AutoTrade on disk
+# Sync stale browser session toggle state if v7 disarmed AutoTrade on disk
 _disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
-if st.session_state.get("_autotrade_disarm_sync_v") != 6:
-    st.session_state["_autotrade_disarm_sync_v"] = 6
+if st.session_state.get("_autotrade_disarm_sync_v") != 7:
+    st.session_state["_autotrade_disarm_sync_v"] = 7
     st.session_state["sidebar_autotrade_toggle"] = _disk_auto_enabled
 
 
@@ -2106,10 +2106,12 @@ elif active_section == "📊 Positions":
         if tp1 and tp2:
             half = (tp1 + tp2) / 2.0
             reached = (lambda lvl: mark_p >= lvl) if is_long else (lambda lvl: mark_p <= lvl)
+            tp1_lock_already_hit = bool(auto_lock_cfg.get("pair") == pr and auto_lock_cfg.get("tp1_hit"))
             if reached(half):
                 ratchet, target_sl = "🔒 ≥50% to TP2: Ratchet SL to TP1", tp1
-            elif reached(tp1):
-                ratchet, target_sl = "✅ TP1 reached: Move SL to Breakeven", entry_p
+            elif reached(tp1) or tp1_lock_already_hit:
+                prof_sl = coindcx_engine.compute_tp1_profit_lock_sl(pr, p["direction"], entry_p, tp1)
+                ratchet, target_sl = f"✅ TP1 reached: Lock SL in Profit ({fmt_px(prof_sl)})", prof_sl
 
         pnl_inr, roe = float(p["pnl_inr"]), float(p["roe_pct"])
         col = "#10b981" if pnl_inr >= 0 else "#ef4444"

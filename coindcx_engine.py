@@ -426,7 +426,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 6
+_REQUIRED_DAEMON_VERSION = 7
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -437,7 +437,7 @@ class _ObsoleteDaemonStop(BaseException):
 
 
 def _check_and_kill_obsolete_daemon():
-    """Immediately terminates any background daemon thread from an older version (< v6)."""
+    """Immediately terminates any background daemon thread from an older version (< v7)."""
     _tname = _threading.current_thread().name
     if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_REQUIRED_DAEMON_VERSION}":
         _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
@@ -2244,9 +2244,13 @@ def run_strategy_backtest(
                         exit_reason = f"TP1 (50% Book) + TP2 (50% Big Drop Runner){scale_tag}"
                     elif c_high >= tp1_p:
                         active_trade["tp1_hit"] = True
-                        # Lock Runner SL at +50% of TP1 distance (or TP1 if already halfway to TP2) so runner never round-trips to zero
+                        prev_c = df_records[idx - 1] if idx > 0 else candle
+                        prev_l = float(prev_c["low"])
                         mid_runner = 0.5 * (tp1_p + tp2_p)
-                        new_sl = tp1_p if c_high >= mid_runner else (entry_p + 0.5 * (tp1_p - entry_p))
+                        if c_high >= mid_runner:
+                            new_sl = tp1_p
+                        else:
+                            new_sl = compute_tp1_profit_lock_sl(pair, "LONG", entry_p, tp1_p, prev_candle_low=prev_l)
                         active_trade["stop_loss"] = new_sl
                         sl_p = new_sl
                 else:
@@ -2262,7 +2266,7 @@ def run_strategy_backtest(
                     elif c_low <= sl_p:
                         exit_triggered = True
                         exit_price = 0.5 * tp1_p + 0.5 * sl_p
-                        r_lbl = "Runner Locked at TP1" if sl_p >= tp1_p else "Runner Trailing Profit SL"
+                        r_lbl = "Runner Locked at TP1" if sl_p >= tp1_p else "Runner Profit-Locked SL"
                         exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
             else:  # SHORT
                 if not active_trade.get("tp1_hit", False):
@@ -2276,8 +2280,13 @@ def run_strategy_backtest(
                         exit_reason = f"TP1 (50% Book) + TP2 (50% Big Drop Runner){scale_tag}"
                     elif c_low <= tp1_p:
                         active_trade["tp1_hit"] = True
+                        prev_c = df_records[idx - 1] if idx > 0 else candle
+                        prev_h = float(prev_c["high"])
                         mid_runner = 0.5 * (tp1_p + tp2_p)
-                        new_sl = tp1_p if c_low <= mid_runner else (entry_p - 0.5 * (entry_p - tp1_p))
+                        if c_low <= mid_runner:
+                            new_sl = tp1_p
+                        else:
+                            new_sl = compute_tp1_profit_lock_sl(pair, "SHORT", entry_p, tp1_p, prev_candle_high=prev_h)
                         active_trade["stop_loss"] = new_sl
                         sl_p = new_sl
                 else:
@@ -2293,7 +2302,7 @@ def run_strategy_backtest(
                     elif c_high >= sl_p:
                         exit_triggered = True
                         exit_price = 0.5 * tp1_p + 0.5 * sl_p
-                        r_lbl = "Runner Locked at TP1" if sl_p <= tp1_p else "Runner Trailing Profit SL"
+                        r_lbl = "Runner Locked at TP1" if sl_p <= tp1_p else "Runner Profit-Locked SL"
                         exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
 
             if exit_triggered:
@@ -3087,6 +3096,142 @@ def register_app_trade_lock(
     return lock_info
 
 
+def compute_tp1_profit_lock_sl(
+    pair: str,
+    direction: str,
+    entry_px: float,
+    tp1_px: float,
+    prev_candle_high: float = None,
+    prev_candle_low: float = None,
+) -> float:
+    """
+    Computes the optimal profit-preserving Stop Loss once TP1 (50% Partial Book) is reached (Strategy 3B/3C):
+      - Locks at least 50% of the Entry 1 -> TP1 profit distance (`entry +/- 0.5 * |tp1 - entry|`),
+        and never worse than Breakeven + fee buffer (`0.18%`).
+      - If the previous 15m candle's structure (`prev_candle_low` for LONG, `prev_candle_high` for SHORT)
+        tightens the stop even further into profit without exceeding `tp1_px`, uses that tighter level!
+    """
+    is_long = str(direction).upper() in ("LONG", "BUY")
+    e_px = float(entry_px or 0.0)
+    t1_px = float(tp1_px or e_px)
+    if e_px <= 0:
+        return 0.0
+
+    # Base profit lock: 50% of Entry -> TP1 distance, minimum +0.18% fee-covered breakeven
+    if is_long:
+        be_plus = e_px * 1.0018
+        half_tp1 = e_px + 0.5 * max(0.0, t1_px - e_px)
+        target_sl = max(be_plus, half_tp1)
+        if prev_candle_low and float(prev_candle_low) > target_sl and float(prev_candle_low) < t1_px:
+            target_sl = float(prev_candle_low)
+    else:
+        be_plus = e_px * 0.9982
+        half_tp1 = e_px - 0.5 * max(0.0, e_px - t1_px)
+        target_sl = min(be_plus, half_tp1)
+        if prev_candle_high and float(prev_candle_high) < target_sl and float(prev_candle_high) > t1_px:
+            target_sl = float(prev_candle_high)
+
+    return format_order_price(pair, target_sl)
+
+
+def _check_recent_15m_tp1_touch_and_prev_hl(pair: str, is_long: bool, tp1_px: float, opened_ts: float = 0.0) -> tuple[bool, float | None, float | None]:
+    """
+    Checks recent 15m candles (since `opened_ts`) to detect whether price wicked through `tp1_px`
+    between daemon ticks, and returns `(touched_tp1, prev_15m_high, prev_15m_low)`.
+    """
+    touched = False
+    prev_h = None
+    prev_l = None
+    try:
+        df_15m = fetch_coindcx_candles(pair, interval="15m", limit=6, sync_live_price=True)
+        if df_15m is not None and not df_15m.empty:
+            if len(df_15m) >= 2:
+                prev_row = df_15m.iloc[-2]
+                prev_h = float(prev_row["high"])
+                prev_l = float(prev_row["low"])
+            if tp1_px > 0:
+                cutoff_ms = max(0.0, (float(opened_ts) - 900.0) * 1000.0) if opened_ts > 0 else 0.0
+                recent_df = df_15m[df_15m["timestamp"] >= cutoff_ms] if cutoff_ms > 0 else df_15m.tail(3)
+                if not recent_df.empty:
+                    if is_long and float(recent_df["high"].max()) >= tp1_px:
+                        touched = True
+                    elif (not is_long) and float(recent_df["low"].min()) <= tp1_px:
+                        touched = True
+    except Exception:
+        pass
+    return touched, prev_h, prev_l
+
+
+def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
+    """
+    Safeguards any live CoinDCX position (even if it is not the primary `active_trade_lock` pair,
+    such as when `INJ` and `RENDER` were both open) by checking whether TP1 was reached on the
+    current price or recent 15m candles, cancelling any unfilled same-side Entry 2 limit order,
+    and ratcheting the Position SL into profit (Strategy 3B/3C).
+    """
+    try:
+        pid = pos.get("id")
+        pair = pos.get("pair")
+        if not pid or not pair:
+            return
+        direction = str(pos.get("direction", "LONG")).upper()
+        is_long = direction in ("LONG", "BUY")
+        entry_p = float(pos.get("entry_price", 0.0) or 0.0)
+        mark_p = float(pos.get("mark_price", entry_p) or entry_p)
+        cur_sl = float(pos.get("stop_loss", 0.0) or 0.0)
+        cur_tp = float(pos.get("take_profit", 0.0) or 0.0)
+        if entry_p <= 0:
+            return
+
+        # If SL is already in profit beyond entry, check Stage 2 (50% to TP2 -> lock SL at TP1)
+        already_in_profit_sl = (cur_sl > entry_p) if (is_long and cur_sl > 0) else ((cur_sl < entry_p) if (not is_long and cur_sl > 0) else False)
+
+        levels = None
+        try:
+            levels = calculate_daily_box_levels(pair)
+        except Exception:
+            pass
+        norm = normalize_two_entry_runner_levels(
+            pair=pair,
+            direction=direction,
+            entry1_px=entry_p,
+            tp2_px=cur_tp if cur_tp > 0 else None,
+            sl_px=cur_sl if cur_sl > 0 else None,
+            live_px=mark_p,
+            levels=levels,
+        )
+        tp1_px = float(norm["tp1"])
+        tp2_px = float(cur_tp if cur_tp > 0 else norm["tp2"])
+
+        if already_in_profit_sl:
+            mid_runner = 0.5 * (tp1_px + tp2_px)
+            if (is_long and mark_p >= mid_runner and cur_sl < tp1_px) or (
+                (not is_long) and mark_p <= mid_runner and cur_sl > tp1_px
+            ):
+                update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=tp1_px, pair=pair)
+            return
+
+        # Check if TP1 was reached by live mark price or recent 15m candle high/low (last 3 candles = 45m)
+        hit_tp1 = (mark_p >= tp1_px) if is_long else (mark_p <= tp1_px)
+        wicked_tp1, prev_h, prev_l = _check_recent_15m_tp1_touch_and_prev_hl(pair, is_long, tp1_px, opened_ts=time.time() - 1800.0)
+        if hit_tp1 or wicked_tp1:
+            entry_side = "buy" if is_long else "sell"
+            cancel_coindcx_open_entry_orders(pair, side=entry_side)
+            new_sl = compute_tp1_profit_lock_sl(
+                pair=pair,
+                direction=direction,
+                entry_px=entry_p,
+                tp1_px=tp1_px,
+                prev_candle_high=prev_h,
+                prev_candle_low=prev_l,
+            )
+            better = (cur_sl <= 0) or ((new_sl > cur_sl) if is_long else (new_sl < cur_sl))
+            if better and new_sl > 0:
+                update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=new_sl, pair=pair)
+    except Exception:
+        pass
+
+
 def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
     """
     Checks whether an App/API-originated crypto trade is currently open across the portfolio AND
@@ -3226,10 +3371,25 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         clear_autotrade_active_lock()
                         return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Completed)"}
 
-                    # Stage 1: Price reaches TP1 (without hitting Entry 2) -> Book 50%, Cancel Entry 2, Ratchet SL!
+                    # Stage 1: Price reaches TP1 (or resting TP1 limit order already filled / 15m candle wicked through TP1)
+                    # -> Book 50% (if not already reduced), Cancel Entry 2, and Ratchet SL to Profit Lock (50% TP1 dist / Prev 15m H-L)!
                     hit_tp1 = (px >= l_tp1) if (is_long and l_tp1 > 0) else ((px <= l_tp1) if (not is_long and l_tp1 > 0) else False)
+                    partial_tp1_already_filled = False
+                    if is_live_ex and matched_live_pos and not tp1_already_hit:
+                        open_pos_qty_chk = float(matched_live_pos.get("quantity", 0.0) or 0.0)
+                        init_qty1_chk = float(lock.get("qty1", open_pos_qty_chk) or open_pos_qty_chk)
+                        if init_qty1_chk > 0 and open_pos_qty_chk > 0 and open_pos_qty_chk <= init_qty1_chk * 0.68:
+                            partial_tp1_already_filled = True
+                            hit_tp1 = True
+
+                    prev_15m_h, prev_15m_l = None, None
+                    if not tp1_already_hit and l_tp1 > 0:
+                        wicked_tp1, prev_15m_h, prev_15m_l = _check_recent_15m_tp1_touch_and_prev_hl(l_pair, is_long, l_tp1, l_ts)
+                        if wicked_tp1:
+                            hit_tp1 = True
+
                     if hit_tp1 and not tp1_already_hit:
-                        # 1. Cancel unfilled Entry 2 limit order (same-side only) so it never fills late
+                        # 1. Cancel unfilled Entry 2 limit order (same-side only) so it never fills late on reversal
                         if is_live_ex and not lock.get("entry2_filled"):
                             cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""), side=entry_side)
                             lock["entry2_cancelled"] = True
@@ -3240,7 +3400,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             init_qty1 = float(lock.get("qty1", open_pos_qty) or open_pos_qty)
                             tp1_oid = str(lock.get("tp1_order_id", ""))
                             # If open_pos_qty is still >= 75% of init_qty1, the resting TP1 limit order hasn't filled yet
-                            if open_pos_qty >= init_qty1 * 0.75:
+                            if not partial_tp1_already_filled and open_pos_qty >= init_qty1 * 0.75:
                                 if tp1_oid and tp1_oid != "DAEMON_50PCT_REDUCE_AT_TP1":
                                     cancel_coindcx_open_entry_orders(l_pair, tp1_oid, side="sell" if is_long else "buy")
                                 half_pos_qty = format_order_quantity(l_pair, open_pos_qty * 0.5)
@@ -3256,14 +3416,18 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                         margin_currency="INR",
                                     )
 
-                        # 3. Ratchet Stop Loss into profit (Entry 1 + 50% of TP1 distance) for the 50% TP2 Runner
-                        ratcheted_sl = format_order_price(
-                            l_pair,
-                            (l_entry + 0.5 * (l_tp1 - l_entry)) if is_long else (l_entry - 0.5 * (l_entry - l_tp1)),
+                        # 3. Ratchet Stop Loss into profit using Strategy 3B/3C (50% TP1 distance + Previous 15m Candle High/Low)
+                        ratcheted_sl = compute_tp1_profit_lock_sl(
+                            pair=l_pair,
+                            direction=l_dir,
+                            entry_px=l_entry,
+                            tp1_px=l_tp1,
+                            prev_candle_high=prev_15m_h,
+                            prev_candle_low=prev_15m_l,
                         )
                         lock["tp1_hit"] = True
                         lock["stop_loss"] = ratcheted_sl
-                        lock["mode"] = f"{lock.get('mode', 'App Trade')} [TP1 50% Booked -> 50% Runner to TP2]"
+                        lock["mode"] = f"{lock.get('mode', 'App Trade')} [TP1 50% Booked -> SL Profit-Locked @ ${ratcheted_sl}]"
                         l_sl = ratcheted_sl
                         save_autotrade_config({"active_trade_lock": lock})
 
@@ -3282,6 +3446,14 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             save_autotrade_config({"active_trade_lock": lock})
                             if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
                                 update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_tp1, pair=l_pair)
+
+            # Also safeguard any OTHER live CoinDCX positions (e.g. if 2 positions exist like INJ + RENDER)
+            if is_live_ex and live_positions:
+                for other_pos in live_positions:
+                    o_pair = other_pos.get("pair")
+                    if not o_pair or o_pair == l_pair:
+                        continue
+                    _auto_protect_live_position_tp1_sl(other_pos)
         except Exception:
             pass
 
@@ -3309,6 +3481,9 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             else (fetch_coindcx_active_positions() or [])
         ) or []
         if live_pos:
+            if manage_exchange:
+                for lp_item in live_pos:
+                    _auto_protect_live_position_tp1_sl(lp_item)
             first_p = live_pos[0]
             return {
                 "is_occupied": True,
@@ -3725,6 +3900,8 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "_send_coindcx_signed_request": _send_coindcx_signed_request,
             "place_coindcx_futures_order": place_coindcx_futures_order,
             "execute_autotrade_two_entry_signal": execute_autotrade_two_entry_signal,
+            "get_active_portfolio_trade_status": get_active_portfolio_trade_status,
+            "compute_tp1_profit_lock_sl": compute_tp1_profit_lock_sl,
         }
         cur_globals = globals()
         for obj in gc.get_objects():
