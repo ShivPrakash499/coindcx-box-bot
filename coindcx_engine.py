@@ -319,15 +319,6 @@ def fetch_futures_funding_rate(pair="B-ETH_USDT"):
         "status": "DEFAULT"
     }
 
-_OBSOLETE_KEYS = {
-    "928412b3788b773f668d691062ddee2dd273f021f63d5520",
-    "23a6860f2262b2dc629f4533505ab436573f91ecf6a9473b",
-    "d18ac02afefd234af117dba1f0e232199636c719ae5437cd",
-}
-_DEFAULT_ACTIVE_KEY = "bcce1ecadc5a06815a9e6e30ad6b5849463a4ec647ae74be"
-_DEFAULT_ACTIVE_SECRET = "f2e91a5bbe065891afad811250a31b82891b7869174b9aac3a4fe883ffb1b411"
-
-
 def _next_monotonic_ms() -> int:
     """Returns a strictly increasing millisecond epoch timestamp."""
     now_ms = int(round(time.time() * 1000))
@@ -381,69 +372,73 @@ def get_coindcx_outbound_ip_info(scan_extra_sockets: int = 0) -> dict:
 
 
 def _get_coindcx_credentials() -> tuple[str, str]:
-    """Reads CoinDCX API Key & Secret dynamically from Streamlit Secrets, os.environ, or active fallback."""
+    """
+    Reads CoinDCX API Key & Secret strictly from Streamlit Server (`st.secrets`) or environment variables (`os.environ`).
+    Never stores or falls back to any hardcoded secret in code.
+    """
     api_key = ""
     api_secret = ""
     try:
         import streamlit as _st
         if hasattr(_st, "secrets"):
-            if "COINDCX_API_KEY" in _st.secrets:
-                api_key = str(_st.secrets["COINDCX_API_KEY"]).strip().strip('"').strip("'")
-            if "COINDCX_API_SECRET" in _st.secrets:
-                api_secret = str(_st.secrets["COINDCX_API_SECRET"]).strip().strip('"').strip("'")
+            for _k_name in ("COINDCX_API_KEY", "coindcx_api_key", "API_KEY"):
+                if _k_name in _st.secrets and str(_st.secrets[_k_name]).strip():
+                    api_key = str(_st.secrets[_k_name]).strip().strip('"').strip("'")
+                    break
+            for _s_name in ("COINDCX_API_SECRET", "COINDCX_SECRET_KEY", "COINDCX_SECRET", "coindcx_api_secret", "API_SECRET"):
+                if _s_name in _st.secrets and str(_st.secrets[_s_name]).strip():
+                    api_secret = str(_st.secrets[_s_name]).strip().strip('"').strip("'")
+                    break
             if not api_key or not api_secret:
                 for _k, _v in _st.secrets.items():
-                    if isinstance(_v, dict):
-                        if not api_key and "COINDCX_API_KEY" in _v:
-                            api_key = str(_v["COINDCX_API_KEY"]).strip().strip('"').strip("'")
-                        if not api_secret and "COINDCX_API_SECRET" in _v:
-                            api_secret = str(_v["COINDCX_API_SECRET"]).strip().strip('"').strip("'")
+                    if hasattr(_v, "get"):
+                        if not api_key:
+                            for _k_name in ("COINDCX_API_KEY", "coindcx_api_key", "API_KEY"):
+                                if _k_name in _v and str(_v[_k_name]).strip():
+                                    api_key = str(_v[_k_name]).strip().strip('"').strip("'")
+                                    break
+                        if not api_secret:
+                            for _s_name in ("COINDCX_API_SECRET", "COINDCX_SECRET_KEY", "COINDCX_SECRET", "coindcx_api_secret", "API_SECRET"):
+                                if _s_name in _v and str(_v[_s_name]).strip():
+                                    api_secret = str(_v[_s_name]).strip().strip('"').strip("'")
+                                    break
     except Exception:
         pass
 
-    if not api_key or api_key in _OBSOLETE_KEYS:
-        env_k = os.getenv("COINDCX_API_KEY", "").strip().strip('"').strip("'")
-        if env_k and env_k not in _OBSOLETE_KEYS:
-            api_key = env_k
-    if not api_secret or api_key in _OBSOLETE_KEYS:
-        env_s = os.getenv("COINDCX_API_SECRET", "").strip().strip('"').strip("'")
-        if env_s and env_s != "your_coindcx_secret_key_here":
-            api_secret = env_s
+    if not api_key:
+        api_key = (os.getenv("COINDCX_API_KEY") or _PERSIST.get("api_key") or "").strip().strip('"').strip("'")
+    if not api_secret:
+        api_secret = (
+            os.getenv("COINDCX_API_SECRET")
+            or os.getenv("COINDCX_SECRET_KEY")
+            or os.getenv("COINDCX_SECRET")
+            or _PERSIST.get("api_secret")
+            or ""
+        ).strip().strip('"').strip("'")
 
     api_key = "".join(api_key.split())
     api_secret = "".join(api_secret.split())
+    if api_secret == "your_coindcx_secret_key_here":
+        api_secret = ""
 
-    # Store any non-default st.secrets credentials as optional secondary candidate in case user rotates key in future,
-    # while guaranteeing that edited/paused st.secrets never override the verified _DEFAULT_ACTIVE_KEY + _DEFAULT_ACTIVE_SECRET!
-    if (
-        api_key
-        and api_secret
-        and api_key not in _OBSOLETE_KEYS
-        and api_secret != "your_coindcx_secret_key_here"
-        and (api_key != _DEFAULT_ACTIVE_KEY or api_secret != _DEFAULT_ACTIVE_SECRET)
-    ):
-        _PERSIST["custom_creds"] = (api_key, api_secret)
-
-    verified_custom = _PERSIST.get("verified_custom_creds")
-    if (
-        isinstance(verified_custom, tuple)
-        and len(verified_custom) == 2
-        and verified_custom == _PERSIST.get("custom_creds")
-    ):
-        api_key, api_secret = verified_custom
-    else:
-        api_key = _DEFAULT_ACTIVE_KEY
-        api_secret = _DEFAULT_ACTIVE_SECRET
-
-    os.environ["COINDCX_API_KEY"] = api_key
-    os.environ["COINDCX_API_SECRET"] = api_secret
-    _PERSIST["api_key"] = api_key
-    _PERSIST["api_secret"] = api_secret
+    if api_key and api_secret:
+        prev_k = _PERSIST.get("api_key", "")
+        prev_s = _PERSIST.get("api_secret", "")
+        os.environ["COINDCX_API_KEY"] = api_key
+        os.environ["COINDCX_API_SECRET"] = api_secret
+        _PERSIST["api_key"] = api_key
+        _PERSIST["api_secret"] = api_secret
+        if (prev_k and prev_k != api_key) or (prev_s and prev_s != api_secret):
+            _PERSIST["session_verified"] = False
+            _PERSIST["last_nat_probe_ts"] = 0.0
+            _WALLET_BALANCE_CACHE["data"] = None
+            _WALLET_BALANCE_CACHE["last_good_live"] = None
+            _ACTIVE_POSITIONS_CACHE["data"] = None
 
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 8
+_REQUIRED_DAEMON_VERSION = 9
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -454,7 +449,7 @@ class _ObsoleteDaemonStop(BaseException):
 
 
 def _check_and_kill_obsolete_daemon():
-    """Immediately terminates any background daemon thread from an older version (< v8)."""
+    """Immediately terminates any background daemon thread from an older version (< v9)."""
     _tname = _threading.current_thread().name
     if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_REQUIRED_DAEMON_VERSION}":
         _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
@@ -464,13 +459,15 @@ def _check_and_kill_obsolete_daemon():
 def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET", url: str = "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets", payload: dict | None = None, timeout: float = 3.5):
     """
     Single-flight Cloud NAT egress IP pinner:
+    - Coalesces concurrent callers (`wallets` + `positions`) via `_NAT_PIN_LOCK` with a 15s timeout so the
+      second caller reuses the newly pinned session immediately instead of failing with HTTP 401.
     - Holds candidate `requests.Session()` sockets open in `cand_pool` simultaneously so Google Cloud NAT
       must allocate distinct egress IPs across its pool instead of recycling a single non-allowlisted NAT IP.
-    - Prioritizes the user's allowlisted NAT IP (`34.83.176.217`) immediately on sight, and falls back to testing
-      other unique candidate IPs in the pool.
-    - Uses a non-blocking single-flight lock (`_NAT_PIN_LOCK`) and 0.03s GIL yields so Streamlit static asset
-      serving is never starved.
+    - Prioritizes the user's allowlisted NAT IP (`34.83.176.217`) immediately on sight using the credentials
+      configured on the Streamlit server (`st.secrets`).
     """
+    if not api_key or not api_secret:
+        return None
     if not _NAT_PIN_LOCK.acquire(blocking=True, timeout=15.0):
         return None
 
@@ -479,13 +476,6 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
     winning_res = None
     winning_ip = ""
     try:
-        cred_candidates = [(_DEFAULT_ACTIVE_KEY, _DEFAULT_ACTIVE_SECRET)]
-        custom_c = _PERSIST.get("custom_creds")
-        if isinstance(custom_c, tuple) and len(custom_c) == 2 and custom_c not in cred_candidates:
-            cred_candidates.append(custom_c)
-        if (api_key, api_secret) not in cred_candidates and api_key and api_secret:
-            cred_candidates.insert(0, (api_key, api_secret))
-
         def _test_signed_on_sess(cand_sess, k_try: str, s_try: str):
             with _COINDCX_SIGN_LOCK:
                 body = payload.copy() if payload else {}
@@ -507,8 +497,7 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
 
         # 1. If a preceding thread that just released _NAT_PIN_LOCK already pinned a verified session, reuse it!
         if _PERSIST.get("session_verified") and _PERSIST.get("session") is not None:
-            cur_k, cur_s = _get_coindcx_credentials()
-            r_reuse = _test_signed_on_sess(_PERSIST["session"], cur_k, cur_s)
+            r_reuse = _test_signed_on_sess(_PERSIST["session"], api_key, api_secret)
             if r_reuse is not None and (r_reuse.status_code == 200 or r_reuse.status_code not in (401, 502, 503)):
                 return r_reuse
 
@@ -527,16 +516,11 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
             cand_pool.append(cand)
             cand_ip = _probe_session_coindcx_ip(cand, timeout=1.6)
             if cand_ip == target_ip:
-                for k_cand, s_cand in cred_candidates:
-                    r_try = _test_signed_on_sess(cand, k_cand, s_cand)
-                    if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
-                        winning_sess = cand
-                        winning_res = r_try
-                        winning_ip = cand_ip
-                        if (k_cand, s_cand) == custom_c:
-                            _PERSIST["verified_custom_creds"] = custom_c
-                        break
-                if winning_sess is not None:
+                r_try = _test_signed_on_sess(cand, api_key, api_secret)
+                if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
+                    winning_sess = cand
+                    winning_res = r_try
+                    winning_ip = cand_ip
                     break
             if cand_ip and cand_ip not in seen_ips:
                 seen_ips[cand_ip] = cand
@@ -547,16 +531,11 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
             ordered_ips = sorted(seen_ips.keys(), key=lambda ip: (0 if ip == target_ip else (1 if ip.startswith("34.") else 2)))
             for cand_ip in ordered_ips:
                 cand = seen_ips[cand_ip]
-                for k_cand, s_cand in cred_candidates:
-                    r_try = _test_signed_on_sess(cand, k_cand, s_cand)
-                    if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
-                        winning_sess = cand
-                        winning_res = r_try
-                        winning_ip = cand_ip
-                        if (k_cand, s_cand) == custom_c:
-                            _PERSIST["verified_custom_creds"] = custom_c
-                        break
-                if winning_sess is not None:
+                r_try = _test_signed_on_sess(cand, api_key, api_secret)
+                if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
+                    winning_sess = cand
+                    winning_res = r_try
+                    winning_ip = cand_ip
                     break
                 time.sleep(0.02)
 

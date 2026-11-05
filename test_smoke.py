@@ -329,7 +329,22 @@ def test_6_deployment_regression_guards():
         assert not mock_email.called, "send_trade_email must NEVER be called when asset is in an active live trade"
         assert "already in an active Live Trade" in res_scan[0]["message"], f"Unexpected scan msg: {res_scan[0]}"
 
-    print("  -> PASS: All deployment & hot-reload regression guards + TP1 profit-lock SL + Live Trade Email Suppression verified.")
+    # 8. Verify zero hardcoded secrets exist anywhere in tracked source files
+    forbidden_tokens = (
+        "_DEFAULT_ACTIVE_KEY",
+        "_DEFAULT_ACTIVE_SECRET",
+        "_DEFAULT_APP_PWD_B64",
+        "_FALLBACK_SA_B64",
+        "bcce1ecadc5a06815a9e6e30ad6b5849463a4ec647ae74be",
+        "f2e91a5bbe065891afad811250a31b82891b7869174b9aac3a4fe883ffb1b411",
+    )
+    for fname in ("coindcx_engine.py", "app.py", "email_notifier.py", "sheets_logger.py", "alert_notifier.py", "gemini_advisor.py", "signal_monitor.py"):
+        with open(os.path.join(ROOT_DIR, fname), "r", encoding="utf-8") as f_chk:
+            txt = f_chk.read()
+            for tok in forbidden_tokens:
+                assert tok not in txt, f"Hardcoded secret token '{tok}' found in {fname}! Secrets must ONLY come from Streamlit Server."
+
+    print("  -> PASS: All deployment & hot-reload regression guards + Zero Hardcoded Secrets + TP1 profit-lock SL verified.")
 
 
 if __name__ == "__main__":

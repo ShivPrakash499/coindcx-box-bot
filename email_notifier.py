@@ -23,17 +23,6 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 IST = pytz.timezone("Asia/Kolkata")
 
-_DEFAULT_SENDER_B64 = "andhbGFzaGl2YUBnbWFpbC5jb20="
-_DEFAULT_APP_PWD_B64 = "b3J0eSBmcHRrIGV5eGEgZnZhbw=="
-_DEFAULT_RECEIVER_B64 = "YmlubmlzaW5naHNoYXVyeWFAZ21haWwuY29t"
-
-
-def _b64_str(val: str) -> str:
-    try:
-        return base64.b64decode(val.encode("ascii")).decode("utf-8").strip()
-    except Exception:
-        return ""
-
 
 def _cfg(name: str, default: str = "") -> str:
     """Streamlit secrets first (cloud, top-level or nested), then environment / .env."""
@@ -59,9 +48,9 @@ def short_name(pair: str) -> str:
 
 
 def get_email_config() -> dict:
-    sender = _cfg("GMAIL_SENDER") or _cfg("SENDER_EMAIL") or _b64_str(_DEFAULT_SENDER_B64)
-    password = _cfg("GMAIL_APP_PASSWORD") or _cfg("SENDER_APP_PASSWORD") or _b64_str(_DEFAULT_APP_PWD_B64)
-    receiver = _cfg("GMAIL_RECEIVER") or _cfg("RECEIVER_EMAIL") or _b64_str(_DEFAULT_RECEIVER_B64) or sender
+    sender = _cfg("GMAIL_SENDER") or _cfg("SENDER_EMAIL")
+    password = _cfg("GMAIL_APP_PASSWORD") or _cfg("SENDER_APP_PASSWORD")
+    receiver = _cfg("GMAIL_RECEIVER") or _cfg("RECEIVER_EMAIL") or sender
     clean_pwd = password.replace(" ", "").strip()
     # 16-character check for standard Google App Passwords
     is_app_password = len(clean_pwd) == 16

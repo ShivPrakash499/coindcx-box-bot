@@ -16,10 +16,17 @@ import streamlit as st
 
 # Sync Streamlit Cloud secrets into os.environ BEFORE backend modules initialize
 try:
+    import json as _json
     if hasattr(st, "secrets"):
         for _sec_k, _sec_v in st.secrets.items():
             if isinstance(_sec_v, (str, int, float, bool)):
                 os.environ[str(_sec_k)] = str(_sec_v)
+            elif str(_sec_k) == "gcp_service_account" and hasattr(_sec_v, "items"):
+                os.environ["GOOGLE_CREDENTIALS_JSON"] = _json.dumps(dict(_sec_v))
+            elif hasattr(_sec_v, "items"):
+                for _sub_k, _sub_v in _sec_v.items():
+                    if isinstance(_sub_v, (str, int, float, bool)):
+                        os.environ[str(_sub_k)] = str(_sub_v)
 except Exception:
     pass
 
@@ -188,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 8
+_DAEMON_VERSION = 9
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -592,10 +599,10 @@ usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (1-Slot)")
-# Sync stale browser session toggle state if v8 disarmed AutoTrade on disk
+# Sync stale browser session toggle state if v9 disarmed AutoTrade on disk
 _disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
-if st.session_state.get("_autotrade_disarm_sync_v") != 8:
-    st.session_state["_autotrade_disarm_sync_v"] = 8
+if st.session_state.get("_autotrade_disarm_sync_v") != 9:
+    st.session_state["_autotrade_disarm_sync_v"] = 9
     st.session_state["sidebar_autotrade_toggle"] = _disk_auto_enabled
 
 

@@ -9,35 +9,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_FALLBACK_SA_B64 = (
-    "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"
-    "tQunBjqqKwign53VNaWmrHWvnX5T"
-)
-
 
 def _load_service_account_dict() -> dict | None:
-    """Loads Google Service Account JSON dict from Streamlit Secrets, local credentials.json, or built-in fallback."""
+    """Loads Google Service Account JSON dict strictly from Streamlit Secrets, environment, or local untracked credentials.json."""
     # 1. Check Streamlit Secrets
     try:
         import streamlit as _st
@@ -53,7 +27,17 @@ def _load_service_account_dict() -> dict | None:
     except Exception:
         pass
 
-    # 2. Check local credentials.json in repo directory or current directory
+    # 2. Check environment variable (synced from Streamlit Secrets for background threads)
+    env_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if env_json:
+        try:
+            sa = json.loads(env_json)
+            if isinstance(sa, dict) and sa.get("private_key"):
+                return sa
+        except Exception:
+            pass
+
+    # 3. Check local untracked credentials.json in repo directory or current directory
     repo_creds = os.path.join(os.path.dirname(os.path.abspath(__file__)), "credentials.json")
     for candidate in (repo_creds, "credentials.json"):
         if os.path.exists(candidate):
@@ -65,13 +49,7 @@ def _load_service_account_dict() -> dict | None:
             except Exception:
                 pass
 
-    # 3. Built-in fallback for Streamlit Cloud
-    try:
-        raw_xored = base64.b64decode(_FALLBACK_SA_B64)
-        compressed = bytes(b ^ 0x5A for b in raw_xored)
-        return json.loads(zlib.decompress(compressed).decode("utf-8"))
-    except Exception:
-        return None
+    return None
 
 
 def _get_ws(book, title):

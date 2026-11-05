@@ -67,7 +67,14 @@
 
 ---
 
-## 8. Mandatory Pre-Push Verification Gate (`test_smoke.py`)
+## 8. Never Store Any Secret in Code — Always Read Strictly From Streamlit Server (`st.secrets`)
+- **Mandatory Rule**:
+  - **NEVER** hardcode or store any API key, API secret, Gmail password, or Google Service Account credential in source code (neither plaintext nor base64/encoded fallback).
+  - Always read credentials dynamically from the Streamlit Server (`st.secrets`, synced into `os.environ` at the top of [`app.py`](file:///C:/coindcx_box_bot/app.py) for background threads) or local untracked `.env` / `credentials.json`.
+
+---
+
+## 9. Mandatory Pre-Push Verification Gate (`test_smoke.py`)
 - Before pushing any commit to `staging` or merging to `main`, always run:
   ```powershell
   C:\coindcx_box_bot\.venv\Scripts\python.exe C:\coindcx_box_bot\test_smoke.py
