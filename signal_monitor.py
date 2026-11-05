@@ -32,6 +32,21 @@ _LAST_SCAN_CACHE = sys.__dict__.setdefault("_signal_monitor_last_scan", {"ts": 0
 _MEM_STATE = sys.__dict__.setdefault("_signal_monitor_state_mem", {"_schema_version": _STATE_SCHEMA_VERSION})
 
 
+def _canon_pair(p: str) -> str:
+    """Normalizes any CoinDCX/Binance pair string ('B-INJ_USDT', 'INJUSDT', 'I-INJ_INR') to its base symbol ('INJ')."""
+    if not p:
+        return ""
+    s = str(p).upper().strip()
+    for pref in ("B-", "I-"):
+        if s.startswith(pref):
+            s = s[len(pref):]
+    for suf in ("_USDT", "USDT", "_INR", "INR"):
+        if s.endswith(suf) and len(s) > len(suf):
+            s = s[:-len(suf)]
+            break
+    return s.replace("_", "").replace("-", "")
+
+
 def _load() -> dict:
     merged = dict(_MEM_STATE)
     try:
@@ -139,27 +154,44 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         autotrade_daily_count = int(state.get(autotrade_daily_key, 0))
 
         # Collect all pairs currently in a Live CoinDCX position or active App Trade Lock
+        # (normalized by base symbol via `_canon_pair` so `B-INJ_USDT` == `I-INJ_INR` == `INJUSDT`)
         open_live_pairs = set()
+        open_live_bases = set()
         if portfolio_occupied and active_Slot_pair:
             open_live_pairs.add(active_Slot_pair)
+            open_live_bases.add(_canon_pair(active_Slot_pair))
+
+        live_pos_verified = False
         try:
-            live_pos_list = (
-                eng._fetch_coindcx_active_positions_sync(return_none_on_error=False)
-                if is_daemon_thread
-                else (eng.fetch_coindcx_active_positions() or [])
-            ) or []
-            for pos in live_pos_list:
+            if is_daemon_thread or send:
+                # Whenever `send=True` (email alerts enabled), ALWAYS perform a synchronous live check
+                # (`return_none_on_error=True`) so a cold cache or transient HTTP 401 can NEVER send emails
+                # while a live trade is actually open on CoinDCX!
+                live_pos_list = eng._fetch_coindcx_active_positions_sync(return_none_on_error=True)
+                if live_pos_list is not None:
+                    live_pos_verified = True
+                else:
+                    # Fallback to cached positions if available; if still unverified, fail-closed on email sending
+                    live_pos_list = eng._ACTIVE_POSITIONS_CACHE.get("data") or []
+            else:
+                live_pos_list = eng.fetch_coindcx_active_positions() or []
+                live_pos_verified = True
+
+            for pos in (live_pos_list or []):
                 if isinstance(pos, dict) and pos.get("pair"):
-                    open_live_pairs.add(pos["pair"])
+                    p_raw = pos["pair"]
+                    open_live_pairs.add(p_raw)
+                    open_live_bases.add(_canon_pair(p_raw))
                     if not portfolio_occupied:
                         portfolio_occupied = True
-                        active_Slot_pair = pos["pair"]
+                        active_Slot_pair = p_raw
         except Exception:
             pass
 
         for pair in pairs:
             if is_daemon_thread:
                 time.sleep(0.03)  # Yield GIL so Streamlit Tornado serves static JS assets immediately
+            pair_base = _canon_pair(pair)
             pair_lock_key = f"PAIR_LOCK|{pair}"
             pair_last = state.get(pair_lock_key, {})
             email_daily_key = f"EMAIL_COUNT|{pair}|{today_ist}"
@@ -186,18 +218,26 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     continue
 
                 # Skip sending duplicate setup alerts or opening trades on assets ALREADY in a Live Trade
-                if pair in open_live_pairs:
+                if pair in open_live_pairs or (pair_base and pair_base in open_live_bases):
                     results.append({
                         **row,
                         "message": f"skipped: {pair} is already in an active Live Trade"
                     })
                     continue
 
-                # 1-Crypto-at-a-Time Guard: If another crypto is already active, do not alert/open a 2nd crypto
-                if portfolio_occupied and active_Slot_pair and active_Slot_pair != pair:
+                # 1-Crypto-at-a-Time Guard: If any crypto is already active, do not alert/open another crypto
+                if portfolio_occupied and active_Slot_pair and _canon_pair(active_Slot_pair) != pair_base:
                     results.append({
                         **row,
                         "message": f"1-crypto-at-a-time guard: {active_Slot_pair} is currently active (50% reserved for Entry 2)"
+                    })
+                    continue
+
+                # Fail-Closed Email Guard: If CoinDCX API could not verify live positions on this tick, suppress email alerts
+                if send and not live_pos_verified and os.getenv("COINDCX_API_KEY"):
+                    results.append({
+                        **row,
+                        "message": "skipped email: waiting for CoinDCX live position verification"
                     })
                     continue
 

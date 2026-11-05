@@ -313,7 +313,23 @@ def test_6_deployment_regression_guards():
     sl_long_prev15m = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00, prev_candle_low=3.94)
     assert abs(sl_long_prev15m - 3.94) < 1e-4, f"Expected tighter prev 15m low SL at $3.94, got {sl_long_prev15m}"
 
-    print("  -> PASS: All deployment & hot-reload regression guards + TP1 profit-lock SL verified.")
+    # 7. Verify signal_monitor suppresses email alerts when an asset has an active live trade (even across pair formats or API error)
+    assert sm._canon_pair("B-INJ_USDT") == sm._canon_pair("I-INJ_INR") == sm._canon_pair("INJUSDT") == "INJ"
+    fake_sig = {
+        "signal": "SHORT", "signal_kind": "SWEEP", "entry": 7.30, "entry2_sweep": 7.43,
+        "tp1": 7.10, "tp2": 6.89, "stop_loss": 7.47, "roe_tp1": 15.0, "candle_ts": 999999999,
+        "margin_inr": 15000.0, "leverage": 10, "trigger_zone": "SELL ZONE", "trigger_reason": "Test"
+    }
+    with patch.object(sm, "scan_pair", return_value=fake_sig), \
+         patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{"pair": "I-INJ_INR", "direction": "SHORT"}]), \
+         patch.object(sm.email_notifier, "send_trade_email") as mock_email:
+        sm._LAST_SCAN_CACHE["results"] = []
+        res_scan = sm.scan_and_alert(pairs=["B-INJ_USDT"], send=True, strategy_ids=["box_theory"], autotrade=False)
+        assert not mock_email.called, "send_trade_email must NEVER be called when asset is in an active live trade"
+        assert "already in an active Live Trade" in res_scan[0]["message"], f"Unexpected scan msg: {res_scan[0]}"
+
+    print("  -> PASS: All deployment & hot-reload regression guards + TP1 profit-lock SL + Live Trade Email Suppression verified.")
 
 
 if __name__ == "__main__":

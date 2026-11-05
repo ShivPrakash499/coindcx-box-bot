@@ -329,9 +329,11 @@ def get_cached_top_movers(watch_tuple: tuple, top_n: int = 6):
 
 @st.cache_data(ttl=60)
 def get_cached_signals_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: float, strat_tuple: tuple, auto_send: bool, auto_trade: bool):
+    # UI render calls `send=False` so browser refreshes never block or send duplicate emails while cold;
+    # the 24/7 background daemon (`_monitor_worker`) handles `send=True` with synchronous live position verification!
     return _safe_scan_and_alert(
         list(watch_tuple), m_inr, lev, u_inr,
-        send=auto_send, strategy_ids=list(strat_tuple), autotrade=auto_trade
+        send=False, strategy_ids=list(strat_tuple), autotrade=auto_trade
     )
 
 def fmt_px(p):
