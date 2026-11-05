@@ -188,7 +188,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 7
+_DAEMON_VERSION = 8
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -394,14 +394,19 @@ def _detect_active_trade_pair() -> str | None:
         live_pos = get_cached_positions() or []
         if live_pos:
             first_pair = live_pos[0].get("pair")
-            if first_pair in GLOBAL_FUTURES_PAIRS:
+            if first_pair:
+                if first_pair not in GLOBAL_FUTURES_PAIRS:
+                    GLOBAL_FUTURES_PAIRS.append(first_pair)
                 return first_pair
     except Exception:
         pass
     try:
         slot = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
-        if slot.get("is_occupied") and slot.get("active_pair") in GLOBAL_FUTURES_PAIRS:
-            return slot.get("active_pair")
+        if slot.get("is_occupied") and slot.get("active_pair"):
+            sp = slot.get("active_pair")
+            if sp not in GLOBAL_FUTURES_PAIRS:
+                GLOBAL_FUTURES_PAIRS.append(sp)
+            return sp
     except Exception:
         pass
     pos = st.session_state.get("active_position")
@@ -416,13 +421,18 @@ if _url_pair and _url_pair in GLOBAL_FUTURES_PAIRS:
     st.session_state.selected_pair = _url_pair
     st.session_state.pair_selector_widget = _url_pair
     st.session_state["_pair_auto_synced"] = True
-elif "selected_pair" not in st.session_state or not st.session_state.get("_pair_auto_synced"):
+    st.session_state["_user_manual_pair_selected"] = True
+else:
     _active_trade_pair = _detect_active_trade_pair()
-    _init_pair = _active_trade_pair if _active_trade_pair else st.session_state.get("selected_pair", "B-ETH_USDT")
-    st.session_state.selected_pair = _init_pair
-    st.session_state.pair_selector_widget = _init_pair
-    if _active_trade_pair:
-        st.session_state["_pair_auto_synced"] = True
+    if "selected_pair" not in st.session_state:
+        _init_pair = _active_trade_pair if _active_trade_pair else "B-ETH_USDT"
+        st.session_state.selected_pair = _init_pair
+        st.session_state.pair_selector_widget = _init_pair
+    elif _active_trade_pair and not st.session_state.get("_user_manual_pair_selected"):
+        if st.session_state.selected_pair != _active_trade_pair:
+            st.session_state.selected_pair = _active_trade_pair
+            st.session_state.pair_selector_widget = _active_trade_pair
+            st.session_state["_pair_auto_synced"] = True
 
 _url_tab = _qp.get("tab", "").lower()
 is_execution_link = _url_tab in ("execute", "execution", "trade")
@@ -467,6 +477,7 @@ def _switch_pair_and_nav(target_pair: str, nav_section: str | None = None, strat
         st.session_state.selected_pair = target_pair
         st.session_state.pair_selector_widget = target_pair
         st.session_state["_pair_auto_synced"] = True
+        st.session_state["_user_manual_pair_selected"] = True
     if strategy_name:
         st.session_state["exec_strategy_mode"] = f"{strategy_name} Only"
     if nav_section in NAV_SECTIONS:
@@ -477,6 +488,7 @@ def _on_pair_dropdown_change():
     if picked in GLOBAL_FUTURES_PAIRS:
         st.session_state.selected_pair = picked
         st.session_state["_pair_auto_synced"] = True
+        st.session_state["_user_manual_pair_selected"] = True
 
 def check_and_update_paper_orders():
     pending = st.session_state.get("paper_pending_orders", [])
@@ -580,10 +592,10 @@ usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (1-Slot)")
-# Sync stale browser session toggle state if v7 disarmed AutoTrade on disk
+# Sync stale browser session toggle state if v8 disarmed AutoTrade on disk
 _disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
-if st.session_state.get("_autotrade_disarm_sync_v") != 7:
-    st.session_state["_autotrade_disarm_sync_v"] = 7
+if st.session_state.get("_autotrade_disarm_sync_v") != 8:
+    st.session_state["_autotrade_disarm_sync_v"] = 8
     st.session_state["sidebar_autotrade_toggle"] = _disk_auto_enabled
 
 
@@ -629,11 +641,15 @@ else:
     _api_err = wallet_data.get("api_error", "")
     if _api_err:
         st.sidebar.caption(f"⚠️ **CoinDCX API Notice:** `{_api_err}`")
+    else:
+        st.sidebar.caption("🔄 **CoinDCX Live API:** Pinning Cloud NAT session...")
     if st.sidebar.button("🔄 Reconnect & Refresh Live Wallet", key="btn_rescan_coindcx_nat", use_container_width=True):
+        coindcx_engine._PERSIST["last_nat_probe_ts"] = 0.0
         coindcx_engine._WALLET_BALANCE_CACHE["data"] = None
+        coindcx_engine._WALLET_BALANCE_CACHE["last_good_live"] = None
         coindcx_engine._WALLET_BALANCE_CACHE["ts"] = 0.0
-        get_cached_balance.clear()
-        get_cached_positions.clear()
+        coindcx_engine._fetch_coindcx_futures_balance_sync()
+        coindcx_engine._fetch_coindcx_active_positions_sync()
         st.rerun()
 
 with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
@@ -666,7 +682,9 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
             "profit_tp1_inr": 500.0, "loss_sl_inr": 500.0
         }, return_details=True)
         (st.success if ok else st.error)(msg)
-    st.caption("🌐 **Server Outbound IP (for CoinDCX API):** `34.83.176.217`")
+    _pinned_ip_str = coindcx_engine._PERSIST.get("pinned_ip") or "34.83.176.217"
+    _verified_badge = "✅" if coindcx_engine._PERSIST.get("session_verified") else "🔄"
+    st.caption(f"🌐 **Server Outbound IP (for CoinDCX API):** `{_pinned_ip_str}` {_verified_badge}")
     if st.button("🔒 Lock Session", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()
@@ -1222,17 +1240,20 @@ def render_unified_live_header(pair: str):
         """)
 
     with h_pnl_col:
-        if matching_live:
-            pnl_inr = float(matching_live["pnl_inr"])
-            roe_pct = float(matching_live["roe_pct"])
-            entry_p = float(matching_live["entry_price"])
-            dir_str = matching_live["direction"]
+        active_card_pos = matching_live or (other_live[0] if other_live else None)
+        if active_card_pos:
+            card_sym = clean_sym(active_card_pos["pair"])
+            pnl_inr = float(active_card_pos["pnl_inr"])
+            roe_pct = float(active_card_pos["roe_pct"])
+            entry_p = float(active_card_pos["entry_price"])
+            dir_str = active_card_pos["direction"]
             pnl_col = "#10b981" if pnl_inr >= 0 else "#ef4444"
             pnl_sgn = "+" if pnl_inr >= 0 else ""
+            extra_count_str = f" (+{len(live_positions)-1} more)" if len(live_positions) > 1 else ""
             st.html(f"""
                 <div class="pro-card" style="border-color:{pnl_col};">
                     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px;">
-                        <span style="font-weight:700; color:{pnl_col}; font-size:0.76rem;">● {sym} ACTIVE TRADE ({dir_str} {matching_live['leverage']}x)</span>
+                        <span style="font-weight:700; color:{pnl_col}; font-size:0.76rem;">● {card_sym} ACTIVE TRADE ({dir_str} {active_card_pos['leverage']}x){extra_count_str}</span>
                         <span style="font-size:0.74rem; color:{subtext_color};">Entry: {fmt_px(entry_p)}</span>
                     </div>
                     <div style="margin-top:4px; display:flex; align-items:baseline; gap:8px; flex-wrap:wrap;">
@@ -1269,11 +1290,7 @@ def render_unified_live_header(pair: str):
                     </div>
                 """)
             else:
-                other_note = (
-                    f"Active on {clean_sym(other_live[0]['pair'])}: {'+' if other_live[0]['pnl_inr'] >= 0 else ''}₹{other_live[0]['pnl_inr']:,.2f}"
-                    if other_live
-                    else f"Wallet: ₹{wallet_data['total_inr']:,.2f} • AutoTrade: {'ON 🚀' if autotrade_on else 'OFF'}"
-                )
+                other_note = f"Wallet: ₹{wallet_data['total_inr']:,.2f} • AutoTrade: {'ON 🚀' if autotrade_on else 'OFF'}"
                 st.html(f"""
                     <div class="pro-card">
                         <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:4px;">
@@ -1287,6 +1304,19 @@ def render_unified_live_header(pair: str):
                 """)
 
 render_unified_live_header(selected_pair)
+
+if not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified"):
+    @st.fragment(run_every="3s")
+    def _auto_sync_live_account_fragment():
+        cur_bal = coindcx_engine._WALLET_BALANCE_CACHE.get("data")
+        cur_pos = coindcx_engine._ACTIVE_POSITIONS_CACHE.get("data")
+        if (isinstance(cur_bal, dict) and cur_bal.get("is_live_api")) or (cur_pos and len(cur_pos) > 0):
+            st.rerun()
+        else:
+            coindcx_engine._trigger_bg_wallet_refresh()
+            coindcx_engine._trigger_bg_positions_refresh()
+
+    _auto_sync_live_account_fragment()
 
 ticker = get_cached_ticker(selected_pair)
 live_price = float(ticker.get("last_price", 0.0))
