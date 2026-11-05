@@ -252,14 +252,16 @@ def check_authentication():
     _pre_pos = fetch_coindcx_active_positions(force_refresh=False) or []
     _pre_k, _pre_s = coindcx_engine._get_coindcx_credentials()
     _k_tag = f"{_pre_k[:4]}..{_pre_k[-4:]}" if len(_pre_k) >= 8 else "NoKey"
-    _ip_tag = coindcx_engine._PERSIST.get("pinned_ip") or "Scanning NAT"
+    _s_tag = f"{_pre_s[:3]}..{_pre_s[-3:]}({len(_pre_s)})" if len(_pre_s) >= 8 else "NoSec"
+    _seen_ips = ", ".join(coindcx_engine._PERSIST.get("seen_coindcx_ips") or [])
+    _ip_tag = coindcx_engine._PERSIST.get("pinned_ip") or (_seen_ips if _seen_ips else "Scanning NAT")
     _pos_pairs = ", ".join(str(p.get("pair", "")).replace("B-", "").replace("_USDT", "") for p in _pre_pos) if _pre_pos else "0"
     if _pre_bal.get("is_live_api"):
-        _api_pill = f"🟢 CoinDCX Live Synced (Key: {_k_tag} | IP: {_ip_tag}) • Wallet: OK • Positions: {len(_pre_pos)} ({_pos_pairs})"
+        _api_pill = f"🟢 CoinDCX Live Synced (Key: {_k_tag} | IP: {_ip_tag}) • Wallet: ₹{_pre_bal.get('total_inr', 0):,.2f} • Positions: {len(_pre_pos)} ({_pos_pairs})"
         _pill_col = "#10b981"
     else:
         _err_str = _pre_bal.get("api_error") or coindcx_engine._PERSIST.get("last_auth_error") or "Connecting..."
-        _api_pill = f"🔄 CoinDCX Status: {_err_str} (Key: {_k_tag} | IP: {_ip_tag} | Pos: {len(_pre_pos)})"
+        _api_pill = f"🔄 CoinDCX Status: {_err_str} (Key: {_k_tag}/{_s_tag} | Seen IPs: {_ip_tag} | Pos: {len(_pre_pos)})"
         _pill_col = "#f59e0b"
 
     pin_slot = st.empty()
