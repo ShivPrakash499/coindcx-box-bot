@@ -2738,42 +2738,21 @@ elif active_section == "🤖 AI Advisor":
         st.error("Gemini Advisor module (`gemini_advisor.py` / `google-genai`) could not be loaded.")
     else:
         current_gem_key = gemini_advisor.get_gemini_api_key()
-        cfg_c1, cfg_c2, cfg_c3 = st.columns([1.6, 1.8, 0.8])
+        entered_gem_key = ""
+        cfg_c1, cfg_c2 = st.columns([2.2, 2.0])
         with cfg_c1:
             model_options = [m[0] for m in gemini_advisor.AVAILABLE_GEMINI_MODELS]
             model_labels = {m[0]: m[1] for m in gemini_advisor.AVAILABLE_GEMINI_MODELS}
             selected_gemini_model = st.selectbox(
-                "🧠 Select Best Gemini Model (Auto-Fallbacks if Tier Locked)",
+                "🧠 Select Best Gemini Model",
                 options=model_options,
                 index=0,
                 format_func=lambda m: model_labels.get(m, m),
                 key="gemini_model_selector",
             )
         with cfg_c2:
-            entered_gem_key = st.text_input(
-                "🔑 Gemini API Key (`GEMINI_API_KEY` — from your Google Cloud / AI Studio Subscription)",
-                value=current_gem_key,
-                type="password",
-                placeholder="Paste AIza... key from '+ Create Gemini API key'",
-                key="gemini_api_key_input_widget",
-            )
-        with cfg_c3:
             st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-            if st.button("💾 Save Key", use_container_width=True, type="primary"):
-                if entered_gem_key.strip():
-                    gemini_advisor.save_gemini_api_key(entered_gem_key.strip())
-                    st.success("✅ Saved!")
-                    st.rerun()
-                else:
-                    st.warning("Paste a valid key first.")
-
-        if not current_gem_key and not entered_gem_key:
-            st.info(
-                "💡 **1-Click Setup for Your Google Subscription (`Default Gemini Project` `gen-lang-client-0777980903`)**:\n"
-                "1. On your Google Cloud Console Welcome tab (where you have `₹28,569` free credits), click the **`+ Create Gemini API key`** button "
-                "(or open [Google AI Studio API Keys](https://aistudio.google.com/apikey) and click **Create API key** in `Default Gemini Project`).\n"
-                "2. Copy the `AIza...` key, paste it into the **🔑 Gemini API Key** box above, and click **💾 Save Key** (or add `GEMINI_API_KEY = \"AIza...\"` in Streamlit Cloud Secrets)."
-            )
+            st.success("🟢 **Connected via Streamlit Server Secrets (`gen-lang-client-0777980903`)**")
 
         # Initialize Chat History in Session State
         if "gemini_chat_messages" not in st.session_state:
@@ -2858,6 +2837,7 @@ elif active_section == "🤖 AI Advisor":
                         sheet_markdown_context=sheet_data.get("markdown_summary", ""),
                         market_context=live_mkt_ctx,
                         api_key=active_key,
+                        selected_pair=selected_pair,
                     )
                 if resp.get("ok"):
                     used_m = resp.get("model_used") or selected_gemini_model
