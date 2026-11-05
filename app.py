@@ -2061,7 +2061,26 @@ elif active_section == "📊 Positions":
         st.rerun()
 
     if not live_positions and not paper and not pending_paper:
-        st.info("No open positions or resting paper orders right now.")
+        _ip_diag = coindcx_engine.get_coindcx_outbound_ip_info()
+        _auth_err = coindcx_engine._PERSIST.get("last_auth_error", "")
+        _act_key, _ = coindcx_engine._get_coindcx_credentials()
+        _key_mask = f"{_act_key[:6]}...{_act_key[-4:]}" if len(_act_key) >= 12 else "Not Set"
+        if not coindcx_engine._PERSIST.get("session_verified") and _auth_err:
+            st.warning(
+                f"⚠️ **CoinDCX Live Sync Notice (`{_auth_err}`)**\n\n"
+                f"- **Active API Key:** `{_key_mask}`\n"
+                f"- **Detected Outbound NAT IP(s):** `{_ip_diag.get('comma_separated') or 'Scanning...'}`\n"
+                f"- If you recently created a new CoinDCX API Key or Streamlit Cloud assigned a new outbound IP, "
+                f"ensure the IP(s) above are allowlisted on your CoinDCX API Key (or update `COINDCX_API_KEY` & `COINDCX_API_SECRET` in Streamlit Secrets)."
+            )
+        else:
+            st.info("No open positions or resting paper orders right now.")
+        if st.button("🔄 Force Live Position & NAT Sync Now", key="btn_force_live_pos_sync", use_container_width=True):
+            with st.spinner("Scanning Cloud NAT pool & fetching live positions from CoinDCX..."):
+                coindcx_engine._PERSIST["last_nat_probe_ts"] = 0.0
+                coindcx_engine._fetch_coindcx_active_positions_sync()
+                coindcx_engine._fetch_coindcx_futures_balance_sync()
+            st.rerun()
 
     live_open_orders = get_cached_open_orders() or []
     auto_lock_cfg = coindcx_engine.get_autotrade_config().get("active_trade_lock") or {}

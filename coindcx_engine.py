@@ -413,8 +413,9 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     api_key = "".join(api_key.split())
     api_secret = "".join(api_secret.split())
 
-    # Always guarantee the verified active CoinDCX keypair is used even if st.secrets was edited to pause alerts
-    if not api_key or api_key in _OBSOLETE_KEYS or api_key != _DEFAULT_ACTIVE_KEY or not api_secret:
+    # Only fall back to _DEFAULT_ACTIVE_KEY if no valid key is provided in st.secrets / .env
+    # (so if the user rotates their CoinDCX API key in Streamlit Secrets, the new key is used immediately!)
+    if not api_key or api_key in _OBSOLETE_KEYS or not api_secret or api_secret == "your_coindcx_secret_key_here":
         api_key = _DEFAULT_ACTIVE_KEY
         api_secret = _DEFAULT_ACTIVE_SECRET
 
@@ -485,7 +486,7 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                 return None
 
         # Keep sockets open in cand_pool so Cloud NAT assigns across all pool IPs
-        for _ in range(18):
+        for _ in range(24):
             cand = requests.Session()
             cand_pool.append(cand)
             cand_ip = _probe_session_coindcx_ip(cand, timeout=1.6)
@@ -524,6 +525,7 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                 _PERSIST["session"] = winning_sess
                 _PERSIST["session_verified"] = True
                 _PERSIST["pinned_ip"] = winning_ip
+                _PERSIST["last_auth_error"] = ""
             return winning_res
         return None
     finally:
@@ -586,13 +588,16 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
 
             if res.status_code == 200:
                 _PERSIST["session_verified"] = True
+                _PERSIST["last_auth_error"] = ""
                 return res, None
 
             if res.status_code not in (400, 401, 429, 500, 502, 503) and "timestamp" not in res.text.lower() and "credential" not in res.text.lower():
                 _PERSIST["session_verified"] = True
+                _PERSIST["last_auth_error"] = ""
                 return res, None
 
             if res.status_code == 401:
+                _PERSIST["last_auth_error"] = "HTTP 401 Invalid credentials / Egress IP not allowlisted"
                 with _COINDCX_SIGN_LOCK:
                     if _PERSIST["session"] is sess:
                         try:
@@ -835,6 +840,8 @@ def fetch_coindcx_futures_balance(force_refresh: bool = False):
 
     # First load if cache is completely empty: seed instant balance from disk and refresh in background
     default_balance = _get_saved_wallet_balance_default()
+    is_verified = bool(_PERSIST.get("session_verified", False))
+    auth_err = str(_PERSIST.get("last_auth_error", "") or "")
     seeded = {
         "total_inr": round(default_balance, 2),
         "available_inr": round(default_balance, 2),
@@ -845,12 +852,14 @@ def fetch_coindcx_futures_balance(force_refresh: bool = False):
         "locked_margin_usd": 0.0,
         "cross_user_margin_usd": 0.0,
         "live_usd_inr": 102.0,
-        "is_live_api": True,
-        "source": "CoinDCX Live Futures API",
+        "is_live_api": is_verified,
+        "api_error": auth_err,
+        "source": "CoinDCX Live Futures API" if is_verified else "Synced Wallet Balance (Connecting...)",
         "_key_prefix": api_key[:8],
     }
-    _WALLET_BALANCE_CACHE["last_good_live"] = seeded
-    _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+    if is_verified:
+        _WALLET_BALANCE_CACHE["last_good_live"] = seeded
+        _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
     if force_refresh:
         return _fetch_coindcx_futures_balance_sync()
     _trigger_bg_wallet_refresh()
@@ -890,7 +899,12 @@ def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> 
                 pass
 
             for item in data:
-                active_pos_qty = float(item.get("active_pos", 0.0) or 0.0)
+                active_pos_qty = float(
+                    item.get("active_pos", 0.0)
+                    or item.get("quantity", 0.0)
+                    or item.get("position_size", 0.0)
+                    or 0.0
+                )
                 if abs(active_pos_qty) > 0:
                     pair = item.get("pair", "")
                     direction = "LONG" if active_pos_qty > 0 else "SHORT"
