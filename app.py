@@ -706,9 +706,10 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
             "profit_tp1_inr": 500.0, "loss_sl_inr": 500.0
         }, return_details=True)
         (st.success if ok else st.error)(msg)
-    _pinned_ip_str = coindcx_engine._PERSIST.get("pinned_ip") or "34.83.176.217"
-    _verified_badge = "✅" if coindcx_engine._PERSIST.get("session_verified") else "🔄"
-    st.caption(f"🌐 **Server Outbound IP (for CoinDCX API):** `{_pinned_ip_str}` {_verified_badge}")
+    _seen_list = coindcx_engine._PERSIST.get("seen_coindcx_ips") or []
+    _pinned_ip_str = coindcx_engine._PERSIST.get("pinned_ip") or (", ".join(_seen_list) if _seen_list else "Scanning...")
+    _verified_badge = "✅" if coindcx_engine._PERSIST.get("session_verified") else "⚠️ Not Allowlisted"
+    st.caption(f"🌐 **Server Outbound IP(s) (for CoinDCX API):** `{_pinned_ip_str}` ({_verified_badge})")
     if st.button("🔒 Lock Session", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()
