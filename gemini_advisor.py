@@ -17,6 +17,8 @@ FALLBACK_MODEL_CHAIN = [
     "gemini-4-argon",
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
 ]
 
 SYSTEM_INSTRUCTION = """You are the Institutional Crypto Futures AI Trading Advisor embedded inside the user's CoinDCX Pro Trading Terminal (`shiv-prakash-trade-assistant`).
@@ -37,35 +39,47 @@ Your role:
 
 
 def get_gemini_api_key() -> str:
-    """Retrieves the user's Gemini API key from Streamlit secrets, environment, or saved config."""
-    # 1. Check Streamlit session state first
+    """Retrieves the user's Gemini API key strictly from Streamlit Server secrets (`st.secrets`) or environment."""
+    _CANDIDATE_NAMES = (
+        "GEMINI_API_KEY",
+        "GOOGLE_API_KEY",
+        "GEMINI_KEY",
+        "GOOGLE_GEMINI_API_KEY",
+        "GEMINI_SECRET",
+        "GEMINI_TOKEN",
+    )
     try:
         import streamlit as st
         ss_key = str(st.session_state.get("gemini_api_key_override", "") or "").strip()
         if ss_key:
             return ss_key
         if hasattr(st, "secrets"):
-            for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-                if k in st.secrets and str(st.secrets[k]).strip():
-                    return str(st.secrets[k]).strip()
+            # 1. Check top-level keys (case-insensitive)
+            for k, v in st.secrets.items():
+                if isinstance(v, str):
+                    v_clean = v.strip().strip('"').strip("'")
+                    if k.upper() in _CANDIDATE_NAMES and v_clean:
+                        return v_clean
+                    if v_clean.startswith("AIza") and len(v_clean) >= 30:
+                        return v_clean
+            # 2. Check nested TOML sections (e.g. if pasted below [gcp_service_account])
+            for k, v in st.secrets.items():
+                if hasattr(v, "items"):
+                    for sub_k, sub_v in v.items():
+                        if isinstance(sub_v, str):
+                            sv_clean = sub_v.strip().strip('"').strip("'")
+                            if str(sub_k).upper() in _CANDIDATE_NAMES and sv_clean:
+                                return sv_clean
+                            if sv_clean.startswith("AIza") and len(sv_clean) >= 30:
+                                return sv_clean
     except Exception:
         pass
 
-    # 2. Check environment variables
-    for k in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-        val = str(os.environ.get(k, "") or "").strip()
+    # 3. Check environment variables
+    for k in _CANDIDATE_NAMES:
+        val = str(os.environ.get(k, "") or os.environ.get(k.lower(), "") or "").strip().strip('"').strip("'")
         if val:
             return val
-
-    # 3. Check persisted autotrade_config.json
-    try:
-        import coindcx_engine
-        cfg = coindcx_engine.get_autotrade_config()
-        saved_key = str(cfg.get("gemini_api_key", "") or "").strip()
-        if saved_key:
-            return saved_key
-    except Exception:
-        pass
 
     return ""
 
@@ -149,6 +163,25 @@ def build_live_market_context(selected_pair: str = "B-SOL_USDT") -> str:
     return "\n".join(lines)
 
 
+def _get_gcp_service_account_client():
+    """Creates a Vertex AI / Google Cloud OAuth2 client from `[gcp_service_account]` in Streamlit secrets if available."""
+    try:
+        import sheets_logger
+        from google.oauth2 import service_account
+        sa_dict = sheets_logger._load_service_account_dict()
+        if not sa_dict or not sa_dict.get("private_key"):
+            return None, None
+        scopes = [
+            "https://www.googleapis.com/auth/cloud-platform",
+            "https://www.googleapis.com/auth/generative-language",
+        ]
+        creds = service_account.Credentials.from_service_account_info(sa_dict, scopes=scopes)
+        project_id = sa_dict.get("project_id", "gen-lang-client-0777980903")
+        return creds, project_id
+    except Exception:
+        return None, None
+
+
 def ask_gemini_trade_advisor(
     user_prompt: str,
     preferred_model: str = "gemini-4-argon",
@@ -159,24 +192,27 @@ def ask_gemini_trade_advisor(
 ) -> dict:
     """
     Sends the user's prompt along with the live Google Sheet trade journal and CoinDCX market context
-    to Gemini via the official `google-genai` Interactions API (`client.interactions.create`).
-    Automatically falls back across `FALLBACK_MODEL_CHAIN` if a model tier is unavailable on the key.
+    to Gemini via the official `google-genai` SDK.
+    Automatically falls back across `FALLBACK_MODEL_CHAIN` and `[gcp_service_account]` if needed.
     """
     key = str(api_key or get_gemini_api_key() or "").strip()
-    if not key:
+    sa_creds, sa_project = (None, None) if key else _get_gcp_service_account_client()
+    if not key and not sa_creds:
         return {
             "ok": False,
             "error": (
-                "Missing `GEMINI_API_KEY`. Click **+ Create Gemini API key** on your Google Cloud Console "
-                "(Project `gen-lang-client-0777980903`) or Google AI Studio (`https://aistudio.google.com/apikey`) "
-                "and paste it in the **Gemini API Key** box above."
+                "Missing `GEMINI_API_KEY` in Streamlit Secrets. Add `GEMINI_API_KEY = \"AIza...\"` "
+                "at the top of your Streamlit Secrets (above `[gcp_service_account]`) or paste it in the box above."
             ),
             "text": "",
             "model_used": None,
             "interaction_id": previous_interaction_id,
         }
 
-    client = genai.Client(api_key=key)
+    if key:
+        client = genai.Client(api_key=key)
+    else:
+        client = genai.Client(vertexai=True, credentials=sa_creds, project=sa_project, location="us-central1")
 
     # Construct the grounded input combining live Google Sheet data + terminal snapshot + user question
     full_input = (
@@ -200,16 +236,25 @@ def ask_gemini_trade_advisor(
             if previous_interaction_id and candidate_model == preferred_model:
                 kwargs["previous_interaction_id"] = previous_interaction_id
 
-            interaction = client.interactions.create(**kwargs)
-            reply_text = getattr(interaction, "output_text", None) or ""
-            if not reply_text and getattr(interaction, "outputs", None):
-                parts = []
-                for out in interaction.outputs:
-                    if getattr(out, "type", "") == "text" or hasattr(out, "text"):
-                        txt = getattr(out, "text", "")
-                        if txt:
-                            parts.append(str(txt))
-                reply_text = "\n".join(parts)
+            if hasattr(client, "interactions"):
+                interaction = client.interactions.create(**kwargs)
+                reply_text = getattr(interaction, "output_text", None) or ""
+                if not reply_text and getattr(interaction, "outputs", None):
+                    parts = []
+                    for out in interaction.outputs:
+                        if getattr(out, "type", "") == "text" or hasattr(out, "text"):
+                            txt = getattr(out, "text", "")
+                            if txt:
+                                parts.append(str(txt))
+                    reply_text = "\n".join(parts)
+                interaction_id = getattr(interaction, "id", None)
+            else:
+                gen_resp = client.models.generate_content(
+                    model=candidate_model,
+                    contents=full_input,
+                )
+                reply_text = getattr(gen_resp, "text", "") or ""
+                interaction_id = None
 
             if not reply_text:
                 reply_text = "No text output returned by the model."
@@ -219,7 +264,7 @@ def ask_gemini_trade_advisor(
                 "error": None,
                 "text": reply_text,
                 "model_used": candidate_model,
-                "interaction_id": getattr(interaction, "id", None),
+                "interaction_id": interaction_id,
             }
         except Exception as e:
             last_err = e
@@ -227,6 +272,61 @@ def ask_gemini_trade_advisor(
             # If the API key itself is invalid, fail fast without trying other models
             if "api_key_invalid" in err_str or "api key not valid" in err_str:
                 break
+            # Fallback to generate_content if interactions endpoint is unsupported for this model
+            try:
+                gen_resp = client.models.generate_content(
+                    model=candidate_model,
+                    contents=f"{SYSTEM_INSTRUCTION}\n\n{full_input}",
+                )
+                reply_text = getattr(gen_resp, "text", "") or ""
+                if reply_text:
+                    return {
+                        "ok": True,
+                        "error": None,
+                        "text": reply_text,
+                        "model_used": candidate_model,
+                        "interaction_id": None,
+                    }
+            except Exception as e2:
+                last_err = e2
+            if sa_creds is not None:
+                try:
+                    import requests as _req
+                    from google.auth.transport.requests import Request as _GAuthReq
+                    if not sa_creds.valid:
+                        sa_creds.refresh(_GAuthReq())
+                    gl_url = f"https://generativelanguage.googleapis.com/v1beta/models/{candidate_model}:generateContent"
+                    gl_resp = _req.post(
+                        gl_url,
+                        headers={
+                            "Authorization": f"Bearer {sa_creds.token}",
+                            "x-goog-user-project": str(sa_project or ""),
+                            "Content-Type": "application/json",
+                        },
+                        json={
+                            "systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
+                            "contents": [{"role": "user", "parts": [{"text": full_input}]}],
+                        },
+                        timeout=30,
+                    )
+                    if gl_resp.status_code == 200:
+                        gl_data = gl_resp.json()
+                        cands = gl_data.get("candidates") or []
+                        if cands:
+                            parts = cands[0].get("content", {}).get("parts") or []
+                            txt = "\n".join(p.get("text", "") for p in parts if p.get("text")).strip()
+                            if txt:
+                                return {
+                                    "ok": True,
+                                    "error": None,
+                                    "text": txt,
+                                    "model_used": candidate_model,
+                                    "interaction_id": None,
+                                }
+                    else:
+                        last_err = f"HTTP {gl_resp.status_code}: {gl_resp.text[:240]}"
+                except Exception as e3:
+                    last_err = e3
             continue
 
     return {

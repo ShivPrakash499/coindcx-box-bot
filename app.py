@@ -21,11 +21,11 @@ try:
         for _sec_k, _sec_v in st.secrets.items():
             if isinstance(_sec_v, (str, int, float, bool)):
                 os.environ[str(_sec_k)] = str(_sec_v)
-            elif str(_sec_k) == "gcp_service_account" and hasattr(_sec_v, "items"):
-                os.environ["GOOGLE_CREDENTIALS_JSON"] = _json.dumps(dict(_sec_v))
             elif hasattr(_sec_v, "items"):
+                if str(_sec_k) == "gcp_service_account":
+                    os.environ["GOOGLE_CREDENTIALS_JSON"] = _json.dumps(dict(_sec_v))
                 for _sub_k, _sub_v in _sec_v.items():
-                    if isinstance(_sub_v, (str, int, float, bool)):
+                    if isinstance(_sub_v, (str, int, float, bool)) and str(_sub_k) not in ("type", "project_id", "private_key_id", "private_key", "client_email", "client_id", "auth_uri", "token_uri", "auth_provider_x509_cert_url", "client_x509_cert_url", "universe_domain"):
                         os.environ[str(_sub_k)] = str(_sub_v)
 except Exception:
     pass
