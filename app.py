@@ -257,7 +257,7 @@ def check_authentication():
     _ip_tag = coindcx_engine._PERSIST.get("pinned_ip") or (_seen_ips if _seen_ips else "Scanning NAT")
     _pos_pairs = ", ".join(str(p.get("pair", "")).replace("B-", "").replace("_USDT", "") for p in _pre_pos) if _pre_pos else "0"
     if _pre_bal.get("is_live_api"):
-        _api_pill = f"🟢 CoinDCX Live Synced (Key: {_k_tag} | IP: {_ip_tag}) • Wallet: Synced • Positions: {len(_pre_pos)} ({_pos_pairs})"
+        _api_pill = f"🟢 CoinDCX Live Synced (Key: {_k_tag} | IP: {_ip_tag}) • Wallet: ₹{_pre_bal.get('total_inr', 0):,.2f} • Positions: {len(_pre_pos)} ({_pos_pairs})"
         _pill_col = "#10b981"
     else:
         _err_str = _pre_bal.get("api_error") or coindcx_engine._PERSIST.get("last_auth_error") or "Connecting..."
