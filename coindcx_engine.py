@@ -507,37 +507,22 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
             return None
         _PERSIST["last_nat_probe_ts"] = now_p
 
-        target_ip = "34.83.176.217"
         seen_ips = {}
 
-        # Keep sockets open in cand_pool so Cloud NAT assigns across all pool IPs
-        for _ in range(28):
+        # Keep sockets open in cand_pool so Cloud NAT assigns across all pool IPs, testing each new unique NAT IP immediately on sight
+        for _ in range(24):
             cand = requests.Session()
             cand_pool.append(cand)
             cand_ip = _probe_session_coindcx_ip(cand, timeout=1.6)
-            if cand_ip == target_ip:
-                r_try = _test_signed_on_sess(cand, api_key, api_secret)
-                if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
-                    winning_sess = cand
-                    winning_res = r_try
-                    winning_ip = cand_ip
-                    break
             if cand_ip and cand_ip not in seen_ips:
                 seen_ips[cand_ip] = cand
-            time.sleep(0.03)
-
-        # If target_ip was not hit directly, test unique candidate IPs (prioritizing 34.* Cloud NAT IPs)
-        if winning_sess is None:
-            ordered_ips = sorted(seen_ips.keys(), key=lambda ip: (0 if ip == target_ip else (1 if ip.startswith("34.") else 2)))
-            for cand_ip in ordered_ips:
-                cand = seen_ips[cand_ip]
                 r_try = _test_signed_on_sess(cand, api_key, api_secret)
                 if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
                     winning_sess = cand
                     winning_res = r_try
                     winning_ip = cand_ip
                     break
-                time.sleep(0.02)
+            time.sleep(0.03)
 
         if winning_sess is not None:
             with _COINDCX_SIGN_LOCK:
