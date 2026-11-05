@@ -248,15 +248,30 @@ def check_authentication():
         return True
 
     required_pin = get_security_pin()
+    _pre_bal = fetch_coindcx_futures_balance(force_refresh=False) or {}
+    _pre_pos = fetch_coindcx_active_positions(force_refresh=False) or []
+    _pre_k, _pre_s = coindcx_engine._get_coindcx_credentials()
+    _k_tag = f"{_pre_k[:4]}..{_pre_k[-4:]}" if len(_pre_k) >= 8 else "NoKey"
+    _ip_tag = coindcx_engine._PERSIST.get("pinned_ip") or "Scanning NAT"
+    _pos_pairs = ", ".join(str(p.get("pair", "")).replace("B-", "").replace("_USDT", "") for p in _pre_pos) if _pre_pos else "0"
+    if _pre_bal.get("is_live_api"):
+        _api_pill = f"🟢 CoinDCX Live Synced (Key: {_k_tag} | IP: {_ip_tag}) • Wallet: OK • Positions: {len(_pre_pos)} ({_pos_pairs})"
+        _pill_col = "#10b981"
+    else:
+        _err_str = _pre_bal.get("api_error") or coindcx_engine._PERSIST.get("last_auth_error") or "Connecting..."
+        _api_pill = f"🔄 CoinDCX Status: {_err_str} (Key: {_k_tag} | IP: {_ip_tag} | Pos: {len(_pre_pos)})"
+        _pill_col = "#f59e0b"
+
     pin_slot = st.empty()
     with pin_slot.container():
         st.html(
-            """
-            <div style="max-width: 400px; margin: 48px auto 16px auto; padding: 28px 24px; background: #0f172a; border-radius: 16px; box-shadow: 0 12px 32px rgba(0,0,0,0.25); text-align: center; border: 1px solid #1e293b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
+            f"""
+            <div style="max-width: 420px; margin: 48px auto 16px auto; padding: 28px 24px; background: #0f172a; border-radius: 16px; box-shadow: 0 12px 32px rgba(0,0,0,0.25); text-align: center; border: 1px solid #1e293b; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;">
                 <div style="font-size: 38px; margin-bottom: 8px;">⚡</div>
                 <h2 style="margin: 0; color: #f8fafc; font-weight: 800; font-size: 22px; letter-spacing: -0.4px;">Crypto Trade Pro</h2>
                 <div style="display: inline-block; background: rgba(59,130,246,0.15); color: #60a5fa; font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 20px; margin-top: 6px; text-transform: uppercase; letter-spacing: 0.5px;">24/7 Daemon Active</div>
-                <p style="color: #94a3b8; font-size: 12.5px; margin-top: 10px; margin-bottom: 0px;">Enter your PIN to unlock execution & position controls.</p>
+                <div style="color: {_pill_col}; font-size: 11px; font-weight: 600; margin-top: 8px;">{_api_pill}</div>
+                <p style="color: #94a3b8; font-size: 12.5px; margin-top: 8px; margin-bottom: 0px;">Enter your PIN to unlock execution & position controls.</p>
             </div>
             """
         )
