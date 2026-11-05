@@ -4,6 +4,13 @@
 
 ---
 
+## 0. NEVER Push Any Change Directly to main (Always staging First)
+- **Mandatory Rule**:
+  - For ANY bug fix, feature, or issue reported by the user, **ALWAYS commit and push ONLY to staging** (git push origin staging).
+  - **NEVER** push or merge to main unless the user has verified staging and explicitly instructs to merge staging into main.
+
+---
+
 ## 1. Never Touch `requirements.txt` Unnecessarily (Prevents Container Restarts & Static JS Chunk Failures)
 - **What Happened**: Adding or changing lines in [`requirements.txt`](file:///C:/coindcx_box_bot/requirements.txt) caused Streamlit Cloud (`uv`) to reinstall packages (`pip`, `certifi`, `pyarrow`) and restart the Uvicorn/Tornado server mid-flight while the browser was fetching dynamically imported UI chunks (`Selectbox.*.js`, `Metric.*.js`, `TextInput.*.js`). It also wiped the in-memory pinned Cloud NAT session (`_PERSIST["session"]`).
 - **Mandatory Rule**:
