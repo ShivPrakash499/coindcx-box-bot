@@ -148,7 +148,8 @@ def classify_daily_ema_bias(close_val: float, ema50_val: float, ema200_val: floa
 DEFAULT_LEVERAGE = 10               # 10x leverage per trade
 MAX_TP_ROE_PCT = 10.0               # TP1 (50% Early Book) = min(2.0% price move [10% total-margin ROE], nearer of MID / 15m 50 EMA)
 MIN_TP_ROE_PCT = 3.0                # Skip trade if TP1 distance is < 0.6% price move
-MAX_SL_ROE_PCT = 5.0                # Strict 1.0% max catastrophe SL price distance
+MAX_SL_ROE_PCT = 5.0                # Legacy constant (not enforced): Box catastrophe SL = 0.5% beyond Entry 2 (SH/SL),
+                                    # i.e. typically 1.3%-5% from Entry 1 depending on how far the sweep level is
 DAILY_WALLET_LOSS_STOP_PCT = 5.0    # STOP trading for the day if 5% of total futures wallet is lost including fees
 MAX_TRADES_PER_DAY = 999            # Legacy trade-count cap removed per discipline update
 DAILY_WIN_ROE_LOCK_PCT = 9999.0     # Legacy daily win-lock removed per discipline update
@@ -218,6 +219,7 @@ def build_two_entry_runner_plan(
       - Entry 1 (50% Margin): Confirmed 15m rejection close price (`entry`).
       - Entry 2 (50% Margin — Same Amount): Placed at the `SH` / `SL` / wick sweep level (`sweep_level`).
       - Emergency Catastrophe SL (`stop_price`): Placed 0.5% beyond `Entry 2` (`SH`/`SL`).
+        NOTE: no 1% cap is applied — SL distance from Entry 1 grows with the sweep-level distance.
       - TP1 (Close 50% / Book Early Profit): Nearer of `MID` or `15m 50 EMA` (capped at 2.0% price move).
       - Remaining 50% Runner: Managed by Trailing 15m H/L SL + Strategy 3 (20% ATR 30% Pullback / Confirmed 5m 9 EMA Cross).
     """
@@ -430,7 +432,7 @@ class BoxTheorySweep(Strategy):
         "TP1 is placed at Box Midpoint (MID) or 15m 50 EMA, whichever is nearer; "
         "remaining 50% runner uses Trailing 15m H/L SL + Strategy 3 (20% ATR 30% pullback / confirmed 5m 9 EMA cross)."
     )
-    daily_warmup_days = 220
+    daily_warmup_days = 1000  # match live 1000-candle Daily EMA200
     tp1_name, tp2_name = "TP1 (50% Book Nearer of MID / 15m 50 EMA)", "50% Runner (15m Trail + 9 EMA / 20% ATR Exit)"
     uses_live_price = True
 
@@ -445,7 +447,7 @@ class BoxTheorySweep(Strategy):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
-        df_15m = _closed_15m(pair, 80)
+        df_15m = _closed_15m(pair, 200)
         if df_15m.empty or len(df_15m) < 3:
             return None
 
@@ -749,19 +751,17 @@ class BoxTheorySweep(Strategy):
             mid = (rh + rl) / 2.0
             bias = classify_daily_ema_bias(prev_close, ema50, ema200)
 
-            lookback_start = max(0, i - 30)
-            prior_slice = daily_records[lookback_start:i - 1]
-            prior_highs = [float(x["high"]) for x in prior_slice] if prior_slice else []
-            prior_lows = [float(x["low"]) for x in prior_slice] if prior_slice else []
+            # Same shared SH/SL formula as live calculate_daily_box_levels (last 30 completed days ending yesterday)
+            swing = eng.compute_box_swing_levels(d.iloc[max(0, i - 30):i])
+            sh, sl = swing["SH"], swing["SL"]
 
-            sh_c = [h for h in prior_highs if h >= rh * 1.008]
-            sh = min(sh_c) if (sh_c and min(sh_c) <= rh * 1.035) else rh * 1.015
-            sl_c = [l for l in prior_lows if l <= rl * 0.992]
-            sl = max(sl_c) if (sl_c and max(sl_c) >= rl * 0.965) else rl * 0.985
-
+            # Identical rounding to live calculate_daily_box_levels() so sweep checks see the exact same levels
             daily_boxes[curr_day_str] = {
-                "RH": rh, "RL": rl, "MID": mid, "SH": sh, "SL": sl,
-                "EMA50": ema50, "EMA200": ema200, "ATR": atr_val, "bias": bias
+                "RH": eng.round_asset_price(rh), "RL": eng.round_asset_price(rl),
+                "MID": eng.round_asset_price(mid, rh),
+                "SH": eng.round_asset_price(sh, rh), "SL": eng.round_asset_price(sl, rl),
+                "EMA50": eng.round_asset_price(ema50, rh), "EMA200": eng.round_asset_price(ema200, rh),
+                "ATR": atr_val, "bias": bias
             }
         return {"boxes": daily_boxes, "ema50_15m": ema50_15m_list}
 
@@ -1575,7 +1575,7 @@ class CombinedPriorityStrategy(Strategy):
         "and ONLY falls back to Strategy 3 (5m Confirmed 9 EMA Cross -> 9 EMA Touch & Confirm) "
         "when Strategies 1 & 2 yield no setup."
     )
-    daily_warmup_days = 220
+    daily_warmup_days = 1000  # match live 1000-candle Daily EMA200
     tp1_name, tp2_name = "TP1 (50% Book Nearer of MID / 15m 50 EMA)", "50% Runner (15m Trail + 9 EMA / 20% ATR Exit)"
     uses_live_price = True
 
