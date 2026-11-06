@@ -440,7 +440,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 12
+_REQUIRED_DAEMON_VERSION = 13
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -538,7 +538,7 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
         win_box = {"sess": None, "res": None, "ip": ""}
 
         def _probe_worker():
-            for _ in range(8):
+            for _ in range(10):
                 if found_evt.is_set():
                     return
                 cand = _make_single_socket_session()
@@ -563,11 +563,11 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                                 found_evt.set()
                         return
 
-        workers = [_threading.Thread(target=_probe_worker, daemon=True) for _ in range(8)]
+        workers = [_threading.Thread(target=_probe_worker, daemon=True) for _ in range(12)]
         for w in workers:
             w.start()
         for w in workers:
-            w.join(timeout=7.5)
+            w.join(timeout=8.5)
 
         winning_sess = win_box["sess"]
         winning_res = win_box["res"]
@@ -3978,6 +3978,7 @@ def _upgrade_all_in_memory_functions_and_disarm():
         _ACTIVE_POSITIONS_CACHE["refreshing"] = False
         _PERSIST["last_nat_probe_ts"] = 0.0
         if not _PERSIST.get("session_verified"):
+            _PERSIST["seen_coindcx_ips"] = []
             _WALLET_BALANCE_CACHE["data"] = None
             _WALLET_BALANCE_CACHE["last_good_live"] = None
             _ACTIVE_POSITIONS_CACHE["data"] = None

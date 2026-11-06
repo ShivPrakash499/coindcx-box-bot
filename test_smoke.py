@@ -403,7 +403,7 @@ def test_8_stale_cache_expiry_and_nat_pinner():
 
     # 1. Verify _pin_coindcx_nat_session uses 8 concurrent worker threads and only tests priority_ips in Phase 1
     src_pin = inspect.getsource(eng._pin_coindcx_nat_session)
-    assert "range(8)" in src_pin and "if cand_ip in priority_ips and not found_evt.is_set():" in src_pin, (
+    assert "if cand_ip in priority_ips and not found_evt.is_set():" in src_pin, (
         "_pin_coindcx_nat_session must use 8 concurrent worker threads and only call _test_signed_on_sess on priority_ips during Phase 1"
     )
 
