@@ -3061,6 +3061,7 @@ def run_strategy_backtest(
 _raw_def_wallet = float(os.getenv("DEFAULT_WALLET_INR", 47287.18))
 DEFAULT_WALLET_INR = 47287.18 if _raw_def_wallet in (30000.0, 250000.0, 40569.80) else _raw_def_wallet
 TRADE_ALLOCATION_FRACTION = 1.0 / 3.0
+MAX_CONCURRENT_TRADES = 3  # 3 concurrent trades x ₹20k = ₹60k wallet
 
 # High-Volatility / High-Movement Crypto Futures Universe (Verified Profitable at 10x Leverage: 67.2% WR, +407% 30d ROI)
 HIGH_VOL_FUTURES_UNIVERSE = [
@@ -4013,27 +4014,36 @@ def execute_autotrade_two_entry_signal(
     lev = int(leverage or cfg.get("leverage", 10))
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
 
+    max_slots = int(cfg.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)
     slot = get_active_portfolio_trade_status()
     if slot.get("is_occupied"):
         act_p = slot.get("active_pair")
-        return False, (
-            f"1-Crypto-at-a-Time Guard: Active trade already open on {act_p} ({slot.get('source')}). "
-            f"Skipping {pair} so 50% margin stays reserved for {act_p} Entry 2."
-        ), {"slot_status": slot}
+        slot_cnt = int(slot.get("count", 1) or 1)
+        if act_p == pair or slot_cnt >= max_slots:
+            return False, (
+                f"Portfolio Slot Guard ({slot_cnt}/{max_slots} active): Active trade already open on {act_p} ({slot.get('source')}). "
+                f"Skipping {pair}."
+            ), {"slot_status": slot}
 
-    # Mandatory synchronous live CoinDCX position check so a 2nd trade can NEVER open if any position is live on the exchange
+    # Mandatory synchronous live CoinDCX position check: block duplicate pair or when >= max_slots (3) positions are open
     live_ex_pos = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
     if live_ex_pos is None and os.getenv("COINDCX_API_KEY"):
         return False, (
-            f"1-Crypto-at-a-Time Safety Guard: Could not verify live CoinDCX positions right now; "
-            f"blocking {pair} AutoTrade to prevent opening a 2nd concurrent position."
+            f"Portfolio Safety Guard: Could not verify live CoinDCX positions right now; "
+            f"blocking {pair} AutoTrade until exchange positions are verified."
         ), {"live_ex_pos": None}
     if live_ex_pos:
-        open_p = live_ex_pos[0].get("pair", "UNKNOWN")
-        return False, (
-            f"1-Crypto-at-a-Time Live Exchange Guard: CoinDCX already has an open position on {open_p}. "
-            f"Skipping {pair} so only 1 crypto is traded at a time."
-        ), {"live_ex_pos": live_ex_pos}
+        same_pair_open = next((p for p in live_ex_pos if p.get("pair") == pair), None)
+        if same_pair_open:
+            return False, (
+                f"Duplicate Pair Guard: CoinDCX already has an open position on {pair}. Skipping duplicate {pair} order."
+            ), {"live_ex_pos": live_ex_pos}
+        if len(live_ex_pos) >= max_slots:
+            open_names = ", ".join(str(p.get("pair", "UNKNOWN")) for p in live_ex_pos[:max_slots])
+            return False, (
+                f"3-Slot Wallet Guard ({len(live_ex_pos)}/{max_slots} active): CoinDCX already has {len(live_ex_pos)} open trades ({open_names}). "
+                f"Skipping {pair} (₹60k wallet / ₹20k per trade = max {max_slots} concurrent trades)."
+            ), {"live_ex_pos": live_ex_pos}
 
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     norm_dir = "LONG" if direction in ("LONG", "BUY") else "SHORT"
@@ -4193,6 +4203,7 @@ def run_portfolio_single_slot_backtest(
     strategy_id: str = "box_theory",
     wallet_inr: float = None,
     exit_mode: str = "hybrid",
+    max_concurrent_trades: int = MAX_CONCURRENT_TRADES,
 ) -> dict:
     """
     Simulates the exact '1 Crypto at a Time @ 10x Leverage' Portfolio across the High-Volatility
@@ -4252,30 +4263,50 @@ def run_portfolio_single_slot_backtest(
 
     df_all = pd.DataFrame(all_candidates).sort_values(by=["entry_time", "vol_rank"]).reset_index(drop=True)
     accepted = []
-    current_exit_time = ""
+    active_open_trades = []
+    max_slots = max(1, int(max_concurrent_trades or MAX_CONCURRENT_TRADES))
     day_counts = {}
     day_pnl = {}
     locked_days = set()
+
+    def _settle_closed_trades(up_to_time: str):
+        nonlocal active_open_trades
+        still_open = []
+        # Sort closing trades chronologically by exit_time so daily 5% wallet loss stop triggers at exact close time
+        closing = [t for t in active_open_trades if str(t["exit_time"]) <= up_to_time]
+        for t in active_open_trades:
+            if str(t["exit_time"]) > up_to_time:
+                still_open.append(t)
+        closing.sort(key=lambda x: str(x["exit_time"]))
+        for t in closing:
+            t_ent_day = str(t["entry_time"])[:10]
+            t_ext_day = str(t["exit_time"])[:10]
+            pnl_v = float(t["net_pnl_inr"])
+            day_pnl[t_ext_day] = day_pnl.get(t_ext_day, 0.0) + pnl_v
+            if t_ent_day != t_ext_day:
+                day_pnl[t_ent_day] = day_pnl.get(t_ent_day, 0.0) + pnl_v
+            if day_pnl.get(t_ext_day, 0.0) <= -max_daily_loss_inr:
+                locked_days.add(t_ext_day)
+            if day_pnl.get(t_ent_day, 0.0) <= -max_daily_loss_inr:
+                locked_days.add(t_ent_day)
+        active_open_trades = still_open
 
     for _, tr in df_all.iterrows():
         ent_t = str(tr["entry_time"])
         ext_t = str(tr["exit_time"])
         day_str = ent_t[:10]
-        ext_day = ext_t[:10]
-        if ent_t < current_exit_time:
-            continue  # Strictly 1 crypto trade open at any time!
+        _settle_closed_trades(ent_t)
         if day_str in locked_days:
             continue
-        accepted.append(tr.to_dict())
-        current_exit_time = ext_t
+        # Only 1 active trade per coin at a time, and at most `max_slots` (3) concurrent trades across the wallet
+        if any(t.get("pair") == tr["pair"] for t in active_open_trades):
+            continue
+        if len(active_open_trades) >= max_slots:
+            continue
+        tr_dict = tr.to_dict()
+        accepted.append(tr_dict)
+        active_open_trades.append(tr_dict)
         day_counts[day_str] = day_counts.get(day_str, 0) + 1
-        day_pnl[day_str] = day_pnl.get(day_str, 0.0) + float(tr["net_pnl_inr"])
-        if ext_day != day_str:
-            day_pnl[ext_day] = day_pnl.get(ext_day, 0.0) + float(tr["net_pnl_inr"])
-        if day_pnl.get(day_str, 0.0) <= -max_daily_loss_inr:
-            locked_days.add(day_str)
-        if day_pnl.get(ext_day, 0.0) <= -max_daily_loss_inr:
-            locked_days.add(ext_day)
 
     pdf = pd.DataFrame(accepted)
     wins = pdf[pdf["is_win"] == True]

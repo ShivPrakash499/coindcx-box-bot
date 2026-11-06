@@ -182,7 +182,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     p_raw = pos["pair"]
                     open_live_pairs.add(p_raw)
                     open_live_bases.add(_canon_pair(p_raw))
-                    if not portfolio_occupied:
+                    if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                         portfolio_occupied = True
                         active_Slot_pair = p_raw
         except Exception:
@@ -340,9 +340,11 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     msg = f"{msg} | 🤖 {auto_msg}"
                     now_exec = time.time()
                     if ok_auto:
-                        portfolio_occupied = True
-                        active_Slot_pair = pair
                         open_live_pairs.add(pair)
+                        open_live_bases.add(pair_base)
+                        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
+                            portfolio_occupied = True
+                            active_Slot_pair = pair
                         state[key] = {
                             "candle_ts": sig["candle_ts"],
                             "sent_at": state.get(key, {}).get("sent_at", now_exec),

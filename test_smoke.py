@@ -249,15 +249,27 @@ def test_5_daily_bias_enforcement():
             assert ok_r and "Daily Bias Guard" not in msg_r, f"Expected RANGE mode trade allowed, got: {ok_r} {msg_r}"
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{"pair": "B-INJ_USDT", "direction": "SHORT", "id": "pos_inj"}]):
-        ok_2nd, msg_2nd, _ = eng.execute_autotrade_two_entry_signal(
-            pair="B-RENDER_USDT",
-            sig={"signal": "SHORT", "entry": 1.51, "entry2_sweep": 1.63, "tp1": 1.48, "tp2": 1.45, "stop_loss": 1.64, "levels": bear_levels},
-            single_trade_margin_inr=15762.39,
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
+             {"pair": "B-INJ_USDT", "direction": "SHORT", "id": "pos_inj"},
+             {"pair": "B-NEAR_USDT", "direction": "LONG", "id": "pos_near"},
+             {"pair": "B-SUI_USDT", "direction": "LONG", "id": "pos_sui"},
+         ]):
+        ok_dup, msg_dup, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-INJ_USDT",
+            sig={"signal": "SHORT", "entry": 7.30, "entry2_sweep": 7.43, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.49, "levels": bear_levels},
+            single_trade_margin_inr=20000.0,
             leverage=10,
         )
-        assert not ok_2nd and "1-Crypto-at-a-Time Live Exchange Guard" in msg_2nd, (
-            f"Expected 2nd concurrent trade blocked by live exchange guard, got: {ok_2nd} {msg_2nd}"
+        assert not ok_dup and "Duplicate Pair Guard" in msg_dup, f"Expected duplicate pair guard, got: {ok_dup} {msg_dup}"
+
+        ok_4th, msg_4th, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-RENDER_USDT",
+            sig={"signal": "SHORT", "entry": 1.51, "entry2_sweep": 1.63, "tp1": 1.48, "tp2": 1.45, "stop_loss": 1.64, "levels": bear_levels},
+            single_trade_margin_inr=20000.0,
+            leverage=10,
+        )
+        assert not ok_4th and "3-Slot Wallet Guard" in msg_4th, (
+            f"Expected 4th concurrent trade blocked by 3-Slot Wallet Guard, got: {ok_4th} {msg_4th}"
         )
 
     base_closes = [6.0] * 250 + [7.20]
