@@ -440,7 +440,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 15
+_REQUIRED_DAEMON_VERSION = 16
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -663,11 +663,11 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
 
         # 2. Fast-path: Always test the permanent GCP Static IP Proxy (`35.230.95.39:8888`) first on a single socket (< 0.3s)
         active_proxy = _get_coindcx_proxy_url()
-        if active_proxy and (now_p - float(_PERSIST.get("last_proxy_probe_ts", 0.0))) >= 1.5:
+        if active_proxy and (now_p - float(_PERSIST.get("last_proxy_probe_ts", 0.0))) >= 30.0:
             _PERSIST["last_proxy_probe_ts"] = now_p
             cand_proxy = _make_single_socket_session(use_proxy=True)
             cand_pool.append(cand_proxy)
-            proxy_ip = _probe_session_coindcx_ip(cand_proxy, timeout=2.5) or "35.230.95.39"
+            proxy_ip = "35.230.95.39"
             r_proxy = _test_signed_on_sess(cand_proxy, api_key, api_secret)
             if r_proxy is not None and (r_proxy.status_code == 200 or r_proxy.status_code not in (401, 502, 503)):
                 sign_lock = _PERSIST.get("lock") or _COINDCX_SIGN_LOCK

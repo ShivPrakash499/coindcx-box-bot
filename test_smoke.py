@@ -364,13 +364,23 @@ def test_7_ui_render_and_navigation_tabs_integrity():
             "CRITICAL UI BUG: `@st.fragment` before `Navigate Section` contains `st.rerun()`!"
         )
 
-    # 3. Verify no top-level st.stop() exists between check_authentication() and Navigate Section
+    # 3. Verify no top-level st.stop() or non-button st.rerun() exists between check_authentication() and Navigate Section
     auth_call_idx = app_src.find("check_authentication()")
     assert 0 < auth_call_idx < nav_idx
     between_auth_and_nav = app_src[auth_call_idx:nav_idx]
     assert "\nst.stop()" not in between_auth_and_nav, (
         "Top-level st.stop() found between check_authentication() and Navigate Section!"
     )
+    assert "input_coindcx_static_proxy_url" not in between_auth_and_nav, (
+        "CRITICAL UI BUG: Sidebar text_input with st.rerun() found before Navigate Section!"
+    )
+    lines_between = between_auth_and_nav.splitlines()
+    for idx_l, line_txt in enumerate(lines_between):
+        if "st.rerun()" in line_txt:
+            context_window = "\n".join(lines_between[max(0, idx_l - 8):idx_l + 1])
+            assert ("st.button(" in context_window or "st.sidebar.button(" in context_window), (
+                f"CRITICAL UI BUG: Unconditional/non-button st.rerun() found before Navigate Section at line {idx_l}:\n{context_window}"
+            )
 
     # 4. Verify all 6 required navigation tabs exist in NAV_SECTIONS and have matching render blocks
     expected_tabs = [
