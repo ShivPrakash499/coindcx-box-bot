@@ -440,7 +440,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 11
+_REQUIRED_DAEMON_VERSION = 12
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -472,15 +472,18 @@ def _make_single_socket_session() -> requests.Session:
 
 def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET", url: str = "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets", payload: dict | None = None, timeout: float = 3.5):
     """
-    Single-flight Cloud NAT egress IP pinner (strictly 1 thread, zero socket/thread starvation):
-    - Holds up to 28 candidate single-socket sessions open simultaneously in `cand_pool` so Google Cloud NAT
-      must cycle across all 8-10 egress IPs in its pool instead of recycling a non-allowlisted IP.
-    - Immediately tests priority allowlisted IPs (`35.230.78.192`, `34.83.176.217`, `last_verified_ip`) on sight
-      without wasting signed API calls on non-allowlisted IPs during the fast scan.
+    Two-stage Cloud NAT egress IP pinner:
+    - Phase 1 (Concurrent Priority Probe & Instant Verify): 8 worker threads open up to 8 sockets each
+      (64 concurrent sockets held open in `cand_pool` so Google Cloud NAT spills across all 6+ egress IPs,
+      including `35.230.78.192`). Workers ONLY call `_test_signed_on_sess` when `cand_ip in priority_ips`,
+      so `_COINDCX_SIGN_LOCK` has zero contention and `35.230.78.192` is verified in ~0.4s on the warm socket.
+    - Phase 2 (Fallback after `w.join()`): If no priority IP won, tests remaining unique `seen_ips` on the
+      main pinner thread after all workers have joined (zero socket close race).
     """
     if not api_key or not api_secret:
         return None
-    if not _NAT_PIN_LOCK.acquire(blocking=True, timeout=12.0):
+    pin_lock = _PERSIST.get("nat_pin_lock") or _NAT_PIN_LOCK
+    if not pin_lock.acquire(blocking=True, timeout=12.0):
         return None
 
     cand_pool = []
@@ -489,7 +492,8 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
     winning_ip = ""
     try:
         def _test_signed_on_sess(cand_sess, k_try: str, s_try: str):
-            with _COINDCX_SIGN_LOCK:
+            sign_lock = _PERSIST.get("lock") or _COINDCX_SIGN_LOCK
+            with sign_lock:
                 body = payload.copy() if payload else {}
                 body["timestamp"] = _next_monotonic_ms()
                 json_body = json.dumps(body, separators=(',', ':'))
@@ -510,15 +514,15 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                 except Exception:
                     return None
 
-        # 1. If a preceding caller that just released _NAT_PIN_LOCK already pinned a verified session, reuse it!
+        # 1. If a preceding caller that just released pin_lock already pinned a verified session, reuse it!
         if _PERSIST.get("session_verified") and _PERSIST.get("session") is not None:
             r_reuse = _test_signed_on_sess(_PERSIST["session"], api_key, api_secret)
             if r_reuse is not None and (r_reuse.status_code == 200 or r_reuse.status_code not in (401, 502, 503)):
                 return r_reuse
 
-        # 2. Avoid back-to-back scans if a scan just failed < 2.0s ago
+        # 2. Avoid back-to-back scans if a scan just failed < 1.5s ago
         now_p = time.time()
-        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < 2.0:
+        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < 1.5:
             return None
         _PERSIST["last_nat_probe_ts"] = now_p
 
@@ -529,26 +533,47 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
 
         seen_ips = {}
         tested_ips = set()
+        pool_lock = _threading.Lock()
+        found_evt = _threading.Event()
+        win_box = {"sess": None, "res": None, "ip": ""}
 
-        # Pass 1: Fast scan across 28 sockets held open in cand_pool, immediately testing priority_ips on sight
-        for _ in range(28):
-            cand = _make_single_socket_session()
-            cand_pool.append(cand)
-            cand_ip = _probe_session_coindcx_ip(cand, timeout=1.5)
-            if cand_ip:
-                if cand_ip not in seen_ips:
-                    seen_ips[cand_ip] = cand
-                if cand_ip in priority_ips:
-                    tested_ips.add(cand_ip)
+        def _probe_worker():
+            for _ in range(8):
+                if found_evt.is_set():
+                    return
+                cand = _make_single_socket_session()
+                with pool_lock:
+                    cand_pool.append(cand)
+                cand_ip = _probe_session_coindcx_ip(cand, timeout=1.6)
+                if not cand_ip or found_evt.is_set():
+                    continue
+                with pool_lock:
+                    if cand_ip not in seen_ips:
+                        seen_ips[cand_ip] = cand
+                if cand_ip in priority_ips and not found_evt.is_set():
+                    with pool_lock:
+                        tested_ips.add(cand_ip)
                     r_try = _test_signed_on_sess(cand, api_key, api_secret)
                     if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
-                        winning_sess = cand
-                        winning_res = r_try
-                        winning_ip = cand_ip
-                        break
-            time.sleep(0.02)
+                        with pool_lock:
+                            if not found_evt.is_set():
+                                win_box["sess"] = cand
+                                win_box["res"] = r_try
+                                win_box["ip"] = cand_ip
+                                found_evt.set()
+                        return
 
-        # Pass 2: Fallback if user allowlisted a different NAT IP not in priority_ips
+        workers = [_threading.Thread(target=_probe_worker, daemon=True) for _ in range(8)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join(timeout=7.5)
+
+        winning_sess = win_box["sess"]
+        winning_res = win_box["res"]
+        winning_ip = win_box["ip"]
+
+        # Phase 2: Fallback after all workers joined if user allowlisted a different NAT IP not in priority_ips
         if winning_sess is None:
             for cand_ip, cand in list(seen_ips.items()):
                 if cand_ip in tested_ips:
@@ -562,7 +587,8 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                     break
 
         if winning_sess is not None:
-            with _COINDCX_SIGN_LOCK:
+            sign_lock = _PERSIST.get("lock") or _COINDCX_SIGN_LOCK
+            with sign_lock:
                 old_sess = _PERSIST.get("session")
                 if old_sess is not None and old_sess is not winning_sess:
                     try:
@@ -584,7 +610,7 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                     s.close()
                 except Exception:
                     pass
-        _NAT_PIN_LOCK.release()
+        pin_lock.release()
 
 
 def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
@@ -788,7 +814,7 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
     if (
         isinstance(last_good, dict)
         and last_good.get("_key_prefix") == api_key[:8]
-        and (now_ts - float(_WALLET_BALANCE_CACHE.get("last_good_ts", 0.0))) < 86400.0
+        and (now_ts - float(_WALLET_BALANCE_CACHE.get("last_good_ts", 0.0))) < 90.0
         and "expired" not in str(api_err_msg).lower()
     ):
         return dict(last_good)
@@ -852,7 +878,7 @@ def fetch_coindcx_futures_balance(force_refresh: bool = False):
         and isinstance(last_good, dict)
         and last_good.get("_key_prefix") == api_key[:8]
         and bool(last_good.get("is_live_api"))
-        and (now_ts - float(_WALLET_BALANCE_CACHE.get("last_good_ts", 0.0))) < 86400.0
+        and (now_ts - float(_WALLET_BALANCE_CACHE.get("last_good_ts", 0.0))) < (300.0 if _PERSIST.get("session_verified") else 45.0)
     ):
         _trigger_bg_wallet_refresh()
         return dict(last_good)
@@ -897,9 +923,10 @@ def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> 
         if return_none_on_error:
             return None
         prev = _ACTIVE_POSITIONS_CACHE.get("data")
-        if prev is not None:
-            _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts - 5.0
+        last_ok = float(_ACTIVE_POSITIONS_CACHE.get("last_ok_ts", 0.0))
+        if prev is not None and _PERSIST.get("session_verified") and (now_pos_ts - last_ok) < 90.0:
             return list(prev)
+        _ACTIVE_POSITIONS_CACHE["data"] = []
         return []
 
     active_positions = []
@@ -1006,6 +1033,9 @@ def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> 
 
     _ACTIVE_POSITIONS_CACHE["data"] = active_positions
     _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts
+    _ACTIVE_POSITIONS_CACHE["last_ok_ts"] = now_pos_ts
+    if (now_pos_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))) > 20.0 or not (_WALLET_BALANCE_CACHE.get("data") or {}).get("is_live_api"):
+        _trigger_bg_wallet_refresh()
     return active_positions
 
 def _trigger_bg_positions_refresh():
@@ -3294,6 +3324,13 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
 
         # Fast-path for UI rendering: return lock status immediately in <1ms without blocking on exchange API calls
         if not manage_exchange:
+            if is_live_ex and l_ts > 0 and (time.time() - l_ts) >= 90 and _PERSIST.get("session_verified"):
+                _cached_p = _ACTIVE_POSITIONS_CACHE.get("data")
+                _last_ok_p = float(_ACTIVE_POSITIONS_CACHE.get("last_ok_ts", 0.0))
+                if isinstance(_cached_p, list) and (time.time() - _last_ok_p) < 120.0:
+                    if not any(p.get("pair") == l_pair for p in _cached_p):
+                        clear_autotrade_active_lock()
+                        return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
             return {
                 "is_occupied": True,
                 "active_pair": l_pair,
@@ -3932,9 +3969,23 @@ def _upgrade_all_in_memory_functions_and_disarm():
 
     if _PERSIST.get("emergency_disarm_version") != _REQUIRED_DAEMON_VERSION:
         _PERSIST["emergency_disarm_version"] = _REQUIRED_DAEMON_VERSION
+        _PERSIST["lock"] = _threading.Lock()
+        _PERSIST["nat_pin_lock"] = _threading.Lock()
+        global _COINDCX_SIGN_LOCK, _NAT_PIN_LOCK
+        _COINDCX_SIGN_LOCK = _PERSIST["lock"]
+        _NAT_PIN_LOCK = _PERSIST["nat_pin_lock"]
         _WALLET_BALANCE_CACHE["refreshing"] = False
         _ACTIVE_POSITIONS_CACHE["refreshing"] = False
         _PERSIST["last_nat_probe_ts"] = 0.0
+        if not _PERSIST.get("session_verified"):
+            _WALLET_BALANCE_CACHE["data"] = None
+            _WALLET_BALANCE_CACHE["last_good_live"] = None
+            _ACTIVE_POSITIONS_CACHE["data"] = None
+            _ACTIVE_POSITIONS_CACHE["last_ok_ts"] = 0.0
+            try:
+                clear_autotrade_active_lock()
+            except Exception:
+                pass
 
     # Proactively warm live positions & wallet balance in background if not yet verified
     if not _PERSIST.get("session_verified") or not _ACTIVE_POSITIONS_CACHE.get("data"):

@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 11
+_DAEMON_VERSION = 12
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -209,6 +209,8 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
                 _reload_if_updated(strategy_registry)
                 _reload_if_updated(coindcx_engine)
                 _reload_if_updated(signal_monitor)
+                if not coindcx_engine._PERSIST.get("session_verified") or (time.time() - float(coindcx_engine._WALLET_BALANCE_CACHE.get("ts", 0.0))) > 25.0:
+                    coindcx_engine._fetch_coindcx_futures_balance_sync()
                 if signal_monitor:
                     auto_cfg = coindcx_engine.get_autotrade_config()
                     rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
@@ -659,10 +661,10 @@ if _slot_status.get("is_occupied"):
 else:
     st.sidebar.caption(f"🟢 **App Slot Free (0/1)** • AutoTrade: **{'ON' if autotrade_on else 'OFF'}**")
 
-if wallet_data.get("is_live_api"):
+if wallet_data.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):
     st.sidebar.caption("✅ **CoinDCX Live API:** Connected & Ready")
 else:
-    _api_err = wallet_data.get("api_error", "")
+    _api_err = wallet_data.get("api_error", "") or coindcx_engine._PERSIST.get("last_auth_error", "")
     if _api_err:
         st.sidebar.caption(f"⚠️ **CoinDCX API Notice:** `{_api_err}`")
     else:
@@ -672,6 +674,7 @@ else:
         coindcx_engine._WALLET_BALANCE_CACHE["data"] = None
         coindcx_engine._WALLET_BALANCE_CACHE["last_good_live"] = None
         coindcx_engine._WALLET_BALANCE_CACHE["ts"] = 0.0
+        coindcx_engine._ACTIVE_POSITIONS_CACHE["data"] = None
         coindcx_engine._fetch_coindcx_futures_balance_sync()
         coindcx_engine._fetch_coindcx_active_positions_sync()
         st.rerun()
@@ -2849,12 +2852,12 @@ elif active_section == "🤖 AI Advisor":
                         "model": "error",
                     })
 
-# Auto-refresh UI once at the very end of the page ONLY when transitioning from cold cache (is_live_api=False) to Live Synced
-if not wallet_data.get("is_live_api"):
+# Auto-refresh UI once at the very end of the page ONLY when transitioning from cold/unverified to Live Synced
+if not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified"):
     @st.fragment(run_every="4s")
     def _auto_sync_cold_wallet_fragment():
         cur_bal = coindcx_engine._WALLET_BALANCE_CACHE.get("data")
-        if isinstance(cur_bal, dict) and cur_bal.get("is_live_api"):
+        if isinstance(cur_bal, dict) and cur_bal.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):
             st.rerun()
         else:
             coindcx_engine._trigger_bg_wallet_refresh()
