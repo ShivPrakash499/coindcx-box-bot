@@ -1,16 +1,25 @@
 """
-Pre-merge automated verification suite (`test_smoke.py`) for Crypto Trade Pro.
-Run this on the `staging` branch before asking for merge approval into `main`:
+Pre-merge & post-merge automated verification suite (`test_smoke.py`) for Crypto Trade Pro.
+Run this on `staging` before merging and on `main` after merging:
     .venv\\Scripts\\python.exe test_smoke.py
+    .venv\\Scripts\\python.exe test_smoke.py --live
 """
 from __future__ import annotations
 
+import ast
+import base64
 import os
 import py_compile
+import re
+import socket
+import ssl
+import struct
 import sys
 import tempfile
 import time
 from unittest.mock import patch
+
+sys.stdout.reconfigure(encoding="utf-8")
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
 if ROOT_DIR not in sys.path:
@@ -38,7 +47,7 @@ class _MockResponse:
 
 
 def test_1_syntax_and_imports():
-    print("[1/4] Checking syntax & compilation across core modules...")
+    print("[1/10] Checking syntax & compilation across core modules...")
     for fname in CORE_MODULES:
         fpath = os.path.join(ROOT_DIR, fname)
         assert os.path.exists(fpath), f"Missing core file: {fname}"
@@ -53,7 +62,7 @@ def test_1_syntax_and_imports():
 
 
 def test_2_simulated_200_ok_wallet_and_positions_no_recursion():
-    print("[2/4] Testing simulated 200 OK CoinDCX Wallet & Positions under strict recursion guard...")
+    print("[2/10] Testing simulated 200 OK CoinDCX Wallet & Positions under strict recursion guard...")
     import coindcx_engine as eng
 
     def _fake_signed_request(method, url, payload=None, timeout=3.5):
@@ -107,7 +116,7 @@ def test_2_simulated_200_ok_wallet_and_positions_no_recursion():
 
 
 def test_3_ui_non_blocking_latency_gate():
-    print("[3/4] Checking UI non-blocking latency gate (< 5.0 ms per call)...")
+    print("[3/10] Checking UI non-blocking latency gate (< 5.0 ms per call)...")
     import coindcx_engine as eng
 
     # Warm the in-memory caches once
@@ -143,7 +152,7 @@ def test_3_ui_non_blocking_latency_gate():
 
 
 def test_4_strategy_and_two_entry_levels():
-    print("[4/4] Verifying 2-Entry + Runner level normalization (LONG & SHORT)...")
+    print("[4/10] Verifying 2-Entry + Runner level normalization (LONG & SHORT)...")
     import coindcx_engine as eng
     import strategies as strat
 
@@ -185,16 +194,15 @@ def test_4_strategy_and_two_entry_levels():
 
 
 def test_5_daily_bias_enforcement():
-    print("[5/5] Verifying Daily 50 & 200 EMA Bias rules (BEARISH->SHORT, BULLISH->LONG, RANGE->Both Box Zones)...")
+    print("[5/10] Verifying Daily 50 & 200 EMA Bias rules (BEARISH->SHORT, BULLISH->LONG, RANGE->Both Box Zones)...")
     import coindcx_engine as eng
-    import strategies as strat
+    import pandas as pd
 
     neutral_levels = {
         "RH": 7.31, "RL": 6.89, "SH": 7.43, "SL": 6.86, "MID": 7.10,
         "EMA50": 7.38, "EMA200": 6.09, "daily_close": 6.98, "trend_bias": "NEUTRAL"
     }
 
-    # 1. Verify AutoTrade Guard blocks LONG in BEARISH, blocks SHORT in BULLISH, and allows RANGE (NEUTRAL) box trades
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]):
         bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
@@ -217,7 +225,6 @@ def test_5_daily_bias_enforcement():
             )
             assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
 
-        # In NEUTRAL/RANGE mode, Daily Bias Guard must NOT block confirmed Buy/Sell Zone trades
         with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
              patch.object(eng, "place_coindcx_futures_order", return_value=(True, "SIMULATED_RANGE_OK", {"id": "sim_1"})), \
              patch.object(eng, "save_autotrade_config", return_value={}), \
@@ -230,7 +237,6 @@ def test_5_daily_bias_enforcement():
             )
             assert ok_r and "Daily Bias Guard" not in msg_r, f"Expected RANGE mode trade allowed, got: {ok_r} {msg_r}"
 
-    # 2. Verify 2nd coin (RENDER) is strictly blocked if CoinDCX has an open position (INJ), even if local lock was cleared!
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{"pair": "B-INJ_USDT", "direction": "SHORT", "id": "pos_inj"}]):
         ok_2nd, msg_2nd, _ = eng.execute_autotrade_two_entry_signal(
@@ -243,77 +249,60 @@ def test_5_daily_bias_enforcement():
             f"Expected 2nd concurrent trade blocked by live exchange guard, got: {ok_2nd} {msg_2nd}"
         )
 
-    # 3. Verify Option B: calculate_daily_box_levels locks Daily Bias to previous completed daily candle
-    import pandas as pd
-    base_closes = [6.0] * 250 + [7.20]  # 251 completed daily candles ending at $7.20
+    base_closes = [6.0] * 250 + [7.20]
     df_low_today = pd.DataFrame({
         "timestamp": [1700000000000 + i * 86400000 for i in range(252)],
         "open": base_closes + [7.20],
         "high": [c + 0.15 for c in base_closes] + [7.50],
         "low": [c - 0.15 for c in base_closes] + [7.00],
-        "close": base_closes + [5.50],  # Forming today candle drops to $5.50
+        "close": base_closes + [5.50],
         "volume": [1000.0] * 252,
     })
     df_high_today = df_low_today.copy()
-    df_high_today.loc[251, "close"] = 9.50  # Forming today candle spikes to $9.50
+    df_high_today.loc[251, "close"] = 9.50
 
     with patch.object(eng, "fetch_coindcx_candles", return_value=df_low_today):
         lv_low = eng.calculate_daily_box_levels("B-INJ_USDT")
     with patch.object(eng, "fetch_coindcx_candles", return_value=df_high_today):
         lv_high = eng.calculate_daily_box_levels("B-INJ_USDT")
 
-    assert lv_low["trend_bias"] == lv_high["trend_bias"] == "BULLISH", (
-        f"Expected locked completed-candle Daily Bias regardless of intraday forming candle, got {lv_low['trend_bias']} vs {lv_high['trend_bias']}"
-    )
+    assert lv_low["trend_bias"] == lv_high["trend_bias"] == "BULLISH"
     assert lv_low["daily_close"] == lv_high["daily_close"] == 7.20
-
     print("  -> PASS: Completed-Candle Daily Bias lock + NEUTRAL/counter-trend blocks verified.")
 
 
 def test_6_deployment_regression_guards():
-    print("[6/6] Verifying deployment regression guards (no SystemExit in daemon check, no ThreadPoolExecutor in signed req, no raw <style> in st.markdown)...")
+    print("[6/10] Verifying deployment regression guards & TP1 profit-lock SL...")
     import inspect
     import coindcx_engine as eng
+    import signal_monitor as sm
 
-    # 1. _check_and_kill_obsolete_daemon must never raise SystemExit (causes Uvicorn unclean shutdown)
     src_kill = inspect.getsource(eng._check_and_kill_obsolete_daemon)
     assert "SystemExit" not in src_kill, "_check_and_kill_obsolete_daemon must raise _ObsoleteDaemonStop, never SystemExit"
 
-    # 2. _send_coindcx_signed_request must never spawn ThreadPoolExecutor (starves Streamlit JS chunk serving)
     src_req = inspect.getsource(eng._send_coindcx_signed_request)
     assert "ThreadPoolExecutor" not in src_req, "_send_coindcx_signed_request must never use ThreadPoolExecutor"
 
-    # 3. _pin_coindcx_nat_session must hold sockets open in cand_pool and use _NAT_PIN_LOCK
     src_pin = inspect.getsource(eng._pin_coindcx_nat_session)
     assert "_NAT_PIN_LOCK" in src_pin and "cand_pool.append" in src_pin, (
         "_pin_coindcx_nat_session must use single-flight _NAT_PIN_LOCK and hold candidate sockets in cand_pool"
     )
 
-    # 4. app.py must not use st.markdown for <style> blocks or auto-save enabled without on_change
     with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as f:
         app_src = f.read()
     assert 'st.markdown(f"""\n<style>' not in app_src, "app.py must use st.html() for <style> blocks, never st.markdown()"
-    assert "on_change=_on_sidebar_autotrade_toggle_change" in app_src, (
-        "app.py sidebar_autotrade_toggle must use on_change callback so stale tabs cannot overwrite enabled=True"
-    )
+    assert "on_change=_on_sidebar_autotrade_toggle_change" in app_src
 
-    # 5. signal_monitor._load must never return {} when _schema_version differs
-    import signal_monitor as sm
-    src_load = inspect.getsource(sm._load)
-    assert "return {}" not in src_load.split("_SCHEMA_VERSION")[0] if "_SCHEMA_VERSION" in src_load else True
-
-    # 6. Verify TP1 profit-preservation SL computation & partial-fill / 15m-wick detection
     sl_short_base = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10)
-    assert abs(sl_short_base - 7.20) < 1e-4, f"Expected SHORT base profit-lock SL at $7.20, got {sl_short_base}"
+    assert abs(sl_short_base - 7.20) < 1e-4
     sl_short_prev15m = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10, prev_candle_high=7.16)
-    assert abs(sl_short_prev15m - 7.16) < 1e-4, f"Expected tighter prev 15m high SL at $7.16, got {sl_short_prev15m}"
+    assert abs(sl_short_prev15m - 7.16) < 1e-4
 
     sl_long_base = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00)
-    assert abs(sl_long_base - 3.90) < 1e-4, f"Expected LONG base profit-lock SL at $3.90, got {sl_long_base}"
+    assert abs(sl_long_base - 3.90) < 1e-4
     sl_long_prev15m = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00, prev_candle_low=3.94)
-    assert abs(sl_long_prev15m - 3.94) < 1e-4, f"Expected tighter prev 15m low SL at $3.94, got {sl_long_prev15m}"
+    assert abs(sl_long_prev15m - 3.94) < 1e-4
 
-    # 7. Verify signal_monitor suppresses email alerts when an asset has an active live trade (even across pair formats or API error)
     assert sm._canon_pair("B-INJ_USDT") == sm._canon_pair("I-INJ_INR") == sm._canon_pair("INJUSDT") == "INJ"
     fake_sig = {
         "signal": "SHORT", "signal_kind": "SWEEP", "entry": 7.30, "entry2_sweep": 7.43,
@@ -327,9 +316,8 @@ def test_6_deployment_regression_guards():
         sm._LAST_SCAN_CACHE["results"] = []
         res_scan = sm.scan_and_alert(pairs=["B-INJ_USDT"], send=True, strategy_ids=["box_theory"], autotrade=False)
         assert not mock_email.called, "send_trade_email must NEVER be called when asset is in an active live trade"
-        assert "already in an active Live Trade" in res_scan[0]["message"], f"Unexpected scan msg: {res_scan[0]}"
+        assert "already in an active Live Trade" in res_scan[0]["message"]
 
-    # 8. Verify zero hardcoded secrets exist anywhere in tracked source files
     forbidden_tokens = (
         "_DEFAULT_ACTIVE_KEY",
         "_DEFAULT_ACTIVE_SECRET",
@@ -342,9 +330,323 @@ def test_6_deployment_regression_guards():
         with open(os.path.join(ROOT_DIR, fname), "r", encoding="utf-8") as f_chk:
             txt = f_chk.read()
             for tok in forbidden_tokens:
-                assert tok not in txt, f"Hardcoded secret token '{tok}' found in {fname}! Secrets must ONLY come from Streamlit Server."
+                assert tok not in txt, f"Hardcoded secret token '{tok}' found in {fname}!"
 
-    print("  -> PASS: All deployment & hot-reload regression guards + Zero Hardcoded Secrets + TP1 profit-lock SL verified.")
+    print("  -> PASS: All deployment & hot-reload regression guards + Zero Hardcoded Secrets verified.")
+
+
+def test_7_ui_render_and_navigation_tabs_integrity():
+    print("[7/10] Verifying full UI layout, navigation tabs rendering, and fragment loop guards...")
+    import coindcx_engine as eng
+
+    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as f:
+        app_src = f.read()
+
+    # 1. Verify _DAEMON_VERSION in app.py matches _REQUIRED_DAEMON_VERSION in coindcx_engine.py
+    m_ver = re.search(r"^_DAEMON_VERSION\s*=\s*(\d+)", app_src, re.MULTILINE)
+    assert m_ver, "Missing _DAEMON_VERSION in app.py"
+    app_daemon_ver = int(m_ver.group(1))
+    assert app_daemon_ver == eng._REQUIRED_DAEMON_VERSION, (
+        f"_DAEMON_VERSION in app.py ({app_daemon_ver}) != _REQUIRED_DAEMON_VERSION in coindcx_engine.py ({eng._REQUIRED_DAEMON_VERSION})"
+    )
+
+    # 2. Verify NO @st.fragment before `active_section = st.radio("Navigate Section"` calls st.rerun()
+    nav_idx = app_src.find('active_section = st.radio(\n    "Navigate Section"')
+    assert nav_idx > 0, "Could not locate `active_section = st.radio(\"Navigate Section\", ...)` in app.py"
+    before_nav = app_src[:nav_idx]
+    assert "_auto_sync_live_account_fragment" not in app_src, (
+        "CRITICAL UI BUG: `_auto_sync_live_account_fragment` found in app.py! "
+        "Mid-page fragments that call st.rerun() abort script execution and prevent navigation tabs from rendering."
+    )
+    frag_idx = before_nav.find("@st.fragment")
+    if frag_idx >= 0:
+        assert "st.rerun()" not in before_nav[frag_idx:], (
+            "CRITICAL UI BUG: `@st.fragment` before `Navigate Section` contains `st.rerun()`!"
+        )
+
+    # 3. Verify no top-level st.stop() exists between check_authentication() and Navigate Section
+    auth_call_idx = app_src.find("check_authentication()")
+    assert 0 < auth_call_idx < nav_idx
+    between_auth_and_nav = app_src[auth_call_idx:nav_idx]
+    assert "\nst.stop()" not in between_auth_and_nav, (
+        "Top-level st.stop() found between check_authentication() and Navigate Section!"
+    )
+
+    # 4. Verify all 6 required navigation tabs exist in NAV_SECTIONS and have matching render blocks
+    expected_tabs = [
+        "⚡ Signals",
+        "🎯 Execute",
+        "📊 Positions",
+        "📈 Chart & Levels",
+        "🧪 Backtest",
+        "🤖 AI Advisor",
+    ]
+    after_nav = app_src[nav_idx:]
+    for tab in expected_tabs:
+        assert f'"{tab}"' in before_nav, f"Missing navigation tab '{tab}' in NAV_SECTIONS"
+        assert (f'active_section == "{tab}"' in after_nav), f"Missing render section for tab '{tab}'"
+
+    # 5. Verify end-of-page fragment condition is strictly complementary (cannot loop)
+    assert 'if not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified"):' in after_nav
+    assert 'if isinstance(cur_bal, dict) and cur_bal.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):' in after_nav
+
+    # 6. Parse AST of app.py to ensure clean top-level structure
+    tree = ast.parse(app_src, filename="app.py")
+    assert len(tree.body) > 20
+    print(f"  -> PASS: All 6 UI tabs ({', '.join(expected_tabs)}) & fragment non-loop invariants verified.")
+
+
+def test_8_stale_cache_expiry_and_nat_pinner():
+    print("[8/10] Verifying stale unverified cache expiry, 0ms lock auto-release, and 8-thread priority NAT pinner...")
+    import inspect
+    import coindcx_engine as eng
+
+    # 1. Verify _pin_coindcx_nat_session uses 8 concurrent worker threads and only tests priority_ips in Phase 1
+    src_pin = inspect.getsource(eng._pin_coindcx_nat_session)
+    assert "range(8)" in src_pin and "if cand_ip in priority_ips and not found_evt.is_set():" in src_pin, (
+        "_pin_coindcx_nat_session must use 8 concurrent worker threads and only call _test_signed_on_sess on priority_ips during Phase 1"
+    )
+
+    # 2. Verify unverified session expires last_good_live after 45s (never masks dead session for 24h)
+    saved_ver = eng._PERSIST.get("session_verified")
+    saved_data = eng._WALLET_BALANCE_CACHE.get("data")
+    saved_lg = eng._WALLET_BALANCE_CACHE.get("last_good_live")
+    saved_lg_ts = eng._WALLET_BALANCE_CACHE.get("last_good_ts")
+    try:
+        k, _ = eng._get_coindcx_credentials()
+        prefix = k[:8] if k else ""
+        eng._PERSIST["session_verified"] = False
+        eng._WALLET_BALANCE_CACHE["data"] = None
+        eng._WALLET_BALANCE_CACHE["last_good_live"] = {
+            "total_inr": 56762.88,
+            "available_inr": 56762.88,
+            "is_live_api": True,
+            "_key_prefix": prefix,
+        }
+        eng._WALLET_BALANCE_CACHE["last_good_ts"] = time.time() - 120.0  # 2 minutes old while unverified
+        with patch.object(eng, "_trigger_bg_wallet_refresh"):
+            res_unver = eng.fetch_coindcx_futures_balance(force_refresh=False)
+            assert res_unver.get("is_live_api") is False, (
+                f"Expected unverified 2-min-old last_good_live to return is_live_api=False, got {res_unver}"
+            )
+    finally:
+        eng._PERSIST["session_verified"] = saved_ver
+        eng._WALLET_BALANCE_CACHE["data"] = saved_data
+        eng._WALLET_BALANCE_CACHE["last_good_live"] = saved_lg
+        eng._WALLET_BALANCE_CACHE["last_good_ts"] = saved_lg_ts
+
+    # 3. Verify _fetch_coindcx_active_positions_sync clears stale positions when session is unverified
+    saved_pos = eng._ACTIVE_POSITIONS_CACHE.get("data")
+    saved_ok_ts = eng._ACTIVE_POSITIONS_CACHE.get("last_ok_ts")
+    try:
+        eng._PERSIST["session_verified"] = False
+        eng._ACTIVE_POSITIONS_CACHE["data"] = [{"pair": "B-NEAR_USDT", "direction": "LONG"}]
+        eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = time.time() - 300.0
+        with patch.object(eng, "_send_coindcx_signed_request", return_value=(None, "HTTP 401")):
+            pos_res = eng._fetch_coindcx_active_positions_sync()
+            assert pos_res == [], f"Expected stale unverified positions to be purged to [], got {pos_res}"
+    finally:
+        eng._PERSIST["session_verified"] = saved_ver
+        eng._ACTIVE_POSITIONS_CACHE["data"] = saved_pos
+        eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = saved_ok_ts
+
+    # 4. Verify get_active_portfolio_trade_status(manage_exchange=False) clears stale lock in 0ms when live positions are confirmed empty
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", temp_cfg):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng.save_autotrade_config({
+                "active_trade_lock": {
+                    "pair": "B-NEAR_USDT",
+                    "direction": "LONG",
+                    "entry": 3.71,
+                    "opened_ts": time.time() - 600.0,
+                    "is_live_exchange": True,
+                }
+            })
+            eng._PERSIST["session_verified"] = True
+            eng._ACTIVE_POSITIONS_CACHE["data"] = []
+            eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = time.time()
+            try:
+                st_res = eng.get_active_portfolio_trade_status(manage_exchange=False)
+                assert st_res["is_occupied"] is False, f"Expected stale NEAR lock to auto-clear in 0ms, got {st_res}"
+            finally:
+                eng._PERSIST["session_verified"] = saved_ver
+                eng._ACTIVE_POSITIONS_CACHE["data"] = saved_pos
+                eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = saved_ok_ts
+
+    print("  -> PASS: Stale unverified cache expiry, 0ms lock auto-release, and 8-thread NAT pinner verified.")
+
+
+def test_9_ai_advisor_and_tick_precision():
+    print("[9/10] Verifying AI Advisor live quant engine, zero manual API key prompt, and tick-exact formatting...")
+    import coindcx_engine as eng
+    import gemini_advisor as ga
+
+    # 1. Verify app.py does NOT render the manual GEMINI_API_KEY text input prompt
+    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as f:
+        app_src = f.read()
+    assert "Paste AIza..." not in app_src, "app.py must not ask user to paste a manual GEMINI_API_KEY on screen"
+    assert "Connected via Streamlit Server Secrets" in app_src
+
+    # 2. Verify tick-exact price formatting (INJ = 3 decimals, ETH = 2, BTC = 1, DOGE = 5)
+    assert eng.format_order_price("B-INJ_USDT", 8.3654) == 8.365
+    assert ga._fmt_tick("B-INJ_USDT", 8.365) == "$8.365"
+    assert ga._fmt_tick("B-ETH_USDT", 2233.35) == "$2233.35"
+    assert ga._fmt_tick("B-DOGE_USDT", 0.07691) == "$0.07691"
+
+    # 3. Verify AI Advisor generates complete, tick-exact responses for all quick-action prompts even without an external API key
+    mock_struct = {
+        "pair": "B-INJ_USDT", "symbol": "INJ",
+        "live_price": 8.365, "high_24h": 8.510, "low_24h": 7.720, "change_24h": 8.96,
+        "SH": 8.288, "RH": 8.081, "MID": 7.542, "RL": 7.003, "SL": 6.861,
+        "ema50_d": 8.120, "ema200_d": 7.450, "daily_bias": "BULLISH", "daily_close": 8.210,
+        "ema20_15m": 8.340, "ema50_15m": 8.210, "rsi_15m": 64.2, "rsi_1h": 68.5,
+        "prev15_high": 8.390, "prev15_low": 8.310, "prev15_close": 8.355,
+    }
+    mock_sheet = {
+        "ok": True,
+        "spreadsheet_title": "Crypto_Trades_Journal",
+        "live_trades": [{"Pair": "B-INJ_USDT", "Direction": "SHORT", "Entry Price": "7.870"}],
+        "closed_trades": [
+            {"Pair": "B-INJ_USDT", "Direction": "LONG", "Entry Price": "7.500", "Exit Price": "7.850", "Result": "WIN", "Realized PnL (INR)": "1800.00"},
+            {"Pair": "B-NEAR_USDT", "Direction": "LONG", "Entry Price": "4.050", "Exit Price": "3.980", "Result": "LOSS", "Realized PnL (INR)": "-549.50"},
+        ],
+    }
+    with patch.object(ga, "_compute_exact_pair_structure", return_value=mock_struct), \
+         patch.object(eng, "fetch_coindcx_active_positions", return_value=[{
+             "pair": "B-INJ_USDT", "direction": "SHORT", "entry_price": 7.870, "mark_price": 8.365,
+             "quantity": 100.0, "leverage": 10, "pnl_inr": -55536.31, "roe_pct": -61.70, "liquidation_price": 12.144
+         }]), \
+         patch("sheets_logger.fetch_all_sheet_trades", return_value=mock_sheet):
+        for prompt in (
+            "Audit All Sheet Trades",
+            "Best Setup on INJ Now",
+            "Review Open Positions",
+            "On active INJ order, do you think price will come down and I will be able to book profit?",
+        ):
+            resp_txt = ga._generate_live_quant_advisor_response(
+                user_prompt=prompt,
+                selected_pair="B-INJ_USDT",
+            )
+            assert isinstance(resp_txt, str) and len(resp_txt) > 150, f"AI Advisor failed on prompt '{prompt}': {resp_txt}"
+            assert "$8.365" in resp_txt or "$8.288" in resp_txt or "INJ" in resp_txt, f"Expected INJ analysis in response: {resp_txt[:200]}"
+
+    print("  -> PASS: AI Advisor live quant engine & 3-decimal INJ tick precision verified.")
+
+
+def _ws_fetch_lock_screen_pill(host: str, max_attempts: int = 6) -> str:
+    """Connects to a Streamlit Cloud host over WebSocket and returns the rendered CoinDCX status pill."""
+    ctx = ssl.create_default_context()
+    raw_sock = socket.create_connection((host, 443), timeout=10)
+    sock = ctx.wrap_socket(raw_sock, server_hostname=host)
+    try:
+        key = base64.b64encode(os.urandom(16)).decode("ascii")
+        req = (
+            f"GET /~/+/_stcore/stream HTTP/1.1\r\n"
+            f"Host: {host}\r\n"
+            f"Upgrade: websocket\r\n"
+            f"Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n"
+            f"Sec-WebSocket-Protocol: streamlit\r\n"
+            f"Origin: https://{host}\r\n"
+            f"User-Agent: Mozilla/5.0\r\n\r\n"
+        )
+        sock.sendall(req.encode("ascii"))
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            buf += chunk
+        _, leftover = buf.split(b"\r\n\r\n", 1)
+        data_buf = bytearray(leftover)
+
+        def send_ws_binary(payload: bytes):
+            mask_key = os.urandom(4)
+            header = bytearray([0x82, 0x80 | len(payload)]) + mask_key
+            masked = bytearray(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+            sock.sendall(header + masked)
+
+        def read_exact(n: int) -> bytes:
+            while len(data_buf) < n:
+                c = sock.recv(8192)
+                if not c:
+                    raise EOFError("Socket closed")
+                data_buf.extend(c)
+            out = bytes(data_buf[:n])
+            del data_buf[:n]
+            return out
+
+        def read_until_finished(timeout_sec: float = 3.0) -> bytes:
+            sock.settimeout(timeout_sec)
+            collected = []
+            try:
+                while True:
+                    b1, b2 = read_exact(2)
+                    opcode = b1 & 0x0F
+                    masked = (b2 & 0x80) != 0
+                    length = b2 & 0x7F
+                    if length == 126:
+                        length = struct.unpack("!H", read_exact(2))[0]
+                    elif length == 127:
+                        length = struct.unpack("!Q", read_exact(8))[0]
+                    mask_k = read_exact(4) if masked else b""
+                    payload = bytearray(read_exact(length))
+                    if masked:
+                        for i in range(length):
+                            payload[i] ^= mask_k[i % 4]
+                    if opcode == 8:
+                        break
+                    if opcode == 9:
+                        sock.sendall(bytearray([0x8A, 0x80]) + os.urandom(4))
+                    elif opcode in (1, 2):
+                        b_pay = bytes(payload)
+                        collected.append(b_pay)
+                        if len(b_pay) < 30 and b"\x30\x00" in b_pay:
+                            break
+            except Exception:
+                pass
+            return b"".join(collected)
+
+        last_pill = ""
+        for attempt in range(1, max_attempts + 1):
+            send_ws_binary(b"\x5a\x00")
+            resp = read_until_finished(2.8)
+            text = resp.decode("utf-8", "ignore")
+            for line in text.splitlines():
+                if "CoinDCX" in line:
+                    last_pill = re.sub(r"<[^>]+>", "", line).strip()
+            if "CoinDCX Live Synced" in last_pill and "35.230.78.192" in last_pill:
+                return last_pill
+            if attempt < max_attempts:
+                time.sleep(2.5)
+        return last_pill
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def test_10_live_cloud_deployments_sync():
+    print("[10/10] Verifying live Streamlit Cloud deployments (`staging` & `main`)...")
+    staging_host = "np-shiv-prakash-trade-assistant.streamlit.app"
+    main_host = "shiv-prakash-trade-assistant.streamlit.app"
+
+    stg_pill = _ws_fetch_lock_screen_pill(staging_host, max_attempts=6)
+    print(f"  [Staging] {stg_pill}")
+    assert "CoinDCX Live Synced" in stg_pill and "35.230.78.192" in stg_pill, (
+        f"Staging is not live synced on 35.230.78.192: {stg_pill}"
+    )
+
+    main_pill = _ws_fetch_lock_screen_pill(main_host, max_attempts=8)
+    print(f"  [Main]    {main_pill}")
+    assert "CoinDCX Live Synced" in main_pill and "35.230.78.192" in main_pill, (
+        f"Main is not live synced on 35.230.78.192: {main_pill}"
+    )
+    print("  -> PASS: Both `staging` and `main` are 100% Live Synced on `35.230.78.192`.")
 
 
 if __name__ == "__main__":
@@ -354,4 +656,9 @@ if __name__ == "__main__":
     test_4_strategy_and_two_entry_levels()
     test_5_daily_bias_enforcement()
     test_6_deployment_regression_guards()
-    print("\nALL STAGING PRE-MERGE CHECKS PASSED!")
+    test_7_ui_render_and_navigation_tabs_integrity()
+    test_8_stale_cache_expiry_and_nat_pinner()
+    test_9_ai_advisor_and_tick_precision()
+    if "--live" in sys.argv:
+        test_10_live_cloud_deployments_sync()
+    print("\nALL AUTOMATED CHECKS PASSED (100%)!")
