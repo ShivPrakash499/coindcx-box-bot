@@ -2856,12 +2856,13 @@ elif active_section == "🤖 AI Advisor":
                         "model": "error",
                     })
 
-# Auto-refresh UI once at the very end of the page ONLY when transitioning from cold/unverified to Live Synced
-if not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified"):
+# Auto-refresh UI at most ONCE at the very end of the page ONLY when transitioning from cold/unverified to Live Synced
+if (not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified")) and not st.session_state.get("_cold_wallet_synced_once"):
     @st.fragment(run_every="4s")
     def _auto_sync_cold_wallet_fragment():
         cur_bal = coindcx_engine._WALLET_BALANCE_CACHE.get("data")
         if isinstance(cur_bal, dict) and cur_bal.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):
+            st.session_state["_cold_wallet_synced_once"] = True
             st.rerun()
         else:
             coindcx_engine._trigger_bg_wallet_refresh()

@@ -397,7 +397,7 @@ def test_7_ui_render_and_navigation_tabs_integrity():
         assert (f'active_section == "{tab}"' in after_nav), f"Missing render section for tab '{tab}'"
 
     # 5. Verify end-of-page fragment condition is strictly complementary (cannot loop)
-    assert 'if not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified"):' in after_nav
+    assert '_cold_wallet_synced_once' in after_nav
     assert 'if isinstance(cur_bal, dict) and cur_bal.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):' in after_nav
 
     # 6. Parse AST of app.py to ensure clean top-level structure
