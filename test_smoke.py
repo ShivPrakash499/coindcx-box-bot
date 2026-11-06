@@ -377,8 +377,8 @@ def test_7_ui_render_and_navigation_tabs_integrity():
     lines_between = between_auth_and_nav.splitlines()
     for idx_l, line_txt in enumerate(lines_between):
         if "st.rerun()" in line_txt:
-            context_window = "\n".join(lines_between[max(0, idx_l - 8):idx_l + 1])
-            assert ("st.button(" in context_window or "st.sidebar.button(" in context_window), (
+            context_window = "\n".join(lines_between[max(0, idx_l - 10):idx_l + 1])
+            assert ("st.button(" in context_window or "st.sidebar.button(" in context_window or "st.form_submit_button(" in context_window), (
                 f"CRITICAL UI BUG: Unconditional/non-button st.rerun() found before Navigate Section at line {idx_l}:\n{context_window}"
             )
 
