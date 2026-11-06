@@ -596,7 +596,6 @@ if not wallet_data.get("is_live_api"):
         wallet_data["available_inr"] = round(_manual_wallet_inr, 2)
         _auto_cfg = coindcx_engine.save_autotrade_config({"wallet_balance_inr": round(_manual_wallet_inr, 2)})
         get_cached_balance.clear()
-        st.rerun()
 
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
 if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
