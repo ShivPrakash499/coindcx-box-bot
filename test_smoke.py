@@ -228,7 +228,8 @@ def test_5_daily_bias_enforcement():
         with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
              patch.object(eng, "place_coindcx_futures_order", return_value=(True, "SIMULATED_RANGE_OK", {"id": "sim_1"})), \
              patch.object(eng, "save_autotrade_config", return_value={}), \
-             patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK", {})):
+             patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK", {})), \
+             patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
             ok_r, msg_r, _ = eng.execute_autotrade_two_entry_signal(
                 pair="B-INJ_USDT",
                 sig={"signal": "SHORT", "entry": 7.30, "entry2_sweep": 7.43, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.49, "levels": neutral_levels},

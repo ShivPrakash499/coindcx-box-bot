@@ -553,7 +553,7 @@ def _trigger_bg_sheet_account_publish(wallet_data: dict | None = None, positions
     if not _PERSIST.get("session_verified") or _PERSIST.get("using_sheet_bridge"):
         return
     now_s = time.time()
-    if (now_s - float(_PERSIST.get("last_sheet_pub_ts", 0.0))) < 20.0:
+    if (now_s - float(_PERSIST.get("last_sheet_pub_ts", 0.0))) < 60.0:
         return
     _PERSIST["last_sheet_pub_ts"] = now_s
     pinned_ip = str(_PERSIST.get("pinned_ip") or "")

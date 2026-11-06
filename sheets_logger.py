@@ -635,7 +635,7 @@ def load_live_account_sync_from_sheet(max_age_sec: float = 900.0, force: bool = 
     """
     now_ts = _time.time()
     cached = _SHEET_SYNC_CACHE.get("data")
-    if not force and isinstance(cached, dict) and (now_ts - float(_SHEET_SYNC_CACHE.get("ts", 0.0))) < 12.0:
+    if not force and isinstance(cached, dict) and (now_ts - float(_SHEET_SYNC_CACHE.get("ts", 0.0))) < 45.0:
         snap_ts = float(cached.get("ts", 0.0) or 0.0)
         if (now_ts - snap_ts) <= max_age_sec:
             return dict(cached)
