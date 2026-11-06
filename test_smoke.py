@@ -475,7 +475,7 @@ def test_8_stale_cache_expiry_and_nat_pinner():
         eng._PERSIST["session_verified"] = False
         eng._ACTIVE_POSITIONS_CACHE["data"] = [{"pair": "B-NEAR_USDT", "direction": "LONG"}]
         eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = time.time() - 300.0
-        with patch.object(eng, "_send_coindcx_signed_request", return_value=(None, "HTTP 401")):
+        with patch.object(eng, "_send_coindcx_signed_request", return_value=(None, "HTTP 401")), patch.object(eng, "_try_load_sheet_account_bridge", return_value=None):
             pos_res = eng._fetch_coindcx_active_positions_sync()
             assert pos_res == [], f"Expected stale unverified positions to be purged to [], got {pos_res}"
     finally:

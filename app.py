@@ -432,7 +432,7 @@ def _detect_active_trade_pair() -> str | None:
         pass
     try:
         slot = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
-        if slot.get("is_occupied") and slot.get("active_pair"):
+        if slot.get("active_pair"):
             sp = slot.get("active_pair")
             if sp not in GLOBAL_FUTURES_PAIRS:
                 GLOBAL_FUTURES_PAIRS.append(sp)
@@ -620,7 +620,7 @@ live_crypto_rate = get_coindcx_live_usdt_inr_rate()
 usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 AutoTrade (1-Slot)")
+st.sidebar.markdown("### 🤖 AutoTrade (3-Slot)")
 # Sync stale browser session toggle state if v9 disarmed AutoTrade on disk
 _disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
 if st.session_state.get("_autotrade_disarm_sync_v") != 9:
@@ -654,15 +654,22 @@ if (
     get_cached_positions.clear()
 
 _slot_status = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
+_slot_cnt = int(_slot_status.get("count", 0) or 0)
+_slot_max = int(_slot_status.get("max_slots", 3) or 3)
+_slot_pairs_list = _slot_status.get("active_pairs") or ([_slot_status.get("active_pair")] if _slot_status.get("active_pair") else [])
+_slot_pairs_str = ", ".join(clean_sym(p) for p in _slot_pairs_list if p)
 if _slot_status.get("is_occupied"):
-    _act_p = _slot_status.get("active_pair", "")
-    _act_d = _slot_status.get("active_direction", "")
-    st.sidebar.warning(f"🔒 **App Lock:** `{clean_sym(_act_p)}` ({_act_d})")
+    st.sidebar.warning(f"🔒 **3-Slot Full ({_slot_cnt}/{_slot_max}):** `{_slot_pairs_str}`")
     if st.sidebar.button("🔓 Release App Trade Lock", key="btn_clear_autotrade_lock", use_container_width=True):
         coindcx_engine.clear_autotrade_active_lock()
         st.rerun()
+elif _slot_cnt > 0:
+    st.sidebar.info(f"🟢 **Active ({_slot_cnt}/{_slot_max} Slots):** `{_slot_pairs_str}` • **{_slot_max - _slot_cnt} Free**")
+    if st.sidebar.button("🔓 Clear Saved Lock", key="btn_clear_autotrade_lock", use_container_width=True):
+        coindcx_engine.clear_autotrade_active_lock()
+        st.rerun()
 else:
-    st.sidebar.caption(f"🟢 **App Slot Free (0/1)** • AutoTrade: **{'ON' if autotrade_on else 'OFF'}**")
+    st.sidebar.caption(f"🟢 **App Slots Free (0/{_slot_max})** • AutoTrade: **{'ON' if autotrade_on else 'OFF'}**")
 
 if wallet_data.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):
     st.sidebar.caption("✅ **CoinDCX Live API:** Connected & Ready")
@@ -1193,7 +1200,7 @@ asset_name = clean_sym(selected_pair)
 _all_live_pos = get_cached_positions() or []
 _slot_info = _slot_status
 _active_pos_pairs = [p["pair"] for p in _all_live_pos if p.get("pair") in GLOBAL_FUTURES_PAIRS]
-if _slot_info.get("is_occupied") and _slot_info.get("active_pair") in GLOBAL_FUTURES_PAIRS:
+if _slot_info.get("active_pair") in GLOBAL_FUTURES_PAIRS:
     if _slot_info["active_pair"] not in _active_pos_pairs:
         _active_pos_pairs.append(_slot_info["active_pair"])
 
@@ -1370,14 +1377,23 @@ if active_section == "⚡ Signals":
         hdr_s1, hdr_s2 = st.columns([3.2, 1.0])
         with hdr_s1:
             slot_now = _slot_status
+            _s_cnt = int(slot_now.get("count", 0) or 0)
+            _s_max = int(slot_now.get("max_slots", 3) or 3)
+            _s_list = slot_now.get("active_pairs") or ([slot_now.get("active_pair")] if slot_now.get("active_pair") else [])
+            _s_pairs = ", ".join(clean_sym(p) for p in _s_list if p)
             if slot_now.get("is_occupied"):
                 st.warning(
-                    f"🔒 **App/API Trade Lock Active:** `{clean_sym(slot_now.get('active_pair'))}` ({slot_now.get('active_direction')}) • "
-                    f"50% margin reserved for Entry 2 @ Sweep."
+                    f"🔒 **3-Slot Wallet Full ({_s_cnt}/{_s_max} Active):** `{_s_pairs}` • "
+                    f"All {_s_max} concurrent trade slots are currently occupied."
+                )
+            elif _s_cnt > 0:
+                st.info(
+                    f"🟢 **Active Trades ({_s_cnt}/{_s_max} Slots):** `{_s_pairs}` • **{_s_max - _s_cnt} Slot(s) Available** • "
+                    f"Single-Trade Margin: **₹{margin_inr:,.2f}** (`{leverage}x`) • AutoTrade: **{'ON 🚀' if autotrade_on else 'OFF'}**"
                 )
             else:
                 st.caption(
-                    f"🟢 **App Slot Free (0/1)** • Wallet: **₹{wallet_data['total_inr']:,.2f}** • Single-Trade Margin: **₹{margin_inr:,.2f}** (`{leverage}x`) • "
+                    f"🟢 **App Slots Free (0/{_s_max})** • Wallet: **₹{wallet_data['total_inr']:,.2f}** • Single-Trade Margin: **₹{margin_inr:,.2f}** (`{leverage}x`) • "
                     f"AutoTrade: **{'ON 🚀' if autotrade_on else 'OFF'}**"
                 )
         with hdr_s2:
@@ -1425,7 +1441,15 @@ if active_section == "⚡ Signals":
                 get_cached_balance.clear()
                 st.rerun()
             elif not any(r.get("autotrade_error") for r in active_signals):
-                _top_r = active_signals[0]
+                _open_set = set(_slot_status.get("active_pairs") or [])
+                if _slot_status.get("active_pair"):
+                    _open_set.add(_slot_status.get("active_pair"))
+                _elig_signals = [r for r in active_signals if r.get("pair") not in _open_set]
+                if not _elig_signals:
+                    _top_r = None
+                else:
+                    _top_r = _elig_signals[0]
+            if not _just_autotraded and not any(r.get("autotrade_error") for r in active_signals) and locals().get("_top_r"):
                 _ok_now, _msg_now, _ = coindcx_engine.execute_autotrade_two_entry_signal(
                     pair=_top_r["pair"],
                     sig=_top_r["signal"],
@@ -2444,13 +2468,13 @@ elif active_section == "📈 Chart & Levels":
 # SECTION 5: 1-CRYPTO-AT-A-TIME HIGH-VOLATILITY BACKTEST
 # ==============================================================================
 elif active_section == "🧪 Backtest":
-    st.markdown("#### 🧪 1-Crypto-at-a-Time High-Volatility Backtest (10x Leverage)")
+    st.markdown("#### 🧪 3-Slot Portfolio High-Volatility Backtest (Up to 3 Concurrent Trades @ 10x Leverage)")
     bc1, bc2, bc3 = st.columns(3)
     bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days"], index=0, key="bt_multi_dur")
     bt_capital = bc2.number_input("Single-Trade Margin (₹)", min_value=5000, value=int(margin_inr), step=5000, key="bt_multi_cap")
     bt_lev = bc3.slider("Leverage (x)", 1, 20, 10, key="bt_multi_lev")
 
-    if st.button("🏆 Run 1-Crypto-at-a-Time Portfolio Backtest (All 12 High-Vol Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
+    if st.button("🏆 Run 3-Slot Portfolio Backtest (All 12 High-Vol Movers — Up to 3 Concurrent Trades)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
         with st.spinner(f"Simulating 1-Crypto-at-a-Time across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
@@ -2489,7 +2513,7 @@ elif active_section == "🧪 Backtest":
             )
 
         # 1. 1-Slot Shared Portfolio Breakdown Table (All 12 Coins + Exact Total Row)
-        st.markdown("##### 1️⃣ 1-Slot Shared Portfolio Breakdown (All 12 Coins — Strictly 1 Trade Open Across Portfolio at a Time)")
+        st.markdown("##### 1️⃣ 3-Slot Shared Portfolio Breakdown (All 12 Coins — Up to 3 Concurrent Trades Across Portfolio)")
         cs_df = port_out.get("coin_summary_df")
         if cs_df is not None and not cs_df.empty:
             _cs_rows = []

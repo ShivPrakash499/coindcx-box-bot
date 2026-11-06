@@ -3753,9 +3753,14 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                     if not any(p.get("pair") == l_pair for p in _cached_p):
                         clear_autotrade_active_lock()
                         return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
+            _c_pos = _ACTIVE_POSITIONS_CACHE.get("data") or []
+            _act_pairs = list(dict.fromkeys([p.get("pair") for p in _c_pos if isinstance(p, dict) and p.get("pair")] + ([l_pair] if l_pair else [])))
+            _cnt = max(1, len(_act_pairs))
             return {
-                "is_occupied": True,
+                "is_occupied": _cnt >= MAX_CONCURRENT_TRADES,
+                "has_active_trade": True,
                 "active_pair": l_pair,
+                "active_pairs": _act_pairs,
                 "active_direction": l_dir,
                 "entry_price": l_entry,
                 "entry2_sweep": l_entry2,
@@ -3764,8 +3769,9 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 "tp1_hit": tp1_already_hit,
                 "entry2_cancelled": bool(lock.get("entry2_cancelled", False)),
                 "stop_loss": l_sl,
-                "source": lock.get("mode", "App/API Active Trade Lock"),
-                "count": 1,
+                "source": lock.get("mode", "App/API Active Trade"),
+                "count": _cnt,
+                "max_slots": MAX_CONCURRENT_TRADES,
             }
 
         try:
@@ -3812,14 +3818,18 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                     elif len(live_positions) > 0:
                         # Another position is open on CoinDCX: keep the portfolio slot occupied!
                         other_p = live_positions[0]
+                        _act_pairs = [p.get("pair") for p in live_positions if p.get("pair")]
                         return {
-                            "is_occupied": True,
+                            "is_occupied": len(live_positions) >= MAX_CONCURRENT_TRADES,
+                            "has_active_trade": True,
                             "active_pair": other_p.get("pair"),
+                            "active_pairs": _act_pairs,
                             "active_direction": other_p.get("direction", "LONG"),
                             "entry_price": float(other_p.get("entry_price", 0.0) or 0.0),
                             "stop_loss": float(other_p.get("stop_loss", 0.0) or 0.0),
                             "source": "CoinDCX Live Active Position",
                             "count": len(live_positions),
+                            "max_slots": MAX_CONCURRENT_TRADES,
                         }
                     elif l_ts > 0 and (time.time() - l_ts) >= 90 and fetch_coindcx_futures_balance().get("is_live_api"):
                         # Require 2 consecutive confirmed 200-OK empty position checks before releasing lock
@@ -3949,9 +3959,14 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
         except Exception:
             pass
 
+        _c_pos2 = _ACTIVE_POSITIONS_CACHE.get("data") or []
+        _act_pairs2 = list(dict.fromkeys([p.get("pair") for p in _c_pos2 if isinstance(p, dict) and p.get("pair")] + ([l_pair] if l_pair else [])))
+        _cnt2 = max(1, len(_act_pairs2))
         return {
-            "is_occupied": True,
+            "is_occupied": _cnt2 >= MAX_CONCURRENT_TRADES,
+            "has_active_trade": True,
             "active_pair": l_pair,
+            "active_pairs": _act_pairs2,
             "active_direction": l_dir,
             "entry_price": float(lock.get("entry", 0.0) or 0.0),
             "entry2_sweep": float(lock.get("entry2_sweep", 0.0) or 0.0),
@@ -3960,8 +3975,9 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             "tp1_hit": bool(lock.get("tp1_hit", False)),
             "entry2_cancelled": bool(lock.get("entry2_cancelled", False)),
             "stop_loss": l_sl,
-            "source": lock.get("mode", "App/API Active Trade Lock"),
-            "count": 1,
+            "source": lock.get("mode", "App/API Active Trade"),
+            "count": _cnt2,
+            "max_slots": MAX_CONCURRENT_TRADES,
         }
 
     # Fallback: if local lock file was cleared or container restarted, check live CoinDCX active positions directly
@@ -3977,19 +3993,23 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 for lp_item in live_pos:
                     _auto_protect_live_position_tp1_sl(lp_item)
             first_p = live_pos[0]
+            _act_pairs3 = [p.get("pair") for p in live_pos if p.get("pair")]
             return {
-                "is_occupied": True,
+                "is_occupied": len(live_pos) >= MAX_CONCURRENT_TRADES,
+                "has_active_trade": True,
                 "active_pair": first_p.get("pair"),
+                "active_pairs": _act_pairs3,
                 "active_direction": first_p.get("direction", "LONG"),
                 "entry_price": float(first_p.get("entry_price", 0.0) or 0.0),
                 "stop_loss": float(first_p.get("stop_loss", 0.0) or 0.0),
                 "source": "CoinDCX Live Active Position",
                 "count": len(live_pos),
+                "max_slots": MAX_CONCURRENT_TRADES,
             }
     except Exception:
         pass
 
-    return {"is_occupied": False, "active_pair": None, "source": "Slot Free (0/1 App Trades Active)"}
+    return {"is_occupied": False, "has_active_trade": False, "active_pair": None, "active_pairs": [], "count": 0, "max_slots": MAX_CONCURRENT_TRADES, "source": f"Slots Free (0/{MAX_CONCURRENT_TRADES} Active)"}
 
 
 def execute_autotrade_two_entry_signal(
