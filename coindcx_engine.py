@@ -816,7 +816,7 @@ def _trigger_bg_wallet_refresh():
     def _bg_worker():
         try:
             res = _fetch_coindcx_futures_balance_sync()
-            if isinstance(res, dict) and res.get("is_live_api") and not _ACTIVE_POSITIONS_CACHE.get("data"):
+            if isinstance(res, dict) and res.get("is_live_api") and (time.time() - float(_ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) > 10.0:
                 _fetch_coindcx_active_positions_sync()
         except Exception:
             pass
@@ -3897,25 +3897,6 @@ def _upgrade_all_in_memory_functions_and_disarm():
     _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
     if _PERSIST.get("emergency_disarm_version") != _REQUIRED_DAEMON_VERSION:
         _PERSIST["emergency_disarm_version"] = _REQUIRED_DAEMON_VERSION
-        try:
-            save_autotrade_config({"enabled": False})
-            if os.path.exists("/mount/src"):
-                def _cleanup_render_orders():
-                    try:
-                        cancel_coindcx_open_entry_orders("B-RENDER_USDT", cancel_all_for_pair=True)
-                    except Exception:
-                        pass
-                _threading.Thread(target=_cleanup_render_orders, daemon=True).start()
-        except Exception:
-            pass
-        # Purge any stale/poisoned wallet_cache (47287.18) or positions_cache from earlier reloads in sys.__dict__
-        _WALLET_BALANCE_CACHE.clear()
-        _WALLET_BALANCE_CACHE.update({"data": None, "ts": 0.0, "last_good_live": None, "last_good_ts": 0.0, "refreshing": False})
-        _ACTIVE_POSITIONS_CACHE.clear()
-        _ACTIVE_POSITIONS_CACHE.update({"data": None, "ts": 0.0, "refreshing": False})
-        _PERSIST["session_verified"] = False
-        _PERSIST["pinned_ip"] = ""
-        _PERSIST["last_nat_probe_ts"] = 0.0
 
     # Proactively warm live positions & wallet balance in background if not yet verified
     if not _PERSIST.get("session_verified") or not _ACTIVE_POSITIONS_CACHE.get("data"):
