@@ -833,8 +833,9 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
         if r_pinned is not None:
             return r_pinned, None
 
-        _PERSIST["last_auth_error"] = "HTTP 401 Invalid credentials / Egress IP not allowlisted"
-        return res, _PERSIST["last_auth_error"]
+        if not _PERSIST.get("using_sheet_bridge"):
+            _PERSIST["last_auth_error"] = "HTTP 401 Invalid credentials / Egress IP not allowlisted"
+        return res, _PERSIST.get("last_auth_error") or "HTTP 401 Invalid credentials / Egress IP not allowlisted"
     except Exception as e:
         return None, str(e)
 
@@ -1154,6 +1155,9 @@ def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> 
             _ACTIVE_POSITIONS_CACHE["data"] = synced_pos
             _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts
             _ACTIVE_POSITIONS_CACHE["last_ok_ts"] = now_pos_ts
+            _PERSIST["session_verified"] = True
+            _PERSIST["using_sheet_bridge"] = True
+            _PERSIST["last_auth_error"] = ""
             return list(synced_pos)
         if return_none_on_error:
             return None
