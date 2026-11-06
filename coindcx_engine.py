@@ -2603,7 +2603,12 @@ def run_strategy_backtest(
                 s5_ema9 = float(s5.get("EMA9", s5_close))
                 s5_range = s5_high - s5_low
 
-                if exit_mode == "strategy3_full":
+                is_s3_trade = (
+                    "Strategy 3" in str(active_trade.get("strategy", ""))
+                    or strategy_id == "ema9_retest"
+                )
+                use_full_s3_runner = (exit_mode == "strategy3_full") or (exit_mode == "smart_hybrid" and is_s3_trade)
+                if use_full_s3_runner:
                     # Variant 1: 100% of trade managed by Trailing 15m SL + Strategy 3 (20% ATR 30% Pullback / Confirmed 9 EMA Cross)
                     if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
                         exit_triggered = True
@@ -4096,11 +4101,16 @@ def execute_autotrade_two_entry_signal(
     tp2_px = norm["tp2"]
     sl_px = norm["stop_loss"]
 
-    # Split single-trade margin 50% for Entry 1 and 50% for Entry 2 @ Sweep
-    tranche_margin_inr = margin_inr * 0.5
+    # Strategy 1 (Box) splits single-trade margin 50%/50% across Entry 1 & Entry 2;
+    # Strategy 2 (ATR Reversal) & Strategy 3 (9 EMA Retest) use Single Entry (100% of single-trade margin on Entry 1)
+    raw_e2 = float(sig.get("entry2_sweep") or 0.0)
+    has_second_entry = (raw_e2 > 0.0) and (sig_strat_id == "box_theory")
+    tranche_margin_inr = (margin_inr * 0.5) if has_second_entry else margin_inr
     tranche_notional_usd = (tranche_margin_inr * lev) / u_inr
     qty1 = format_order_quantity(pair, tranche_notional_usd / entry1_px) if entry1_px > 0 else 0.0
-    qty2 = format_order_quantity(pair, tranche_notional_usd / entry2_px) if entry2_px > 0 else 0.0
+    qty2 = format_order_quantity(pair, tranche_notional_usd / entry2_px) if (has_second_entry and entry2_px > 0) else 0.0
+    if not has_second_entry:
+        entry2_px = 0.0
 
     # If 50% tranche is below CoinDCX Rs.2,448 minimum notional, use full margin on Entry 1 or bump notional
     if (qty1 * entry1_px * u_inr) < 2448.0 and (margin_inr * lev) >= 2448.0:
@@ -4202,7 +4212,7 @@ def run_portfolio_single_slot_backtest(
     usd_inr: float = 85.0,
     strategy_id: str = "box_theory",
     wallet_inr: float = None,
-    exit_mode: str = "hybrid",
+    exit_mode: str = "smart_hybrid",
     max_concurrent_trades: int = MAX_CONCURRENT_TRADES,
 ) -> dict:
     """
