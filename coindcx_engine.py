@@ -2030,9 +2030,8 @@ def compute_box_swing_levels(df_completed: pd.DataFrame) -> dict:
 
     `df_completed` = completed daily candles in ascending order whose LAST row is the previous day (RH/RL day).
     Only the last 30 completed candles are used.
-      - SH = nearest prior high at least max(0.8% of RH, 35% avg daily rise) above RH, if within avg daily rise;
-             otherwise RH + max(avg daily rise, min gap).
-      - SL = mirror image using average daily drop below RL.
+      - SH = nearest prior high at least 0.8% above RH, if within 3.5% of RH; otherwise RH + 1.5%.
+      - SL = nearest prior low at least 0.8% below RL, if within 3.5% of RL; otherwise RL - 1.5%.
     """
     dfc = df_completed.tail(30)
     prev_day = dfc.iloc[-1]
@@ -2049,23 +2048,21 @@ def compute_box_swing_levels(df_completed: pd.DataFrame) -> dict:
     if not avg_daily_drop or avg_daily_drop <= 0 or avg_daily_drop != avg_daily_drop:
         avg_daily_drop = (rh - rl) * 0.25
 
-    # Minimum structural separation between RH <-> SH and RL <-> SL so SH/SL never collapse onto RH/RL
-    min_sh_gap = max(rh * 0.008, avg_daily_rise * 0.35)
-    max_sh_gap = max(avg_daily_rise, min_sh_gap)
-    min_sl_gap = max(rl * 0.008, avg_daily_drop * 0.35)
-    max_sl_gap = max(avg_daily_drop, min_sl_gap)
-
-    sh_candidates = [float(h) for h in df_hist["high"].tolist() if float(h) >= rh + min_sh_gap]
-    if sh_candidates and (min(sh_candidates) - rh) <= max_sh_gap:
+    # Formula B (selected for both live & backtest):
+    #   SH = nearest prior high >= RH * 1.008, if it is <= RH * 1.035; otherwise RH * 1.015
+    #   SL = nearest prior low  <= RL * 0.992, if it is >= RL * 0.965; otherwise RL * 0.985
+    # (avg_daily_rise / avg_daily_drop above are kept for UI display only)
+    sh_candidates = [float(h) for h in df_hist["high"].tolist() if float(h) >= rh * 1.008]
+    if sh_candidates and min(sh_candidates) <= rh * 1.035:
         sh = min(sh_candidates)
     else:
-        sh = rh + max_sh_gap
+        sh = rh * 1.015
 
-    sl_candidates = [float(l) for l in df_hist["low"].tolist() if float(l) <= rl - min_sl_gap]
-    if sl_candidates and (rl - max(sl_candidates)) <= max_sl_gap:
+    sl_candidates = [float(l) for l in df_hist["low"].tolist() if float(l) <= rl * 0.992]
+    if sl_candidates and max(sl_candidates) >= rl * 0.965:
         sl = max(sl_candidates)
     else:
-        sl = rl - max_sl_gap
+        sl = rl * 0.985
 
     return {
         "RH": rh, "RL": rl, "SH": sh, "SL": sl,
