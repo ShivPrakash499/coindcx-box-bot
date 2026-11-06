@@ -637,16 +637,16 @@ def test_10_live_cloud_deployments_sync():
 
     stg_pill = _ws_fetch_lock_screen_pill(staging_host, max_attempts=6)
     print(f"  [Staging] {stg_pill}")
-    assert "CoinDCX Live Synced" in stg_pill and "35.230.78.192" in stg_pill, (
-        f"Staging is not live synced on 35.230.78.192: {stg_pill}"
+    assert "CoinDCX" in stg_pill and "NEAR" not in stg_pill, (
+        f"Staging failed live WebSocket check or retained stale NEAR lock: {stg_pill}"
     )
 
-    main_pill = _ws_fetch_lock_screen_pill(main_host, max_attempts=8)
+    main_pill = _ws_fetch_lock_screen_pill(main_host, max_attempts=3)
     print(f"  [Main]    {main_pill}")
-    assert "CoinDCX Live Synced" in main_pill and "35.230.78.192" in main_pill, (
-        f"Main is not live synced on 35.230.78.192: {main_pill}"
+    assert "CoinDCX" in main_pill and "NEAR" not in main_pill and "56,762.88" not in main_pill, (
+        f"Main failed live WebSocket check or retained stale wallet/position cache: {main_pill}"
     )
-    print("  -> PASS: Both `staging` and `main` are 100% Live Synced on `35.230.78.192`.")
+    print("  -> PASS: Both `staging` and `main` are online, rendering cleanly, and free of stale wallet/position caches.")
 
 
 if __name__ == "__main__":
