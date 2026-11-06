@@ -440,7 +440,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 14
+_REQUIRED_DAEMON_VERSION = 15
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -507,6 +507,10 @@ def _get_coindcx_proxy_url() -> str:
             proxy_url = str(_sl._SHEET_SYNC_CACHE.get("proxy_url") or "").strip()
         except Exception:
             pass
+
+    if not proxy_url:
+        # Built-in Permanent GCP Static IP Proxy (domain-filtered strictly to api.coindcx.com)
+        proxy_url = "http://35.230.95.39:8888"
 
     if proxy_url and not proxy_url.startswith(("http://", "https://", "socks5://")):
         proxy_url = f"http://{proxy_url}"
@@ -655,20 +659,15 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
             if r_reuse is not None and (r_reuse.status_code == 200 or r_reuse.status_code not in (401, 502, 503)):
                 return r_reuse
 
-        # 2. Avoid back-to-back scans if a scan just failed < 1.5s ago (or < 60s when Sheet Bridge is active and no proxy is set)
         now_p = time.time()
-        min_probe_gap = 60.0 if (_PERSIST.get("using_sheet_bridge") and not _get_coindcx_proxy_url()) else 1.5
-        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < min_probe_gap:
-            return None
-        _PERSIST["last_nat_probe_ts"] = now_p
 
-        # Fast-path: When a Static IP Proxy (`COINDCX_PROXY_URL`) is configured, every socket already
-        # exits from the permanent Static IP — verify and pin on a single socket in < 0.3s!
+        # 2. Fast-path: Always test the permanent GCP Static IP Proxy (`35.230.95.39:8888`) first on a single socket (< 0.3s)
         active_proxy = _get_coindcx_proxy_url()
-        if active_proxy:
-            cand_proxy = _make_single_socket_session()
+        if active_proxy and (now_p - float(_PERSIST.get("last_proxy_probe_ts", 0.0))) >= 1.5:
+            _PERSIST["last_proxy_probe_ts"] = now_p
+            cand_proxy = _make_single_socket_session(use_proxy=True)
             cand_pool.append(cand_proxy)
-            proxy_ip = _probe_session_coindcx_ip(cand_proxy, timeout=3.0) or "Static-Proxy"
+            proxy_ip = _probe_session_coindcx_ip(cand_proxy, timeout=2.5) or "35.230.95.39"
             r_proxy = _test_signed_on_sess(cand_proxy, api_key, api_secret)
             if r_proxy is not None and (r_proxy.status_code == 200 or r_proxy.status_code not in (401, 502, 503)):
                 sign_lock = _PERSIST.get("lock") or _COINDCX_SIGN_LOCK
@@ -688,6 +687,12 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                     _PERSIST["last_auth_error"] = ""
                 winning_sess = cand_proxy
                 return r_proxy
+
+        # 3. Avoid back-to-back 120-socket direct NAT scans if a scan just ran < 1.5s ago (or < 60s when Sheet Bridge is active)
+        min_probe_gap = 60.0 if _PERSIST.get("using_sheet_bridge") else 1.5
+        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < min_probe_gap:
+            return None
+        _PERSIST["last_nat_probe_ts"] = now_p
 
         priority_ips = {"35.230.78.192", "34.83.176.217"}
         last_v_ip = _PERSIST.get("last_verified_ip")
