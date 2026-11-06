@@ -376,6 +376,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     Reads CoinDCX API Key & Secret strictly from Streamlit Server (`st.secrets`) or environment variables (`os.environ`).
     Never stores or falls back to any hardcoded secret in code.
     """
+    _check_and_kill_obsolete_daemon()
     api_key = ""
     api_secret = ""
     try:
@@ -438,7 +439,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 9
+_REQUIRED_DAEMON_VERSION = 10
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -449,9 +450,11 @@ class _ObsoleteDaemonStop(BaseException):
 
 
 def _check_and_kill_obsolete_daemon():
-    """Immediately terminates any background daemon thread from an older version (< v9)."""
+    """Immediately terminates any background daemon thread from an older version (< v10) or legacy CoinDCXNatKeepAlive."""
     _tname = _threading.current_thread().name
-    if _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_REQUIRED_DAEMON_VERSION}":
+    if _tname == "CoinDCXNatKeepAlive" or (
+        _tname.startswith("CryptoTradeAssistantDaemon") and _tname != f"CryptoTradeAssistantDaemon_v{_REQUIRED_DAEMON_VERSION}"
+    ):
         _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
         raise _ObsoleteDaemonStop(f"Terminating obsolete daemon thread {_tname} (active is v{_REQUIRED_DAEMON_VERSION})")
 
@@ -466,60 +469,23 @@ def _make_single_socket_session() -> requests.Session:
     return s
 
 
-def _ensure_nat_keepalive_daemon():
-    """Starts a single background thread that keeps the pinned 35.230.78.192 TCP socket warm every 7s
-    so Cloudflare never drops the Keep-Alive connection, and automatically re-pins if unverified."""
-    if _PERSIST.get("keepalive_started"):
-        return
-    _PERSIST["keepalive_started"] = True
-
-    def _keepalive_loop():
-        while True:
-            try:
-                time.sleep(5.0)
-                k, s = _get_coindcx_credentials()
-                if not k or not s:
-                    continue
-                if _PERSIST.get("session_verified") and _PERSIST.get("session") is not None:
-                    idle_s = time.time() - float(_PERSIST.get("last_sess_io_ts", 0.0))
-                    if idle_s >= 6.0:
-                        with _COINDCX_SIGN_LOCK:
-                            sess = _PERSIST.get("session")
-                            pinned = _PERSIST.get("pinned_ip", "")
-                            if sess is not None:
-                                cur_ip = _probe_session_coindcx_ip(sess, timeout=2.0)
-                                _PERSIST["last_sess_io_ts"] = time.time()
-                                if cur_ip and pinned and cur_ip != pinned:
-                                    # Cloudflare recycled the socket onto a different NAT IP; re-pin immediately!
-                                    _PERSIST["session_verified"] = False
-                                    _PERSIST["pinned_ip"] = ""
-                if not _PERSIST.get("session_verified"):
-                    _PERSIST["last_nat_probe_ts"] = 0.0
-                    _fetch_coindcx_futures_balance_sync()
-                    if _PERSIST.get("session_verified"):
-                        _fetch_coindcx_active_positions_sync()
-            except Exception:
-                pass
-
-    _threading.Thread(target=_keepalive_loop, daemon=True, name="CoinDCXNatKeepAlive").start()
-
-
 def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET", url: str = "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets", payload: dict | None = None, timeout: float = 3.5):
     """
-    Single-flight Cloud NAT egress IP pinner:
-    - Holds up to 64 candidate sockets open simultaneously across 8 worker threads so Google Cloud NAT
-      must allocate across all 8-12 egress IPs in its pool (including 35.230.78.192).
-    - Immediately tests each unique NAT IP on sight and locks the winning single-socket session.
+    Single-flight Cloud NAT egress IP pinner (strictly 1 thread, zero socket/thread starvation):
+    - Holds up to 28 candidate single-socket sessions open simultaneously in `cand_pool` so Google Cloud NAT
+      must cycle across all 8-10 egress IPs in its pool instead of recycling a non-allowlisted IP.
+    - Immediately tests priority allowlisted IPs (`35.230.78.192`, `34.83.176.217`, `last_verified_ip`) on sight
+      without wasting signed API calls on non-allowlisted IPs during the fast scan.
     """
     if not api_key or not api_secret:
         return None
-    if not _NAT_PIN_LOCK.acquire(blocking=True, timeout=15.0):
+    if not _NAT_PIN_LOCK.acquire(blocking=True, timeout=12.0):
         return None
 
     cand_pool = []
-    pool_lock = _threading.Lock()
-    found_evt = _threading.Event()
-    win_box = {"sess": None, "res": None, "ip": ""}
+    winning_sess = None
+    winning_res = None
+    winning_ip = ""
     try:
         def _test_signed_on_sess(cand_sess, k_try: str, s_try: str):
             with _COINDCX_SIGN_LOCK:
@@ -543,73 +509,76 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                 except Exception:
                     return None
 
-        # 1. If a preceding thread that just released _NAT_PIN_LOCK already pinned a verified session, reuse it!
+        # 1. If a preceding caller that just released _NAT_PIN_LOCK already pinned a verified session, reuse it!
         if _PERSIST.get("session_verified") and _PERSIST.get("session") is not None:
             r_reuse = _test_signed_on_sess(_PERSIST["session"], api_key, api_secret)
             if r_reuse is not None and (r_reuse.status_code == 200 or r_reuse.status_code not in (401, 502, 503)):
                 return r_reuse
 
-        # 2. Avoid back-to-back scans if a scan just failed < 1.5s ago
+        # 2. Avoid back-to-back scans if a scan just failed < 2.0s ago
         now_p = time.time()
-        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < 1.5:
+        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < 2.0:
             return None
         _PERSIST["last_nat_probe_ts"] = now_p
 
+        priority_ips = {"35.230.78.192", "34.83.176.217"}
+        last_v_ip = _PERSIST.get("last_verified_ip")
+        if last_v_ip:
+            priority_ips.add(last_v_ip)
+
+        seen_ips = {}
         tested_ips = set()
 
-        def _probe_worker():
-            for _ in range(8):
-                if found_evt.is_set():
-                    return
-                cand = _make_single_socket_session()
-                with pool_lock:
-                    cand_pool.append(cand)
-                cand_ip = _probe_session_coindcx_ip(cand, timeout=1.8)
-                if not cand_ip or found_evt.is_set():
-                    continue
-                should_test = False
-                with pool_lock:
-                    if cand_ip not in tested_ips or cand_ip in ("35.230.78.192", "34.83.176.217"):
-                        tested_ips.add(cand_ip)
-                        should_test = True
-                if should_test and not found_evt.is_set():
+        # Pass 1: Fast scan across 28 sockets held open in cand_pool, immediately testing priority_ips on sight
+        for _ in range(28):
+            cand = _make_single_socket_session()
+            cand_pool.append(cand)
+            cand_ip = _probe_session_coindcx_ip(cand, timeout=1.5)
+            if cand_ip:
+                if cand_ip not in seen_ips:
+                    seen_ips[cand_ip] = cand
+                if cand_ip in priority_ips:
+                    tested_ips.add(cand_ip)
                     r_try = _test_signed_on_sess(cand, api_key, api_secret)
                     if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
-                        with pool_lock:
-                            if not found_evt.is_set():
-                                win_box["sess"] = cand
-                                win_box["res"] = r_try
-                                win_box["ip"] = cand_ip
-                                found_evt.set()
-                        return
+                        winning_sess = cand
+                        winning_res = r_try
+                        winning_ip = cand_ip
+                        break
+            time.sleep(0.02)
 
-        workers = [
-            _threading.Thread(target=_probe_worker, daemon=True)
-            for _ in range(8)
-        ]
-        for w in workers:
-            w.start()
-        for w in workers:
-            w.join(timeout=8.0)
+        # Pass 2: Fallback if user allowlisted a different NAT IP not in priority_ips
+        if winning_sess is None:
+            for cand_ip, cand in list(seen_ips.items()):
+                if cand_ip in tested_ips:
+                    continue
+                tested_ips.add(cand_ip)
+                r_try = _test_signed_on_sess(cand, api_key, api_secret)
+                if r_try is not None and (r_try.status_code == 200 or r_try.status_code not in (401, 502, 503)):
+                    winning_sess = cand
+                    winning_res = r_try
+                    winning_ip = cand_ip
+                    break
 
-        if win_box["sess"] is not None:
+        if winning_sess is not None:
             with _COINDCX_SIGN_LOCK:
                 old_sess = _PERSIST.get("session")
-                if old_sess is not None and old_sess is not win_box["sess"]:
+                if old_sess is not None and old_sess is not winning_sess:
                     try:
                         old_sess.close()
                     except Exception:
                         pass
-                _PERSIST["session"] = win_box["sess"]
+                _PERSIST["session"] = winning_sess
                 _PERSIST["session_verified"] = True
-                _PERSIST["pinned_ip"] = win_box["ip"]
+                _PERSIST["pinned_ip"] = winning_ip
+                _PERSIST["last_verified_ip"] = winning_ip
                 _PERSIST["last_sess_io_ts"] = time.time()
                 _PERSIST["last_auth_error"] = ""
-            return win_box["res"]
+            return winning_res
         return None
     finally:
         for s in cand_pool:
-            if s is not win_box["sess"]:
+            if s is not winning_sess:
                 try:
                     s.close()
                 except Exception:
@@ -625,7 +594,6 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
       the active 35.230.78.192 connection.
     """
     _check_and_kill_obsolete_daemon()
-    _ensure_nat_keepalive_daemon()
     api_key, api_secret = _get_coindcx_credentials()
 
     if not api_key or not api_secret:

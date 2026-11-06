@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 9
+_DAEMON_VERSION = 10
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -1330,18 +1330,9 @@ def render_unified_live_header(pair: str):
 
 render_unified_live_header(selected_pair)
 
-if not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified"):
-    @st.fragment(run_every="3s")
-    def _auto_sync_live_account_fragment():
-        cur_bal = coindcx_engine._WALLET_BALANCE_CACHE.get("data")
-        cur_pos = coindcx_engine._ACTIVE_POSITIONS_CACHE.get("data")
-        if (isinstance(cur_bal, dict) and cur_bal.get("is_live_api")) or (cur_pos and len(cur_pos) > 0):
-            st.rerun()
-        else:
-            coindcx_engine._trigger_bg_wallet_refresh()
-            coindcx_engine._trigger_bg_positions_refresh()
-
-    _auto_sync_live_account_fragment()
+if not wallet_data.get("is_live_api"):
+    coindcx_engine._trigger_bg_wallet_refresh()
+    coindcx_engine._trigger_bg_positions_refresh()
 
 ticker = get_cached_ticker(selected_pair)
 live_price = float(ticker.get("last_price", 0.0))
@@ -2858,3 +2849,15 @@ elif active_section == "🤖 AI Advisor":
                         "model": "error",
                     })
 
+# Auto-refresh UI once at the very end of the page ONLY when transitioning from cold cache (is_live_api=False) to Live Synced
+if not wallet_data.get("is_live_api"):
+    @st.fragment(run_every="4s")
+    def _auto_sync_cold_wallet_fragment():
+        cur_bal = coindcx_engine._WALLET_BALANCE_CACHE.get("data")
+        if isinstance(cur_bal, dict) and cur_bal.get("is_live_api"):
+            st.rerun()
+        else:
+            coindcx_engine._trigger_bg_wallet_refresh()
+            coindcx_engine._trigger_bg_positions_refresh()
+
+    _auto_sync_cold_wallet_fragment()
