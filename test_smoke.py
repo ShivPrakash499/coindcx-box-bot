@@ -190,7 +190,17 @@ def test_4_strategy_and_two_entry_levels():
     assert abs(inj_plan["entry2_sweep"] - 7.43) < 1e-6, f"Expected Entry 2 at SH $7.43, got {inj_plan['entry2_sweep']}"
     assert inj_plan["stop"] > 7.43, f"Expected Catastrophe SL strictly above SH $7.43, got {inj_plan['stop']}"
 
-    print(f"  -> PASS: LONG ({long_lvls}), SHORT ({short_lvls}) & SH/SL structural Entry2/SL verified.")
+    # Verify _nearest_box_tp1 picks nearer of MID or 15m 50 EMA, and Strategy 2 single-entry + 5% wallet loss stop
+    tp1_s_px, tp1_s_lbl = strat._nearest_box_tp1("SHORT", entry=7.30, mid=7.00, ema50_15m=7.15, fallback_edge=6.80)
+    assert abs(tp1_s_px - 7.15) < 1e-6 and tp1_s_lbl == "15m 50 EMA"
+    tp1_l_px, tp1_l_lbl = strat._nearest_box_tp1("LONG", entry=6.90, mid=7.10, ema50_15m=7.02, fallback_edge=7.30)
+    assert abs(tp1_l_px - 7.02) < 1e-6 and tp1_l_lbl == "15m 50 EMA"
+    s2_plan = strat.build_single_entry_runner_plan("LONG", entry=7.00, struct_stop=6.88, struct_tp1=7.15, struct_tp2=7.30, leverage=10)
+    assert s2_plan is not None and s2_plan["entry2_sweep"] == 0.0
+    assert strat.DAILY_WALLET_LOSS_STOP_PCT == 5.0
+    assert "ema9_retest" in strat.STRATEGY_REGISTRY and "combined" in strat.STRATEGY_REGISTRY
+
+    print(f"  -> PASS: LONG ({long_lvls}), SHORT ({short_lvls}) & SH/SL structural Entry2/SL + Strategy 1/2/3 rules verified.")
 
 
 def test_5_daily_bias_enforcement():

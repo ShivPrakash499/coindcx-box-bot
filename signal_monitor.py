@@ -23,7 +23,7 @@ DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
 COOLDOWN_MIN = 60          # per strategy + pair + direction, plus pair-level anti-spam guard
 SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zone in the same direction
 MAX_DAILY_ALERTS_PER_PAIR = 3
-MAX_DAILY_PORTFOLIO_TRADES = 6
+MAX_DAILY_PORTFOLIO_TRADES = 999
 _STATE_SCHEMA_VERSION = 3
 _SCAN_LOCK = sys.__dict__.setdefault("_signal_monitor_scan_lock", threading.Lock())
 _LAST_SCAN_CACHE = sys.__dict__.setdefault("_signal_monitor_last_scan", {"ts": 0.0, "results": []})
@@ -197,7 +197,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
             email_daily_key = f"EMAIL_COUNT|{pair}|{today_ist}"
             email_daily_count = int(state.get(email_daily_key, 0))
 
+            pair_primary_triggered = False
             for sid in strategy_ids:
+                if sid == "ema9_retest" and pair_primary_triggered:
+                    continue  # Strategy 3 only runs when Strategies 1 & 2 yield no setup
                 s = strat_registry.get_strategy(sid)
                 row = {
                     "pair": pair, "strategy_id": s.id, "strategy_name": s.name,
@@ -212,6 +215,8 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if not sig or sig["signal"] == "NEUTRAL":
                     results.append({**row, "message": "no signal"})
                     continue
+                if sid in ("box_theory", "atr_reversal"):
+                    pair_primary_triggered = True
 
                 if float(sig.get("roe_tp1", 0.0)) < 3.0:
                     results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})

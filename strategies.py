@@ -31,18 +31,27 @@ IST = eng.IST
 # ----------------------------------------------------------------------------------------------
 def position_metrics(pair: str, entry: float, stop: float, tp1: float, tp2: float,
                      margin_inr: float, leverage: int, usd_inr: float,
-                     entry2_sweep: float = 0.0) -> dict:
-    """Quantity, ROE and INR projections for a 2-Entry + Runner setup (Tranche 1 at Entry + Tranche 2 at Sweep Level,
-    50% TP1 Early Book + 50% TP2 Runner to opposite Box Edge)."""
+                     entry2_sweep: float | None = None) -> dict:
+    """Quantity, ROE and INR projections for a 2-Entry + Runner setup (or Single-Entry when entry2_sweep == 0.0)."""
     margin_usd = margin_inr / usd_inr if usd_inr else 0.0
     position_usd = margin_usd * leverage
     qty = eng.format_order_quantity(pair, position_usd / entry) if entry > 0 else 0
-    tranche_qty = eng.format_order_quantity(pair, (position_usd * 0.5) / entry) if entry > 0 else 0
 
-    if entry2_sweep <= 0 and entry > 0:
-        is_long = tp1 >= entry
-        entry2_sweep = eng.round_asset_price(entry * (0.99 if is_long else 1.01), entry)
-    avg_entry_2x = eng.round_asset_price((entry + entry2_sweep) / 2.0, entry) if entry2_sweep > 0 else entry
+    if entry2_sweep is None:
+        if entry > 0:
+            is_long = tp1 >= entry
+            entry2_sweep = eng.round_asset_price(entry * (0.99 if is_long else 1.01), entry)
+        else:
+            entry2_sweep = 0.0
+
+    has_entry2 = float(entry2_sweep or 0.0) > 0.0
+    tranche_qty = (
+        eng.format_order_quantity(pair, (position_usd * 0.5) / entry)
+        if (entry > 0 and has_entry2)
+        else qty
+    )
+    tranche_margin_inr = round(margin_inr * 0.5, 2) if has_entry2 else round(margin_inr, 2)
+    avg_entry_2x = eng.round_asset_price((entry + entry2_sweep) / 2.0, entry) if has_entry2 else entry
 
     risk = abs(entry - stop) if stop > 0 else 0
     r1 = abs(entry - tp1)
@@ -51,7 +60,7 @@ def position_metrics(pair: str, entry: float, stop: float, tp1: float, tp2: floa
     def roe(x):
         return round((x / entry) * leverage * 100, 2) if entry > 0 else 0
 
-    # Blended Runner PnL if 50% exits at TP1 and 50% rides to TP2
+    # Blended Runner PnL if 50% exits at TP1 and 50% rides to TP2 / Trailing SL
     profit_tp1_full_inr = round(r1 * qty * usd_inr, 2)
     profit_tp2_full_inr = round(r2 * qty * usd_inr, 2)
     profit_blended_runner_inr = round(0.5 * profit_tp1_full_inr + 0.5 * profit_tp2_full_inr, 2)
@@ -60,8 +69,8 @@ def position_metrics(pair: str, entry: float, stop: float, tp1: float, tp2: floa
     return {
         "crypto_qty": qty,
         "tranche_qty": tranche_qty,
-        "tranche_margin_inr": round(margin_inr * 0.5, 2),
-        "entry2_sweep": eng.round_asset_price(entry2_sweep, entry) if entry2_sweep > 0 else entry,
+        "tranche_margin_inr": tranche_margin_inr,
+        "entry2_sweep": eng.round_asset_price(entry2_sweep, entry) if has_entry2 else 0.0,
         "avg_entry_2x": avg_entry_2x,
         "position_usd": round(position_usd, 2),
         "margin_inr": margin_inr,
@@ -80,7 +89,7 @@ def position_metrics(pair: str, entry: float, stop: float, tp1: float, tp2: floa
 
 
 def backtest_session_name(c_time) -> str:
-    """Session bucket used in backtest reports (unchanged from the original backtester)."""
+    """Session bucket used in backtest reports."""
     h, m = c_time.hour, c_time.minute
     if (h == 7) or (h == 8 and m <= 30):
         return "🌅 Asia Open"
@@ -100,6 +109,7 @@ def _closed_15m(pair: str, limit: int) -> pd.DataFrame:
     if closed.empty:
         closed = df.iloc[:-1].reset_index(drop=True)
     if not closed.empty:
+        closed["EMA9"] = closed["close"].ewm(span=9, adjust=False).mean()
         closed["EMA50"] = closed["close"].ewm(span=50, adjust=False).mean()
         closed["EMA200"] = closed["close"].ewm(span=200, adjust=False).mean()
     return closed.iloc[-limit:].reset_index(drop=True) if len(closed) > limit else closed
@@ -114,6 +124,7 @@ def _closed_5m(pair: str, limit: int) -> pd.DataFrame:
     if closed.empty:
         closed = df.iloc[:-1].reset_index(drop=True)
     if not closed.empty:
+        closed["EMA9"] = closed["close"].ewm(span=9, adjust=False).mean()
         closed["EMA50"] = closed["close"].ewm(span=50, adjust=False).mean()
         closed["EMA200"] = closed["close"].ewm(span=200, adjust=False).mean()
     return closed.iloc[-limit:].reset_index(drop=True) if len(closed) > limit else closed
@@ -122,9 +133,9 @@ def _closed_5m(pair: str, limit: int) -> pd.DataFrame:
 def classify_daily_ema_bias(close_val: float, ema50_val: float, ema200_val: float) -> str:
     """
     Strict Daily Trend Bias Rule:
-      - Daily Close < 50 EMA AND Daily Close < 200 EMA -> BEARISH (SHORT setups only)
-      - Daily Close > 50 EMA AND Daily Close > 200 EMA -> BULLISH (LONG setups only)
-      - Otherwise (price between 50 EMA and 200 EMA)   -> NEUTRAL (NO TRADE)
+      - Daily Close < 50 EMA AND Daily Close < 200 EMA -> BEARISH (SHORT setups only in Box Strategy)
+      - Daily Close > 50 EMA AND Daily Close > 200 EMA -> BULLISH (LONG setups only in Box Strategy)
+      - Otherwise (price between 50 EMA and 200 EMA)   -> NEUTRAL (Both outer Box edges active)
     """
     if close_val < ema50_val and close_val < ema200_val:
         return "BEARISH"
@@ -133,13 +144,61 @@ def classify_daily_ema_bias(close_val: float, ema50_val: float, ema200_val: floa
     return "NEUTRAL"
 
 
-# Dynamic 2-Entry + Runner TP1/TP2 & Sweep Scale-In Constants (at 10x default leverage; 50% Tranche 1 = 5x effective)
-DEFAULT_LEVERAGE = 10         # 10x leverage per trade (50% margin on Entry 1 + 50% margin reserved for Entry 2)
-MAX_TP_ROE_PCT = 10.0         # TP1 (50% Early Book) = min(2.0% price move [10% total-margin ROE], MID)
-MIN_TP_ROE_PCT = 3.0          # Skip trade if TP1 distance is < 0.6% price move
-MAX_SL_ROE_PCT = 5.0          # Strict 1.0% max catastrophe SL price distance (5% ROE on Entry 1's 50% margin at 10x)
-MAX_TRADES_PER_DAY = 2        # Max 2 trades per coin per day
-DAILY_WIN_ROE_LOCK_PCT = 10.0 # Done for the day once a trade hits >= 10% ROE
+# Dynamic 2-Entry + Runner TP1/TP2 & Discipline Constants
+DEFAULT_LEVERAGE = 10               # 10x leverage per trade
+MAX_TP_ROE_PCT = 10.0               # TP1 (50% Early Book) = min(2.0% price move [10% total-margin ROE], nearer of MID / 15m 50 EMA)
+MIN_TP_ROE_PCT = 3.0                # Skip trade if TP1 distance is < 0.6% price move
+MAX_SL_ROE_PCT = 5.0                # Strict 1.0% max catastrophe SL price distance
+DAILY_WALLET_LOSS_STOP_PCT = 5.0    # STOP trading for the day if 5% of total futures wallet is lost including fees
+MAX_TRADES_PER_DAY = 999            # Legacy trade-count cap removed per discipline update
+DAILY_WIN_ROE_LOCK_PCT = 9999.0     # Legacy daily win-lock removed per discipline update
+
+
+def _nearest_box_tp1(
+    direction: str,
+    entry: float,
+    mid: float,
+    ema50_15m: float,
+    fallback_edge: float,
+) -> tuple[float, str]:
+    """
+    Strategy 1 Rule: Keep TP1 at Box Midpoint (`MID`) or `15m 50 EMA`, whichever is NEARER to `entry`
+    in the profitable direction (requiring at least the minimum valid 0.59% price distance when available).
+    """
+    is_long = direction.upper() in ("LONG", "BUY")
+    min_dist = entry * 0.0059
+    if is_long:
+        raw_cands = []
+        if mid > entry:
+            raw_cands.append((mid - entry, mid, "MID"))
+        if ema50_15m > entry:
+            raw_cands.append((ema50_15m - entry, ema50_15m, "15m 50 EMA"))
+        valid_cands = [c for c in raw_cands if c[0] >= min_dist]
+        if valid_cands:
+            _, best_px, best_lbl = min(valid_cands, key=lambda c: c[0])
+            return best_px, best_lbl
+        if fallback_edge > entry and (fallback_edge - entry) >= min_dist:
+            return fallback_edge, "RH"
+        if raw_cands:
+            _, best_px, best_lbl = max(raw_cands, key=lambda c: c[0])
+            return best_px, best_lbl
+        return (fallback_edge if fallback_edge > entry else entry * 1.015), "RH"
+    else:
+        raw_cands = []
+        if 0 < mid < entry:
+            raw_cands.append((entry - mid, mid, "MID"))
+        if 0 < ema50_15m < entry:
+            raw_cands.append((entry - ema50_15m, ema50_15m, "15m 50 EMA"))
+        valid_cands = [c for c in raw_cands if c[0] >= min_dist]
+        if valid_cands:
+            _, best_px, best_lbl = min(valid_cands, key=lambda c: c[0])
+            return best_px, best_lbl
+        if 0 < fallback_edge < entry and (entry - fallback_edge) >= min_dist:
+            return fallback_edge, "RL"
+        if raw_cands:
+            _, best_px, best_lbl = max(raw_cands, key=lambda c: c[0])
+            return best_px, best_lbl
+        return (fallback_edge if 0 < fallback_edge < entry else entry * 0.985), "RL"
 
 
 def build_two_entry_runner_plan(
@@ -152,18 +211,15 @@ def build_two_entry_runner_plan(
     max_tp1_roe: float = MAX_TP_ROE_PCT,
     min_tp1_roe: float = MIN_TP_ROE_PCT,
     enforce_min_tp: bool = True,
+    tp1_ref_name: str = "MID",
 ) -> dict | None:
     """
-    2-Entry Sweep Scale-In + 2-Stage Runner Exit Plan (10x Leverage, 50/50 Tranche Split):
-      - Entry 1 (50% Margin): Confirmed rejection close price (`entry`).
-      - Entry 2 (50% Margin — Same Amount): Placed at the `SH` / `SL` / wick sweep level (`sweep_level`),
-        turning stop-hunts into a 2nd fill instead of a premature stop-out.
-      - Emergency Catastrophe SL (`stop_price`): Placed just beyond `Entry 2` (`SH`/`SL`) and strictly
-        capped at 1.0% price move (`5% ROE` on Tranche 1's 50% margin at 10x).
-      - TP1 (Close 50% / Book Early Profit + Free-Ride Runner):
-        `min(struct_tp1 [MID], 2.0% price move [20% ROE on Tranche 1 / 10% ROE on Total Trade Margin])`.
-      - TP2 (Hold Remaining 50% Risk-Free Runner for Big Drop):
-        Opposite Box Edge (`RL`/`SL` for SHORT, `RH`/`SH` for LONG).
+    2-Entry Sweep Scale-In + Runner Plan (10x Leverage, 50/50 Tranche Split for Box Strategy):
+      - Entry 1 (50% Margin): Confirmed 15m rejection close price (`entry`).
+      - Entry 2 (50% Margin — Same Amount): Placed at the `SH` / `SL` / wick sweep level (`sweep_level`).
+      - Emergency Catastrophe SL (`stop_price`): Placed 0.5% beyond `Entry 2` (`SH`/`SL`).
+      - TP1 (Close 50% / Book Early Profit): Nearer of `MID` or `15m 50 EMA` (capped at 2.0% price move).
+      - Remaining 50% Runner: Managed by Trailing 15m H/L SL + Strategy 3 (20% ATR 30% Pullback / Confirmed 5m 9 EMA Cross).
     """
     if entry <= 0:
         return None
@@ -171,18 +227,14 @@ def build_two_entry_runner_plan(
     eff_lev = 5.0  # 50% Tranche 1 @ 10x leverage = 5x effective leverage on total trade margin
     is_long = direction.upper() in ("LONG", "BUY")
 
-    # 1. TP1 (Early Profit Booking on 50% of position: <= 2.0% price move or MID whichever is closer)
     struct_tp1_dist = abs(struct_tp1 - entry)
     max_tp1_dist = entry * (max_tp1_roe / 100.0 / eff_lev)
     min_tp1_dist = entry * (min_tp1_roe / 100.0 / eff_lev)
-    max_sl_dist = entry * (MAX_SL_ROE_PCT / 100.0 / eff_lev)  # 1.0% structural price distance
 
     tp1_dist = min(struct_tp1_dist, max_tp1_dist)
     if enforce_min_tp and tp1_dist < (min_tp1_dist * 0.98):
         return None
 
-    # 2. Entry 2 (Equal-size scale-in order at structural SH / SL sweep level, >= 0.8% from Entry 1)
-    #    & Catastrophe SL placed 0.5% beyond Entry 2 (SH / SL) so price never stops out inside the RH-SH / RL-SL zone
     if is_long:
         entry2 = min(sweep_level, entry * 0.992) if (0 < sweep_level < entry) else entry * 0.992
         avg_entry = (entry + entry2) / 2.0
@@ -202,13 +254,79 @@ def build_two_entry_runner_plan(
 
     tp1_roe = round((tp1_dist / entry) * lev * 100.0, 1)
     tp2_roe = round((tp2_dist / entry) * lev * 100.0, 1)
-    tp1_label = f"50% Book ({tp1_roe:.0f}% ROE -> SL to BE)" if tp1_dist < struct_tp1_dist else f"50% Book MID ({tp1_roe:.1f}% ROE -> SL to BE)"
-    tp2_label = f"50% Runner ({tp2_roe:.0f}% ROE Big Drop)"
+    tp1_label = (
+        f"50% Book ({tp1_roe:.0f}% ROE -> 15m Trail)"
+        if tp1_dist < struct_tp1_dist
+        else f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> 15m Trail)"
+    )
+    tp2_label = f"50% Runner (15m Trail + 9 EMA / 20% ATR Exit, ref {tp2_roe:.0f}% ROE)"
 
     return {
         "entry": entry,
         "entry2_sweep": entry2,
         "avg_entry_2x": avg_entry,
+        "stop": stop_price,
+        "tp1": tp1_price,
+        "tp2": tp2_price,
+        "tp1_label": tp1_label,
+        "tp2_label": tp2_label,
+    }
+
+
+def build_single_entry_runner_plan(
+    direction: str,
+    entry: float,
+    struct_stop: float,
+    struct_tp1: float,
+    struct_tp2: float,
+    leverage: int = DEFAULT_LEVERAGE,
+    max_tp1_roe: float = MAX_TP_ROE_PCT,
+    min_tp1_roe: float = MIN_TP_ROE_PCT,
+    enforce_min_tp: bool = True,
+    tp1_ref_name: str = "50% Retrace",
+) -> dict | None:
+    """
+    Single-Entry Plan (`entry2_sweep = 0.0`) used for Strategy 2 (1-Candle ATR Reversal) and Strategy 3 (9 EMA Retest),
+    where Entry 2 scale-in is not used.
+    """
+    if entry <= 0:
+        return None
+    lev = max(1, int(leverage))
+    eff_lev = 5.0
+    is_long = direction.upper() in ("LONG", "BUY")
+
+    struct_tp1_dist = abs(struct_tp1 - entry)
+    max_tp1_dist = entry * (max_tp1_roe / 100.0 / eff_lev)
+    min_tp1_dist = entry * (min_tp1_roe / 100.0 / eff_lev)
+
+    tp1_dist = min(struct_tp1_dist, max_tp1_dist)
+    if enforce_min_tp and tp1_dist < (min_tp1_dist * 0.98):
+        return None
+
+    if is_long:
+        raw_stop = struct_stop if (0 < struct_stop < entry) else entry * 0.992
+        stop_price = max(min(raw_stop, entry * 0.9965), entry * 0.988)
+        tp1_price = entry + tp1_dist
+        raw_tp2_dist = (struct_tp2 - entry) if struct_tp2 > tp1_price else max(tp1_dist * 2.2, entry * 0.044)
+        tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
+        tp2_price = entry + tp2_dist
+    else:
+        raw_stop = struct_stop if (struct_stop > entry) else entry * 1.008
+        stop_price = min(max(raw_stop, entry * 1.0035), entry * 1.012)
+        tp1_price = entry - tp1_dist
+        raw_tp2_dist = (entry - struct_tp2) if (0 < struct_tp2 < tp1_price) else max(tp1_dist * 2.2, entry * 0.044)
+        tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
+        tp2_price = entry - tp2_dist
+
+    tp1_roe = round((tp1_dist / entry) * lev * 100.0, 1)
+    tp2_roe = round((tp2_dist / entry) * lev * 100.0, 1)
+    tp1_label = f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> 15m Trail)"
+    tp2_label = f"50% Runner (15m Trail + 9 EMA / 20% ATR Exit, ref {tp2_roe:.0f}% ROE)"
+
+    return {
+        "entry": entry,
+        "entry2_sweep": 0.0,
+        "avg_entry_2x": entry,
         "stop": stop_price,
         "tp1": tp1_price,
         "tp2": tp2_price,
@@ -229,9 +347,7 @@ def apply_dynamic_roe_tp_sl(
     enforce_min_tp: bool = True,
     struct_tp2: float = 0.0,
 ) -> tuple[float, float, str] | None:
-    """
-    Backwards-compatible wrapper returning (stop_price, tp1_price, tp1_label) from build_two_entry_runner_plan.
-    """
+    """Backwards-compatible wrapper returning (stop_price, tp1_price, tp1_label)."""
     plan = build_two_entry_runner_plan(
         direction=direction,
         entry=entry,
@@ -294,27 +410,28 @@ class Strategy:
 
     def _stamp(self, d: dict | None) -> dict | None:
         if d is not None:
-            d["strategy_id"], d["strategy_name"] = self.id, self.name
+            d.setdefault("strategy_id", self.id)
+            d.setdefault("strategy_name", self.name)
         return d
 
 
 # ----------------------------------------------------------------------------------------------
-# Strategy 1: Box Theory + 50/200 EMA Trend & Rejection
+# Strategy 1: Box Theory + 50/200 EMA Trend & 15m Rejection
 # ----------------------------------------------------------------------------------------------
 class BoxTheorySweep(Strategy):
     id = "box_theory"
     name = "Box Theory Sweep"
     short = "Box"
-    timeframe = "Daily 50/200 EMA Bias -> 15m/5m Zone or 50 EMA Next-Candle Rejection"
+    timeframe = "Daily 50/200 EMA Bias -> Strictly 15m Zone or 50 EMA Rejection"
     description = (
-        "Daily 50 EMA & 200 EMA trend-filtered strategy: "
-        "When Daily is below 50 & 200 EMA (Bearish), ONLY takes SHORT setups when price reaches Sell Zone (RH-SH) "
-        "or 50 EMA and rejects on the next candle. "
-        "When Daily is above 50 & 200 EMA (Bullish), ONLY takes LONG setups when price reaches Buy Zone (RL-SL) "
-        "or 50 EMA and rejects on the next candle."
+        "Daily 50 EMA & 200 EMA trend-filtered Box strategy using strictly 15m candle confirmation: "
+        "(A/C) Sweeps RH/SH (Short) or RL/SL (Long) and closes back inside on 15m candle; "
+        "(B/D) Touches Daily 50 EMA and rejects on 15m candle (no 65% box-zone restriction). "
+        "TP1 is placed at Box Midpoint (MID) or 15m 50 EMA, whichever is nearer; "
+        "remaining 50% runner uses Trailing 15m H/L SL + Strategy 3 (20% ATR 30% pullback / confirmed 5m 9 EMA cross)."
     )
     daily_warmup_days = 220
-    tp1_name, tp2_name = "TP1 (50% Book <=10% ROE / MID)", "TP2 (50% Runner to RL/RH)"
+    tp1_name, tp2_name = "TP1 (50% Book Nearer of MID / 15m 50 EMA)", "50% Runner (15m Trail + 9 EMA / 20% ATR Exit)"
     uses_live_price = True
 
     def compute_levels(self, pair):
@@ -329,8 +446,7 @@ class BoxTheorySweep(Strategy):
         if not levels:
             return None
         df_15m = _closed_15m(pair, 80)
-        df_5m = _closed_5m(pair, 80)
-        if df_15m.empty or df_5m.empty or len(df_15m) < 3 or len(df_5m) < 3:
+        if df_15m.empty or len(df_15m) < 3:
             return None
 
         rh, rl = float(levels["RH"]), float(levels["RL"])
@@ -344,115 +460,112 @@ class BoxTheorySweep(Strategy):
         session = eng.get_current_session_info(datetime.now(IST))
 
         recs_15m = df_15m.to_dict("records")
-        recs_5m = df_5m.to_dict("records")
-        c5 = recs_5m[-1]
-        prev_c5 = recs_5m[-2]
         c15 = recs_15m[-1]
         prev_c15 = recs_15m[-2]
-
-        c5_close = float(c5["close"])
-        c5_open = float(c5.get("open", c5_close))
-        c5_high = float(c5["high"])
-        c5_low = float(c5["low"])
-        prev_c5_close = float(prev_c5["close"])
 
         c15_close = float(c15["close"])
         c15_open = float(c15.get("open", c15_close))
         c15_high = float(c15["high"])
         c15_low = float(c15["low"])
+        c15_range = c15_high - c15_low
+        prev_c15_high = float(prev_c15["high"])
+        prev_c15_low = float(prev_c15["low"])
         prev_c15_close = float(prev_c15["close"])
-        ema50_15m = float(c15.get("EMA50", daily_ema50))
-        prev_ema50_15m = float(prev_c15.get("EMA50", ema50_15m))
+        ema50_15m = float(c15.get("EMA50", mid))
 
-        candle_time = datetime.fromtimestamp(c5["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
+        candle_time = datetime.fromtimestamp(c15["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
+        near_tp1, near_tp1_lbl = _nearest_box_tp1(
+            "SHORT" if trend_bias == "BEARISH" else "LONG",
+            c15_close, mid, ema50_15m,
+            rl if trend_bias == "BEARISH" else rh,
+        )
 
         out = {
             "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-            "candle_evaluated": f"Daily {trend_bias} Bias | 15m/5m confirmation ({candle_time}) [{session['emoji']} {session['name']}]",
+            "candle_evaluated": f"Daily {trend_bias} Bias | 15m confirmation ({candle_time}) [{session['emoji']} {session['name']}]",
             "session": session, "session_name": f"{session['emoji']} {session['name']}",
             "is_prime_session": session["is_prime"], "is_us_open_candle": session["session_id"] == "NEW_YORK",
-            "pair": pair, "levels": levels, "candle_ts": int(c5["timestamp"]),
+            "pair": pair, "levels": levels, "candle_ts": int(c15["timestamp"]),
             "signal": "NEUTRAL", "signal_kind": None, "trigger_zone": None, "trigger_reason": "",
             "setup": f"WAIT / NO TRADE (Daily Bias: {trend_bias} | 50 EMA: ${daily_ema50:,.2f}, 200 EMA: ${daily_ema200:,.2f})",
-            "entry": c5_close, "stop_loss": 0.0, "tp1": mid, "tp2": rl if trend_bias == "BEARISH" else rh,
+            "entry": c15_close, "stop_loss": 0.0, "tp1": near_tp1, "tp2": rl if trend_bias == "BEARISH" else rh,
         }
-        out.update(position_metrics(pair, c5_close, 0.0, mid, out["tp2"], margin_inr, leverage, usd_inr))
+        out.update(position_metrics(pair, c15_close, 0.0, near_tp1, out["tp2"], margin_inr, leverage, usd_inr))
 
         bias_label = (
             f"Daily Bearish (<50 EMA ${daily_ema50:,.2f} & <200 EMA ${daily_ema200:,.2f})" if trend_bias == "BEARISH"
             else (
                 f"Daily Bullish (>50 EMA ${daily_ema50:,.2f} & >200 EMA ${daily_ema200:,.2f})" if trend_bias == "BULLISH"
-                else f"Daily Neutral/Range (Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f} — NO TRADE)"
+                else f"Daily Range (Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f})"
             )
         )
         out["daily_trend_summary"] = bias_label
 
-        recent_15m = recs_15m[-3:]
-
         # ------------------------------------------------------------------
-        # 1. SHORT SETUPS (WHEN DAILY BIAS IS BEARISH OR RANGE/NEUTRAL):
-        #    - Outer Box RH or SH Liquidity Sweep + Rejection (allowed in BEARISH & NEUTRAL/Range)
-        #    - Daily 50 EMA Touch + Next-Candle Rejection (strictly in BEARISH)
+        # 1. SHORT SETUPS (Strictly 15m Confirmation):
+        #    A: Outer Box RH or SH Liquidity Sweep + 15m Close Below RH/SH (in BEARISH & NEUTRAL)
+        #    B: Daily 50 EMA Touch + 15m Bearish Rejection (in BEARISH, no 65% box filter)
         # ------------------------------------------------------------------
-        swept_rh_prior = any(float(r["high"]) >= rh or float(r["open"]) >= rh for r in recent_15m)
-        swept_rh_curr15 = (c15_high >= rh) or (float(prev_c15["high"]) >= rh)
-        rejected_rh_5m = swept_rh_prior and (c5_close < rh) and (c5_close <= c5_open or c5_close < prev_c5_close)
-        rejected_rh_15m = swept_rh_curr15 and (c15_close < rh) and (c15_close <= c15_open or c15_close < prev_c15_close)
+        upper_wick_15m = c15_high - max(c15_open, c15_close)
+        has_bear_confirm_15m = (c15_close < c15_open and c15_close < prev_c15_close) or (
+            c15_close < c15_open and c15_range > 0 and (upper_wick_15m / c15_range) >= 0.30
+        )
+        swept_rh_15m = (prev_c15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(prev_c15_high, c15_high) <= sh * 1.005)
+        swept_sh_15m = (prev_c15_high >= sh or c15_high >= sh) and (c15_close < sh) and (max(prev_c15_high, c15_high) <= sh * 1.012)
 
-        swept_sh_prior = any(float(r["high"]) >= sh or float(r["open"]) >= sh for r in recent_15m)
-        swept_sh_curr15 = (c15_high >= sh) or (float(prev_c15["high"]) >= sh)
-        rejected_sh_5m = swept_sh_prior and (c5_close < sh) and (c5_close <= c5_open or c5_close < prev_c5_close)
-        rejected_sh_15m = swept_sh_curr15 and (c15_close < sh) and (c15_close <= c15_open or c15_close < prev_c15_close)
+        rejected_rh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_rh_15m and has_bear_confirm_15m
+        rejected_sh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_sh_15m and has_bear_confirm_15m
 
-        if trend_bias in ("BEARISH", "NEUTRAL") and (rejected_rh_5m or rejected_rh_15m or rejected_sh_5m or rejected_sh_15m):
-            use_5m = rejected_rh_5m or rejected_sh_5m
-            raw_entry = c5_close if use_5m else c15_close
-            entry = eng.round_asset_price(raw_entry, rh)
-            sweep_high = max(float(r["high"]) for r in recent_15m)
-            scale_in_lvl = max(sh, sweep_high, entry * 1.008)
-            struct_tp1 = mid if entry > mid else rl
+        if rejected_rh_15m or rejected_sh_15m:
+            entry = eng.round_asset_price(c15_close, rh)
+            scale_in_lvl = max(sh, prev_c15_high, c15_high, entry * 1.008)
+            struct_tp1, tp1_ref = _nearest_box_tp1("SHORT", entry, mid, ema50_15m, rl)
             struct_tp2 = rl if entry > rl * 1.012 else sl
-            plan = build_two_entry_runner_plan("SHORT", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage)
+            plan = build_two_entry_runner_plan(
+                "SHORT", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage, tp1_ref_name=tp1_ref
+            )
             if plan:
                 stop = eng.round_asset_price(plan["stop"], rh)
                 tp1 = eng.round_asset_price(plan["tp1"], rh)
                 tp2 = eng.round_asset_price(plan["tp2"], rh)
                 entry2 = eng.round_asset_price(plan["entry2_sweep"], rh)
-                tf_lbl = "5m" if use_5m else "15m"
-                lvl_tag = f"SH (${sh:,.2f})" if (rejected_sh_5m or rejected_sh_15m) else f"RH (${rh:,.2f})"
+                lvl_tag = f"SH (${sh:,.2f})" if rejected_sh_15m else f"RH (${rh:,.2f})"
                 reason = (
-                    f"{bias_label} | Swept {lvl_tag} + {tf_lbl} rejection "
+                    f"{bias_label} | Swept {lvl_tag} + 15m rejection "
                     f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
                     "signal": "SHORT", "signal_kind": "REVERSAL", "trigger_zone": "Sell Zone RH-SH",
                     "trigger_reason": reason,
-                    "setup": f"SELL (Short): {lvl_tag} Sweep + 2-Entry Runner ({session['name']})",
+                    "setup": f"SELL (Short): {lvl_tag} Sweep + 15m Rejection ({session['name']})",
                     "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                    "candle_ts": int(c5["timestamp"] if use_5m else c15["timestamp"]),
+                    "candle_ts": int(c15["timestamp"]),
                 })
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                 return self._stamp(out)
 
         if trend_bias == "BEARISH":
-            min_short_zone = rl + 0.35 * (rh - rl)
             touched_daily_ema50 = (
                 (daily_close < daily_ema50)
-                and any(float(r["high"]) >= daily_ema50 * 0.999 and float(r["low"]) <= daily_ema50 * 1.005 for r in recent_15m)
-                and c5_close >= min_short_zone
+                and (
+                    (prev_c15_high >= daily_ema50 * 0.9995 and prev_c15_low <= daily_ema50 * 1.005)
+                    or (c15_high >= daily_ema50 * 0.9995 and c15_low <= daily_ema50 * 1.005)
+                )
             )
             rejected_d_ema50 = (
                 touched_daily_ema50
-                and (c5_close < daily_ema50)
-                and (c5_close < c5_open)
-                and (c5_close < prev_c5_close)
+                and (c15_close < daily_ema50)
+                and (c15_close < c15_open)
+                and (c15_close < prev_c15_close)
             )
             if rejected_d_ema50:
-                entry = eng.round_asset_price(c5_close, rh)
-                sweep_high = max(float(prev_c15["high"]), c15_high, c5_high, daily_ema50)
-                struct_tp1 = mid if entry > mid else rl
-                struct_tp2 = rl if entry > rl * 1.012 else sl
-                plan = build_two_entry_runner_plan("SHORT", entry, max(sweep_high, sh), struct_tp1, struct_tp2, leverage)
+                entry = eng.round_asset_price(c15_close, rh)
+                sweep_high = max(prev_c15_high, c15_high, daily_ema50, sh if entry >= rh * 0.985 else 0.0)
+                struct_tp1, tp1_ref = _nearest_box_tp1("SHORT", entry, mid, ema50_15m, rl)
+                struct_tp2 = rl if entry > rl * 1.012 else (sl if entry > sl * 1.012 else entry * 0.96)
+                plan = build_two_entry_runner_plan(
+                    "SHORT", entry, sweep_high, struct_tp1, struct_tp2, leverage, tp1_ref_name=tp1_ref
+                )
                 if plan:
                     stop = eng.round_asset_price(plan["stop"], rh)
                     tp1 = eng.round_asset_price(plan["tp1"], rh)
@@ -460,83 +573,84 @@ class BoxTheorySweep(Strategy):
                     entry2 = eng.round_asset_price(plan["entry2_sweep"], rh)
                     if stop > entry > tp1:
                         reason = (
-                            f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + next-candle "
+                            f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + 15m "
                             f"bearish rejection (Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                         )
                         out.update({
                             "signal": "SHORT", "signal_kind": "EMA50_REJECTION", "trigger_zone": "Daily 50 EMA Resistance",
                             "trigger_reason": reason,
-                            "setup": f"SELL (Short): Daily 50 EMA Touch + 2-Entry Runner ({session['name']})",
+                            "setup": f"SELL (Short): Daily 50 EMA Touch + 15m Rejection ({session['name']})",
                             "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                            "candle_ts": int(c5["timestamp"]),
+                            "candle_ts": int(c15["timestamp"]),
                         })
                         out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                         return self._stamp(out)
 
         # ------------------------------------------------------------------
-        # 2. LONG SETUPS (WHEN DAILY BIAS IS BULLISH OR RANGE/NEUTRAL):
-        #    - Outer Box RL or SL Liquidity Sweep + Rejection (allowed in BULLISH & NEUTRAL/Range)
-        #    - Daily 50 EMA Touch + Next-Candle Rejection (strictly in BULLISH)
+        # 2. LONG SETUPS (Strictly 15m Confirmation):
+        #    C: Outer Box RL or SL Liquidity Sweep + 15m Close Above RL/SL (in BULLISH & NEUTRAL)
+        #    D: Daily 50 EMA Touch + 15m Bullish Rejection (in BULLISH, no 65% box filter)
         # ------------------------------------------------------------------
-        swept_rl_prior = any(float(r["low"]) <= rl or float(r["open"]) <= rl for r in recent_15m)
-        swept_rl_curr15 = (c15_low <= rl) or (float(prev_c15["low"]) <= rl)
-        rejected_rl_5m = swept_rl_prior and (c5_close > rl) and (c5_close >= c5_open or c5_close > prev_c5_close)
-        rejected_rl_15m = swept_rl_curr15 and (c15_close > rl) and (c15_close >= c15_open or c15_close > prev_c15_close)
+        lower_wick_15m = min(c15_open, c15_close) - c15_low
+        has_bull_confirm_15m = (c15_close > c15_open and c15_close > prev_c15_close) or (
+            c15_close > c15_open and c15_range > 0 and (lower_wick_15m / c15_range) >= 0.30
+        )
+        swept_rl_15m = (prev_c15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(prev_c15_low, c15_low) >= sl * 0.995)
+        swept_sl_15m = (prev_c15_low <= sl or c15_low <= sl) and (c15_close > sl) and (min(prev_c15_low, c15_low) >= sl * 0.988)
 
-        swept_sl_prior = any(float(r["low"]) <= sl or float(r["open"]) <= sl for r in recent_15m)
-        swept_sl_curr15 = (c15_low <= sl) or (float(prev_c15["low"]) <= sl)
-        rejected_sl_5m = swept_sl_prior and (c5_close > sl) and (c5_close >= c5_open or c5_close > prev_c5_close)
-        rejected_sl_15m = swept_sl_curr15 and (c15_close > sl) and (c15_close >= c15_open or c15_close > prev_c15_close)
+        rejected_rl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_rl_15m and has_bull_confirm_15m
+        rejected_sl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_sl_15m and has_bull_confirm_15m
 
-        if trend_bias in ("BULLISH", "NEUTRAL") and (rejected_rl_5m or rejected_rl_15m or rejected_sl_5m or rejected_sl_15m):
-            use_5m = rejected_rl_5m or rejected_sl_5m
-            raw_entry = c5_close if use_5m else c15_close
-            entry = eng.round_asset_price(raw_entry, rl)
-            sweep_low = min(float(r["low"]) for r in recent_15m)
-            scale_in_lvl = min(sl, sweep_low, entry * 0.992)
-            struct_tp1 = mid if entry < mid else rh
+        if rejected_rl_15m or rejected_sl_15m:
+            entry = eng.round_asset_price(c15_close, rl)
+            scale_in_lvl = min(sl, prev_c15_low, c15_low, entry * 0.992)
+            struct_tp1, tp1_ref = _nearest_box_tp1("LONG", entry, mid, ema50_15m, rh)
             struct_tp2 = rh if entry < rh * 0.988 else sh
-            plan = build_two_entry_runner_plan("LONG", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage)
+            plan = build_two_entry_runner_plan(
+                "LONG", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage, tp1_ref_name=tp1_ref
+            )
             if plan:
                 stop = eng.round_asset_price(plan["stop"], rl)
                 tp1 = eng.round_asset_price(plan["tp1"], rl)
                 tp2 = eng.round_asset_price(plan["tp2"], rl)
                 entry2 = eng.round_asset_price(plan["entry2_sweep"], rl)
-                tf_lbl = "5m" if use_5m else "15m"
-                lvl_tag = f"SL (${sl:,.2f})" if (rejected_sl_5m or rejected_sl_15m) else f"RL (${rl:,.2f})"
+                lvl_tag = f"SL (${sl:,.2f})" if rejected_sl_15m else f"RL (${rl:,.2f})"
                 reason = (
-                    f"{bias_label} | Swept {lvl_tag} + {tf_lbl} rejection "
+                    f"{bias_label} | Swept {lvl_tag} + 15m rejection "
                     f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
                     "signal": "LONG", "signal_kind": "REVERSAL", "trigger_zone": "Buy Zone RL-SL",
                     "trigger_reason": reason,
-                    "setup": f"BUY (Long): {lvl_tag} Sweep + 2-Entry Runner ({session['name']})",
+                    "setup": f"BUY (Long): {lvl_tag} Sweep + 15m Rejection ({session['name']})",
                     "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                    "candle_ts": int(c5["timestamp"] if use_5m else c15["timestamp"]),
+                    "candle_ts": int(c15["timestamp"]),
                 })
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                 return self._stamp(out)
 
         if trend_bias == "BULLISH":
-            max_long_zone = rh - 0.35 * (rh - rl)
             touched_daily_ema50 = (
                 (daily_close > daily_ema50)
-                and any(float(r["low"]) <= daily_ema50 * 1.001 and float(r["high"]) >= daily_ema50 * 0.995 for r in recent_15m)
-                and c5_close <= max_long_zone
+                and (
+                    (prev_c15_low <= daily_ema50 * 1.0005 and prev_c15_high >= daily_ema50 * 0.995)
+                    or (c15_low <= daily_ema50 * 1.0005 and c15_high >= daily_ema50 * 0.995)
+                )
             )
             rejected_d_ema50 = (
                 touched_daily_ema50
-                and (c5_close > daily_ema50)
-                and (c5_close > c5_open)
-                and (c5_close > prev_c5_close)
+                and (c15_close > daily_ema50)
+                and (c15_close > c15_open)
+                and (c15_close > prev_c15_close)
             )
             if rejected_d_ema50:
-                entry = eng.round_asset_price(c5_close, rl)
-                sweep_low = min(float(prev_c15["low"]), c15_low, c5_low, daily_ema50)
-                struct_tp1 = mid if entry < mid else rh
-                struct_tp2 = rh if entry < rh * 0.988 else sh
-                plan = build_two_entry_runner_plan("LONG", entry, min(sweep_low, sl), struct_tp1, struct_tp2, leverage)
+                entry = eng.round_asset_price(c15_close, rl)
+                sweep_low = min(prev_c15_low, c15_low, daily_ema50, sl if entry <= rl * 1.015 else entry)
+                struct_tp1, tp1_ref = _nearest_box_tp1("LONG", entry, mid, ema50_15m, rh)
+                struct_tp2 = rh if entry < rh * 0.988 else (sh if entry < sh * 0.988 else entry * 1.04)
+                plan = build_two_entry_runner_plan(
+                    "LONG", entry, sweep_low, struct_tp1, struct_tp2, leverage, tp1_ref_name=tp1_ref
+                )
                 if plan:
                     stop = eng.round_asset_price(plan["stop"], rl)
                     tp1 = eng.round_asset_price(plan["tp1"], rl)
@@ -544,24 +658,24 @@ class BoxTheorySweep(Strategy):
                     entry2 = eng.round_asset_price(plan["entry2_sweep"], rl)
                     if stop < entry < tp1:
                         reason = (
-                            f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + next-candle "
+                            f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + 15m "
                             f"bullish rejection (Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                         )
                         out.update({
                             "signal": "LONG", "signal_kind": "EMA50_REJECTION", "trigger_zone": "Daily 50 EMA Support",
                             "trigger_reason": reason,
-                            "setup": f"BUY (Long): Daily 50 EMA Touch + 2-Entry Runner ({session['name']})",
+                            "setup": f"BUY (Long): Daily 50 EMA Touch + 15m Rejection ({session['name']})",
                             "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                            "candle_ts": int(c5["timestamp"]),
+                            "candle_ts": int(c15["timestamp"]),
                         })
                         out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
                         return self._stamp(out)
 
         out["setup"] = (
             f"WAIT / WATCHING ZONES ({bias_label} — "
-            f"watching Buy Zone RL ${rl:,.2f} / SL ${sl:,.2f} & Sell Zone RH ${rh:,.2f} / SH ${sh:,.2f} for rejection)"
+            f"watching Buy Zone RL ${rl:,.2f} / SL ${sl:,.2f} & Sell Zone RH ${rh:,.2f} / SH ${sh:,.2f} on 15m)"
         )
-        out["trigger_reason"] = f"{bias_label}: Watching RL/SL Buy Zone and RH/SH Sell Zone for sweep + rejection"
+        out["trigger_reason"] = f"{bias_label}: Watching RL/SL Buy Zone and RH/SH Sell Zone for 15m sweep + rejection"
         return self._stamp(out)
 
     def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
@@ -576,23 +690,23 @@ class BoxTheorySweep(Strategy):
         b = eng.calculate_trade_setup_details("BUY", levels, live_price, margin_inr, leverage, usd_inr, pair=pair)
         s = eng.calculate_trade_setup_details("SELL", levels, live_price, margin_inr, leverage, usd_inr, pair=pair)
         if b:
-            b["trigger_reason"] = f"Planned ({trend_bias}): Entry1 @ RL/SL + Entry2 @ SL (${levels.get('SL', 0):,.2f}) | TP1 50% Book -> TP2 Runner to RH"
+            b["trigger_reason"] = f"Planned ({trend_bias}): Entry1 @ RL/SL + Entry2 @ SL (${levels.get('SL', 0):,.2f}) | TP1 Nearer of MID/15m EMA50 -> Runner"
         if s:
-            s["trigger_reason"] = f"Planned ({trend_bias}): Entry1 @ RH/SH + Entry2 @ SH (${levels.get('SH', 0):,.2f}) | TP1 50% Book -> TP2 Runner to RL"
+            s["trigger_reason"] = f"Planned ({trend_bias}): Entry1 @ RH/SH + Entry2 @ SH (${levels.get('SH', 0):,.2f}) | TP1 Nearer of MID/15m EMA50 -> Runner"
 
         if sig and sig.get("signal") == "LONG":
             return {"BUY": self._stamp({**sig, "direction": "BUY"}), "SELL": self._stamp(s),
-                    "note": f"⚡ Live confirmed LONG signal: {sig.get('trigger_reason')}"}
+                    "note": f"⚡ Live confirmed 15m LONG signal: {sig.get('trigger_reason')}"}
         if sig and sig.get("signal") == "SHORT":
             return {"BUY": self._stamp(b), "SELL": self._stamp({**sig, "direction": "SELL"}),
-                    "note": f"⚡ Live confirmed SHORT signal: {sig.get('trigger_reason')}"}
+                    "note": f"⚡ Live confirmed 15m SHORT signal: {sig.get('trigger_reason')}"}
 
         if trend_bias == "BEARISH":
-            note_txt = f"🔴 Daily Trend Bias is BEARISH (< 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — Primary Short bias (2-Entry Runner armed on both RH/SH & RL/SL)."
+            note_txt = f"🔴 Daily Trend Bias is BEARISH (< 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — Primary Short bias on 15m confirmation."
         elif trend_bias == "BULLISH":
-            note_txt = f"🟢 Daily Trend Bias is BULLISH (> 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — Primary Long bias (2-Entry Runner armed on both RL/SL & RH/SH)."
+            note_txt = f"🟢 Daily Trend Bias is BULLISH (> 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — Primary Long bias on 15m confirmation."
         else:
-            note_txt = f"🟡 Daily Range Mode: Price (${levels.get('daily_close', 0):,.2f}) is between 50 EMA (${levels.get('EMA50', 0):,.2f}) and 200 EMA (${levels.get('EMA200', 0):,.2f}) — Both Box Edges Active."
+            note_txt = f"🟡 Daily Range Mode: Price (${levels.get('daily_close', 0):,.2f}) is between 50 EMA (${levels.get('EMA50', 0):,.2f}) and 200 EMA (${levels.get('EMA200', 0):,.2f}) — Both Box Edges Active on 15m."
         return {
             "BUY": self._stamp(b),
             "SELL": self._stamp(s),
@@ -615,14 +729,11 @@ class BoxTheorySweep(Strategy):
             lines.append({"label": "Daily 200 EMA", "price": levels["EMA200"], "color": "#f59e0b", "dash": "dash"})
         return lines
 
-    # ---- backtest: Daily 50 & 200 EMA Bias + Box RH/SH/RL/SL or 50 EMA Touch + 2-Entry Runner ----
+    # ---- backtest: Daily 50 & 200 EMA Bias + 15m Box RH/SH/RL/SL or Daily 50 EMA Touch ----
     def prepare_backtest(self, df, df_daily):
-        d = df_daily.copy().reset_index(drop=True)
-        d["EMA50"] = d["close"].ewm(span=50, adjust=False).mean()
-        d["EMA200"] = d["close"].ewm(span=200, adjust=False).mean()
+        d = daily_sma_atr(df_daily.copy().reset_index(drop=True))
         daily_records = d.to_dict("records")
 
-        # Also precompute 15m 50 EMA across the execution candles
         ema50_15m_list = df["close"].ewm(span=50, adjust=False).mean().tolist()
 
         daily_boxes = {}
@@ -634,6 +745,7 @@ class BoxTheorySweep(Strategy):
             prev_close = float(prev_day["close"])
             ema50 = float(prev_day["EMA50"])
             ema200 = float(prev_day["EMA200"])
+            atr_val = float(prev_day["ATR"]) if not pd.isna(prev_day.get("ATR")) else (rh - rl)
             mid = (rh + rl) / 2.0
             bias = classify_daily_ema_bias(prev_close, ema50, ema200)
 
@@ -649,7 +761,7 @@ class BoxTheorySweep(Strategy):
 
             daily_boxes[curr_day_str] = {
                 "RH": rh, "RL": rl, "MID": mid, "SH": sh, "SL": sl,
-                "EMA50": ema50, "EMA200": ema200, "bias": bias
+                "EMA50": ema50, "EMA200": ema200, "ATR": atr_val, "bias": bias
             }
         return {"boxes": daily_boxes, "ema50_15m": ema50_15m_list}
 
@@ -665,6 +777,7 @@ class BoxTheorySweep(Strategy):
         rh, rl, mid = box["RH"], box["RL"], box["MID"]
         sh, sl = box["SH"], box["SL"]
         daily_ema50 = box["EMA50"]
+        ema50_15m = float(ctx["ema50_15m"][idx]) if idx < len(ctx.get("ema50_15m", [])) else mid
         prev = records[idx - 1]
 
         c_high = float(candle["high"])
@@ -682,7 +795,8 @@ class BoxTheorySweep(Strategy):
             else ("Daily >50/200 EMA" if bias == "BULLISH" else "Daily Range (Between 50/200 EMA)")
         )
 
-        # 1. SHORT SETUPS (WHEN DAILY BIAS IS BEARISH OR NEUTRAL/RANGE):
+        # 1. SHORT SETUPS (Strictly 15m Confirmation):
+        #    A: Outer Box RH or SH Sweep + 15m Close Below RH/SH
         upper_wick = c_high - max(c_open, c_close)
         has_bear_confirm = (c_close < c_open and c_close < p_close) or (
             c_close < c_open and candle_range > 0 and (upper_wick / candle_range) >= 0.30
@@ -695,35 +809,47 @@ class BoxTheorySweep(Strategy):
 
         if swept_rh_rej or swept_sh_rej:
             scale_in_lvl = max(sh, p_high, c_high)
-            struct_tp1 = mid if c_close > mid else rl
+            struct_tp1, tp1_ref = _nearest_box_tp1("SHORT", c_close, mid, ema50_15m, rl)
             struct_tp2 = rl if c_close > rl * 1.012 else sl
-            plan = build_two_entry_runner_plan("SHORT", c_close, scale_in_lvl, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
+            plan = build_two_entry_runner_plan(
+                "SHORT", c_close, scale_in_lvl, struct_tp1, struct_tp2,
+                leverage=DEFAULT_LEVERAGE, tp1_ref_name=tp1_ref,
+            )
             if plan:
                 z_lbl = "Swept SH Swing High" if swept_sh_rej else "Swept RH Sell Zone"
                 return {
                     "direction": "SHORT", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
                     "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
                     "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
-                    "reason": f"{tag} + {z_lbl}"
+                    "reason": f"{tag} + {z_lbl} (TP1: {tp1_ref})",
+                    "strategy_tag": "Strategy 1 (Box)",
                 }
 
+        #    B: Daily 50 EMA Touch + 15m Bearish Rejection (No 65% Box Filter)
         if bias == "BEARISH":
-            min_short_zone = rl + 0.35 * (rh - rl)
-            touched_d_ema50 = (p_high >= daily_ema50 * 0.9995) and (p_low <= daily_ema50 * 1.005)
-            if touched_d_ema50 and (c_close < daily_ema50) and (c_close < c_open) and (c_close < p_close) and (c_close >= min_short_zone):
-                sweep_hi = max(p_high, c_high, daily_ema50, sh)
-                struct_tp1 = mid if c_close > mid else rl
-                struct_tp2 = rl if c_close > rl * 1.012 else sl
-                plan = build_two_entry_runner_plan("SHORT", c_close, sweep_hi, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
+            touched_d_ema50 = (
+                (p_high >= daily_ema50 * 0.9995 and p_low <= daily_ema50 * 1.005)
+                or (c_high >= daily_ema50 * 0.9995 and c_low <= daily_ema50 * 1.005)
+            )
+            if touched_d_ema50 and (c_close < daily_ema50) and (c_close < c_open) and (c_close < p_close):
+                sweep_hi = max(p_high, c_high, daily_ema50, sh if c_close >= rh * 0.985 else 0.0)
+                struct_tp1, tp1_ref = _nearest_box_tp1("SHORT", c_close, mid, ema50_15m, rl)
+                struct_tp2 = rl if c_close > rl * 1.012 else (sl if c_close > sl * 1.012 else c_close * 0.96)
+                plan = build_two_entry_runner_plan(
+                    "SHORT", c_close, sweep_hi, struct_tp1, struct_tp2,
+                    leverage=DEFAULT_LEVERAGE, tp1_ref_name=tp1_ref,
+                )
                 if plan and plan["stop"] > c_close > plan["tp1"]:
                     return {
                         "direction": "SHORT", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
                         "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
                         "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
-                        "reason": "Daily <50/200 EMA + Daily 50 EMA Rejection"
+                        "reason": f"Daily <50/200 EMA + 15m Daily 50 EMA Rejection (TP1: {tp1_ref})",
+                        "strategy_tag": "Strategy 1 (Box)",
                     }
 
-        # 2. LONG SETUPS (WHEN DAILY BIAS IS BULLISH OR NEUTRAL/RANGE):
+        # 2. LONG SETUPS (Strictly 15m Confirmation):
+        #    C: Outer Box RL or SL Sweep + 15m Close Above RL/SL
         lower_wick = min(c_open, c_close) - c_low
         has_bull_confirm = (c_close > c_open and c_close > p_close) or (
             c_close > c_open and candle_range > 0 and (lower_wick / candle_range) >= 0.30
@@ -736,39 +862,50 @@ class BoxTheorySweep(Strategy):
 
         if swept_rl_rej or swept_sl_rej:
             scale_in_lvl = min(sl, p_low, c_low)
-            struct_tp1 = mid if c_close < mid else rh
+            struct_tp1, tp1_ref = _nearest_box_tp1("LONG", c_close, mid, ema50_15m, rh)
             struct_tp2 = rh if c_close < rh * 0.988 else sh
-            plan = build_two_entry_runner_plan("LONG", c_close, scale_in_lvl, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
+            plan = build_two_entry_runner_plan(
+                "LONG", c_close, scale_in_lvl, struct_tp1, struct_tp2,
+                leverage=DEFAULT_LEVERAGE, tp1_ref_name=tp1_ref,
+            )
             if plan:
                 z_lbl = "Swept SL Swing Low" if swept_sl_rej else "Swept RL Buy Zone"
                 return {
                     "direction": "LONG", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
                     "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
                     "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
-                    "reason": f"{tag} + {z_lbl}"
+                    "reason": f"{tag} + {z_lbl} (TP1: {tp1_ref})",
+                    "strategy_tag": "Strategy 1 (Box)",
                 }
 
+        #    D: Daily 50 EMA Touch + 15m Bullish Rejection (No 65% Box Filter)
         if bias == "BULLISH":
-            max_long_zone = rh - 0.35 * (rh - rl)
-            touched_d_ema50 = (p_low <= daily_ema50 * 1.0005) and (p_high >= daily_ema50 * 0.995)
-            if touched_d_ema50 and (c_close > daily_ema50) and (c_close > c_open) and (c_close > p_close) and (c_close <= max_long_zone):
-                sweep_lo = min(p_low, c_low, daily_ema50, sl)
-                struct_tp1 = mid if c_close < mid else rh
-                struct_tp2 = rh if c_close < rh * 0.988 else sh
-                plan = build_two_entry_runner_plan("LONG", c_close, sweep_lo, struct_tp1, struct_tp2, leverage=DEFAULT_LEVERAGE)
+            touched_d_ema50 = (
+                (p_low <= daily_ema50 * 1.0005 and p_high >= daily_ema50 * 0.995)
+                or (c_low <= daily_ema50 * 1.0005 and c_high >= daily_ema50 * 0.995)
+            )
+            if touched_d_ema50 and (c_close > daily_ema50) and (c_close > c_open) and (c_close > p_close):
+                sweep_lo = min(p_low, c_low, daily_ema50, sl if c_close <= rl * 1.015 else c_close)
+                struct_tp1, tp1_ref = _nearest_box_tp1("LONG", c_close, mid, ema50_15m, rh)
+                struct_tp2 = rh if c_close < rh * 0.988 else (sh if c_close < sh * 0.988 else c_close * 1.04)
+                plan = build_two_entry_runner_plan(
+                    "LONG", c_close, sweep_lo, struct_tp1, struct_tp2,
+                    leverage=DEFAULT_LEVERAGE, tp1_ref_name=tp1_ref,
+                )
                 if plan and plan["stop"] < c_close < plan["tp1"]:
                     return {
                         "direction": "LONG", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
                         "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
                         "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
-                        "reason": "Daily >50/200 EMA + Daily 50 EMA Rejection"
+                        "reason": f"Daily >50/200 EMA + 15m Daily 50 EMA Rejection (TP1: {tp1_ref})",
+                        "strategy_tag": "Strategy 1 (Box)",
                     }
 
         return None
 
 
 # ----------------------------------------------------------------------------------------------
-# Strategy 2: 1-Candle 25% ATR Reversal (The Rumers, youtu.be/4zazKDSXlh8 + Daily 50/200 EMA Bias)
+# Strategy 2: 1-Candle 25% ATR Reversal (Both LONG & SHORT, Single Entry / No Entry 2)
 # ----------------------------------------------------------------------------------------------
 ATR_PERIOD = 14
 SMA_PERIOD = 50
@@ -838,66 +975,71 @@ def find_flush(records, end_idx: int, atr: float, direction: str, lookback: int 
     return None
 
 
-def detect_atr_reversal(records, j: int, atr: float, bias: str):
+def detect_atr_reversal(records, j: int, atr: float, bias: str = None):
     """
-    Evaluates candle j (a CLOSED 15m candle) for the 1-candle crossover entry.
-    bias BULLISH (daily close > EMA50 & EMA200) -> LONG only ; BEARISH (< EMA50 & EMA200) -> SHORT only.
-    The crossover must be the FIRST one since the flush ended (one trade per flush).
+    Evaluates candle j for the 1-candle crossover entry (works for BOTH LONG and SHORT on any day;
+    Single Entry with entry2_sweep = 0.0).
     """
-    if bias not in ("BULLISH", "BEARISH") or j < 2:
+    if j < 2 or atr is None or atr <= 0:
         return None
-    direction = "LONG" if bias == "BULLISH" else "SHORT"
-    if not _crossover(records, j, direction):
-        return None
-    flush = find_flush(records, j - 1, atr, direction)
-    if not flush:
-        return None
-    if any(_crossover(records, m, direction) for m in range(flush["end"] + 1, j)):
-        return None   # this flush already produced its crossover
 
-    entry = float(records[j]["close"])
-    seg = records[flush["start"]:j + 1]
-    if direction == "LONG":
-        origin = flush["high"]
-        extreme = min(float(r["low"]) for r in seg)
-        struct_stop = extreme * (1 - SL_BUFFER)
-        struct_tp1 = extreme + 0.5 * (origin - extreme)
-        if not (struct_stop < entry < struct_tp1):
-            return None
-        side_txt = "above 50 & 200 EMA"
-        move = "Flush"
-    else:
-        origin = flush["low"]
-        extreme = max(float(r["high"]) for r in seg)
-        struct_stop = extreme * (1 + SL_BUFFER)
-        struct_tp1 = extreme - 0.5 * (extreme - origin)
-        if not (struct_tp1 < entry < struct_stop):
-            return None
-        side_txt = "below 50 & 200 EMA"
-        move = "Spike"
+    for direction in ("LONG", "SHORT"):
+        if not _crossover(records, j, direction):
+            continue
+        flush = find_flush(records, j - 1, atr, direction)
+        if not flush:
+            continue
+        if any(_crossover(records, m, direction) for m in range(flush["end"] + 1, j)):
+            continue   # this flush already produced its crossover
 
-    plan = build_two_entry_runner_plan(direction, entry, extreme, struct_tp1, origin, leverage=DEFAULT_LEVERAGE)
-    if not plan:
-        return None
-    return {
-        "direction": direction, "entry": entry, "entry2_sweep": plan["entry2_sweep"],
-        "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
-        "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
-        "flush": flush, "extreme": extreme,
-        "reason": f"15m {move} = {flush['pct_atr']:.0f}% of Daily ATR (>25% threshold) {side_txt}",
-    }
+        entry = float(records[j]["close"])
+        seg = records[flush["start"]:j + 1]
+        if direction == "LONG":
+            origin = flush["high"]
+            extreme = min(float(r["low"]) for r in seg)
+            struct_stop = extreme * (1 - SL_BUFFER)
+            struct_tp1 = extreme + 0.5 * (origin - extreme)
+            if not (struct_stop < entry < struct_tp1):
+                continue
+            move = "Flush"
+        else:
+            origin = flush["low"]
+            extreme = max(float(r["high"]) for r in seg)
+            struct_stop = extreme * (1 + SL_BUFFER)
+            struct_tp1 = extreme - 0.5 * (extreme - origin)
+            if not (struct_tp1 < entry < struct_stop):
+                continue
+            move = "Spike"
+
+        plan = build_single_entry_runner_plan(
+            direction, entry, struct_stop, struct_tp1, origin,
+            leverage=DEFAULT_LEVERAGE, tp1_ref_name="50% Retrace",
+        )
+        if not plan:
+            continue
+        return {
+            "direction": direction, "entry": entry, "entry2_sweep": 0.0,
+            "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
+            "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
+            "flush": flush, "extreme": extreme,
+            "reason": f"15m {move} = {flush['pct_atr']:.0f}% of Daily ATR (>25% threshold) -> 1-Candle {direction} Reversal",
+            "strategy_tag": "Strategy 2 (ATR Reversal)",
+        }
+    return None
 
 
 class AtrReversal(Strategy):
     id = "atr_reversal"
     name = "1-Candle 25% ATR Reversal"
     short = "ATR Rev"
-    timeframe = "15m Flush -> 5m Crossover"
-    description = ("Daily 50 & 200 EMA bias + 14-day ATR: 15m candle watches for >=25% ATR manipulation flush/spike, "
-                   "switching to 5m timeframe for 1-candle reversal crossover entry (SL beyond flush extreme, "
-                   "TP1 50% retrace, TP2 origin).")
+    timeframe = "15m Flush/Spike -> Crossover (Long & Short, Single Entry)"
+    description = (
+        "14-day Daily ATR manipulation reversal strategy (works for BOTH Long and Short on any day, Single Entry): "
+        "Detects a 1-3 candle 15m manipulation flush or spike >= 25% of Daily ATR and enters on the first "
+        "1-candle reversal crossover (no Entry 2; SL beyond flush/spike extreme, TP1 at 50% retrace, Runner managed by 15m SL & 9 EMA)."
+    )
     daily_warmup_days = 220
-    tp1_name, tp2_name = "50% Retrace", "Origin"
+    tp1_name, tp2_name = "50% Retrace", "Origin / 9 EMA Trail"
     uses_live_price = False
     chart_marker_hint = "▲▼ markers = 15m candles whose high-low range is >= 25% of Daily ATR (shown on the 15m timeframe)."
 
@@ -906,7 +1048,7 @@ class AtrReversal(Strategy):
         d = eng.fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
         if d.empty or len(d) < SMA_PERIOD + 2:
             return None
-        d_comp = daily_sma_atr(d.iloc[:-1].reset_index(drop=True))   # completed days for ATR & fixed Daily Bias
+        d_comp = daily_sma_atr(d.iloc[:-1].reset_index(drop=True))
         last_comp = d_comp.iloc[-1]
         if pd.isna(last_comp["EMA50"]) or pd.isna(last_comp["ATR"]):
             return None
@@ -938,7 +1080,6 @@ class AtrReversal(Strategy):
         levels, recs15, recs5 = self._context(pair, levels)
         if not levels or not recs15:
             return None
-        bias = levels["bias"]
         session = eng.get_current_session_info(datetime.now(IST))
         last_c5 = recs5[-1] if recs5 else recs15[-1]
         candle_time = datetime.fromtimestamp(last_c5["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
@@ -950,109 +1091,98 @@ class AtrReversal(Strategy):
             "is_prime_session": session["is_prime"], "is_us_open_candle": session["session_id"] == "NEW_YORK",
             "pair": pair, "levels": levels, "candle_ts": int(last_c5["timestamp"]),
             "signal": "NEUTRAL", "signal_kind": None, "trigger_zone": None, "trigger_reason": "",
-            "setup": f"WAIT / NO TRADE (Daily Bias: {bias})",
-            "entry": float(last_c5["close"]), "stop_loss": 0.0, "tp1": 0.0, "tp2": 0.0,
+            "setup": f"WAIT / NO TRADE (Watching 15m candles for >={levels['ATR25']:,.2f} Flush/Spike manipulation)",
+            "entry": float(last_c5["close"]), "entry2_sweep": 0.0, "stop_loss": 0.0, "tp1": 0.0, "tp2": 0.0,
         }
-        out.update(position_metrics(pair, out["entry"], 0.0, out["entry"], out["entry"], margin_inr, leverage, usd_inr))
+        out.update(position_metrics(pair, out["entry"], 0.0, out["entry"], out["entry"], margin_inr, leverage, usd_inr, entry2_sweep=0.0))
 
-        if bias not in ("BULLISH", "BEARISH"):
-            out["setup"] = (
-                f"WAIT / NO TRADE — Daily Close (${levels['daily_close']:,.2f}) is between "
-                f"50 EMA (${levels['EMA50']:,.2f}) and 200 EMA (${levels['EMA200']:,.2f})"
-            )
-            return self._stamp(out)
-
-        direction = "LONG" if bias == "BULLISH" else "SHORT"
-        move = "Flush" if direction == "LONG" else "Spike"
-        out["setup"] = f"WAIT / NO TRADE (Watching 15m candles for >={levels['ATR25']:,.2f} {move} manipulation)"
-
-        # Step 1: Detect 15m manipulation move >= 25% Daily ATR
         j15 = len(recs15) - 1
-        flush = find_flush(recs15, j15, levels["ATR"], direction)
-        if not flush:
-            return self._stamp(out)
+        active_flush_msg = None
+        for direction in ("LONG", "SHORT"):
+            move = "Flush" if direction == "LONG" else "Spike"
+            flush = find_flush(recs15, j15, levels["ATR"], direction)
+            if not flush:
+                continue
+            active_flush_msg = (direction, move, flush)
+            if recs5 and len(recs5) >= 2:
+                k5 = len(recs5) - 1
+                if _crossover(recs5, k5, direction):
+                    cur5 = recs5[k5]
+                    prev5 = recs5[k5 - 1]
+                    entry = float(cur5["close"])
+                    if direction == "LONG":
+                        extreme = flush["low"]
+                        origin = flush["high"]
+                        struct_stop = extreme * (1 - SL_BUFFER)
+                        struct_tp1 = extreme + 0.5 * (origin - extreme)
+                        valid_rr = struct_stop < entry < struct_tp1
+                        crossover_info = f"close ${entry:,.2f} > prev 5m red high ${float(prev5['high']):,.2f}"
+                    else:
+                        extreme = flush["high"]
+                        origin = flush["low"]
+                        struct_stop = extreme * (1 + SL_BUFFER)
+                        struct_tp1 = extreme - 0.5 * (extreme - origin)
+                        valid_rr = struct_tp1 < entry < struct_stop
+                        crossover_info = f"close ${entry:,.2f} < prev 5m green low ${float(prev5['low']):,.2f}"
 
-        # Step 2: Switch to 5m timeframe for 1-candle reversal crossover confirmation
-        if recs5 and len(recs5) >= 2:
-            k5 = len(recs5) - 1
-            if _crossover(recs5, k5, direction):
-                cur5 = recs5[k5]
-                prev5 = recs5[k5 - 1]
-                entry = float(cur5["close"])
-                if direction == "LONG":
-                    extreme = flush["low"]
-                    origin = flush["high"]
-                    struct_stop = extreme * (1 - SL_BUFFER)
-                    struct_tp1 = extreme + 0.5 * (origin - extreme)
-                    valid_rr = struct_stop < entry < struct_tp1
-                    side_txt = "above 50 & 200 EMA"
-                    crossover_info = f"close ${entry:,.2f} > prev 5m red high ${float(prev5['high']):,.2f}"
-                else:
-                    extreme = flush["high"]
-                    origin = flush["low"]
-                    struct_stop = extreme * (1 + SL_BUFFER)
-                    struct_tp1 = extreme - 0.5 * (extreme - origin)
-                    valid_rr = struct_tp1 < entry < struct_stop
-                    side_txt = "below 50 & 200 EMA"
-                    crossover_info = f"close ${entry:,.2f} < prev 5m green low ${float(prev5['low']):,.2f}"
+                    plan = build_single_entry_runner_plan(
+                        direction, entry, struct_stop, struct_tp1, origin, leverage, tp1_ref_name="50% Retrace"
+                    ) if valid_rr else None
+                    if plan:
+                        stop, tp1, tp2 = plan["stop"], plan["tp1"], plan["tp2"]
+                        word = "BUY (Long)" if direction == "LONG" else "SELL (Short)"
+                        reason = (
+                            f"15m {move} = {flush['pct_atr']:.0f}% ATR confirmed by 5m crossover "
+                            f"({crossover_info} | Single Entry | {plan['tp1_label']} & {plan['tp2_label']})"
+                        )
+                        out.update({
+                            "signal": direction, "signal_kind": "ATR_REVERSAL",
+                            "trigger_zone": f"15m >=25% ATR {move} Reversal",
+                            "trigger_reason": reason, "setup": f"{word}: 15m {move} + 5m Crossover (Single Entry) - {reason}",
+                            "entry": eng.round_asset_price(entry, entry),
+                            "entry2_sweep": 0.0,
+                            "stop_loss": eng.round_asset_price(stop, entry),
+                            "tp1": eng.round_asset_price(tp1, entry),
+                            "tp2": eng.round_asset_price(tp2, entry),
+                            "flush": flush,
+                        })
+                        out.update(position_metrics(pair, out["entry"], out["stop_loss"], out["tp1"], out["tp2"], margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+                        return self._stamp(out)
 
-                plan = build_two_entry_runner_plan(direction, entry, extreme, struct_tp1, origin, leverage) if valid_rr else None
-                if plan:
-                    stop, tp1, tp2, entry2 = plan["stop"], plan["tp1"], plan["tp2"], plan["entry2_sweep"]
-                    word = "BUY (Long)" if direction == "LONG" else "SELL (Short)"
-                    reason = (
-                        f"15m {move} = {flush['pct_atr']:.0f}% ATR confirmed by 5m crossover "
-                        f"({crossover_info} | {plan['tp1_label']} & {plan['tp2_label']}) {side_txt}"
-                    )
-                    out.update({
-                        "signal": direction, "signal_kind": "ATR_REVERSAL",
-                        "trigger_zone": "Bullish flush above 50/200 EMA" if direction == "LONG" else "Bearish spike below 50/200 EMA",
-                        "trigger_reason": reason, "setup": f"{word}: 15m {move} + 5m Crossover Confirmation - {reason}",
-                        "entry": eng.round_asset_price(entry, entry),
-                        "entry2_sweep": eng.round_asset_price(entry2, entry),
-                        "stop_loss": eng.round_asset_price(stop, entry),
-                        "tp1": eng.round_asset_price(tp1, entry),
-                        "tp2": eng.round_asset_price(tp2, entry),
-                        "flush": flush,
-                    })
-                    out.update(position_metrics(pair, out["entry"], out["stop_loss"], out["tp1"], out["tp2"], margin_inr, leverage, usd_inr, entry2_sweep=out["entry2_sweep"]))
-                    return self._stamp(out)
-
-        out["setup"] = f"WAIT / WATCHING 5m (15m {move} = {flush['pct_atr']:.0f}% ATR active — watching 5m timeframe for 1-candle crossover)"
-        out["trigger_reason"] = f"15m {move} = {flush['pct_atr']:.0f}% ATR active — waiting for 5m crossover confirmation"
+        if active_flush_msg:
+            _, move, flush = active_flush_msg
+            out["setup"] = f"WAIT / WATCHING 5m (15m {move} = {flush['pct_atr']:.0f}% ATR active — watching 5m timeframe for 1-candle crossover)"
+            out["trigger_reason"] = f"15m {move} = {flush['pct_atr']:.0f}% ATR active — waiting for 5m crossover confirmation"
         return self._stamp(out)
 
     def armed_plan(self, pair, levels):
-        """Latest qualifying flush still waiting for its crossover (or None)."""
+        """Latest qualifying flush/spike in either direction still waiting for its crossover (or None)."""
         levels, recs15, recs5 = self._context(pair, levels)
-        if not levels or not recs15 or levels["bias"] not in ("BULLISH", "BEARISH"):
+        if not levels or not recs15:
             return None
-        direction = "LONG" if levels["bias"] == "BULLISH" else "SHORT"
         j15 = len(recs15) - 1
-        flush = find_flush(recs15, j15, levels["ATR"], direction)
-        if not flush:
-            return None
         use_recs = recs5 if recs5 else recs15
-        if any(_crossover(use_recs, m, direction) for m in range(max(1, len(use_recs) - 6), len(use_recs))):
-            return None
-        pick = _is_red if direction == "LONG" else _is_green
-        ref = next((r for r in reversed(use_recs[-12:]) if pick(r)), use_recs[-1])
-        if direction == "LONG":
-            extreme = flush["low"]
-            entry, struct_stop, tp2 = float(ref["high"]), extreme * (1 - SL_BUFFER), flush["high"]
-            struct_tp1 = extreme + 0.5 * (tp2 - extreme)
-        else:
-            extreme = flush["high"]
-            entry, struct_stop, tp2 = float(ref["low"]), extreme * (1 + SL_BUFFER), flush["low"]
-            struct_tp1 = extreme - 0.5 * (extreme - tp2)
-        dyn = apply_dynamic_roe_tp_sl(direction, entry, struct_stop, struct_tp1, leverage=5, enforce_min_tp=False)
-        if dyn:
-            stop, tp1, _ = dyn
-            tp2 = tp1
-        else:
-            stop, tp1 = struct_stop, struct_tp1
-        return {"direction": direction, "entry": entry, "stop": stop, "tp1": tp1, "tp2": tp2, "flush": flush,
-                "levels": levels}
+        for direction in ("LONG", "SHORT"):
+            flush = find_flush(recs15, j15, levels["ATR"], direction)
+            if not flush:
+                continue
+            if any(_crossover(use_recs, m, direction) for m in range(max(1, len(use_recs) - 6), len(use_recs))):
+                continue
+            pick = _is_red if direction == "LONG" else _is_green
+            ref = next((r for r in reversed(use_recs[-12:]) if pick(r)), use_recs[-1])
+            if direction == "LONG":
+                extreme = flush["low"]
+                entry, struct_stop, tp2 = float(ref["high"]), extreme * (1 - SL_BUFFER), flush["high"]
+                struct_tp1 = extreme + 0.5 * (tp2 - extreme)
+            else:
+                extreme = flush["high"]
+                entry, struct_stop, tp2 = float(ref["low"]), extreme * (1 + SL_BUFFER), flush["low"]
+                struct_tp1 = extreme - 0.5 * (extreme - tp2)
+            plan = build_single_entry_runner_plan(direction, entry, struct_stop, struct_tp1, tp2, leverage=DEFAULT_LEVERAGE, enforce_min_tp=False)
+            stop = plan["stop"] if plan else struct_stop
+            tp1 = plan["tp1"] if plan else struct_tp1
+            return {"direction": direction, "entry": entry, "entry2_sweep": 0.0, "stop": stop, "tp1": tp1, "tp2": tp2, "flush": flush, "levels": levels}
+        return None
 
     def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
         out = {"BUY": None, "SELL": None, "note": ""}
@@ -1065,22 +1195,18 @@ class AtrReversal(Strategy):
         plan = self.armed_plan(pair, levels)
         if not plan:
             lv = (sig or {}).get("levels") or levels
-            if lv and lv.get("bias") == "NEUTRAL":
-                out["note"] = f"Daily Close is between 50 EMA (${lv['EMA50']:,.2f}) and 200 EMA (${lv['EMA200']:,.2f}) — no setup armed."
-                return out
-            side = "bearish flush (LONG idea)" if (lv or {}).get("bias") == "BULLISH" else "bullish spike (SHORT idea)"
             thr = f" of >= ${lv['ATR25']:,.4f}" if lv else ""
-            out["note"] = f"Waiting for a 15m {side}{thr} — no order ticket until a qualifying move prints."
+            out["note"] = f"Waiting for a 15m Flush (LONG) or Spike (SHORT){thr} — both directions active."
             return out
         ref = plan["entry"]
         e, sl, t1, t2 = (eng.round_asset_price(plan[k], ref) for k in ("entry", "stop", "tp1", "tp2"))
         key = "BUY" if plan["direction"] == "LONG" else "SELL"
         move = "Flush" if key == "BUY" else "Spike"
         reason = (f"Armed: 15m {move} = {plan['flush']['pct_atr']:.0f}% of Daily ATR — watching 5m timeframe for close "
-                  f"{'above' if key == 'BUY' else 'below'} {e:,.4f}")
-        setup = {"direction": key, "setup": f"{'BUY (Long)' if key == 'BUY' else 'SELL (Short)'}: 1-Candle Crossover (armed)",
-                 "entry": e, "stop_loss": sl, "tp1": t1, "tp2": t2, "trigger_reason": reason, "flush": plan["flush"]}
-        setup.update(position_metrics(pair, e, sl, t1, t2, margin_inr, leverage, usd_inr))
+                  f"{'above' if key == 'BUY' else 'below'} {e:,.4f} (Single Entry)")
+        setup = {"direction": key, "setup": f"{'BUY (Long)' if key == 'BUY' else 'SELL (Short)'}: 1-Candle Crossover (Single Entry armed)",
+                 "entry": e, "entry2_sweep": 0.0, "stop_loss": sl, "tp1": t1, "tp2": t2, "trigger_reason": reason, "flush": plan["flush"]}
+        setup.update(position_metrics(pair, e, sl, t1, t2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
         out[key] = self._stamp(setup)
         out["note"] = reason
         return out
@@ -1121,15 +1247,11 @@ class AtrReversal(Strategy):
     def metric_badges(self, levels):
         if not levels:
             return []
-        bias_txt = (
-            "🟢 BULLISH (longs only)" if levels["bias"] == "BULLISH"
-            else ("🔴 BEARISH (shorts only)" if levels["bias"] == "BEARISH" else "⚪ NEUTRAL (no trade)")
-        )
         return [
             ("Daily 50 EMA", f"${levels['EMA50']:,.4f}", f"Daily close ${levels['daily_close']:,.4f}"),
             ("Daily 200 EMA", f"${levels['EMA200']:,.4f}", None),
             ("25% ATR Threshold", f"${levels['ATR25']:,.4f}", f"Daily ATR ${levels['ATR']:,.4f}"),
-            ("Daily Bias", bias_txt, None),
+            ("Mode", "🟢🔴 LONG & SHORT (Single Entry)", None),
         ]
 
     def level_rows(self, levels, live_price):
@@ -1139,8 +1261,8 @@ class AtrReversal(Strategy):
         def dist(p):
             return f"{(p - live_price) / live_price * 100:.2f}%" if live_price else "N/A"
         return [
-            {"Level Name": "Daily 50 EMA", "Price": f"${levels['EMA50']:,.4f}", "Role in Strategy": "Primary trend & pullback filter (Close > 50 & 200 EMA = LONG only)", "Distance from Live": dist(levels["EMA50"])},
-            {"Level Name": "Daily 200 EMA", "Price": f"${levels['EMA200']:,.4f}", "Role in Strategy": "Macro trend filter (Close < 50 & 200 EMA = SHORT only)", "Distance from Live": dist(levels["EMA200"])},
+            {"Level Name": "Daily 50 EMA", "Price": f"${levels['EMA50']:,.4f}", "Role in Strategy": "Reference trend EMA (Both Long & Short active)", "Distance from Live": dist(levels["EMA50"])},
+            {"Level Name": "Daily 200 EMA", "Price": f"${levels['EMA200']:,.4f}", "Role in Strategy": "Macro reference EMA", "Distance from Live": dist(levels["EMA200"])},
             {"Level Name": "Daily ATR (14)", "Price": f"${levels['ATR']:,.4f}", "Role in Strategy": "Average daily range used to size the manipulation move", "Distance from Live": "—"},
             {"Level Name": "25% ATR Threshold", "Price": f"${levels['ATR25']:,.4f}", "Role in Strategy": "Minimum 1-3 candle 15m flush / spike size to arm a setup", "Distance from Live": "—"},
         ]
@@ -1150,7 +1272,7 @@ class AtrReversal(Strategy):
         d = daily_sma_atr(df_daily.reset_index(drop=True))
         stats = {}
         for i in range(1, len(d)):
-            prev = d.iloc[i - 1]   # completed prior day only (no look-ahead)
+            prev = d.iloc[i - 1]
             if pd.isna(prev["EMA50"]) or pd.isna(prev["ATR"]):
                 continue
             bias = classify_daily_ema_bias(float(prev["close"]), float(prev["EMA50"]), float(prev["EMA200"]))
@@ -1166,11 +1288,370 @@ class AtrReversal(Strategy):
 
 
 # ----------------------------------------------------------------------------------------------
+# Strategy 3: 9 EMA Touch & Confirm Retest (Fallback when Strategies 1 & 2 have no setup)
+# ----------------------------------------------------------------------------------------------
+def _has_confirmed_ema9_cross(recs, k: int, direction: str, atr: float = 0.0, max_lookback: int = 12) -> int | None:
+    """
+    Checks whether a confirmed 9 EMA cross (2 consecutive closes on the new side of EMA9 after crossing
+    from the opposite side, driven by or following a >=20% Daily ATR move in the recent window) occurred
+    at some index `m` in `[k - max_lookback, k - 1]`, and price has stayed on that side of EMA9 until `k`.
+    Never triggers on the cross candle `m` itself (`m <= k - 1`).
+    """
+    if k < 4 or not atr or atr <= 0:
+        return None
+    # Require a >=20% Daily ATR 1-to-3 candle move in the recent window [k - 18, k - 1]
+    win_start = max(0, k - 18)
+    has_atr20_move = False
+    for idx_w in range(win_start, k):
+        w_slice = recs[max(win_start, idx_w - 2):idx_w + 1]
+        hi_w = max(float(x["high"]) for x in w_slice)
+        lo_w = min(float(x["low"]) for x in w_slice)
+        if (hi_w - lo_w) >= 0.20 * atr:
+            has_atr20_move = True
+            break
+    if not has_atr20_move:
+        return None
+
+    start_m = max(2, k - max_lookback)
+    for m in range(k - 1, start_m - 1, -1):
+        c_m = float(recs[m]["close"])
+        e_m = float(recs[m]["EMA9"])
+        c_m1 = float(recs[m - 1]["close"])
+        e_m1 = float(recs[m - 1]["EMA9"])
+        c_m2 = float(recs[m - 2]["close"])
+        e_m2 = float(recs[m - 2]["EMA9"])
+        if direction == "LONG":
+            crossed_up = (c_m2 <= e_m2) and (c_m1 > e_m1) and (c_m > e_m)
+            if crossed_up:
+                invalidated = False
+                for t in range(m + 1, k):
+                    if float(recs[t]["close"]) < float(recs[t]["EMA9"]) * 0.998:
+                        invalidated = True
+                        break
+                if not invalidated:
+                    return m
+        else:
+            crossed_dn = (c_m2 >= e_m2) and (c_m1 < e_m1) and (c_m < e_m)
+            if crossed_dn:
+                invalidated = False
+                for t in range(m + 1, k):
+                    if float(recs[t]["close"]) > float(recs[t]["EMA9"]) * 1.002:
+                        invalidated = True
+                        break
+                if not invalidated:
+                    return m
+    return None
+
+
+def _is_ema9_touch_and_confirm(recs, k: int, direction: str, atr: float) -> bool:
+    """True if candle k (after an earlier confirmed 9 EMA cross) touches 9 EMA and confirms rejection."""
+    if k < 2:
+        return False
+    cur = recs[k]
+    prev = recs[k - 1]
+    c_open = float(cur["open"])
+    c_high = float(cur["high"])
+    c_low = float(cur["low"])
+    c_close = float(cur["close"])
+    ema9 = float(cur["EMA9"])
+    p_high = float(prev["high"])
+    p_low = float(prev["low"])
+    p_close = float(prev["close"])
+    p_ema9 = float(prev["EMA9"])
+    c_range = c_high - c_low
+
+    # Do not enter on an overextended >=20% Daily ATR separator candle
+    if atr and atr > 0:
+        if c_range >= 0.20 * atr or abs(c_close - ema9) >= 0.20 * atr:
+            return False
+
+    if direction == "LONG":
+        touched = (c_low <= ema9 * 1.0008 and c_high >= ema9) or (p_low <= p_ema9 * 1.0008 and p_close >= p_ema9 * 0.999)
+        confirmed = (c_close > ema9) and (c_close > c_open) and (c_close > p_close)
+        return bool(touched and confirmed)
+    else:
+        touched = (c_high >= ema9 * 0.9992 and c_low <= ema9) or (p_high >= p_ema9 * 0.9992 and p_close <= p_ema9 * 1.001)
+        confirmed = (c_close < ema9) and (c_close < c_open) and (c_close < p_close)
+        return bool(touched and confirmed)
+
+
+def detect_ema9_retest_entry(recs, k: int, atr: float):
+    """
+    Strategy 3 Fallback Entry:
+      1. Earlier confirmed 9 EMA cross (2 consecutive closes across 9 EMA) — never enters on the cross itself.
+      2. A subsequent candle `k` pulls back to touch the 9 EMA and confirms in the new direction.
+      3. First retest since the confirmed cross (`one trade per confirmed cross`).
+    """
+    if k < 3 or not atr or atr <= 0:
+        return None
+
+    for direction in ("LONG", "SHORT"):
+        cross_idx = _has_confirmed_ema9_cross(recs, k, direction, atr=atr)
+        if cross_idx is None:
+            continue
+        if not _is_ema9_touch_and_confirm(recs, k, direction, atr):
+            continue
+        # Only take the FIRST touch-and-confirm after `cross_idx`
+        if any(_is_ema9_touch_and_confirm(recs, m, direction, atr) for m in range(cross_idx + 1, k)):
+            continue
+
+        cur = recs[k]
+        prev = recs[k - 1]
+        entry = float(cur["close"])
+        ema9 = float(cur["EMA9"])
+        if direction == "LONG":
+            wick_low = min(float(cur["low"]), float(prev["low"]), ema9)
+            struct_stop = min(wick_low * (1 - SL_BUFFER), entry * 0.995)
+            tp1_move = max(min(0.35 * atr, entry * 0.015), entry * 0.0068)
+            struct_tp1 = entry + tp1_move
+            struct_tp2 = entry + max(0.80 * atr, tp1_move * 2.2)
+        else:
+            wick_high = max(float(cur["high"]), float(prev["high"]), ema9)
+            struct_stop = max(wick_high * (1 + SL_BUFFER), entry * 1.005)
+            tp1_move = max(min(0.35 * atr, entry * 0.015), entry * 0.0068)
+            struct_tp1 = entry - tp1_move
+            struct_tp2 = entry - max(0.80 * atr, tp1_move * 2.2)
+
+        plan = build_single_entry_runner_plan(
+            direction, entry, struct_stop, struct_tp1, struct_tp2,
+            leverage=DEFAULT_LEVERAGE, tp1_ref_name="9 EMA Pullback Target",
+        )
+        if not plan:
+            continue
+        return {
+            "direction": direction,
+            "entry": entry,
+            "entry2_sweep": 0.0,
+            "stop": plan["stop"],
+            "tp1": plan["tp1"],
+            "tp2": plan["tp2"],
+            "tp1_label": plan["tp1_label"],
+            "tp2_label": plan["tp2_label"],
+            "reason": f"Confirmed 9 EMA Cross -> Subsequent 9 EMA Touch & {direction} Rejection",
+            "strategy_tag": "Strategy 3 (9 EMA Retest)",
+        }
+    return None
+
+
+class Ema9RetestStrategy(Strategy):
+    id = "ema9_retest"
+    name = "9 EMA Touch & Confirm (Fallback)"
+    short = "9EMA Retest"
+    timeframe = "5m Confirmed 9 EMA Cross -> Subsequent 5m 9 EMA Touch & Rejection"
+    description = (
+        "Strategy 3 Fallback Entry & Active Trade Exit Engine: "
+        "Only takes a new trade when Strategies 1 & 2 have no setup. "
+        "Does NOT enter immediately on a 9 EMA cross; waits for a confirmed 5m 9 EMA cross (2 consecutive closes) "
+        "followed by a later 5m candle that touches the 9 EMA and confirms rejection (<20% Daily ATR)."
+    )
+    daily_warmup_days = 220
+    tp1_name, tp2_name = "TP1 (50% Book)", "50% Runner (15m Trail + 9 EMA / 20% ATR Exit)"
+    uses_live_price = False
+
+    def compute_levels(self, pair):
+        d = eng.fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
+        if d.empty or len(d) < SMA_PERIOD + 2:
+            return None
+        d_comp = daily_sma_atr(d.iloc[:-1].reset_index(drop=True))
+        last_comp = d_comp.iloc[-1]
+        if pd.isna(last_comp["ATR"]):
+            return None
+        close = float(last_comp["close"])
+        atr = float(last_comp["ATR"])
+        df5 = _closed_5m(pair, 40)
+        ema9_5m = float(df5["EMA9"].iloc[-1]) if (not df5.empty and "EMA9" in df5) else close
+        return {
+            "EMA9_5M": eng.round_asset_price(ema9_5m, close),
+            "ATR": round(atr, 6),
+            "ATR20": round(0.20 * atr, 6),
+            "daily_close": eng.round_asset_price(close, close),
+            "prev_day_date": datetime.fromtimestamp(last_comp["timestamp"] / 1000, tz=IST).strftime("%Y-%m-%d"),
+        }
+
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+        levels = levels or self.compute_levels(pair)
+        if not levels:
+            return None
+        df5 = _closed_5m(pair, 60)
+        if df5.empty or len(df5) < 6:
+            return None
+        recs5 = df5.to_dict("records")
+        last_c5 = recs5[-1]
+        session = eng.get_current_session_info(datetime.now(IST))
+        candle_time = datetime.fromtimestamp(last_c5["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
+        entry_px = float(last_c5["close"])
+
+        out = {
+            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+            "candle_evaluated": f"5m 9 EMA Touch & Confirm ({candle_time}) [{session['emoji']} {session['name']}]",
+            "session": session, "session_name": f"{session['emoji']} {session['name']}",
+            "is_prime_session": session["is_prime"], "is_us_open_candle": session["session_id"] == "NEW_YORK",
+            "pair": pair, "levels": levels, "candle_ts": int(last_c5["timestamp"]),
+            "signal": "NEUTRAL", "signal_kind": None, "trigger_zone": None, "trigger_reason": "",
+            "setup": f"WAIT / WATCHING 5m 9 EMA (${levels.get('EMA9_5M', entry_px):,.4f}) for post-cross touch & confirmation",
+            "entry": entry_px, "entry2_sweep": 0.0, "stop_loss": 0.0, "tp1": entry_px, "tp2": entry_px,
+        }
+        out.update(position_metrics(pair, entry_px, 0.0, entry_px, entry_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+
+        sig3 = detect_ema9_retest_entry(recs5, len(recs5) - 1, float(levels["ATR"]))
+        if sig3:
+            direction = sig3["direction"]
+            word = "BUY (Long)" if direction == "LONG" else "SELL (Short)"
+            e = eng.round_asset_price(sig3["entry"], sig3["entry"])
+            sl = eng.round_asset_price(sig3["stop"], e)
+            tp1 = eng.round_asset_price(sig3["tp1"], e)
+            tp2 = eng.round_asset_price(sig3["tp2"], e)
+            out.update({
+                "signal": direction,
+                "signal_kind": "EMA9_RETEST",
+                "trigger_zone": "5m 9 EMA Retest",
+                "trigger_reason": sig3["reason"],
+                "setup": f"{word}: 5m 9 EMA Touch & Confirm (Fallback) - {sig3['reason']}",
+                "entry": e, "entry2_sweep": 0.0, "stop_loss": sl, "tp1": tp1, "tp2": tp2,
+            })
+            out.update(position_metrics(pair, e, sl, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+        return self._stamp(out)
+
+    def prepare_backtest(self, df, df_daily):
+        d = daily_sma_atr(df_daily.reset_index(drop=True))
+        stats = {}
+        for i in range(1, len(d)):
+            prev = d.iloc[i - 1]
+            if pd.isna(prev["ATR"]):
+                continue
+            stats[d.iloc[i]["date_str"]] = {"atr": float(prev["ATR"])}
+
+        # Use 5m candles attached to df.attrs["df_5m"] when available; otherwise compute EMA9 on df
+        df_5m = df.attrs.get("df_5m") if hasattr(df, "attrs") else None
+        sub5_by_15m = {}
+        recs5 = []
+        if df_5m is not None and not df_5m.empty:
+            c5 = df_5m.copy().reset_index(drop=True)
+            if "EMA9" not in c5:
+                c5["EMA9"] = c5["close"].ewm(span=9, adjust=False).mean()
+            recs5 = c5.to_dict("records")
+            for idx5, r5 in enumerate(recs5):
+                bucket = (int(r5["timestamp"]) // 900000) * 900000
+                sub5_by_15m.setdefault(bucket, []).append(idx5)
+        else:
+            c15 = df.copy().reset_index(drop=True)
+            c15["EMA9"] = c15["close"].ewm(span=9, adjust=False).mean()
+            recs5 = c15.to_dict("records")
+            for idx15, r15 in enumerate(recs5):
+                bucket = (int(r15["timestamp"]) // 900000) * 900000
+                sub5_by_15m[bucket] = [idx15]
+
+        return {"daily": stats, "recs5": recs5, "sub5_by_15m": sub5_by_15m}
+
+    def backtest_has_context(self, candle, ctx):
+        return candle["date_str"] in ctx["daily"]
+
+    def backtest_entry(self, idx, candle, ctx, records):
+        day = ctx["daily"].get(candle["date_str"])
+        if not day:
+            return None
+        atr = day["atr"]
+        bucket = (int(candle["timestamp"]) // 900000) * 900000
+        idx5_list = ctx.get("sub5_by_15m", {}).get(bucket, [])
+        recs5 = ctx.get("recs5", [])
+        for k5 in idx5_list:
+            sig = detect_ema9_retest_entry(recs5, k5, atr)
+            if sig:
+                return sig
+        return None
+
+
+# ----------------------------------------------------------------------------------------------
+# Combined Priority Strategy (Strategy 1 -> Strategy 2 -> Strategy 3 Fallback)
+# ----------------------------------------------------------------------------------------------
+class CombinedPriorityStrategy(Strategy):
+    id = "combined"
+    name = "Combined (1: Box -> 2: ATR Rev -> 3: 9 EMA Fallback)"
+    short = "Combined 1->2->3"
+    timeframe = "15m Box & ATR Reversal + 5m 9 EMA Touch-Retest Fallback"
+    description = (
+        "Evaluates Strategy 1 (15m Box Sweep / Daily 50 EMA Rejection) first, "
+        "then Strategy 2 (1-Candle 25% ATR Reversal, Long & Short, Single Entry), "
+        "and ONLY falls back to Strategy 3 (5m Confirmed 9 EMA Cross -> 9 EMA Touch & Confirm) "
+        "when Strategies 1 & 2 yield no setup."
+    )
+    daily_warmup_days = 220
+    tp1_name, tp2_name = "TP1 (50% Book Nearer of MID / 15m 50 EMA)", "50% Runner (15m Trail + 9 EMA / 20% ATR Exit)"
+    uses_live_price = True
+
+    def __init__(self, include_strategy3_entry: bool = True):
+        self.s1 = BoxTheorySweep()
+        self.s2 = AtrReversal()
+        self.s3 = Ema9RetestStrategy()
+        self.include_strategy3_entry = include_strategy3_entry
+
+    def compute_levels(self, pair):
+        return self.s1.compute_levels(pair)
+
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
+            return sig1
+        sig2 = self.s2.evaluate_signal(pair, None, margin_inr, leverage, usd_inr)
+        if sig2 and sig2.get("signal") in ("LONG", "SHORT"):
+            return sig2
+        if self.include_strategy3_entry:
+            sig3 = self.s3.evaluate_signal(pair, None, margin_inr, leverage, usd_inr)
+            if sig3 and sig3.get("signal") in ("LONG", "SHORT"):
+                return sig3
+        return sig1
+
+    def prepare_backtest(self, df, df_daily):
+        ctx1 = self.s1.prepare_backtest(df, df_daily)
+        ctx2 = self.s2.prepare_backtest(df, df_daily)
+        ctx3 = self.s3.prepare_backtest(df, df_daily)
+        return {
+            "ctx1": ctx1,
+            "ctx2": ctx2,
+            "ctx3": ctx3,
+            "boxes": ctx1["boxes"],
+            "s1_s2_days": set(),
+            "s3_days": set(),
+        }
+
+    def backtest_has_context(self, candle, ctx):
+        return self.s1.backtest_has_context(candle, ctx["ctx1"])
+
+    def backtest_entry(self, idx, candle, ctx, records):
+        day_str = candle["date_str"]
+        # Priority 1: Strategy 1 (Box Theory 15m)
+        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+        if e1:
+            ctx["s1_s2_days"].add(day_str)
+            return e1
+        # Priority 2: Strategy 2 (1-Candle 25% ATR Reversal, Long & Short, Single Entry)
+        if self.s2.backtest_has_context(candle, ctx["ctx2"]):
+            e2 = self.s2.backtest_entry(idx, candle, ctx["ctx2"], records)
+            if e2:
+                ctx["s1_s2_days"].add(day_str)
+                return e2
+        # Priority 3: Strategy 3 Fallback (ONLY if Strategies 1 & 2 have yielded no setup on this day, max 1 fallback per day)
+        if (
+            self.include_strategy3_entry
+            and day_str not in ctx["s1_s2_days"]
+            and day_str not in ctx["s3_days"]
+            and self.s3.backtest_has_context(candle, ctx["ctx3"])
+        ):
+            e3 = self.s3.backtest_entry(idx, candle, ctx["ctx3"], records)
+            if e3:
+                ctx["s3_days"].add(day_str)
+                return e3
+        return None
+
+
+# ----------------------------------------------------------------------------------------------
 # Registry
 # ----------------------------------------------------------------------------------------------
 STRATEGY_REGISTRY: dict[str, Strategy] = {
     BoxTheorySweep.id: BoxTheorySweep(),
     AtrReversal.id: AtrReversal(),
+    Ema9RetestStrategy.id: Ema9RetestStrategy(),
+    CombinedPriorityStrategy.id: CombinedPriorityStrategy(include_strategy3_entry=True),
 }
 DEFAULT_STRATEGY_ID = BoxTheorySweep.id
 
@@ -1180,7 +1661,11 @@ def get_strategy(strategy_id: str | None) -> Strategy:
 
 
 def list_strategies() -> list[Strategy]:
-    return list(STRATEGY_REGISTRY.values())
+    return [
+        STRATEGY_REGISTRY[BoxTheorySweep.id],
+        STRATEGY_REGISTRY[AtrReversal.id],
+        STRATEGY_REGISTRY[Ema9RetestStrategy.id],
+    ]
 
 
 def strategy_by_name(name: str) -> Strategy | None:
