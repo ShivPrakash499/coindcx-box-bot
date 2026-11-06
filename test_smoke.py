@@ -200,32 +200,6 @@ def test_4_strategy_and_two_entry_levels():
     assert strat.DAILY_WALLET_LOSS_STOP_PCT == 5.0
     assert "ema9_retest" in strat.STRATEGY_REGISTRY and "combined" in strat.STRATEGY_REGISTRY
 
-    # Verify strict RH/RL sweep reversal: reverse candle must close below sweep candle's low (SHORT) / above sweep candle's high (LONG)
-    box_s = strat.BoxTheorySweep()
-    test_ctx = {
-        "boxes": {
-            "2026-11-06": {
-                "RH": 7.30, "RL": 6.90, "MID": 7.10, "SH": 7.42, "SL": 6.80,
-                "EMA50": 7.50, "EMA200": 7.60, "ATR": 0.40, "bias": "BEARISH",
-            }
-        },
-        "ema50_15m": [7.15, 7.15, 7.15],
-    }
-    recs_not_below_low = [
-        {"date_str": "2026-11-06", "open": 7.25, "high": 7.28, "low": 7.22, "close": 7.26},
-        {"date_str": "2026-11-06", "open": 7.26, "high": 7.34, "low": 7.24, "close": 7.29},  # sweep candle (low=7.24)
-        {"date_str": "2026-11-06", "open": 7.29, "high": 7.30, "low": 7.23, "close": 7.25},  # closes < RH (7.30) but >= sweep low (7.24) -> NO TRADE
-    ]
-    assert box_s.backtest_entry(2, recs_not_below_low[2], test_ctx, recs_not_below_low) is None
-
-    recs_below_low = [
-        {"date_str": "2026-11-06", "open": 7.25, "high": 7.28, "low": 7.22, "close": 7.26},
-        {"date_str": "2026-11-06", "open": 7.26, "high": 7.34, "low": 7.26, "close": 7.29},  # sweep candle (low=7.26)
-        {"date_str": "2026-11-06", "open": 7.29, "high": 7.30, "low": 7.22, "close": 7.24},  # closes < RH (7.30) AND < sweep low (7.26) -> SHORT
-    ]
-    bt_sig = box_s.backtest_entry(2, recs_below_low[2], test_ctx, recs_below_low)
-    assert bt_sig is not None and bt_sig["direction"] == "SHORT" and abs(bt_sig["entry"] - 7.24) < 1e-6
-
     print(f"  -> PASS: LONG ({long_lvls}), SHORT ({short_lvls}) & SH/SL structural Entry2/SL + Strategy 1/2/3 rules verified.")
 
 

@@ -502,42 +502,23 @@ class BoxTheorySweep(Strategy):
         out["daily_trend_summary"] = bias_label
 
         # ------------------------------------------------------------------
-        # 1. SHORT SETUPS (Strictly Completed 15m Reversal Candle Closing < Sweep Candle Low):
-        #    A: Outer Box RH or SH Liquidity Sweep -> Completed 15m Reverse Candle closes < RH/SH AND < Sweep Candle Low
+        # 1. SHORT SETUPS (Strictly 15m Confirmation):
+        #    A: Outer Box RH or SH Liquidity Sweep + 15m Close Below RH/SH (in BEARISH & NEUTRAL)
         #    B: Daily 50 EMA Touch + 15m Bearish Rejection (in BEARISH, no 65% box filter)
         # ------------------------------------------------------------------
-        n_recs = len(recs_15m)
-        rev_idx = n_recs - 1
-        start_lb = max(0, rev_idx - 3)
-        matched_sc_short = None
-        rejected_sh_15m = False
-        rejected_rh_15m = False
-        if trend_bias in ("BEARISH", "NEUTRAL") and (c15_close < c15_open):
-            for k_b in range(rev_idx - 1, start_lb - 1, -1):
-                sc = recs_15m[k_b]
-                s_high = float(sc["high"])
-                s_low = float(sc["low"])
-                cluster_high = max(float(recs_15m[m]["high"]) for m in range(k_b, rev_idx + 1))
-                already_broke = any(
-                    float(recs_15m[m]["close"]) < s_low and float(recs_15m[m]["close"]) < rh
-                    for m in range(k_b + 1, rev_idx)
-                )
-                if already_broke:
-                    continue
-                if (s_high >= sh) and (c15_close < sh) and (c15_close < s_low) and (cluster_high <= sh * 1.012):
-                    matched_sc_short = sc
-                    rejected_sh_15m = True
-                    break
-                if (s_high >= rh) and (c15_close < rh) and (c15_close < s_low) and (cluster_high <= sh * 1.005):
-                    matched_sc_short = sc
-                    rejected_rh_15m = True
-                    break
+        upper_wick_15m = c15_high - max(c15_open, c15_close)
+        has_bear_confirm_15m = (c15_close < c15_open and c15_close < prev_c15_close) or (
+            c15_close < c15_open and c15_range > 0 and (upper_wick_15m / c15_range) >= 0.30
+        )
+        swept_rh_15m = (prev_c15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(prev_c15_high, c15_high) <= sh * 1.005)
+        swept_sh_15m = (prev_c15_high >= sh or c15_high >= sh) and (c15_close < sh) and (max(prev_c15_high, c15_high) <= sh * 1.012)
+
+        rejected_rh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_rh_15m and has_bear_confirm_15m
+        rejected_sh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_sh_15m and has_bear_confirm_15m
 
         if rejected_rh_15m or rejected_sh_15m:
-            s_high = float(matched_sc_short["high"])
-            s_low = float(matched_sc_short["low"])
             entry = eng.round_asset_price(c15_close, rh)
-            scale_in_lvl = max(sh, s_high, c15_high, entry * 1.008)
+            scale_in_lvl = max(sh, prev_c15_high, c15_high, entry * 1.008)
             struct_tp1, tp1_ref = _nearest_box_tp1("SHORT", entry, mid, ema50_15m, rl)
             struct_tp2 = rl if entry > rl * 1.012 else sl
             plan = build_two_entry_runner_plan(
@@ -550,19 +531,14 @@ class BoxTheorySweep(Strategy):
                 entry2 = eng.round_asset_price(plan["entry2_sweep"], rh)
                 lvl_tag = f"SH (${sh:,.2f})" if rejected_sh_15m else f"RH (${rh:,.2f})"
                 reason = (
-                    f"{bias_label} | Swept {lvl_tag} + 15m Reverse Close (${c15_close:,.2f}) < Sweep Low (${s_low:,.2f}) "
-                    f"(Limit Entry1 @ Close ${entry:,.2f} [Open ${c15_open:,.2f}] + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
+                    f"{bias_label} | Swept {lvl_tag} + 15m rejection "
+                    f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
                     "signal": "SHORT", "signal_kind": "REVERSAL", "trigger_zone": "Sell Zone RH-SH",
                     "trigger_reason": reason,
-                    "setup": f"SELL (Short): {lvl_tag} Sweep + 15m Reverse Close < Sweep Low ({session['name']})",
-                    "entry": entry, "entry_order_type": "limit_order",
-                    "reverse_candle_close": eng.round_asset_price(c15_close, rh),
-                    "reverse_candle_open": eng.round_asset_price(c15_open, rh),
-                    "sweep_candle_low": eng.round_asset_price(s_low, rh),
-                    "sweep_candle_high": eng.round_asset_price(s_high, rh),
-                    "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                    "setup": f"SELL (Short): {lvl_tag} Sweep + 15m Rejection ({session['name']})",
+                    "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
                     "candle_ts": int(c15["timestamp"]),
                 })
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
@@ -611,39 +587,23 @@ class BoxTheorySweep(Strategy):
                         return self._stamp(out)
 
         # ------------------------------------------------------------------
-        # 2. LONG SETUPS (Strictly Completed 15m Reversal Candle Closing > Sweep Candle High):
-        #    C: Outer Box RL or SL Liquidity Sweep -> Completed 15m Reverse Candle closes > RL/SL AND > Sweep Candle High
+        # 2. LONG SETUPS (Strictly 15m Confirmation):
+        #    C: Outer Box RL or SL Liquidity Sweep + 15m Close Above RL/SL (in BULLISH & NEUTRAL)
         #    D: Daily 50 EMA Touch + 15m Bullish Rejection (in BULLISH, no 65% box filter)
         # ------------------------------------------------------------------
-        matched_sc_long = None
-        rejected_sl_15m = False
-        rejected_rl_15m = False
-        if trend_bias in ("BULLISH", "NEUTRAL") and (c15_close > c15_open):
-            for k_b in range(rev_idx - 1, start_lb - 1, -1):
-                sc = recs_15m[k_b]
-                s_high = float(sc["high"])
-                s_low = float(sc["low"])
-                cluster_low = min(float(recs_15m[m]["low"]) for m in range(k_b, rev_idx + 1))
-                already_broke = any(
-                    float(recs_15m[m]["close"]) > s_high and float(recs_15m[m]["close"]) > rl
-                    for m in range(k_b + 1, rev_idx)
-                )
-                if already_broke:
-                    continue
-                if (s_low <= sl) and (c15_close > sl) and (c15_close > s_high) and (cluster_low >= sl * 0.988):
-                    matched_sc_long = sc
-                    rejected_sl_15m = True
-                    break
-                if (s_low <= rl) and (c15_close > rl) and (c15_close > s_high) and (cluster_low >= sl * 0.995):
-                    matched_sc_long = sc
-                    rejected_rl_15m = True
-                    break
+        lower_wick_15m = min(c15_open, c15_close) - c15_low
+        has_bull_confirm_15m = (c15_close > c15_open and c15_close > prev_c15_close) or (
+            c15_close > c15_open and c15_range > 0 and (lower_wick_15m / c15_range) >= 0.30
+        )
+        swept_rl_15m = (prev_c15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(prev_c15_low, c15_low) >= sl * 0.995)
+        swept_sl_15m = (prev_c15_low <= sl or c15_low <= sl) and (c15_close > sl) and (min(prev_c15_low, c15_low) >= sl * 0.988)
+
+        rejected_rl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_rl_15m and has_bull_confirm_15m
+        rejected_sl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_sl_15m and has_bull_confirm_15m
 
         if rejected_rl_15m or rejected_sl_15m:
-            s_high = float(matched_sc_long["high"])
-            s_low = float(matched_sc_long["low"])
             entry = eng.round_asset_price(c15_close, rl)
-            scale_in_lvl = min(sl, s_low, c15_low, entry * 0.992)
+            scale_in_lvl = min(sl, prev_c15_low, c15_low, entry * 0.992)
             struct_tp1, tp1_ref = _nearest_box_tp1("LONG", entry, mid, ema50_15m, rh)
             struct_tp2 = rh if entry < rh * 0.988 else sh
             plan = build_two_entry_runner_plan(
@@ -656,19 +616,14 @@ class BoxTheorySweep(Strategy):
                 entry2 = eng.round_asset_price(plan["entry2_sweep"], rl)
                 lvl_tag = f"SL (${sl:,.2f})" if rejected_sl_15m else f"RL (${rl:,.2f})"
                 reason = (
-                    f"{bias_label} | Swept {lvl_tag} + 15m Reverse Close (${c15_close:,.2f}) > Sweep High (${s_high:,.2f}) "
-                    f"(Limit Entry1 @ Close ${entry:,.2f} [Open ${c15_open:,.2f}] + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
+                    f"{bias_label} | Swept {lvl_tag} + 15m rejection "
+                    f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
                     "signal": "LONG", "signal_kind": "REVERSAL", "trigger_zone": "Buy Zone RL-SL",
                     "trigger_reason": reason,
-                    "setup": f"BUY (Long): {lvl_tag} Sweep + 15m Reverse Close > Sweep High ({session['name']})",
-                    "entry": entry, "entry_order_type": "limit_order",
-                    "reverse_candle_close": eng.round_asset_price(c15_close, rl),
-                    "reverse_candle_open": eng.round_asset_price(c15_open, rl),
-                    "sweep_candle_low": eng.round_asset_price(s_low, rl),
-                    "sweep_candle_high": eng.round_asset_price(s_high, rl),
-                    "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                    "setup": f"BUY (Long): {lvl_tag} Sweep + 15m Rejection ({session['name']})",
+                    "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
                     "candle_ts": int(c15["timestamp"]),
                 })
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
@@ -840,38 +795,20 @@ class BoxTheorySweep(Strategy):
             else ("Daily >50/200 EMA" if bias == "BULLISH" else "Daily Range (Between 50/200 EMA)")
         )
 
-        # 1. SHORT SETUPS (Strictly Completed 15m Reverse Candle Closing < Sweep Candle Low):
-        #    A: Outer Box RH or SH Sweep -> Completed 15m Reverse Candle closes < RH/SH AND < Sweep Candle Low
-        start_k = max(0, idx - 3)
-        matched_sc_short = None
-        swept_sh_rej = False
-        swept_rh_rej = False
-        if bias in ("BEARISH", "NEUTRAL") and (c_close < c_open):
-            for k_b in range(idx - 1, start_k - 1, -1):
-                sc = records[k_b]
-                if sc["date_str"] != candle["date_str"]:
-                    continue
-                s_high = float(sc["high"])
-                s_low = float(sc["low"])
-                cluster_high = max(float(records[m]["high"]) for m in range(k_b, idx + 1))
-                already_broke = any(
-                    float(records[m]["close"]) < s_low and float(records[m]["close"]) < rh
-                    for m in range(k_b + 1, idx)
-                )
-                if already_broke:
-                    continue
-                if (s_high >= sh) and (c_close < sh) and (c_close < s_low) and (cluster_high <= sh * 1.012):
-                    matched_sc_short = sc
-                    swept_sh_rej = True
-                    break
-                if (s_high >= rh) and (c_close < rh) and (c_close < s_low) and (cluster_high <= sh * 1.005):
-                    matched_sc_short = sc
-                    swept_rh_rej = True
-                    break
+        # 1. SHORT SETUPS (Strictly 15m Confirmation):
+        #    A: Outer Box RH or SH Sweep + 15m Close Below RH/SH
+        upper_wick = c_high - max(c_open, c_close)
+        has_bear_confirm = (c_close < c_open and c_close < p_close) or (
+            c_close < c_open and candle_range > 0 and (upper_wick / candle_range) >= 0.30
+        )
+        swept_rh_seq = (p_high >= rh or c_high >= rh) and (c_close < rh) and (max(p_high, c_high) <= sh * 1.005)
+        swept_sh_seq = (p_high >= sh or c_high >= sh) and (c_close < sh) and (max(p_high, c_high) <= sh * 1.012)
+
+        swept_rh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_rh_seq and has_bear_confirm
+        swept_sh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_sh_seq and has_bear_confirm
 
         if swept_rh_rej or swept_sh_rej:
-            s_high = float(matched_sc_short["high"])
-            scale_in_lvl = max(sh, s_high, c_high)
+            scale_in_lvl = max(sh, p_high, c_high)
             struct_tp1, tp1_ref = _nearest_box_tp1("SHORT", c_close, mid, ema50_15m, rl)
             struct_tp2 = rl if c_close > rl * 1.012 else sl
             plan = build_two_entry_runner_plan(
@@ -879,12 +816,12 @@ class BoxTheorySweep(Strategy):
                 leverage=DEFAULT_LEVERAGE, tp1_ref_name=tp1_ref,
             )
             if plan:
-                z_lbl = "Swept SH Swing High + Rev Close < Sweep Low" if swept_sh_rej else "Swept RH Sell Zone + Rev Close < Sweep Low"
+                z_lbl = "Swept SH Swing High" if swept_sh_rej else "Swept RH Sell Zone"
                 return {
                     "direction": "SHORT", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
                     "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
                     "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
-                    "reason": f"{tag} + {z_lbl} [Limit@CLOSE] (TP1: {tp1_ref})",
+                    "reason": f"{tag} + {z_lbl} (TP1: {tp1_ref})",
                     "strategy_tag": "Strategy 1 (Box)",
                 }
 
@@ -911,37 +848,20 @@ class BoxTheorySweep(Strategy):
                         "strategy_tag": "Strategy 1 (Box)",
                     }
 
-        # 2. LONG SETUPS (Strictly Completed 15m Reverse Candle Closing > Sweep Candle High):
-        #    C: Outer Box RL or SL Sweep -> Completed 15m Reverse Candle closes > RL/SL AND > Sweep Candle High
-        matched_sc_long = None
-        swept_sl_rej = False
-        swept_rl_rej = False
-        if bias in ("BULLISH", "NEUTRAL") and (c_close > c_open):
-            for k_b in range(idx - 1, start_k - 1, -1):
-                sc = records[k_b]
-                if sc["date_str"] != candle["date_str"]:
-                    continue
-                s_high = float(sc["high"])
-                s_low = float(sc["low"])
-                cluster_low = min(float(records[m]["low"]) for m in range(k_b, idx + 1))
-                already_broke = any(
-                    float(records[m]["close"]) > s_high and float(records[m]["close"]) > rl
-                    for m in range(k_b + 1, idx)
-                )
-                if already_broke:
-                    continue
-                if (s_low <= sl) and (c_close > sl) and (c_close > s_high) and (cluster_low >= sl * 0.988):
-                    matched_sc_long = sc
-                    swept_sl_rej = True
-                    break
-                if (s_low <= rl) and (c_close > rl) and (c_close > s_high) and (cluster_low >= sl * 0.995):
-                    matched_sc_long = sc
-                    swept_rl_rej = True
-                    break
+        # 2. LONG SETUPS (Strictly 15m Confirmation):
+        #    C: Outer Box RL or SL Sweep + 15m Close Above RL/SL
+        lower_wick = min(c_open, c_close) - c_low
+        has_bull_confirm = (c_close > c_open and c_close > p_close) or (
+            c_close > c_open and candle_range > 0 and (lower_wick / candle_range) >= 0.30
+        )
+        swept_rl_seq = (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
+        swept_sl_seq = (p_low <= sl or c_low <= sl) and (c_close > sl) and (min(p_low, c_low) >= sl * 0.988)
+
+        swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
+        swept_sl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_sl_seq and has_bull_confirm
 
         if swept_rl_rej or swept_sl_rej:
-            s_low = float(matched_sc_long["low"])
-            scale_in_lvl = min(sl, s_low, c_low)
+            scale_in_lvl = min(sl, p_low, c_low)
             struct_tp1, tp1_ref = _nearest_box_tp1("LONG", c_close, mid, ema50_15m, rh)
             struct_tp2 = rh if c_close < rh * 0.988 else sh
             plan = build_two_entry_runner_plan(
@@ -949,12 +869,12 @@ class BoxTheorySweep(Strategy):
                 leverage=DEFAULT_LEVERAGE, tp1_ref_name=tp1_ref,
             )
             if plan:
-                z_lbl = "Swept SL Swing Low + Rev Close > Sweep High" if swept_sl_rej else "Swept RL Buy Zone + Rev Close > Sweep High"
+                z_lbl = "Swept SL Swing Low" if swept_sl_rej else "Swept RL Buy Zone"
                 return {
                     "direction": "LONG", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
                     "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
                     "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
-                    "reason": f"{tag} + {z_lbl} [Limit@CLOSE] (TP1: {tp1_ref})",
+                    "reason": f"{tag} + {z_lbl} (TP1: {tp1_ref})",
                     "strategy_tag": "Strategy 1 (Box)",
                 }
 
