@@ -200,6 +200,30 @@ def test_4_strategy_and_two_entry_levels():
     assert strat.DAILY_WALLET_LOSS_STOP_PCT == 5.0
     assert "ema9_retest" in strat.STRATEGY_REGISTRY and "combined" in strat.STRATEGY_REGISTRY
 
+    # Live <-> Backtest Box level parity: calculate_daily_box_levels() must equal prepare_backtest() for the same day
+    import pandas as pd
+    import random
+    random.seed(7)
+    n_days = 300
+    px, rows = 7.0, []
+    for i in range(n_days):
+        o = px
+        c = max(0.5, o * (1 + random.uniform(-0.05, 0.05)))
+        h = max(o, c) * (1 + random.uniform(0, 0.03))
+        l = min(o, c) * (1 - random.uniform(0, 0.03))
+        rows.append({"timestamp": 1700000000000 + i * 86400000, "open": o, "high": h, "low": l, "close": c, "volume": 1.0})
+        px = c
+    d_par = pd.DataFrame(rows)
+    d_par["date_str"] = pd.to_datetime(d_par["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(eng.IST).dt.strftime("%Y-%m-%d")
+    ctx_par = strat.BoxTheorySweep().prepare_backtest(pd.DataFrame({"close": [1.0, 1.0]}), d_par)
+    for i_day in (n_days - 20, n_days - 1):
+        with patch.object(eng, "fetch_coindcx_candles", return_value=d_par.iloc[:i_day + 1].reset_index(drop=True)):
+            lv_par = eng.calculate_daily_box_levels("B-INJ_USDT")
+        bt_par = ctx_par["boxes"][d_par.iloc[i_day]["date_str"]]
+        for k_lv in ("RH", "RL", "SH", "SL", "MID"):
+            assert abs(lv_par[k_lv] - bt_par[k_lv]) < 1e-9, f"Live/backtest {k_lv} mismatch: {lv_par[k_lv]} vs {bt_par[k_lv]}"
+        assert lv_par["trend_bias"] == bt_par["bias"]
+
     print(f"  -> PASS: LONG ({long_lvls}), SHORT ({short_lvls}) & SH/SL structural Entry2/SL + Strategy 1/2/3 rules verified.")
 
 

@@ -2023,6 +2023,56 @@ def fetch_historical_candles_paginated(
     _HISTORICAL_CANDLES_CACHE[cache_key] = {"df": df, "timestamp": now_ts}
     return df
 
+def compute_box_swing_levels(df_completed: pd.DataFrame) -> dict:
+    """
+    Single source of truth for Box RH / RL / SH / SL used by BOTH live trading (calculate_daily_box_levels)
+    and backtesting (BoxTheorySweep.prepare_backtest), so both always produce identical levels.
+
+    `df_completed` = completed daily candles in ascending order whose LAST row is the previous day (RH/RL day).
+    Only the last 30 completed candles are used.
+      - SH = nearest prior high at least max(0.8% of RH, 35% avg daily rise) above RH, if within avg daily rise;
+             otherwise RH + max(avg daily rise, min gap).
+      - SL = mirror image using average daily drop below RL.
+    """
+    dfc = df_completed.tail(30)
+    prev_day = dfc.iloc[-1]
+    rh = float(prev_day["high"])
+    rl = float(prev_day["low"])
+    df_hist = dfc.iloc[:-1]
+
+    up_days = dfc[dfc["close"] >= dfc["open"]]
+    down_days = dfc[dfc["close"] < dfc["open"]]
+    avg_daily_rise = float((up_days["close"] - up_days["open"]).mean()) if len(up_days) > 0 else (rh - rl) * 0.25
+    avg_daily_drop = float((down_days["open"] - down_days["close"]).mean()) if len(down_days) > 0 else (rh - rl) * 0.25
+    if not avg_daily_rise or avg_daily_rise <= 0 or avg_daily_rise != avg_daily_rise:
+        avg_daily_rise = (rh - rl) * 0.25
+    if not avg_daily_drop or avg_daily_drop <= 0 or avg_daily_drop != avg_daily_drop:
+        avg_daily_drop = (rh - rl) * 0.25
+
+    # Minimum structural separation between RH <-> SH and RL <-> SL so SH/SL never collapse onto RH/RL
+    min_sh_gap = max(rh * 0.008, avg_daily_rise * 0.35)
+    max_sh_gap = max(avg_daily_rise, min_sh_gap)
+    min_sl_gap = max(rl * 0.008, avg_daily_drop * 0.35)
+    max_sl_gap = max(avg_daily_drop, min_sl_gap)
+
+    sh_candidates = [float(h) for h in df_hist["high"].tolist() if float(h) >= rh + min_sh_gap]
+    if sh_candidates and (min(sh_candidates) - rh) <= max_sh_gap:
+        sh = min(sh_candidates)
+    else:
+        sh = rh + max_sh_gap
+
+    sl_candidates = [float(l) for l in df_hist["low"].tolist() if float(l) <= rl - min_sl_gap]
+    if sl_candidates and (rl - max(sl_candidates)) <= max_sl_gap:
+        sl = max(sl_candidates)
+    else:
+        sl = rl - max_sl_gap
+
+    return {
+        "RH": rh, "RL": rl, "SH": sh, "SL": sl,
+        "avg_daily_rise": avg_daily_rise, "avg_daily_drop": avg_daily_drop,
+    }
+
+
 def calculate_daily_box_levels(pair="B-ETH_USDT"):
     """
     Calculates Previous Day High (RH), Low (RL), Swing High (SH), Swing Low (SL),
@@ -2058,52 +2108,10 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
     else:
         trend_bias = "NEUTRAL"
 
-    # Historical completed candles before yesterday within the 30-day window
-    df_hist = df_completed.iloc[:-1]
-
-    # Calculate average daily price rise (for green days) and average daily price drop (for red days)
-    up_days = df_completed[df_completed['close'] >= df_completed['open']]
-    down_days = df_completed[df_completed['close'] < df_completed['open']]
-
-    avg_daily_rise = float((up_days['close'] - up_days['open']).mean()) if len(up_days) > 0 else (rh - rl) * 0.25
-    avg_daily_drop = float((down_days['open'] - down_days['close']).mean()) if len(down_days) > 0 else (rh - rl) * 0.25
-
-    if avg_daily_rise <= 0:
-        avg_daily_rise = (rh - rl) * 0.25
-    if avg_daily_drop <= 0:
-        avg_daily_drop = (rh - rl) * 0.25
-
-    # Minimum structural separation between RH <-> SH and RL <-> SL so SH/SL never collapse onto RH/RL
-    min_sh_gap = max(rh * 0.008, avg_daily_rise * 0.35)
-    max_sh_gap = max(avg_daily_rise, min_sh_gap)
-    min_sl_gap = max(rl * 0.008, avg_daily_drop * 0.35)
-    max_sl_gap = max(avg_daily_drop, min_sl_gap)
-
-    # Look for swing peaks beyond RH + min_sh_gap strictly within the 30-day window
-    historical_highs = df_hist['high'].tolist() if not df_hist.empty else []
-    sh_candidates = [float(h) for h in historical_highs if float(h) >= rh + min_sh_gap]
-    if sh_candidates:
-        nearest_sh = min(sh_candidates)
-        # If candidate is within average daily rise distance from RH, use it; otherwise place at RH + max_sh_gap
-        if (nearest_sh - rh) <= max_sh_gap:
-            sh = nearest_sh
-        else:
-            sh = rh + max_sh_gap
-    else:
-        sh = rh + max_sh_gap
-
-    # Look for swing troughs beyond RL - min_sl_gap strictly within the 30-day window
-    historical_lows = df_hist['low'].tolist() if not df_hist.empty else []
-    sl_candidates = [float(l) for l in historical_lows if float(l) <= rl - min_sl_gap]
-    if sl_candidates:
-        nearest_sl = max(sl_candidates)
-        # If candidate is within average daily drop distance from RL, use it; otherwise place at RL - max_sl_gap
-        if (rl - nearest_sl) <= max_sl_gap:
-            sl = nearest_sl
-        else:
-            sl = rl - max_sl_gap
-    else:
-        sl = rl - max_sl_gap
+    # Shared SH/SL formula (identical in live and backtest — see compute_box_swing_levels)
+    swing = compute_box_swing_levels(df_completed)
+    sh, sl = swing["SH"], swing["SL"]
+    avg_daily_rise, avg_daily_drop = swing["avg_daily_rise"], swing["avg_daily_drop"]
 
     return {
         "RH": round_asset_price(rh),
