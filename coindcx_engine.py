@@ -440,7 +440,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 13
+_REQUIRED_DAEMON_VERSION = 14
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -460,13 +460,147 @@ def _check_and_kill_obsolete_daemon():
         raise _ObsoleteDaemonStop(f"Terminating obsolete daemon thread {_tname} (active is v{_REQUIRED_DAEMON_VERSION})")
 
 
+def _get_coindcx_proxy_url() -> str:
+    """
+    Returns the configured Static IP Proxy URL (`http://user:pass@IP:8888` or `http://IP:8888`)
+    for CoinDCX signed requests from Streamlit Secrets, environment variables, autotrade_config.json,
+    or the shared `_Live_Account_Sync` Google Sheet tab.
+    """
+    proxy_url = ""
+    try:
+        import streamlit as _st
+        if hasattr(_st, "secrets"):
+            for _p_key in ("COINDCX_PROXY_URL", "coindcx_proxy_url", "STATIC_PROXY_URL"):
+                if _p_key in _st.secrets and str(_st.secrets[_p_key]).strip():
+                    proxy_url = str(_st.secrets[_p_key]).strip().strip('"').strip("'")
+                    break
+            if not proxy_url:
+                for _k, _v in _st.secrets.items():
+                    if hasattr(_v, "get"):
+                        for _p_key in ("COINDCX_PROXY_URL", "coindcx_proxy_url", "STATIC_PROXY_URL"):
+                            if _p_key in _v and str(_v[_p_key]).strip():
+                                proxy_url = str(_v[_p_key]).strip().strip('"').strip("'")
+                                break
+    except Exception:
+        pass
+
+    if not proxy_url:
+        proxy_url = (
+            os.getenv("COINDCX_PROXY_URL")
+            or _PERSIST.get("proxy_url")
+            or ""
+        ).strip().strip('"').strip("'")
+
+    if not proxy_url:
+        try:
+            if os.path.exists(AUTOTRADE_CONFIG_FILE):
+                with open(AUTOTRADE_CONFIG_FILE, "r", encoding="utf-8") as _f:
+                    _cfg_p = json.load(_f)
+                    if isinstance(_cfg_p, dict) and str(_cfg_p.get("coindcx_proxy_url", "")).strip():
+                        proxy_url = str(_cfg_p["coindcx_proxy_url"]).strip()
+        except Exception:
+            pass
+
+    if not proxy_url:
+        try:
+            import sheets_logger as _sl
+            proxy_url = str(_sl._SHEET_SYNC_CACHE.get("proxy_url") or "").strip()
+        except Exception:
+            pass
+
+    if proxy_url and not proxy_url.startswith(("http://", "https://", "socks5://")):
+        proxy_url = f"http://{proxy_url}"
+    if proxy_url:
+        _PERSIST["proxy_url"] = proxy_url
+    return proxy_url
+
+
+def set_coindcx_proxy_url(proxy_url: str, sync_to_sheet: bool = True) -> str:
+    """Updates the Static IP Proxy URL in memory, autotrade_config.json, and optionally Crypto_Trades_Journal."""
+    clean_p = (proxy_url or "").strip().strip('"').strip("'")
+    if clean_p and not clean_p.startswith(("http://", "https://", "socks5://")):
+        clean_p = f"http://{clean_p}"
+    _PERSIST["proxy_url"] = clean_p
+    os.environ["COINDCX_PROXY_URL"] = clean_p
+    _PERSIST["session_verified"] = False
+    _PERSIST["last_nat_probe_ts"] = 0.0
+    try:
+        save_autotrade_config({"coindcx_proxy_url": clean_p})
+    except Exception:
+        pass
+    if sync_to_sheet:
+        def _sync_p():
+            try:
+                import sheets_logger as _sl
+                _sl.save_live_account_sync_to_sheet(
+                    wallet=_WALLET_BALANCE_CACHE.get("data"),
+                    positions=_ACTIVE_POSITIONS_CACHE.get("data"),
+                    pinned_ip=_PERSIST.get("pinned_ip", ""),
+                    proxy_url=clean_p,
+                )
+            except Exception:
+                pass
+        _threading.Thread(target=_sync_p, daemon=True, name="CoinDCXProxySync").start()
+    return clean_p
+
+
+def _trigger_bg_sheet_account_publish(wallet_data: dict | None = None, positions_data: list | None = None):
+    """Publishes verified live CoinDCX wallet & positions to Crypto_Trades_Journal every 20s in a background thread."""
+    if not _PERSIST.get("session_verified") or _PERSIST.get("using_sheet_bridge"):
+        return
+    now_s = time.time()
+    if (now_s - float(_PERSIST.get("last_sheet_pub_ts", 0.0))) < 20.0:
+        return
+    _PERSIST["last_sheet_pub_ts"] = now_s
+    pinned_ip = str(_PERSIST.get("pinned_ip") or "")
+
+    def _pub_worker():
+        try:
+            import sheets_logger as _sl
+            _sl.save_live_account_sync_to_sheet(
+                wallet=wallet_data if isinstance(wallet_data, dict) else _WALLET_BALANCE_CACHE.get("data"),
+                positions=positions_data if isinstance(positions_data, list) else _ACTIVE_POSITIONS_CACHE.get("data"),
+                pinned_ip=pinned_ip,
+            )
+        except Exception:
+            pass
+
+    _threading.Thread(target=_pub_worker, daemon=True, name="CoinDCXSheetSyncPub").start()
+
+
+def _try_load_sheet_account_bridge(api_key: str, max_age_sec: float = 900.0) -> dict | None:
+    """
+    When a server's GKE node rotates off the allowlisted NAT IP, loads the verified live wallet & positions
+    (and any newly configured Static IP Proxy URL) from Crypto_Trades_Journal ('_Live_Account_Sync' tab).
+    """
+    if not api_key:
+        return None
+    try:
+        import sheets_logger as _sl
+        snap = _sl.load_live_account_sync_from_sheet(max_age_sec=max_age_sec)
+        if not isinstance(snap, dict):
+            return None
+        sheet_proxy = str(snap.get("proxy_url") or "").strip()
+        if sheet_proxy and sheet_proxy != _PERSIST.get("proxy_url", ""):
+            _PERSIST["proxy_url"] = sheet_proxy
+            os.environ["COINDCX_PROXY_URL"] = sheet_proxy
+            _PERSIST["last_nat_probe_ts"] = 0.0
+        return snap
+    except Exception:
+        return None
+
+
 def _make_single_socket_session() -> requests.Session:
     """Creates a requests.Session strictly limited to 1 TCP connection (pool_maxsize=1) so urllib3
-    never opens a 2nd unpinned Cloud NAT socket under concurrent load."""
+    never opens a 2nd unpinned Cloud NAT socket under concurrent load. Automatically attaches
+    COINDCX_PROXY_URL when a Static IP proxy is configured."""
     s = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
+    proxy_url = _get_coindcx_proxy_url()
+    if proxy_url:
+        s.proxies = {"http": proxy_url, "https": proxy_url}
     return s
 
 
@@ -514,17 +648,45 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                 except Exception:
                     return None
 
-        # 1. If a preceding caller that just released pin_lock already pinned a verified session, reuse it!
-        if _PERSIST.get("session_verified") and _PERSIST.get("session") is not None:
+        # 1. If a preceding caller that just released pin_lock already pinned a direct verified session, reuse it!
+        if _PERSIST.get("session_verified") and not _PERSIST.get("using_sheet_bridge") and _PERSIST.get("session") is not None:
             r_reuse = _test_signed_on_sess(_PERSIST["session"], api_key, api_secret)
             if r_reuse is not None and (r_reuse.status_code == 200 or r_reuse.status_code not in (401, 502, 503)):
                 return r_reuse
 
-        # 2. Avoid back-to-back scans if a scan just failed < 1.5s ago
+        # 2. Avoid back-to-back scans if a scan just failed < 1.5s ago (or < 60s when Sheet Bridge is active and no proxy is set)
         now_p = time.time()
-        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < 1.5:
+        min_probe_gap = 60.0 if (_PERSIST.get("using_sheet_bridge") and not _get_coindcx_proxy_url()) else 1.5
+        if (now_p - float(_PERSIST.get("last_nat_probe_ts", 0.0))) < min_probe_gap:
             return None
         _PERSIST["last_nat_probe_ts"] = now_p
+
+        # Fast-path: When a Static IP Proxy (`COINDCX_PROXY_URL`) is configured, every socket already
+        # exits from the permanent Static IP — verify and pin on a single socket in < 0.3s!
+        active_proxy = _get_coindcx_proxy_url()
+        if active_proxy:
+            cand_proxy = _make_single_socket_session()
+            cand_pool.append(cand_proxy)
+            proxy_ip = _probe_session_coindcx_ip(cand_proxy, timeout=3.0) or "Static-Proxy"
+            r_proxy = _test_signed_on_sess(cand_proxy, api_key, api_secret)
+            if r_proxy is not None and (r_proxy.status_code == 200 or r_proxy.status_code not in (401, 502, 503)):
+                sign_lock = _PERSIST.get("lock") or _COINDCX_SIGN_LOCK
+                with sign_lock:
+                    old_sess = _PERSIST.get("session")
+                    if old_sess is not None and old_sess is not cand_proxy:
+                        try:
+                            old_sess.close()
+                        except Exception:
+                            pass
+                    _PERSIST["session"] = cand_proxy
+                    _PERSIST["session_verified"] = True
+                    _PERSIST["using_sheet_bridge"] = False
+                    _PERSIST["pinned_ip"] = proxy_ip
+                    _PERSIST["last_verified_ip"] = proxy_ip
+                    _PERSIST["last_sess_io_ts"] = time.time()
+                    _PERSIST["last_auth_error"] = ""
+                winning_sess = cand_proxy
+                return r_proxy
 
         priority_ips = {"35.230.78.192", "34.83.176.217"}
         last_v_ip = _PERSIST.get("last_verified_ip")
@@ -597,6 +759,7 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
                         pass
                 _PERSIST["session"] = winning_sess
                 _PERSIST["session_verified"] = True
+                _PERSIST["using_sheet_bridge"] = False
                 _PERSIST["pinned_ip"] = winning_ip
                 _PERSIST["last_verified_ip"] = winning_ip
                 _PERSIST["last_sess_io_ts"] = time.time()
@@ -628,7 +791,7 @@ def _send_coindcx_signed_request(method, url, payload=None, timeout=3.5):
 
     try:
         res = None
-        if _PERSIST.get("session_verified") and _PERSIST.get("session") is not None:
+        if _PERSIST.get("session_verified") and not _PERSIST.get("using_sheet_bridge") and _PERSIST.get("session") is not None:
             with _COINDCX_SIGN_LOCK:
                 sess = _PERSIST["session"]
                 body = payload.copy() if payload else {}
@@ -803,12 +966,68 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
         _WALLET_BALANCE_CACHE["ts"] = now_ts
         _WALLET_BALANCE_CACHE["last_good_live"] = live_res
         _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+        _PERSIST["using_sheet_bridge"] = False
+        _trigger_bg_sheet_account_publish(wallet_data=live_res, positions_data=_ACTIVE_POSITIONS_CACHE.get("data"))
         if abs(total_inr - default_balance) > 1.0:
             try:
                 save_autotrade_config({"wallet_balance_inr": round(total_inr, 2)})
             except Exception:
                 pass
         return dict(live_res)
+
+    # Cross-Server Sync Bridge via Crypto_Trades_Journal ('_Live_Account_Sync' tab):
+    # If another server (e.g. staging on 35.230.78.192) is verified and publishing live account state,
+    # or if a new Static IP Proxy URL was saved to the sheet, sync immediately!
+    prev_proxy = _PERSIST.get("proxy_url", "")
+    bridge = _try_load_sheet_account_bridge(api_key)
+    if isinstance(bridge, dict):
+        if bridge.get("proxy_url") and bridge.get("proxy_url") != prev_proxy:
+            res_retry, _ = _send_coindcx_signed_request("GET", "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets")
+            if res_retry is not None and res_retry.status_code == 200 and _parse_futures_wallets(res_retry):
+                raw_calc_inr = inr_balance + locked_inr + (usdt_balance * usd_inr)
+                total_inr = raw_calc_inr if raw_calc_inr > 0 else default_balance
+                avail_usdt = max(0.0, usdt_balance - locked_margin_usd - cross_margin_usd)
+                avail_inr = inr_balance + (avail_usdt * usd_inr) if raw_calc_inr > 0 else default_balance
+                live_res = {
+                    "total_inr": round(total_inr, 2),
+                    "available_inr": round(avail_inr, 2),
+                    "inr_cash": round(inr_balance if inr_balance > 0 else total_inr, 2),
+                    "locked_inr": round(locked_inr, 2),
+                    "usdt_cash": round(usdt_balance, 4),
+                    "available_usdt": round(avail_usdt, 4),
+                    "locked_margin_usd": round(locked_margin_usd, 4),
+                    "cross_user_margin_usd": round(cross_margin_usd, 4),
+                    "live_usd_inr": usd_inr,
+                    "is_live_api": True,
+                    "source": "CoinDCX Live Futures API (Static Proxy)",
+                    "_key_prefix": api_key[:8],
+                }
+                _WALLET_BALANCE_CACHE["data"] = live_res
+                _WALLET_BALANCE_CACHE["ts"] = now_ts
+                _WALLET_BALANCE_CACHE["last_good_live"] = live_res
+                _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+                return dict(live_res)
+
+        b_wallet = bridge.get("wallet")
+        if isinstance(b_wallet, dict) and b_wallet.get("is_live_api") and not bridge.get("stale"):
+            bridge_ip = str(bridge.get("pinned_ip") or "35.230.78.192")
+            synced_wallet = dict(b_wallet)
+            synced_wallet["_key_prefix"] = api_key[:8]
+            synced_wallet["is_live_api"] = True
+            synced_wallet["source"] = f"CoinDCX Live Futures API (Synced via {bridge_ip})"
+            _WALLET_BALANCE_CACHE["data"] = synced_wallet
+            _WALLET_BALANCE_CACHE["ts"] = now_ts
+            _WALLET_BALANCE_CACHE["last_good_live"] = synced_wallet
+            _WALLET_BALANCE_CACHE["last_good_ts"] = now_ts
+            _PERSIST["session_verified"] = True
+            _PERSIST["using_sheet_bridge"] = True
+            _PERSIST["pinned_ip"] = bridge_ip
+            _PERSIST["last_auth_error"] = ""
+            if isinstance(bridge.get("positions"), list):
+                _ACTIVE_POSITIONS_CACHE["data"] = list(bridge["positions"])
+                _ACTIVE_POSITIONS_CACHE["ts"] = now_ts
+                _ACTIVE_POSITIONS_CACHE["last_ok_ts"] = now_ts
+            return dict(synced_wallet)
 
     last_good = _WALLET_BALANCE_CACHE.get("last_good_live")
     if (
@@ -865,6 +1084,8 @@ def fetch_coindcx_futures_balance(force_refresh: bool = False):
         and isinstance(cached_bal, dict)
         and cached_bal.get("_key_prefix") == api_key[:8]
     ):
+        if cached_bal.get("is_live_api") and _PERSIST.get("session_verified") and not _PERSIST.get("using_sheet_bridge"):
+            _trigger_bg_sheet_account_publish(wallet_data=cached_bal, positions_data=_ACTIVE_POSITIONS_CACHE.get("data"))
         age = now_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))
         if age < 30.0:
             return dict(cached_bal)
@@ -920,6 +1141,14 @@ def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> 
 
     res, err = _send_coindcx_signed_request("POST", "https://api.coindcx.com/exchange/v1/derivatives/futures/positions", payload)
     if not res or res.status_code != 200:
+        api_key_p, _ = _get_coindcx_credentials()
+        bridge_p = _try_load_sheet_account_bridge(api_key_p)
+        if isinstance(bridge_p, dict) and isinstance(bridge_p.get("positions"), list) and not bridge_p.get("stale"):
+            synced_pos = list(bridge_p["positions"])
+            _ACTIVE_POSITIONS_CACHE["data"] = synced_pos
+            _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts
+            _ACTIVE_POSITIONS_CACHE["last_ok_ts"] = now_pos_ts
+            return list(synced_pos)
         if return_none_on_error:
             return None
         prev = _ACTIVE_POSITIONS_CACHE.get("data")
@@ -1034,6 +1263,7 @@ def _fetch_coindcx_active_positions_sync(return_none_on_error: bool = False) -> 
     _ACTIVE_POSITIONS_CACHE["data"] = active_positions
     _ACTIVE_POSITIONS_CACHE["ts"] = now_pos_ts
     _ACTIVE_POSITIONS_CACHE["last_ok_ts"] = now_pos_ts
+    _trigger_bg_sheet_account_publish(wallet_data=_WALLET_BALANCE_CACHE.get("data"), positions_data=active_positions)
     if (now_pos_ts - float(_WALLET_BALANCE_CACHE.get("ts", 0.0))) > 20.0 or not (_WALLET_BALANCE_CACHE.get("data") or {}).get("is_live_api"):
         _trigger_bg_wallet_refresh()
     return active_positions
@@ -3988,13 +4218,21 @@ def _upgrade_all_in_memory_functions_and_disarm():
             except Exception:
                 pass
 
-    # Proactively warm live positions & wallet balance in background if not yet verified
+    # Proactively warm live positions & wallet balance in background if not yet verified,
+    # or immediately publish verified live account state to Crypto_Trades_Journal so peer deployments stay synced!
+    if _PERSIST.get("session_verified") and not _PERSIST.get("using_sheet_bridge"):
+        _trigger_bg_sheet_account_publish(
+            wallet_data=_WALLET_BALANCE_CACHE.get("data"),
+            positions_data=_ACTIVE_POSITIONS_CACHE.get("data"),
+        )
     if not _PERSIST.get("session_verified") or not _ACTIVE_POSITIONS_CACHE.get("data"):
         _trigger_bg_wallet_refresh()
         _trigger_bg_positions_refresh()
 
     try:
         import importlib as _il
+        if "sheets_logger" in _sys.modules:
+            _il.reload(_sys.modules["sheets_logger"])
         if "strategies" in _sys.modules:
             _il.reload(_sys.modules["strategies"])
         if "signal_monitor" in _sys.modules:

@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 13
+_DAEMON_VERSION = 14
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -207,10 +207,14 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
         while sys.__dict__.get("_active_daemon_version") == daemon_version:
             try:
                 _reload_if_updated(strategy_registry)
+                _reload_if_updated(sheets_logger)
                 _reload_if_updated(coindcx_engine)
                 _reload_if_updated(signal_monitor)
                 if not coindcx_engine._PERSIST.get("session_verified") or (time.time() - float(coindcx_engine._WALLET_BALANCE_CACHE.get("ts", 0.0))) > 25.0:
                     coindcx_engine._fetch_coindcx_futures_balance_sync()
+                if (time.time() - float(coindcx_engine._ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) > 25.0:
+                    coindcx_engine._fetch_coindcx_active_positions_sync()
+                coindcx_engine._trigger_bg_sheet_account_publish()
                 if signal_monitor:
                     auto_cfg = coindcx_engine.get_autotrade_config()
                     rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
@@ -713,6 +717,20 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
     _pinned_ip_str = coindcx_engine._PERSIST.get("pinned_ip") or (", ".join(_seen_list) if _seen_list else "Scanning...")
     _verified_badge = "✅" if coindcx_engine._PERSIST.get("session_verified") else "⚠️ Not Allowlisted"
     st.caption(f"🌐 **Server Outbound IP(s) (for CoinDCX API):** `{_pinned_ip_str}` ({_verified_badge})")
+    _cur_proxy = coindcx_engine._get_coindcx_proxy_url()
+    _new_proxy = st.text_input(
+        "🛡️ Static IP Proxy URL (Optional — synced across Staging & Main)",
+        value=_cur_proxy,
+        type="password",
+        placeholder="http://coindcx:token@STATIC_IP:8888",
+        help="Routes all signed CoinDCX requests from both Staging & Main through 1 permanent GCP Static IP so you never have to rotate CoinDCX API keys.",
+        key="input_coindcx_static_proxy_url",
+    )
+    if _new_proxy.strip() != _cur_proxy:
+        coindcx_engine.set_coindcx_proxy_url(_new_proxy.strip(), sync_to_sheet=True)
+        coindcx_engine._fetch_coindcx_futures_balance_sync()
+        coindcx_engine._fetch_coindcx_active_positions_sync()
+        st.rerun()
     if st.button("🔒 Lock Session", use_container_width=True):
         st.session_state.authenticated = False
         st.rerun()

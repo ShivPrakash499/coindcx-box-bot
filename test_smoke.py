@@ -475,7 +475,57 @@ def test_8_stale_cache_expiry_and_nat_pinner():
                 eng._ACTIVE_POSITIONS_CACHE["data"] = saved_pos
                 eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = saved_ok_ts
 
-    print("  -> PASS: Stale unverified cache expiry, 0ms lock auto-release, and 8-thread NAT pinner verified.")
+    # 5. Verify Static IP Proxy (`COINDCX_PROXY_URL`) attaches to single-socket sessions and Cross-Server Sheet Bridge syncs live wallet/positions
+    saved_proxy = eng._PERSIST.get("proxy_url", "")
+    try:
+        with patch.dict(os.environ, {"COINDCX_PROXY_URL": "http://coindcx:tok123@34.100.200.1:8888"}):
+            eng._PERSIST["proxy_url"] = ""
+            p_url = eng._get_coindcx_proxy_url()
+            assert p_url == "http://coindcx:tok123@34.100.200.1:8888", f"Unexpected proxy_url: {p_url}"
+            s_prox = eng._make_single_socket_session()
+            assert s_prox.proxies.get("https") == "http://coindcx:tok123@34.100.200.1:8888"
+            s_prox.close()
+    finally:
+        eng._PERSIST["proxy_url"] = saved_proxy
+        os.environ.pop("COINDCX_PROXY_URL", None)
+
+    mock_bridge_snap = {
+        "ts": time.time(),
+        "pinned_ip": "35.230.78.192",
+        "proxy_url": "",
+        "wallet": {
+            "total_inr": 58585.19,
+            "available_inr": 58585.19,
+            "inr_cash": 58585.19,
+            "locked_inr": 0.0,
+            "usdt_cash": 0.0,
+            "available_usdt": 0.0,
+            "locked_margin_usd": 0.0,
+            "cross_user_margin_usd": 0.0,
+            "live_usd_inr": 102.0,
+            "is_live_api": True,
+            "source": "CoinDCX Live Futures API",
+        },
+        "positions": [],
+    }
+    try:
+        with patch.object(eng, "_get_coindcx_credentials", return_value=("d6d123456789c512", "sec123456789")),              patch.object(eng, "_send_coindcx_signed_request", return_value=(None, "HTTP 401")),              patch.object(eng, "_try_load_sheet_account_bridge", return_value=mock_bridge_snap):
+            bridged_bal = eng._fetch_coindcx_futures_balance_sync()
+            assert bridged_bal.get("is_live_api") is True and abs(bridged_bal.get("total_inr", 0) - 58585.19) < 1e-2, (
+                f"Expected Sheet Bridge to sync live wallet ₹58,585.19 on NAT rotation, got {bridged_bal}"
+            )
+            bridged_pos = eng._fetch_coindcx_active_positions_sync()
+            assert bridged_pos == [], f"Expected Sheet Bridge to sync 0 positions, got {bridged_pos}"
+    finally:
+        eng._PERSIST["session_verified"] = saved_ver
+        eng._PERSIST["using_sheet_bridge"] = False
+        eng._WALLET_BALANCE_CACHE["data"] = saved_data
+        eng._WALLET_BALANCE_CACHE["last_good_live"] = saved_lg
+        eng._WALLET_BALANCE_CACHE["last_good_ts"] = saved_lg_ts
+        eng._ACTIVE_POSITIONS_CACHE["data"] = saved_pos
+        eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = saved_ok_ts
+
+    print("  -> PASS: Stale unverified cache expiry, 0ms lock auto-release, Static IP Proxy, and Cross-Server Sheet Bridge verified.")
 
 
 def test_9_ai_advisor_and_tick_precision():

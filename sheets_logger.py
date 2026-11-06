@@ -550,3 +550,122 @@ def fetch_all_sheet_trades(sheet_name: str | None = None) -> dict:
         result["markdown_summary"] = f"[!] Unable to read Google Sheet '{target_sheet}': {e}"
         return result
 
+
+import time as _time
+from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+
+_IST = _tz(_td(hours=5, minutes=30))
+_SHEET_SYNC_CACHE = {
+    "ts": 0.0,
+    "data": None,
+    "proxy_url": "",
+    "last_wallet": None,
+    "last_positions": None,
+}
+
+
+def save_live_account_sync_to_sheet(
+    wallet: dict | None = None,
+    positions: list | None = None,
+    pinned_ip: str = "",
+    proxy_url: str | None = None,
+) -> bool:
+    """
+    Saves the latest verified live CoinDCX Futures wallet & positions snapshot (plus optional Static IP Proxy URL)
+    into the '_Live_Account_Sync' worksheet of 'Crypto_Trades_Journal' so that any other deployment (e.g. main vs staging)
+    can stay 100% synced even when Google Cloud NAT rotates egress IPs on one node.
+    """
+    try:
+        if isinstance(wallet, dict) and wallet.get("is_live_api"):
+            _SHEET_SYNC_CACHE["last_wallet"] = dict(wallet)
+        if isinstance(positions, list):
+            _SHEET_SYNC_CACHE["last_positions"] = list(positions)
+
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = _client().open(target_sheet)
+        ws = _get_ws(book, "_Live_Account_Sync")
+        vals = ws.get_all_values()
+
+        existing_payload = {}
+        existing_proxy = _SHEET_SYNC_CACHE.get("proxy_url", "")
+        if len(vals) >= 2 and vals[1]:
+            if len(vals[1]) >= 1 and vals[1][0]:
+                try:
+                    existing_payload = json.loads(vals[1][0])
+                except Exception:
+                    existing_payload = {}
+            if len(vals[1]) >= 2 and str(vals[1][1]).strip():
+                existing_proxy = str(vals[1][1]).strip()
+
+        eff_wallet = _SHEET_SYNC_CACHE.get("last_wallet") or existing_payload.get("wallet")
+        eff_positions = (
+            _SHEET_SYNC_CACHE.get("last_positions")
+            if _SHEET_SYNC_CACHE.get("last_positions") is not None
+            else existing_payload.get("positions", [])
+        )
+        eff_ip = pinned_ip or existing_payload.get("pinned_ip", "")
+        eff_proxy = proxy_url.strip() if isinstance(proxy_url, str) else existing_proxy
+        if eff_proxy:
+            _SHEET_SYNC_CACHE["proxy_url"] = eff_proxy
+
+        now_ts = _time.time()
+        ist_str = _dt.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        payload = {
+            "ts": now_ts,
+            "updated_ist": ist_str,
+            "pinned_ip": eff_ip,
+            "wallet": eff_wallet,
+            "positions": eff_positions if isinstance(eff_positions, list) else [],
+        }
+        headers = ["Live_Account_JSON", "Static_Proxy_URL", "Updated_IST", "Pinned_IP"]
+        row2 = [json.dumps(payload, separators=(",", ":")), eff_proxy, ist_str, eff_ip]
+        ws.update("A1:D2", [headers, row2])
+        _SHEET_SYNC_CACHE["data"] = {**payload, "proxy_url": eff_proxy}
+        _SHEET_SYNC_CACHE["ts"] = now_ts
+        return True
+    except Exception:
+        return False
+
+
+def load_live_account_sync_from_sheet(max_age_sec: float = 900.0, force: bool = False) -> dict | None:
+    """
+    Reads the latest verified live CoinDCX Futures wallet & positions snapshot (and optional Static IP Proxy URL)
+    from the '_Live_Account_Sync' worksheet of 'Crypto_Trades_Journal'.
+    Uses a 12-second in-memory read cache so UI calls never hit Google Sheets rate limits.
+    """
+    now_ts = _time.time()
+    cached = _SHEET_SYNC_CACHE.get("data")
+    if not force and isinstance(cached, dict) and (now_ts - float(_SHEET_SYNC_CACHE.get("ts", 0.0))) < 12.0:
+        snap_ts = float(cached.get("ts", 0.0) or 0.0)
+        if (now_ts - snap_ts) <= max_age_sec:
+            return dict(cached)
+
+    try:
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = _client().open(target_sheet)
+        ws = book.worksheet("_Live_Account_Sync")
+        vals = ws.get_all_values()
+        _SHEET_SYNC_CACHE["ts"] = now_ts
+        if not vals or len(vals) < 2 or not vals[1]:
+            return None
+
+        raw_json = str(vals[1][0]).strip() if len(vals[1]) >= 1 else ""
+        raw_proxy = str(vals[1][1]).strip() if len(vals[1]) >= 2 else ""
+        if raw_proxy:
+            _SHEET_SYNC_CACHE["proxy_url"] = raw_proxy
+
+        payload = json.loads(raw_json) if raw_json else {}
+        if not isinstance(payload, dict):
+            payload = {}
+        payload["proxy_url"] = raw_proxy
+        _SHEET_SYNC_CACHE["data"] = payload
+
+        snap_ts = float(payload.get("ts", 0.0) or 0.0)
+        if snap_ts > 0 and (now_ts - snap_ts) <= max_age_sec:
+            return dict(payload)
+        if raw_proxy:
+            return {"proxy_url": raw_proxy, "stale": True}
+        return None
+    except Exception:
+        _SHEET_SYNC_CACHE["ts"] = now_ts
+        return None
