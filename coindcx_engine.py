@@ -1379,10 +1379,7 @@ def exit_coindcx_position(position_id: str, pair: str = None) -> tuple[bool, str
             if matched is None:
                 _ACTIVE_POSITIONS_CACHE["data"] = fresh_pos
                 try:
-                    cancel_coindcx_open_entry_orders(pair)
-                except Exception:
-                    pass
-                try:
+                    cancel_coindcx_open_entry_orders(pair, cancel_all_for_pair=True)
                     clear_autotrade_active_lock()
                 except Exception:
                     pass
@@ -1396,10 +1393,7 @@ def exit_coindcx_position(position_id: str, pair: str = None) -> tuple[bool, str
         _ACTIVE_POSITIONS_CACHE["data"] = None
         try:
             if pair:
-                cancel_coindcx_open_entry_orders(pair)
-        except Exception:
-            pass
-        try:
+                cancel_coindcx_open_entry_orders(pair, cancel_all_for_pair=True)
             clear_autotrade_active_lock()
         except Exception:
             pass
