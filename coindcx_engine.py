@@ -4138,18 +4138,35 @@ def execute_autotrade_two_entry_signal(
     has_live_creds = bool(api_key_now and api_secret_now)
 
     if wallet.get("is_live_api") or has_live_creds:
-        # Leg 1: Entry 1 (50% Margin = qty1) with CoinDCX's single native Position TP = TP2 (Runner) & SL = Catastrophe SL
+        # Leg 1: Entry 1 (50% Margin = qty1) placed as a Limit Order at the completed reverse candle's close (or open)
+        entry1_order_type = str(sig.get("entry_order_type") or "limit_order").lower()
+        if entry1_order_type not in ("limit_order", "market_order"):
+            entry1_order_type = "limit_order"
         ok1, msg1, extra1 = place_coindcx_futures_order(
             pair=pair,
             side=side,
             quantity=qty1,
             leverage=lev,
-            order_type="market_order",
+            order_type=entry1_order_type,
+            price=entry1_px if entry1_order_type == "limit_order" else None,
             margin_currency="INR",
             tp_price=tp2_px,
             sl_price=sl_px,
             post_only=False,
         )
+        # Fallback to market_order only if CoinDCX rejects limit price due to immediate cross
+        if not ok1 and entry1_order_type == "limit_order":
+            ok1, msg1, extra1 = place_coindcx_futures_order(
+                pair=pair,
+                side=side,
+                quantity=qty1,
+                leverage=lev,
+                order_type="market_order",
+                margin_currency="INR",
+                tp_price=tp2_px,
+                sl_price=sl_px,
+                post_only=False,
+            )
         if ok1:
             # Synchronize Position TP2/SL + TP1 50% Limit Order + Entry 2 Sweep Limit Order onto the live position
             sync_ok, sync_msg, sync_details = sync_full_2entry_runner_to_position(
