@@ -13,6 +13,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT_DIR not in sys.path:
@@ -28,8 +29,10 @@ PROXY_PORT = 8888
 
 
 def _run_gcloud(args: list[str]) -> tuple[int, str, str]:
-    cmd = ["gcloud"] + args + [f"--project={PROJECT_ID}", "--quiet"]
-    proc = subprocess.run(cmd, capture_output=True, text=True, shell=(os.name == "nt"))
+    env = dict(os.environ)
+    env["CLOUDSDK_CORE_PROJECT"] = PROJECT_ID
+    cmd = ["gcloud", f"--project={PROJECT_ID}", "--quiet"] + args
+    proc = subprocess.run(cmd, capture_output=True, text=True, env=env, shell=(os.name == "nt"))
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
 
@@ -98,7 +101,7 @@ def provision_static_ip_proxy(enable_api_if_requested: bool = False) -> dict:
         "export DEBIAN_FRONTEND=noninteractive\n"
         "apt-get update -y && apt-get install -y tinyproxy\n"
         f"sed -i 's/^Port .*/Port {PROXY_PORT}/' /etc/tinyproxy/tinyproxy.conf\n"
-        "sed -i 's/^Allow 127.0.0.1/#Allow 127.0.0.1/' /etc/tinyproxy/tinyproxy.conf\n"
+        "sed -i 's/^Allow /#Allow /g' /etc/tinyproxy/tinyproxy.conf\n"
         f"grep -q '^BasicAuth ' /etc/tinyproxy/tinyproxy.conf || echo 'BasicAuth coindcx {proxy_token}' >> /etc/tinyproxy/tinyproxy.conf\n"
         "systemctl enable tinyproxy && systemctl restart tinyproxy\n"
     )
@@ -112,16 +115,25 @@ def provision_static_ip_proxy(enable_api_if_requested: bool = False) -> dict:
     ])
     vm_items = json.loads(out_vm) if (rc_vm == 0 and out_vm) else []
     if not vm_items:
-        rc_cv, out_cv, err_cv = _run_gcloud([
-            "compute", "instances", "create", INSTANCE_NAME,
-            f"--zone={ZONE}",
-            "--machine-type=e2-micro",
-            f"--address={static_ip}",
-            "--tags=coindcx-proxy",
-            "--image-family=debian-12",
-            "--image-project=debian-cloud",
-            f"--metadata=startup-script={startup_script}",
-        ])
+        with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8", newline="\n") as tf:
+            tf.write(startup_script)
+            startup_file = tf.name
+        try:
+            rc_cv, out_cv, err_cv = _run_gcloud([
+                "compute", "instances", "create", INSTANCE_NAME,
+                f"--zone={ZONE}",
+                "--machine-type=e2-micro",
+                f"--address={static_ip}",
+                "--tags=coindcx-proxy",
+                "--image-family=debian-12",
+                "--image-project=debian-cloud",
+                f"--metadata-from-file=startup-script={startup_file}",
+            ])
+        finally:
+            try:
+                os.remove(startup_file)
+            except Exception:
+                pass
         if rc_cv != 0:
             return {"ok": False, "error": f"Failed to create proxy VM: {err_cv or out_cv}"}
 

@@ -590,17 +590,18 @@ def _try_load_sheet_account_bridge(api_key: str, max_age_sec: float = 900.0) -> 
         return None
 
 
-def _make_single_socket_session() -> requests.Session:
+def _make_single_socket_session(use_proxy: bool = True) -> requests.Session:
     """Creates a requests.Session strictly limited to 1 TCP connection (pool_maxsize=1) so urllib3
     never opens a 2nd unpinned Cloud NAT socket under concurrent load. Automatically attaches
-    COINDCX_PROXY_URL when a Static IP proxy is configured."""
+    COINDCX_PROXY_URL when a Static IP proxy is configured and use_proxy=True."""
     s = requests.Session()
     adapter = requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=1, max_retries=0)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
-    proxy_url = _get_coindcx_proxy_url()
-    if proxy_url:
-        s.proxies = {"http": proxy_url, "https": proxy_url}
+    if use_proxy:
+        proxy_url = _get_coindcx_proxy_url()
+        if proxy_url:
+            s.proxies = {"http": proxy_url, "https": proxy_url}
     return s
 
 
@@ -703,7 +704,7 @@ def _pin_coindcx_nat_session(api_key: str, api_secret: str, method: str = "GET",
             for _ in range(10):
                 if found_evt.is_set():
                     return
-                cand = _make_single_socket_session()
+                cand = _make_single_socket_session(use_proxy=False)
                 with pool_lock:
                     cand_pool.append(cand)
                 cand_ip = _probe_session_coindcx_ip(cand, timeout=1.6)
