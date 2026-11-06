@@ -331,6 +331,7 @@ def _next_monotonic_ms() -> int:
 def _probe_session_coindcx_ip(sess: requests.Session, timeout: float = 2.5) -> str:
     """Queries https://api.coindcx.com/cdn-cgi/trace on the exact Keep-Alive session to return
     the true outbound IP address that api.coindcx.com sees for this TCP socket."""
+    _check_and_kill_obsolete_daemon()
     try:
         r = sess.get(
             "https://api.coindcx.com/cdn-cgi/trace",
@@ -439,7 +440,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 10
+_REQUIRED_DAEMON_VERSION = 11
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -3895,27 +3896,16 @@ def _upgrade_all_in_memory_functions_and_disarm():
     3. Upgrades __code__ on any older in-memory function objects held by stale threads so they immediately hit _check_and_kill_obsolete_daemon().
     """
     _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
-    if _PERSIST.get("emergency_disarm_version") != _REQUIRED_DAEMON_VERSION:
-        _PERSIST["emergency_disarm_version"] = _REQUIRED_DAEMON_VERSION
-
-    # Proactively warm live positions & wallet balance in background if not yet verified
-    if not _PERSIST.get("session_verified") or not _ACTIVE_POSITIONS_CACHE.get("data"):
-        _trigger_bg_positions_refresh()
-        _trigger_bg_wallet_refresh()
-
-    try:
-        import importlib as _il
-        if "strategies" in _sys.modules:
-            _il.reload(_sys.modules["strategies"])
-        if "signal_monitor" in _sys.modules:
-            _il.reload(_sys.modules["signal_monitor"])
-    except Exception as _rel_e:
-        print(f"[Module Hot-Reload Notice]: {_rel_e}")
-
     try:
         import gc
         import types
         target_fns = {
+            "_check_and_kill_obsolete_daemon": _check_and_kill_obsolete_daemon,
+            "_get_coindcx_credentials": _get_coindcx_credentials,
+            "_probe_session_coindcx_ip": _probe_session_coindcx_ip,
+            "_pin_coindcx_nat_session": _pin_coindcx_nat_session,
+            "_fetch_coindcx_futures_balance_sync": _fetch_coindcx_futures_balance_sync,
+            "_fetch_coindcx_active_positions_sync": _fetch_coindcx_active_positions_sync,
             "get_autotrade_config": get_autotrade_config,
             "get_rotational_margin_inr": get_rotational_margin_inr,
             "get_coindcx_live_usdt_inr_rate": get_coindcx_live_usdt_inr_rate,
@@ -3939,6 +3929,26 @@ def _upgrade_all_in_memory_functions_and_disarm():
                         pass
     except Exception:
         pass
+
+    if _PERSIST.get("emergency_disarm_version") != _REQUIRED_DAEMON_VERSION:
+        _PERSIST["emergency_disarm_version"] = _REQUIRED_DAEMON_VERSION
+        _WALLET_BALANCE_CACHE["refreshing"] = False
+        _ACTIVE_POSITIONS_CACHE["refreshing"] = False
+        _PERSIST["last_nat_probe_ts"] = 0.0
+
+    # Proactively warm live positions & wallet balance in background if not yet verified
+    if not _PERSIST.get("session_verified") or not _ACTIVE_POSITIONS_CACHE.get("data"):
+        _trigger_bg_wallet_refresh()
+        _trigger_bg_positions_refresh()
+
+    try:
+        import importlib as _il
+        if "strategies" in _sys.modules:
+            _il.reload(_sys.modules["strategies"])
+        if "signal_monitor" in _sys.modules:
+            _il.reload(_sys.modules["signal_monitor"])
+    except Exception as _rel_e:
+        print(f"[Module Hot-Reload Notice]: {_rel_e}")
 
 
 _upgrade_all_in_memory_functions_and_disarm()
