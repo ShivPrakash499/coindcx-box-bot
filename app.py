@@ -1743,6 +1743,7 @@ elif active_section == "🎯 Execute":
             choice_tracker_key = f"last_setup_tag_{selected_pair}"
             levels_tracker_key = f"last_formula_entry_{selected_pair}_{setup_tag}"
             tp1_tracker_key = f"last_formula_tp1_{selected_pair}_{setup_tag}"
+            custom_e1_tracker_key = f"last_custom_entry_{selected_pair}_{setup_tag}"
 
             _strat_has_e2 = (active_strategy.id == "box_theory")
             _raw_e2_default = float(active_trade.get("entry2_sweep") or (levels["SL"] if (levels and trade_dir == "BUY") else (levels["SH"] if levels else active_trade["entry"]))) if _strat_has_e2 else 0.0
@@ -1751,7 +1752,7 @@ elif active_section == "🎯 Execute":
                 direction=trade_dir,
                 entry1_px=float(active_trade["entry"]),
                 entry2_px=_raw_e2_default,
-                tp1_px=float(active_trade["tp1"]),
+                tp1_px=None if _strat_has_e2 else float(active_trade["tp1"]),
                 tp2_px=float(active_trade["tp2"]),
                 sl_px=float(active_trade["stop_loss"]),
                 live_px=float(active_trade["entry"]),
@@ -1768,11 +1769,33 @@ elif active_section == "🎯 Execute":
                 st.session_state[choice_tracker_key] = setup_tag
                 st.session_state[levels_tracker_key] = float(active_trade["entry"])
                 st.session_state[tp1_tracker_key] = float(_init_norm["tp1"])
+                st.session_state[custom_e1_tracker_key] = float(_init_norm["entry"])
                 st.session_state[entry_key] = float(_init_norm["entry"])
                 st.session_state[e2_key] = float(_init_norm["entry2_sweep"])
                 st.session_state[sl_key] = float(_init_norm["stop_loss"])
                 st.session_state[tp1_key] = float(_init_norm["tp1"])
                 st.session_state[tp2_key] = float(_init_norm["tp2"])
+
+            # If the user changed Limit Entry 1 (`entry_key`), automatically recalculate TP1 (Midpoint(Entry1, TP2) vs 15m 50 EMA), Entry 2, and SL
+            _pending_e1 = float(st.session_state.get(entry_key, _init_norm["entry"]))
+            _formula_norm_for_e1 = coindcx_engine.normalize_two_entry_runner_levels(
+                pair=selected_pair,
+                direction=trade_dir,
+                entry1_px=_pending_e1,
+                entry2_px=_raw_e2_default,
+                tp1_px=None if _strat_has_e2 else float(active_trade["tp1"]),
+                tp2_px=float(st.session_state.get(tp2_key, _init_norm["tp2"])),
+                sl_px=float(st.session_state.get(sl_key, _init_norm["stop_loss"])),
+                live_px=_pending_e1,
+                levels=levels if _strat_has_e2 else None,
+            )
+            if abs(_pending_e1 - float(st.session_state.get(custom_e1_tracker_key, _init_norm["entry"]))) > 1e-6:
+                st.session_state[custom_e1_tracker_key] = _pending_e1
+                st.session_state[tp1_key] = float(_formula_norm_for_e1["tp1"])
+                st.session_state[tp2_key] = float(_formula_norm_for_e1["tp2"])
+                if _strat_has_e2:
+                    st.session_state[e2_key] = float(_formula_norm_for_e1["entry2_sweep"])
+                    st.session_state[sl_key] = float(_formula_norm_for_e1["stop_loss"])
 
             p_ref = float(active_trade["entry"])
             step_val = 0.5 if p_ref > 1.0 else (0.0001 if p_ref > 0.001 else 0.000001)
@@ -1844,7 +1867,7 @@ elif active_section == "🎯 Execute":
             _is_full_runner = (active_strategy.id == "ema9_retest")
             _cur_fill_mode = str(st.session_state.get(f"e1_fill_mode_{selected_pair}", "⚡ Market (Instant)"))
             _user_custom_e1 = abs(float(active_trade["entry"]) - float(_init_norm["entry"])) > 1e-6
-            _user_custom_tp1 = abs(float(active_trade["tp1"]) - float(_init_norm["tp1"])) > 1e-6
+            _user_custom_tp1 = abs(float(active_trade["tp1"]) - float(_formula_norm_for_e1["tp1"])) > 1e-6
             _disp_trade = dict(active_trade)
             if "Market" in _cur_fill_mode and float(cur_price) > 0 and not _user_custom_e1:
                 _mkt_norm = coindcx_engine.normalize_two_entry_runner_levels(
@@ -2004,17 +2027,16 @@ elif active_section == "🎯 Execute":
                     else:
                         _use_market_e1 = "Market" in e1_fill_mode
                         _ref_e1_px = shield_live_px if (_use_market_e1 and shield_live_px > 0) else float(active_trade["entry"])
-                        _entry_shifted = (_use_market_e1 and shield_live_px > 0 and abs(shield_live_px - float(active_trade["entry"])) / max(1e-9, float(active_trade["entry"])) > 0.003)
-                        _user_edited_tp1 = abs(float(active_trade["tp1"]) - float(_init_norm["tp1"])) > 1e-6
+                        _user_edited_tp1 = abs(float(active_trade["tp1"]) - float(_formula_norm_for_e1["tp1"])) > 1e-6
                         _exec_norm = coindcx_engine.normalize_two_entry_runner_levels(
                             pair=selected_pair,
                             direction=trade_dir,
                             entry1_px=_ref_e1_px,
                             entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
-                            tp1_px=None if (_entry_shifted and not _user_edited_tp1 and active_strategy.id == "box_theory") else float(active_trade["tp1"]),
+                            tp1_px=None if (not _user_edited_tp1 and active_strategy.id == "box_theory") else float(active_trade["tp1"]),
                             tp2_px=float(active_trade["tp2"]),
                             sl_px=float(active_trade["stop_loss"]),
-                            live_px=shield_live_px if shield_live_px > 0 else _ref_e1_px,
+                            live_px=(shield_live_px if (_use_market_e1 and shield_live_px > 0) else _ref_e1_px),
                             levels=levels if _has_e2 else None,
                         )
                         _maker_px = _exec_norm["entry"]

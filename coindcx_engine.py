@@ -4156,29 +4156,32 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         if lock.get("missing_count", 0) > 0:
                             lock["missing_count"] = 0
                             save_autotrade_config({"active_trade_lock": lock})
-                        # Auto-heal too-near TP1 (<0.59% from Entry 1) on an open position before TP1 has hit
-                        if not tp1_already_hit and l_entry > 0 and abs(l_tp1 - l_entry) / l_entry < 0.0059:
+                        # Auto-heal too-near TP1 (<0.59% from Entry 1) OR attach resting TP1 limit order once a Limit Entry 1 fills
+                        _cur_tp1_oid = str(lock.get("tp1_order_id", "") or "")
+                        _needs_tp1_limit_attach = (_cur_tp1_oid in ("", "DAEMON_50PCT_REDUCE_AT_TP1")) and (str(lock.get("strategy_id", "box_theory")) != "ema9_retest")
+                        _tp1_too_near = (l_entry > 0 and abs(l_tp1 - l_entry) / l_entry < 0.0059)
+                        if not tp1_already_hit and (_tp1_too_near or _needs_tp1_limit_attach):
                             try:
                                 _box_lvls = calculate_daily_box_levels(l_pair)
                             except Exception:
                                 _box_lvls = None
+                            _actual_e1 = float(matched_live_pos.get("entry_price") or l_entry)
                             _fix_norm = normalize_two_entry_runner_levels(
                                 pair=l_pair,
                                 direction=l_dir,
-                                entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
+                                entry1_px=_actual_e1,
                                 entry2_px=l_entry2,
-                                tp1_px=None,
+                                tp1_px=None if _tp1_too_near else l_tp1,
                                 tp2_px=l_tp2,
                                 sl_px=l_sl,
-                                live_px=float(matched_live_pos.get("entry_price") or l_entry),
+                                live_px=_actual_e1,
                                 levels=_box_lvls,
                             )
                             _new_tp1 = float(_fix_norm["tp1"])
-                            if abs(_new_tp1 - l_tp1) > 1e-6:
-                                _old_tp1_oid = str(lock.get("tp1_order_id", "") or "")
+                            if abs(_new_tp1 - l_tp1) > 1e-6 or _needs_tp1_limit_attach:
                                 _opp_s = "SELL" if l_dir in ("LONG", "BUY") else "BUY"
-                                if _old_tp1_oid and not _old_tp1_oid.startswith(("DAEMON_", "FULL_", "STRATEGY")):
-                                    cancel_coindcx_open_entry_orders(l_pair, _old_tp1_oid, side=_opp_s.lower())
+                                if _cur_tp1_oid and not _cur_tp1_oid.startswith(("DAEMON_", "FULL_", "STRATEGY")):
+                                    cancel_coindcx_open_entry_orders(l_pair, _cur_tp1_oid, side=_opp_s.lower())
                                 _pos_q = float(matched_live_pos.get("quantity", 0.0) or 0.0)
                                 _tp1_q = format_order_quantity(l_pair, _pos_q * 0.5)
                                 _pos_lev = int(round(float(matched_live_pos.get("leverage") or lock.get("leverage", 10) or 10)))
@@ -4197,6 +4200,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                         lock["tp1_order_id"] = str((_ext_tp1 or {}).get("order_id", "DAEMON_50PCT_REDUCE_AT_TP1"))
                                 l_tp1 = _new_tp1
                                 lock["tp1"] = _new_tp1
+                                lock["entry"] = _actual_e1
                                 save_autotrade_config({"active_trade_lock": lock})
                         # Auto-heal missing TP or SL on CoinDCX whenever either trigger is None
                         if matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None:
