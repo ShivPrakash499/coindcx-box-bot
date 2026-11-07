@@ -1712,6 +1712,8 @@ elif active_section == "🎯 Execute":
                     strategy_registry.setup_tag(_s.id, "SIGNAL"),
                     _s
                 ))
+            if exec_strategy_mode == _all_label and _s.id != "box_theory":
+                continue
             _plan = get_cached_strategy_plan(_s.id, selected_pair, float(cur_price), trade_margin_inr, trade_leverage, trade_usd_inr)
             for _d, _ico in (("BUY", "🟢"), ("SELL", "🔴")):
                 _st = _plan.get(_d)
@@ -1974,9 +1976,19 @@ elif active_section == "🎯 Execute":
                     key=f"price_shield_{selected_pair}"
                 )
 
-            if matching_active_pos:
+            _pos_matches_dir = bool(
+                matching_active_pos
+                and (
+                    (str(matching_active_pos.get("direction", "")).upper() in ("LONG", "BUY") and trade_dir == "BUY")
+                    or (str(matching_active_pos.get("direction", "")).upper() in ("SHORT", "SELL") and trade_dir == "SELL")
+                )
+            )
+            if _pos_matches_dir:
+                _sync_lbl = (
+                    f"🛡️ Sync TP1 ({fmt_px(_disp_trade['tp1'])}) + TP2 ({fmt_px(_disp_trade['tp2'])}) + SL ({fmt_px(_disp_trade['stop_loss'])}) to Open {cur_asset} Position"
+                ).replace("$", "\\$")
                 if st.button(
-                    f"🛡️ Sync TP1 ({fmt_px(active_trade['tp1'])}) + TP2 ({fmt_px(active_trade['tp2'])}) + SL ({fmt_px(active_trade['stop_loss'])}) to Open {cur_asset} Position",
+                    _sync_lbl,
                     key=f"btn_sync_existing_{selected_pair}",
                     use_container_width=True,
                 ):
@@ -1986,9 +1998,9 @@ elif active_section == "🎯 Execute":
                             direction=matching_active_pos["direction"],
                             entry1_px=float(matching_active_pos["entry_price"]),
                             entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
-                            tp1_px=float(active_trade["tp1"]),
-                            tp2_px=float(active_trade["tp2"]),
-                            sl_px=float(active_trade["stop_loss"]),
+                            tp1_px=float(_disp_trade["tp1"]),
+                            tp2_px=float(_disp_trade["tp2"]),
+                            sl_px=float(_disp_trade["stop_loss"]),
                             total_margin_inr=trade_margin_inr,
                             leverage=trade_leverage,
                             usd_inr=trade_usd_inr,
