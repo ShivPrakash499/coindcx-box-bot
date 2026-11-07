@@ -977,7 +977,11 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
         _trigger_bg_sheet_account_publish(wallet_data=live_res, positions_data=_ACTIVE_POSITIONS_CACHE.get("data"))
         if abs(total_inr - default_balance) > 1.0:
             try:
-                save_autotrade_config({"wallet_balance_inr": round(total_inr, 2)})
+                _cur_cfg = get_autotrade_config()
+                _upd = {"wallet_balance_inr": round(total_inr, 2)}
+                if not _cur_cfg.get("user_custom_margin"):
+                    _upd["single_trade_margin_inr"] = round(total_inr * TRADE_ALLOCATION_FRACTION, 2)
+                save_autotrade_config(_upd)
             except Exception:
                 pass
         return dict(live_res)
@@ -1030,6 +1034,16 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
             _PERSIST["using_sheet_bridge"] = True
             _PERSIST["pinned_ip"] = bridge_ip
             _PERSIST["last_auth_error"] = ""
+            try:
+                _b_tot = float(synced_wallet.get("total_inr", 0.0) or 0.0)
+                if _b_tot > 0:
+                    _cur_cfg_b = get_autotrade_config()
+                    _upd_b = {"wallet_balance_inr": round(_b_tot, 2)}
+                    if not _cur_cfg_b.get("user_custom_margin"):
+                        _upd_b["single_trade_margin_inr"] = round(_b_tot * TRADE_ALLOCATION_FRACTION, 2)
+                    save_autotrade_config(_upd_b)
+            except Exception:
+                pass
             if isinstance(bridge.get("positions"), list):
                 _ACTIVE_POSITIONS_CACHE["data"] = list(bridge["positions"])
                 _ACTIVE_POSITIONS_CACHE["ts"] = now_ts
@@ -3252,6 +3266,10 @@ def get_autotrade_config() -> dict:
             if isinstance(cached_data, dict) and _AUTOTRADE_CFG_MEM_CACHE.get("mtime") == mtime:
                 res = dict(default_cfg)
                 res.update(cached_data)
+                wb_c = float(res.get("wallet_balance_inr", 47287.18) or 47287.18)
+                sm_c = float(res.get("single_trade_margin_inr", 0) or 0)
+                if sm_c <= 0 or sm_c in (15762.39, 30000.0, 250000.0, 100000.0) or not res.get("user_custom_margin"):
+                    res["single_trade_margin_inr"] = round(wb_c * TRADE_ALLOCATION_FRACTION, 2)
                 return res
             with open(AUTOTRADE_CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
@@ -3260,7 +3278,8 @@ def get_autotrade_config() -> dict:
                     _AUTOTRADE_CFG_MEM_CACHE["mtime"] = mtime
                     default_cfg.update(saved)
                     wb = float(default_cfg.get("wallet_balance_inr", 47287.18) or 47287.18)
-                    if float(default_cfg.get("single_trade_margin_inr", 0) or 0) <= 0:
+                    sm_val = float(default_cfg.get("single_trade_margin_inr", 0) or 0)
+                    if sm_val <= 0 or sm_val in (15762.39, 30000.0, 250000.0, 100000.0) or not default_cfg.get("user_custom_margin"):
                         default_cfg["single_trade_margin_inr"] = round(wb * TRADE_ALLOCATION_FRACTION, 2)
     except Exception:
         pass

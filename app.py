@@ -597,11 +597,34 @@ if not wallet_data.get("is_live_api"):
         _auto_cfg = coindcx_engine.save_autotrade_config({"wallet_balance_inr": round(_manual_wallet_inr, 2)})
         get_cached_balance.clear()
 
+_one_third_wallet = round(float(wallet_data["total_inr"]) * coindcx_engine.TRADE_ALLOCATION_FRACTION, 2)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
-if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
-    default_margin = float(wallet_data["total_inr"])
+if (
+    _saved_margin <= 0
+    or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0)
+    or not _auto_cfg.get("user_custom_margin")
+):
+    default_margin = _one_third_wallet
 else:
     default_margin = _saved_margin
+
+# Keep Streamlit widget state synced to 1/3 of live wallet whenever wallet updates and user hasn't set custom margin
+if not _auto_cfg.get("user_custom_margin"):
+    if st.session_state.get("_last_synced_one_third_margin") != _one_third_wallet:
+        st.session_state["_last_synced_one_third_margin"] = _one_third_wallet
+        st.session_state["sidebar_single_trade_margin_input"] = float(_one_third_wallet)
+
+
+def _on_sidebar_margin_change():
+    new_m = round(float(st.session_state.get("sidebar_single_trade_margin_input", _one_third_wallet)), 2)
+    is_cust = abs(new_m - _one_third_wallet) > 1.0
+    coindcx_engine.save_autotrade_config({
+        "single_trade_margin_inr": new_m,
+        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+        "user_custom_margin": is_cust,
+    })
+    get_cached_signals_scan.clear()
+
 
 margin_inr = st.sidebar.number_input(
     "Single-Trade Margin (INR)",
@@ -610,7 +633,9 @@ margin_inr = st.sidebar.number_input(
     value=float(default_margin),
     step=500.0,
     format="%.2f",
-    help="50% used on Entry 1 and 50% reserved for Entry 2 @ Sweep."
+    key="sidebar_single_trade_margin_input",
+    on_change=_on_sidebar_margin_change,
+    help="Automatically set to 1/3rd of Futures Wallet (3-Slot Mode: 50% Entry 1 + 50% Entry 2 @ Sweep)."
 )
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
