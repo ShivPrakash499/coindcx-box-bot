@@ -615,6 +615,12 @@ margin_inr = st.sidebar.number_input(
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
 st.sidebar.caption(f"Split: **₹{margin_inr*0.5:,.2f}** Entry 1 + **₹{margin_inr*0.5:,.2f}** Entry 2 @ {leverage}x")
+try:
+    _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(float(margin_inr), int(leverage), wallet_data)
+    if _eff_note:
+        st.sidebar.warning(f"⚠️ AutoTrade will use **₹{_eff_margin:,.2f}** per trade. {_eff_note}")
+except Exception:
+    pass
 
 live_crypto_rate = get_coindcx_live_usdt_inr_rate()
 usd_inr = float(live_crypto_rate)

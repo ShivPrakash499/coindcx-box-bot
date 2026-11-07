@@ -3160,13 +3160,79 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
 _AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 0.0, "data": None})
 
 
+# Keys that must survive a Streamlit Cloud restart (persisted per deployment to the Google Sheet)
+_DURABLE_AUTOTRADE_KEYS = ("enabled", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit")
+
+
+def _get_deployment_id() -> str:
+    """
+    Identifies this deployment ('main' / 'staging') so main and staging never share AutoTrade state.
+    Only active on Streamlit Cloud (/mount/src/...) so local runs and tests never touch the shared Google Sheet.
+    """
+    env_id = str(os.getenv("APP_DEPLOYMENT_ID", "") or "").strip()
+    if env_id:
+        return env_id
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not here.replace("\\", "/").startswith("/mount/src/"):
+        return ""
+    try:
+        with open(os.path.join(here, ".git", "HEAD"), "r", encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if head.startswith("ref: refs/heads/"):
+            return head.split("ref: refs/heads/", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _restore_autotrade_state_once() -> None:
+    """On a fresh container (no local config file yet), restore durable AutoTrade state from the Google Sheet once."""
+    if _PERSIST.get("autotrade_state_restore_done"):
+        return
+    _PERSIST["autotrade_state_restore_done"] = True
+    dep_id = _get_deployment_id()
+    if not dep_id or os.path.exists(AUTOTRADE_CONFIG_FILE):
+        return
+    try:
+        import sheets_logger as _sl
+        saved = _sl.load_autotrade_state_from_sheet(dep_id)
+        if isinstance(saved, dict) and saved:
+            restored = {k: saved[k] for k in _DURABLE_AUTOTRADE_KEYS if k in saved}
+            if restored:
+                os.makedirs(os.path.dirname(AUTOTRADE_CONFIG_FILE), exist_ok=True)
+                with open(AUTOTRADE_CONFIG_FILE, "w", encoding="utf-8") as fh:
+                    json.dump(restored, fh, indent=2)
+                print(f"[AutoTrade State] Restored from Google Sheet for '{dep_id}': {restored}")
+    except Exception as e:
+        print(f"[AutoTrade State Restore Notice]: {e}")
+
+
+def _persist_autotrade_state_bg(cfg: dict) -> None:
+    """Writes durable AutoTrade keys for this deployment to the Google Sheet in a background thread."""
+    dep_id = _get_deployment_id()
+    if not dep_id:
+        return
+    state = {k: cfg.get(k) for k in _DURABLE_AUTOTRADE_KEYS if k in cfg}
+
+    def _worker():
+        try:
+            import sheets_logger as _sl
+            _sl.save_autotrade_state_to_sheet(dep_id, state)
+        except Exception:
+            pass
+
+    _threading.Thread(target=_worker, daemon=True, name="AutoTradeStatePersist").start()
+
+
 def get_autotrade_config() -> dict:
     """
     Loads persistent AutoTrade & Single-Trade Margin settings shared between the Streamlit UI
     and the 24/7 background monitor daemon in 0ms (never makes network or recursive balance calls).
     Immediately terminates any obsolete pre-v3 background daemon threads from earlier @st.cache_resource runs.
+    On a fresh Streamlit Cloud container, durable keys (AutoTrade ON/OFF etc.) are restored once from the Google Sheet.
     """
     _check_and_kill_obsolete_daemon()
+    _restore_autotrade_state_once()
 
     default_cfg = {
         "enabled": False,
@@ -3204,7 +3270,10 @@ def get_autotrade_config() -> dict:
 def save_autotrade_config(updates: dict) -> dict:
     """Saves updated AutoTrade settings to .cache/autotrade_config.json without triggering any API calls."""
     cfg = get_autotrade_config()
+    durable_changed = any(k in updates and updates.get(k) != cfg.get(k) for k in _DURABLE_AUTOTRADE_KEYS)
     cfg.update(updates)
+    if durable_changed:
+        _persist_autotrade_state_bg(cfg)
     cfg["updated_at"] = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
     try:
         os.makedirs(os.path.dirname(AUTOTRADE_CONFIG_FILE), exist_ok=True)
@@ -4017,6 +4086,66 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
     return {"is_occupied": False, "has_active_trade": False, "active_pair": None, "active_pairs": [], "count": 0, "max_slots": MAX_CONCURRENT_TRADES, "source": f"Slots Free (0/{MAX_CONCURRENT_TRADES} Active)"}
 
 
+def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, dict]:
+    """
+    Live 5% Daily Loss Stop (IST day):
+      - Day-start baseline = first verified live futures wallet balance seen after 00:00 IST (persisted).
+      - Wallet balance = realized balance incl. locked margin (excludes unrealized PnL), so it already includes fees.
+      - If (baseline - current) >= DAILY_WALLET_LOSS_STOP_PCT% of baseline -> block new trades until next IST day.
+    Fails open (does not block) only when the live wallet cannot be verified (orders would fail anyway).
+    """
+    import strategies as _strategies
+    pct = float(getattr(_strategies, "DAILY_WALLET_LOSS_STOP_PCT", 5.0) or 5.0)
+    today = datetime.now(IST).strftime("%Y-%m-%d")
+    w = wallet if isinstance(wallet, dict) else fetch_coindcx_futures_balance()
+    if not (isinstance(w, dict) and w.get("is_live_api")):
+        return False, "Daily loss stop: live wallet not verified (not enforced this tick)", {}
+    cur = float(w.get("total_inr", 0.0) or 0.0)
+    if cur <= 0:
+        return False, "Daily loss stop: wallet balance unavailable", {}
+    cfg = get_autotrade_config()
+    ds = cfg.get("daily_start_wallet")
+    if not (isinstance(ds, dict) and ds.get("date") == today and float(ds.get("inr", 0) or 0) > 0):
+        ds = {"date": today, "inr": round(cur, 2)}
+        save_autotrade_config({"daily_start_wallet": ds})
+    start = float(ds["inr"])
+    loss = start - cur
+    limit = start * pct / 100.0
+    info = {"date": today, "day_start_inr": start, "current_inr": cur, "loss_inr": round(loss, 2), "limit_inr": round(limit, 2)}
+    if loss >= limit:
+        if cfg.get("daily_loss_stop_hit") != today:
+            save_autotrade_config({"daily_loss_stop_hit": today})
+        return True, (
+            f"5% Daily Loss Stop: wallet down ₹{loss:,.2f} today (start ₹{start:,.2f} -> now ₹{cur:,.2f}, "
+            f"limit ₹{limit:,.2f}). No new trades until 00:00 IST."
+        ), info
+    return False, f"Daily loss ₹{max(loss, 0):,.2f} / limit ₹{limit:,.2f}", info
+
+
+def compute_wallet_capped_margin(margin_inr: float, leverage: int, wallet: dict | None = None,
+                                 max_slots: int | None = None) -> tuple[float, str]:
+    """
+    Caps the per-trade margin to what the live futures wallet can actually fund:
+      effective = min(Single-Trade Margin setting, wallet total / slots, free balance * 0.98).
+    Returns (effective_margin_inr, note). Unverified wallet -> returns the setting unchanged.
+    """
+    w = wallet if isinstance(wallet, dict) else fetch_coindcx_futures_balance()
+    slots = max(1, int(max_slots or MAX_CONCURRENT_TRADES))
+    if not (isinstance(w, dict) and w.get("is_live_api")):
+        return float(margin_inr), ""
+    total = float(w.get("total_inr", 0.0) or 0.0)
+    avail = float(w.get("available_inr", total) or 0.0)
+    per_slot = total / slots if total > 0 else float(margin_inr)
+    eff = max(0.0, min(float(margin_inr), per_slot, avail * 0.98))
+    note = ""
+    if eff + 0.01 < float(margin_inr):
+        note = (
+            f"Margin capped to ₹{eff:,.2f} (setting ₹{float(margin_inr):,.2f}; wallet ₹{total:,.2f} / {slots} slots = "
+            f"₹{per_slot:,.2f}; free ₹{avail:,.2f})"
+        )
+    return round(eff, 2), note
+
+
 def execute_autotrade_two_entry_signal(
     pair: str,
     sig: dict,
@@ -4039,6 +4168,19 @@ def execute_autotrade_two_entry_signal(
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
 
     max_slots = int(cfg.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)
+
+    # Live 5% Daily Loss Stop + wallet-aware sizing (never request more margin than the futures wallet holds)
+    _wallet_now = fetch_coindcx_futures_balance()
+    _stop_hit, _stop_msg, _stop_info = check_live_daily_loss_stop(_wallet_now)
+    if _stop_hit:
+        return False, _stop_msg, {"daily_loss_stop": _stop_info}
+    margin_inr, _cap_note = compute_wallet_capped_margin(margin_inr, lev, _wallet_now, max_slots)
+    if (margin_inr * lev) < 2448.0:
+        return False, (
+            f"Insufficient Futures Wallet: usable margin ₹{margin_inr:,.2f} x {lev}x = ₹{margin_inr * lev:,.2f} notional "
+            f"is below CoinDCX's ₹2,448 minimum. {_cap_note}"
+        ), {"wallet": _wallet_now}
+
     slot = get_active_portfolio_trade_status()
     if slot.get("is_occupied"):
         act_p = slot.get("active_pair")
@@ -4202,6 +4344,7 @@ def execute_autotrade_two_entry_signal(
                 )
             return True, (
                 f"Live 2-Entry + Runner Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | {sync_msg}"
+                + (f" | {_cap_note}" if _cap_note else "")
             ), {
                 "entry1_order": extra1,
                 "sync_details": sync_details,

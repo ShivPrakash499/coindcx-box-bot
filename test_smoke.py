@@ -315,7 +315,45 @@ def test_5_daily_bias_enforcement():
 
     assert lv_low["trend_bias"] == lv_high["trend_bias"] == "BULLISH"
     assert lv_low["daily_close"] == lv_high["daily_close"] == 7.20
+    # Wallet-aware sizing: Rs.5,500 wallet with a Rs.20,000 margin setting -> capped to wallet/3 slots
+    w55 = {"is_live_api": True, "total_inr": 5500.0, "available_inr": 5500.0}
+    eff_m, eff_note = eng.compute_wallet_capped_margin(20000.0, 10, w55, 3)
+    assert abs(eff_m - 1833.33) < 0.02 and "capped" in eff_note, (eff_m, eff_note)
+    assert eff_m * 10 * 0.5 >= 2448.0, "Each 50% tranche must still clear CoinDCX Rs.2,448 minimum notional"
+    tiny_m, _ = eng.compute_wallet_capped_margin(20000.0, 10, {"is_live_api": True, "total_inr": 600.0, "available_inr": 600.0}, 3)
+    assert tiny_m * 10 < 2448.0
+    unv_m, unv_note = eng.compute_wallet_capped_margin(20000.0, 10, {"is_live_api": False, "total_inr": 5500.0}, 3)
+    assert unv_m == 20000.0 and unv_note == ""
+
+    # Live 5% daily loss stop: day-start Rs.5,500 -> Rs.5,200 (-Rs.300 >= Rs.275 limit) blocks; Rs.5,300 does not
+    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    cfg_ds = {"enabled": True, "daily_start_wallet": {"date": today_s, "inr": 5500.0}}
+    with patch.object(eng, "get_autotrade_config", return_value=dict(cfg_ds)), \
+         patch.object(eng, "save_autotrade_config", return_value={}):
+        hit, hit_msg, _ = eng.check_live_daily_loss_stop({"is_live_api": True, "total_inr": 5200.0})
+        assert hit and "5% Daily Loss Stop" in hit_msg, hit_msg
+        ok_hit, _, _ = eng.check_live_daily_loss_stop({"is_live_api": True, "total_inr": 5300.0})
+        assert not ok_hit
+        with patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 5200.0, "available_inr": 5200.0}):
+            ok_x, msg_x, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-INJ_USDT",
+                sig={"signal": "SHORT", "entry": 7.30, "entry2_sweep": 7.43, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.49, "levels": neutral_levels},
+                single_trade_margin_inr=20000.0, leverage=10,
+            )
+            assert not ok_x and "5% Daily Loss Stop" in msg_x, msg_x
+    # New IST day -> baseline resets to current wallet, no block
+    with patch.object(eng, "get_autotrade_config", return_value={"daily_start_wallet": {"date": "2000-01-01", "inr": 9999.0}}), \
+         patch.object(eng, "save_autotrade_config", return_value={}) as m_save:
+        hit2, _, info2 = eng.check_live_daily_loss_stop({"is_live_api": True, "total_inr": 5200.0})
+        assert not hit2 and info2["day_start_inr"] == 5200.0 and m_save.called
+
+    # signal_monitor constant must exist (was an undefined-name crash) & local runs never touch the shared sheet state
+    import signal_monitor as _sm
+    assert _sm.MAX_CONCURRENT_PORTFOLIO_TRADES == eng.MAX_CONCURRENT_TRADES == 3
+    if not os.getenv("APP_DEPLOYMENT_ID"):
+        assert eng._get_deployment_id() == ""
     print("  -> PASS: Completed-Candle Daily Bias lock + NEUTRAL/counter-trend blocks verified.")
+    print("  -> PASS: Wallet-capped margin (Rs.5,500 -> Rs.1,833/trade), live 5% daily loss stop & slot constant verified.")
 
 
 def test_6_deployment_regression_guards():
