@@ -4,10 +4,10 @@
 
 ---
 
-## 0. NEVER Push Any Change Directly to main (Always staging First)
+## 0. DO NOT EVER PUSH TO main BEFORE USER CONFIRMS ON staging
 - **Mandatory Rule**:
-  - For ANY bug fix, feature, or issue reported by the user, **ALWAYS commit and push ONLY to staging** (git push origin staging).
-  - **NEVER** push or merge to main unless the user has verified staging and explicitly instructs to merge staging into main.
+  - For ANY bug fix, feature, or follow-up request from the user, **ALWAYS commit and push ONLY to staging** (git push origin staging).
+  - **DO NOT EVER** push or merge to main before the user has tested on staging and explicitly instructed to push/merge that specific change to main (even if an earlier change in the same session was pushed to main).
 
 ---
 
