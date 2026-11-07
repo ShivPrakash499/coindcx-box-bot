@@ -597,11 +597,34 @@ if not wallet_data.get("is_live_api"):
         _auto_cfg = coindcx_engine.save_autotrade_config({"wallet_balance_inr": round(_manual_wallet_inr, 2)})
         get_cached_balance.clear()
 
+_one_third_wallet = round(float(wallet_data["total_inr"]) * coindcx_engine.TRADE_ALLOCATION_FRACTION, 2)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
-if _saved_margin <= 0 or _saved_margin in (30000.0, 250000.0):
-    default_margin = float(wallet_data["total_inr"])
+if (
+    _saved_margin <= 0
+    or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0)
+    or not _auto_cfg.get("user_custom_margin")
+):
+    default_margin = _one_third_wallet
 else:
     default_margin = _saved_margin
+
+# Keep Streamlit widget state synced to 1/3 of live wallet whenever wallet updates and user hasn't set custom margin
+if not _auto_cfg.get("user_custom_margin"):
+    if st.session_state.get("_last_synced_one_third_margin") != _one_third_wallet:
+        st.session_state["_last_synced_one_third_margin"] = _one_third_wallet
+        st.session_state["sidebar_single_trade_margin_input"] = float(_one_third_wallet)
+
+
+def _on_sidebar_margin_change():
+    new_m = round(float(st.session_state.get("sidebar_single_trade_margin_input", _one_third_wallet)), 2)
+    is_cust = abs(new_m - _one_third_wallet) > 1.0
+    coindcx_engine.save_autotrade_config({
+        "single_trade_margin_inr": new_m,
+        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+        "user_custom_margin": is_cust,
+    })
+    get_cached_signals_scan.clear()
+
 
 margin_inr = st.sidebar.number_input(
     "Single-Trade Margin (INR)",
@@ -610,11 +633,19 @@ margin_inr = st.sidebar.number_input(
     value=float(default_margin),
     step=500.0,
     format="%.2f",
-    help="50% used on Entry 1 and 50% reserved for Entry 2 @ Sweep."
+    key="sidebar_single_trade_margin_input",
+    on_change=_on_sidebar_margin_change,
+    help="Automatically set to 1/3rd of Futures Wallet (3-Slot Mode: 50% Entry 1 + 50% Entry 2 @ Sweep)."
 )
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
 st.sidebar.caption(f"Split: **₹{margin_inr*0.5:,.2f}** Entry 1 + **₹{margin_inr*0.5:,.2f}** Entry 2 @ {leverage}x")
+try:
+    _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(float(margin_inr), int(leverage), wallet_data)
+    if _eff_note:
+        st.sidebar.warning(f"⚠️ AutoTrade will use **₹{_eff_margin:,.2f}** per trade. {_eff_note}")
+except Exception:
+    pass
 
 live_crypto_rate = get_coindcx_live_usdt_inr_rate()
 usd_inr = float(live_crypto_rate)
@@ -1711,27 +1742,60 @@ elif active_section == "🎯 Execute":
             tp2_key = f"custom_tp2_{selected_pair}_{setup_tag}"
             choice_tracker_key = f"last_setup_tag_{selected_pair}"
             levels_tracker_key = f"last_formula_entry_{selected_pair}_{setup_tag}"
+            tp1_tracker_key = f"last_formula_tp1_{selected_pair}_{setup_tag}"
+            custom_e1_tracker_key = f"last_custom_entry_{selected_pair}_{setup_tag}"
 
+            _strat_has_e2 = (active_strategy.id == "box_theory")
+            _raw_e2_default = float(active_trade.get("entry2_sweep") or (levels["SL"] if (levels and trade_dir == "BUY") else (levels["SH"] if levels else active_trade["entry"]))) if _strat_has_e2 else 0.0
             _init_norm = coindcx_engine.normalize_two_entry_runner_levels(
                 pair=selected_pair,
                 direction=trade_dir,
                 entry1_px=float(active_trade["entry"]),
-                entry2_px=float(active_trade.get("entry2_sweep") or (levels["SL"] if (levels and trade_dir == "BUY") else (levels["SH"] if levels else active_trade["entry"]))),
-                tp1_px=float(active_trade["tp1"]),
+                entry2_px=_raw_e2_default,
+                tp1_px=None if _strat_has_e2 else float(active_trade["tp1"]),
                 tp2_px=float(active_trade["tp2"]),
                 sl_px=float(active_trade["stop_loss"]),
-                live_px=float(cur_price) if float(cur_price) > 0 else float(active_trade["entry"]),
-                levels=levels,
+                live_px=float(active_trade["entry"]),
+                levels=levels if _strat_has_e2 else None,
             )
+            if not _strat_has_e2:
+                _init_norm["entry2_sweep"] = 0.0
 
-            if st.session_state.get(choice_tracker_key) != setup_tag or st.session_state.get(levels_tracker_key) != float(active_trade["entry"]):
+            if (
+                st.session_state.get(choice_tracker_key) != setup_tag
+                or st.session_state.get(levels_tracker_key) != float(active_trade["entry"])
+                or st.session_state.get(tp1_tracker_key) != float(_init_norm["tp1"])
+            ):
                 st.session_state[choice_tracker_key] = setup_tag
                 st.session_state[levels_tracker_key] = float(active_trade["entry"])
+                st.session_state[tp1_tracker_key] = float(_init_norm["tp1"])
+                st.session_state[custom_e1_tracker_key] = float(_init_norm["entry"])
                 st.session_state[entry_key] = float(_init_norm["entry"])
                 st.session_state[e2_key] = float(_init_norm["entry2_sweep"])
                 st.session_state[sl_key] = float(_init_norm["stop_loss"])
                 st.session_state[tp1_key] = float(_init_norm["tp1"])
                 st.session_state[tp2_key] = float(_init_norm["tp2"])
+
+            # If the user changed Limit Entry 1 (`entry_key`), automatically recalculate TP1 (Midpoint(Entry1, TP2) vs 15m 50 EMA), Entry 2, and SL
+            _pending_e1 = float(st.session_state.get(entry_key, _init_norm["entry"]))
+            _formula_norm_for_e1 = coindcx_engine.normalize_two_entry_runner_levels(
+                pair=selected_pair,
+                direction=trade_dir,
+                entry1_px=_pending_e1,
+                entry2_px=_raw_e2_default,
+                tp1_px=None if _strat_has_e2 else float(active_trade["tp1"]),
+                tp2_px=float(st.session_state.get(tp2_key, _init_norm["tp2"])),
+                sl_px=float(st.session_state.get(sl_key, _init_norm["stop_loss"])),
+                live_px=_pending_e1,
+                levels=levels if _strat_has_e2 else None,
+            )
+            if abs(_pending_e1 - float(st.session_state.get(custom_e1_tracker_key, _init_norm["entry"]))) > 1e-6:
+                st.session_state[custom_e1_tracker_key] = _pending_e1
+                st.session_state[tp1_key] = float(_formula_norm_for_e1["tp1"])
+                st.session_state[tp2_key] = float(_formula_norm_for_e1["tp2"])
+                if _strat_has_e2:
+                    st.session_state[e2_key] = float(_formula_norm_for_e1["entry2_sweep"])
+                    st.session_state[sl_key] = float(_formula_norm_for_e1["stop_loss"])
 
             p_ref = float(active_trade["entry"])
             step_val = 0.5 if p_ref > 1.0 else (0.0001 if p_ref > 0.001 else 0.000001)
@@ -1739,26 +1803,29 @@ elif active_section == "🎯 Execute":
 
             adj_col1, adj_col2 = st.columns(2)
             with adj_col1:
-                custom_entry = st.number_input("Entry 1 (50%) ($)", value=float(st.session_state.get(entry_key, _init_norm["entry"])), step=step_val, format=fmt_str, key=entry_key)
-                custom_e2 = st.number_input("Entry 2 @ Sweep (50%) ($)", value=float(st.session_state.get(e2_key, _init_norm["entry2_sweep"])), step=step_val, format=fmt_str, key=e2_key)
+                _e1_label = "Entry 1 (50%) ($)" if _strat_has_e2 else "Entry 1 (100% Single Entry) ($)"
+                custom_entry = st.number_input(_e1_label, value=float(st.session_state.get(entry_key, _init_norm["entry"])), step=step_val, format=fmt_str, key=entry_key)
+                custom_e2 = st.number_input("Entry 2 @ Sweep (50%) ($)", value=float(st.session_state.get(e2_key, _init_norm["entry2_sweep"])), step=step_val, format=fmt_str, key=e2_key, disabled=not _strat_has_e2)
                 custom_sl = st.number_input("Catastrophe SL ($)", value=float(st.session_state.get(sl_key, _init_norm["stop_loss"])), step=step_val, format=fmt_str, key=sl_key)
             with adj_col2:
-                custom_tp1 = st.number_input("TP1 (50% Book -> BE) ($)", value=float(st.session_state.get(tp1_key, _init_norm["tp1"])), step=step_val, format=fmt_str, key=tp1_key)
-                custom_tp2 = st.number_input("TP2 (50% Runner) ($)", value=float(st.session_state.get(tp2_key, _init_norm["tp2"])), step=step_val, format=fmt_str, key=tp2_key)
+                _tp1_label = "TP1 (SL -> Ratchet, 100% Runner) ($)" if active_strategy.id == "ema9_retest" else "TP1 (50% Book -> SL Ratchet) ($)"
+                _tp2_label = "TP2 (100% Full Runner) ($)" if active_strategy.id == "ema9_retest" else "TP2 (50% Runner) ($)"
+                custom_tp1 = st.number_input(_tp1_label, value=float(st.session_state.get(tp1_key, _init_norm["tp1"])), step=step_val, format=fmt_str, key=tp1_key)
+                custom_tp2 = st.number_input(_tp2_label, value=float(st.session_state.get(tp2_key, _init_norm["tp2"])), step=step_val, format=fmt_str, key=tp2_key)
 
             # Ensure Entry 2, SL, TP1, TP2 are strictly on the valid side of Entry 1 for CoinDCX
             _live_norm = coindcx_engine.normalize_two_entry_runner_levels(
                 pair=selected_pair,
                 direction=trade_dir,
                 entry1_px=custom_entry,
-                entry2_px=custom_e2,
+                entry2_px=custom_e2 if _strat_has_e2 else 0.0,
                 tp1_px=custom_tp1,
                 tp2_px=custom_tp2,
                 sl_px=custom_sl,
                 live_px=custom_entry,
-                levels=levels,
+                levels=levels if _strat_has_e2 else None,
             )
-            custom_e2 = _live_norm["entry2_sweep"]
+            custom_e2 = _live_norm["entry2_sweep"] if _strat_has_e2 else 0.0
             custom_sl = _live_norm["stop_loss"]
             custom_tp1 = _live_norm["tp1"]
             custom_tp2 = _live_norm["tp2"]
@@ -1794,17 +1861,55 @@ elif active_section == "🎯 Execute":
 
     with exec_right:
         if active_trade:
-            st.markdown("#### 🎫 2-Entry + 50/50 Runner Ticket")
-            _e2_lvl = float(active_trade.get("entry2_sweep") or custom_e2)
-            _avg_2x = (active_trade["entry"] + float(_e2_lvl)) / 2.0
-            _tranche_m = trade_margin_inr * 0.5
-            _tranche_q = format_order_quantity(selected_pair, active_trade["crypto_qty"] * 0.5)
-            _tp1_half_q = format_order_quantity(selected_pair, _tranche_q * 0.5)
-            _e2_q = format_order_quantity(selected_pair, ((trade_margin_inr * 0.5 * trade_leverage) / trade_usd_inr) / _e2_lvl) if _e2_lvl > 0 else 0.0
-            _blended_profit = 0.5 * active_trade["profit_tp1_inr"] + 0.5 * active_trade["profit_tp2_inr"]
-            _blended_roe = round(0.5 * active_trade["roe_tp1"] + 0.5 * active_trade["roe_tp2"], 2)
+            st.markdown("#### 🎫 Smart Hybrid Execution Ticket")
+            _e2_lvl = float(active_trade.get("entry2_sweep") or custom_e2) if (active_strategy.id == "box_theory") else 0.0
+            _has_e2 = (active_strategy.id == "box_theory") and (_e2_lvl > 0.0)
+            _is_full_runner = (active_strategy.id == "ema9_retest")
+            _cur_fill_mode = str(st.session_state.get(f"e1_fill_mode_{selected_pair}", "⚡ Market (Instant)"))
+            _user_custom_e1 = abs(float(active_trade["entry"]) - float(_init_norm["entry"])) > 1e-6
+            _user_custom_tp1 = abs(float(active_trade["tp1"]) - float(_formula_norm_for_e1["tp1"])) > 1e-6
+            _disp_trade = dict(active_trade)
+            if "Market" in _cur_fill_mode and float(cur_price) > 0 and not _user_custom_e1:
+                _mkt_norm = coindcx_engine.normalize_two_entry_runner_levels(
+                    pair=selected_pair,
+                    direction=trade_dir,
+                    entry1_px=float(cur_price),
+                    entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
+                    tp1_px=float(active_trade["tp1"]) if _user_custom_tp1 else None,
+                    tp2_px=float(active_trade["tp2"]),
+                    sl_px=float(active_trade["stop_loss"]),
+                    live_px=float(cur_price),
+                    levels=levels if _has_e2 else None,
+                )
+                _m_e1 = float(_mkt_norm["entry"])
+                _m_tp1 = float(_mkt_norm["tp1"])
+                _m_tp2 = float(_mkt_norm["tp2"])
+                _m_sl = float(_mkt_norm["stop_loss"])
+                _m_qty = format_order_quantity(selected_pair, ((trade_margin_inr * trade_leverage) / trade_usd_inr) / _m_e1) if _m_e1 > 0 else active_trade["crypto_qty"]
+                _disp_trade.update({
+                    "entry": _m_e1,
+                    "tp1": _m_tp1,
+                    "tp2": _m_tp2,
+                    "stop_loss": _m_sl,
+                    "crypto_qty": _m_qty,
+                    "roe_tp1": round((abs(_m_tp1 - _m_e1) / _m_e1) * trade_leverage * 100, 2) if _m_e1 > 0 else 0,
+                    "roe_tp2": round((abs(_m_tp2 - _m_e1) / _m_e1) * trade_leverage * 100, 2) if _m_e1 > 0 else 0,
+                    "roe_sl": round((abs(_m_e1 - _m_sl) / _m_e1) * trade_leverage * 100, 2) if _m_e1 > 0 else 0,
+                    "profit_tp1_inr": round(abs(_m_tp1 - _m_e1) * _m_qty * trade_usd_inr, 2),
+                    "profit_tp2_inr": round(abs(_m_tp2 - _m_e1) * _m_qty * trade_usd_inr, 2),
+                })
+
+            _avg_2x = (_disp_trade["entry"] + float(_e2_lvl)) / 2.0 if _has_e2 else _disp_trade["entry"]
+            _tranche_m = trade_margin_inr * (0.5 if _has_e2 else 1.0)
+            _tranche_q = format_order_quantity(selected_pair, _disp_trade["crypto_qty"] * (0.5 if _has_e2 else 1.0))
+            _tp1_half_q = 0.0 if _is_full_runner else format_order_quantity(selected_pair, _tranche_q * 0.5)
+            _e2_q = format_order_quantity(selected_pair, ((trade_margin_inr * 0.5 * trade_leverage) / trade_usd_inr) / _e2_lvl) if _has_e2 else 0.0
+            _blended_profit = _disp_trade["profit_tp2_inr"] if _is_full_runner else (0.5 * _disp_trade["profit_tp1_inr"] + 0.5 * _disp_trade["profit_tp2_inr"])
+            _blended_roe = round(_disp_trade["roe_tp2"], 2) if _is_full_runner else round(0.5 * _disp_trade["roe_tp1"] + 0.5 * _disp_trade["roe_tp2"], 2)
             _fee_inr = cost_details["total_cost_inr"] if cost_details else 0.0
-            _be_px = cost_details["breakeven_price"] if cost_details else active_trade["entry"]
+            _be_px = cost_details["breakeven_price"] if cost_details else _disp_trade["entry"]
+            _e2_display = f"{fmt_px(_e2_lvl)} ({_e2_q} {cur_asset} • Avg: {fmt_px(_avg_2x)})" if _has_e2 else "Disabled (100% Single Entry)"
+            _tp1_display = f"{fmt_px(_disp_trade['tp1'])} (SL Ratchet Only • 100% Runner)" if _is_full_runner else f"{fmt_px(_disp_trade['tp1'])} ({_tp1_half_q} {cur_asset} • +{_disp_trade['roe_tp1']}% ROE)"
 
             st.html(f"""
             <div class="pro-card" style="padding:14px;">
@@ -1813,20 +1918,20 @@ elif active_section == "🎯 Execute":
                     <span style="font-weight:700; color:{text_color}; font-size:0.95rem;">Live: {fmt_px(cur_price)}</span>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr auto; row-gap:6px; font-size:0.86rem; color:{text_color};">
-                    <span style="color:{subtext_color};">Entry 1 (50% Zone):</span>
-                    <span style="text-align:right; font-weight:700;">{fmt_px(active_trade['entry'])} (₹{_tranche_m:,.0f} / {_tranche_q} {cur_asset})</span>
+                    <span style="color:{subtext_color};">Entry 1 ({'50% Zone' if _has_e2 else '100% Single Entry'}):</span>
+                    <span style="text-align:right; font-weight:700;">{fmt_px(_disp_trade['entry'])} (₹{_tranche_m:,.0f} / {_tranche_q} {cur_asset})</span>
 
                     <span style="color:{subtext_color};">Entry 2 / Trade 2 (50% Sweep Limit):</span>
-                    <span style="text-align:right; color:#8b5cf6; font-weight:700;">{fmt_px(_e2_lvl)} ({_e2_q} {cur_asset} • Avg: {fmt_px(_avg_2x)})</span>
+                    <span style="text-align:right; color:#8b5cf6; font-weight:700;">{_e2_display}</span>
 
-                    <span style="color:{subtext_color};">TP1 (50% Limit Order -> SL to BE):</span>
-                    <span style="text-align:right; color:#38bdf8; font-weight:700;">{fmt_px(active_trade['tp1'])} ({_tp1_half_q} {cur_asset} • +{active_trade['roe_tp1']}% ROE)</span>
+                    <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else '50% Limit Order -> SL Ratchet'}):</span>
+                    <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
 
-                    <span style="color:{subtext_color};">TP2 (50% Position TP Runner):</span>
-                    <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(active_trade['tp2'])} (+{active_trade['roe_tp2']}% ROE)</span>
+                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else '50% Position TP Runner'}):</span>
+                    <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(_disp_trade['tp2'])} (+{_disp_trade['roe_tp2']}% ROE)</span>
 
                     <span style="color:{subtext_color};">Catastrophe Stop Loss (Position SL):</span>
-                    <span style="text-align:right; color:#ef4444; font-weight:700;">{fmt_px(active_trade['stop_loss'])} (-{active_trade['roe_sl']}%)</span>
+                    <span style="text-align:right; color:#ef4444; font-weight:700;">{fmt_px(_disp_trade['stop_loss'])} (-{_disp_trade['roe_sl']}%)</span>
 
                     <span style="color:{subtext_color};">Est. Fee (incl. GST) / Breakeven:</span>
                     <span style="text-align:right; color:{subtext_color}; font-weight:600;">₹{_fee_inr:,.0f} • BE {fmt_px(_be_px)}</span>
@@ -1871,22 +1976,23 @@ elif active_section == "🎯 Execute":
 
             if matching_active_pos:
                 if st.button(
-                    f"🛡️ Sync TP1 ({fmt_px(active_trade['tp1'])}) + TP2 ({fmt_px(active_trade['tp2'])}) + SL ({fmt_px(active_trade['stop_loss'])}) + Entry 2 ({fmt_px(_e2_lvl)}) to Open {cur_asset} Position",
+                    f"🛡️ Sync TP1 ({fmt_px(active_trade['tp1'])}) + TP2 ({fmt_px(active_trade['tp2'])}) + SL ({fmt_px(active_trade['stop_loss'])}) to Open {cur_asset} Position",
                     key=f"btn_sync_existing_{selected_pair}",
                     use_container_width=True,
                 ):
-                    with st.spinner(f"Attaching TP1, TP2, SL & Entry 2 to open {cur_asset} position on CoinDCX..."):
+                    with st.spinner(f"Attaching Smart Hybrid TP1, TP2, SL & Entry 2 to open {cur_asset} position on CoinDCX..."):
                         s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                             pair=selected_pair,
                             direction=matching_active_pos["direction"],
                             entry1_px=float(matching_active_pos["entry_price"]),
-                            entry2_px=float(_e2_lvl),
+                            entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
                             tp1_px=float(active_trade["tp1"]),
                             tp2_px=float(active_trade["tp2"]),
                             sl_px=float(active_trade["stop_loss"]),
                             total_margin_inr=trade_margin_inr,
                             leverage=trade_leverage,
                             usd_inr=trade_usd_inr,
+                            strategy_id=active_strategy.id,
                         )
                         get_cached_positions.clear()
                         get_cached_open_orders.clear()
@@ -1921,38 +2027,41 @@ elif active_section == "🎯 Execute":
                     else:
                         _use_market_e1 = "Market" in e1_fill_mode
                         _ref_e1_px = shield_live_px if (_use_market_e1 and shield_live_px > 0) else float(active_trade["entry"])
+                        _user_edited_tp1 = abs(float(active_trade["tp1"]) - float(_formula_norm_for_e1["tp1"])) > 1e-6
                         _exec_norm = coindcx_engine.normalize_two_entry_runner_levels(
                             pair=selected_pair,
                             direction=trade_dir,
                             entry1_px=_ref_e1_px,
-                            entry2_px=float(_e2_lvl),
-                            tp1_px=float(active_trade["tp1"]),
+                            entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
+                            tp1_px=None if (not _user_edited_tp1 and active_strategy.id == "box_theory") else float(active_trade["tp1"]),
                             tp2_px=float(active_trade["tp2"]),
                             sl_px=float(active_trade["stop_loss"]),
-                            live_px=shield_live_px if shield_live_px > 0 else _ref_e1_px,
-                            levels=levels,
+                            live_px=(shield_live_px if (_use_market_e1 and shield_live_px > 0) else _ref_e1_px),
+                            levels=levels if _has_e2 else None,
                         )
                         _maker_px = _exec_norm["entry"]
-                        _e2_px = _exec_norm["entry2_sweep"]
+                        _e2_px = _exec_norm["entry2_sweep"] if _has_e2 else 0.0
                         _tp1_px = _exec_norm["tp1"]
                         _tp2_px = _exec_norm["tp2"]
                         _sl_px = _exec_norm["stop_loss"]
 
-                        _e1_qty = _tranche_q if (_tranche_q * _maker_px * trade_usd_inr) >= 2448.0 else active_trade["crypto_qty"]
-                        _e2_qty = format_order_quantity(selected_pair, (trade_margin_inr * 0.5 * trade_leverage / trade_usd_inr) / _e2_px) if _e2_px > 0 else 0.0
+                        _e1_qty = (_tranche_q if (_tranche_q * _maker_px * trade_usd_inr) >= 2448.0 else active_trade["crypto_qty"]) if _has_e2 else active_trade["crypto_qty"]
+                        _e2_qty = format_order_quantity(selected_pair, (trade_margin_inr * 0.5 * trade_leverage / trade_usd_inr) / _e2_px) if (_has_e2 and _e2_px > 0) else 0.0
                         _e2_order_id = ""
-                        _tp1_order_id = "DAEMON_50PCT_REDUCE_AT_TP1"
-                        with st.spinner("Submitting Entry 1 + Position TP2/SL + TP1 Limit + Entry 2 Sweep Limit to CoinDCX..."):
+                        _tp1_order_id = "FULL_RUNNER_SL_RATCHET_AT_TP1" if _is_full_runner else "DAEMON_50PCT_REDUCE_AT_TP1"
+                        _synced_live_lock = False
+                        with st.spinner("Submitting Smart Hybrid order + Position TP2/SL + TP1 Limit + Entry 2 to CoinDCX..."):
                             ok, api_msg, api_extra = place_coindcx_futures_order(
                                 pair=selected_pair, side=trade_dir, quantity=_e1_qty,
                                 leverage=trade_leverage,
                                 order_type="market_order" if _use_market_e1 else "limit_order",
                                 price=None if _use_market_e1 else _maker_px,
                                 post_only=False, margin_currency="INR",
-                                tp_price=_tp2_px, sl_price=_sl_px
+                                tp_price=None if _use_market_e1 else _tp2_px,
+                                sl_price=None if _use_market_e1 else _sl_px
                             )
                             if ok:
-                                # Synchronize Position TP2/SL + TP1 50% Limit Order + Entry 2 Sweep Limit Order
+                                # Synchronize Position TP2/SL + TP1 Limit Order + Entry 2 Sweep Limit Order
                                 s_ok, s_msg, s_det = coindcx_engine.sync_full_2entry_runner_to_position(
                                     pair=selected_pair,
                                     direction=trade_dir,
@@ -1964,13 +2073,15 @@ elif active_section == "🎯 Execute":
                                     total_margin_inr=trade_margin_inr,
                                     leverage=trade_leverage,
                                     usd_inr=trade_usd_inr,
+                                    strategy_id=active_strategy.id,
                                 )
                                 if s_ok:
+                                    _synced_live_lock = True
                                     api_msg = f"{api_msg} | {s_msg}"
                                     _lock_d = s_det.get("lock") or {}
                                     _e2_order_id = str(_lock_d.get("entry2_order_id", ""))
-                                    _tp1_order_id = str(_lock_d.get("tp1_order_id", "DAEMON_50PCT_REDUCE_AT_TP1"))
-                                elif _e2_qty > 0 and (_e2_qty * _e2_px * trade_usd_inr) >= 2448.0:
+                                    _tp1_order_id = str(_lock_d.get("tp1_order_id", _tp1_order_id))
+                                elif _has_e2 and _e2_qty > 0 and (_e2_qty * _e2_px * trade_usd_inr) >= 2448.0:
                                     # If Entry 1 was a resting limit order not yet filled into a position, still place Entry 2 Limit Order!
                                     ok2, msg2, extra2 = place_coindcx_futures_order(
                                         pair=selected_pair, side=trade_dir, quantity=_e2_qty,
@@ -1996,25 +2107,31 @@ elif active_section == "🎯 Execute":
                     is_live = "Live" in exec_mode
                     cur_market_px = float(get_cached_ticker(selected_pair).get("last_price", 0.0))
                     is_buy_dir = (trade_dir == "BUY")
-                    limit_entry_px = float(active_trade["entry"])
+                    limit_entry_px = _maker_px if is_live else float(active_trade["entry"])
+                    rec_sl = _sl_px if is_live else float(active_trade["stop_loss"])
+                    rec_tp1 = _tp1_px if is_live else float(active_trade["tp1"])
+                    rec_tp2 = _tp2_px if is_live else float(active_trade["tp2"])
+                    rec_e2 = _e2_px if is_live else (float(_e2_lvl) if _has_e2 else 0.0)
                     already_reached = (cur_market_px <= limit_entry_px) if is_buy_dir else (cur_market_px >= limit_entry_px) if cur_market_px > 0 else True
                     order_status = "LIVE_FILLED" if is_live else ("PAPER_FILLED" if already_reached else "PAPER_PENDING")
 
-                    coindcx_engine.register_app_trade_lock(
-                        pair=selected_pair, direction=trade_dir, entry=limit_entry_px,
-                        stop_loss=active_trade["stop_loss"], tp1=active_trade["tp1"], tp2=active_trade["tp2"],
-                        entry2_sweep=float(_e2_lvl),
-                        margin_inr=trade_margin_inr, leverage=trade_leverage, qty1=active_trade["crypto_qty"],
-                        mode="App/API Live Execution (2-Entry + Runner)" if is_live else "App/API Paper Execution",
-                        is_live_exchange=is_live,
-                        entry2_order_id=_e2_order_id if is_live else "",
-                        tp1_order_id=_tp1_order_id if is_live else "DAEMON_50PCT_REDUCE_AT_TP1",
-                    )
+                    if not (is_live and _synced_live_lock):
+                        coindcx_engine.register_app_trade_lock(
+                            pair=selected_pair, direction=trade_dir, entry=limit_entry_px,
+                            stop_loss=rec_sl, tp1=rec_tp1, tp2=rec_tp2,
+                            entry2_sweep=rec_e2,
+                            margin_inr=trade_margin_inr, leverage=trade_leverage, qty1=_e1_qty if is_live else active_trade["crypto_qty"],
+                            mode="App/API Live Execution (Smart Hybrid)" if is_live else "App/API Paper Execution",
+                            is_live_exchange=is_live,
+                            entry2_order_id=_e2_order_id if is_live else "",
+                            tp1_order_id=_tp1_order_id if is_live else ("FULL_RUNNER_SL_RATCHET_AT_TP1" if _is_full_runner else "DAEMON_50PCT_REDUCE_AT_TP1"),
+                            strategy_id=active_strategy.id,
+                        )
 
                     order_record = {
                         "timestamp": exec_time, "pair": selected_pair, "signal": trade_dir, "direction": trade_dir,
                         "setup": active_trade.get("setup", "Box Setup"), "entry": limit_entry_px,
-                        "stop_loss": active_trade["stop_loss"], "tp1": active_trade["tp1"], "tp2": active_trade["tp2"],
+                        "stop_loss": rec_sl, "tp1": rec_tp1, "tp2": rec_tp2,
                         "crypto_qty": active_trade["crypto_qty"], "margin_inr": trade_margin_inr,
                         "leverage": trade_leverage, "usd_inr": trade_usd_inr,
                         "profit_tp1_inr": active_trade["profit_tp1_inr"], "loss_sl_inr": active_trade["loss_sl_inr"],

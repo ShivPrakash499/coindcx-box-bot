@@ -24,6 +24,7 @@ COOLDOWN_MIN = 60          # per strategy + pair + direction, plus pair-level an
 SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zone in the same direction
 MAX_DAILY_ALERTS_PER_PAIR = 3
 MAX_DAILY_PORTFOLIO_TRADES = 999
+MAX_CONCURRENT_PORTFOLIO_TRADES = int(getattr(eng, "MAX_CONCURRENT_TRADES", 3) or 3)  # 3-slot wallet
 _STATE_SCHEMA_VERSION = 3
 _SCAN_LOCK = sys.__dict__.setdefault("_signal_monitor_scan_lock", threading.Lock())
 _LAST_SCAN_CACHE = sys.__dict__.setdefault("_signal_monitor_last_scan", {"ts": 0.0, "results": []})
@@ -188,6 +189,14 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         except Exception:
             pass
 
+        # Live 5% Daily Loss Stop: if hit, keep scanning/alerting but place no new AutoTrades today
+        daily_stop_hit, daily_stop_msg = False, ""
+        if autotrade:
+            try:
+                daily_stop_hit, daily_stop_msg, _ = eng.check_live_daily_loss_stop()
+            except Exception as e:
+                print(f"[Daily Loss Stop Check Notice]: {e}")
+
         for pair in pairs:
             if is_daemon_thread:
                 time.sleep(0.03)  # Yield GIL so Streamlit Tornado serves static JS assets immediately
@@ -326,7 +335,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 # If AutoTrade is toggled ON in Sidebar and no other coin is active, place the 2-Entry + Runner trade!
                 # Even if a SIGNAL email was already sent earlier while AutoTrade was OFF, execute immediately
                 # as long as this confirmed signal has not already been autotraded!
-                if (
+                if autotrade and daily_stop_hit:
+                    autotrade_error = daily_stop_msg
+                    msg = f"{msg} | 🛑 {daily_stop_msg}"
+                elif (
                     autotrade
                     and not portfolio_occupied
                     and not already_autotraded_candle

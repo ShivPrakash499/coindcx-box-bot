@@ -669,3 +669,47 @@ def load_live_account_sync_from_sheet(max_age_sec: float = 900.0, force: bool = 
     except Exception:
         _SHEET_SYNC_CACHE["ts"] = now_ts
         return None
+
+
+def save_autotrade_state_to_sheet(deployment_id: str, state: dict) -> bool:
+    """
+    Persists AutoTrade ON/OFF, single-trade margin, leverage and the daily-loss-stop baseline for one deployment
+    (e.g. 'main' or 'staging') into the '_AutoTrade_State' tab, so a Streamlit Cloud restart can restore it.
+    """
+    try:
+        if not deployment_id:
+            return False
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = _client().open(target_sheet)
+        ws = _get_ws(book, "_AutoTrade_State")
+        vals = ws.get_all_values()
+        ist_str = _dt.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        row = [deployment_id, json.dumps(state, separators=(",", ":")), ist_str]
+        if not vals:
+            ws.update("A1:C2", [["Deployment", "State_JSON", "Updated_IST"], row])
+            return True
+        for idx, r in enumerate(vals[1:], start=2):
+            if r and str(r[0]).strip() == deployment_id:
+                ws.update(f"A{idx}:C{idx}", [row])
+                return True
+        ws.update(f"A{len(vals) + 1}:C{len(vals) + 1}", [row])
+        return True
+    except Exception:
+        return False
+
+
+def load_autotrade_state_from_sheet(deployment_id: str) -> dict | None:
+    """Reads the persisted AutoTrade state for one deployment from the '_AutoTrade_State' tab (None if absent)."""
+    try:
+        if not deployment_id:
+            return None
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = _client().open(target_sheet)
+        ws = book.worksheet("_AutoTrade_State")
+        for r in ws.get_all_values()[1:]:
+            if r and str(r[0]).strip() == deployment_id and len(r) >= 2 and str(r[1]).strip():
+                data = json.loads(r[1])
+                return data if isinstance(data, dict) else None
+        return None
+    except Exception:
+        return None
