@@ -163,43 +163,52 @@ def _nearest_box_tp1(
     fallback_edge: float,
 ) -> tuple[float, str]:
     """
-    Strategy 1 Rule: Keep TP1 at Box Midpoint (`MID`) or `15m 50 EMA`, whichever is NEARER to `entry`
-    in the profitable direction (requiring at least the minimum valid 0.59% price distance when available).
+    Strategy 1 Rule: Keep TP1 at the Midpoint between `Entry 1` and `TP2` (`(entry + TP2) / 2`)
+    or `15m 50 EMA`, whichever is NEARER to `entry` in the profitable direction (requiring at least
+    the minimum valid distance so `15m 50 EMA` is never selected when sitting right next to a mid-box entry).
     """
     is_long = direction.upper() in ("LONG", "BUY")
     min_dist = entry * 0.0059
     if is_long:
-        raw_cands = []
-        if mid > entry:
-            raw_cands.append((mid - entry, mid, "MID"))
-        if ema50_15m > entry:
-            raw_cands.append((ema50_15m - entry, ema50_15m, "15m 50 EMA"))
-        valid_cands = [c for c in raw_cands if c[0] >= min_dist]
+        tp2_ref = fallback_edge if (fallback_edge > entry * 1.008) else (mid if mid > entry * 1.012 else entry * 1.024)
+        tp_mid = (entry + tp2_ref) / 2.0
+        mid_lbl = "MID" if (mid > 0 and abs(tp_mid - mid) / max(1e-9, entry) <= 0.002) else "Mid(Entry1,TP2)"
+        min_ema_dist = max(entry * 0.008, abs(tp_mid - entry) * 0.50)
+
+        valid_cands = []
+        if tp_mid > entry and (tp_mid - entry) >= min_dist:
+            valid_cands.append((tp_mid - entry, tp_mid, mid_lbl))
+        if ema50_15m > entry and (ema50_15m - entry) >= max(min_dist, min_ema_dist):
+            valid_cands.append((ema50_15m - entry, ema50_15m, "15m 50 EMA"))
+
         if valid_cands:
             _, best_px, best_lbl = min(valid_cands, key=lambda c: c[0])
             return best_px, best_lbl
+        if tp_mid > entry:
+            return tp_mid, mid_lbl
         if fallback_edge > entry and (fallback_edge - entry) >= min_dist:
-            return fallback_edge, "RH"
-        if raw_cands:
-            _, best_px, best_lbl = max(raw_cands, key=lambda c: c[0])
-            return best_px, best_lbl
-        return (fallback_edge if fallback_edge > entry else entry * 1.015), "RH"
+            return (entry + fallback_edge) / 2.0, mid_lbl
+        return entry * 1.012, mid_lbl
     else:
-        raw_cands = []
-        if 0 < mid < entry:
-            raw_cands.append((entry - mid, mid, "MID"))
-        if 0 < ema50_15m < entry:
-            raw_cands.append((entry - ema50_15m, ema50_15m, "15m 50 EMA"))
-        valid_cands = [c for c in raw_cands if c[0] >= min_dist]
+        tp2_ref = fallback_edge if (0 < fallback_edge < entry * 0.992) else (mid if 0 < mid < entry * 0.988 else entry * 0.976)
+        tp_mid = (entry + tp2_ref) / 2.0
+        mid_lbl = "MID" if (mid > 0 and abs(tp_mid - mid) / max(1e-9, entry) <= 0.002) else "Mid(Entry1,TP2)"
+        min_ema_dist = max(entry * 0.008, abs(entry - tp_mid) * 0.50)
+
+        valid_cands = []
+        if 0 < tp_mid < entry and (entry - tp_mid) >= min_dist:
+            valid_cands.append((entry - tp_mid, tp_mid, mid_lbl))
+        if 0 < ema50_15m < entry and (entry - ema50_15m) >= max(min_dist, min_ema_dist):
+            valid_cands.append((entry - ema50_15m, ema50_15m, "15m 50 EMA"))
+
         if valid_cands:
             _, best_px, best_lbl = min(valid_cands, key=lambda c: c[0])
             return best_px, best_lbl
+        if 0 < tp_mid < entry:
+            return tp_mid, mid_lbl
         if 0 < fallback_edge < entry and (entry - fallback_edge) >= min_dist:
-            return fallback_edge, "RL"
-        if raw_cands:
-            _, best_px, best_lbl = max(raw_cands, key=lambda c: c[0])
-            return best_px, best_lbl
-        return (fallback_edge if 0 < fallback_edge < entry else entry * 0.985), "RL"
+            return (entry + fallback_edge) / 2.0, mid_lbl
+        return entry * 0.988, mid_lbl
 
 
 def build_two_entry_runner_plan(

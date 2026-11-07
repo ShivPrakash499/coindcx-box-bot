@@ -1742,6 +1742,7 @@ elif active_section == "🎯 Execute":
             tp2_key = f"custom_tp2_{selected_pair}_{setup_tag}"
             choice_tracker_key = f"last_setup_tag_{selected_pair}"
             levels_tracker_key = f"last_formula_entry_{selected_pair}_{setup_tag}"
+            tp1_tracker_key = f"last_formula_tp1_{selected_pair}_{setup_tag}"
 
             _strat_has_e2 = (active_strategy.id == "box_theory")
             _raw_e2_default = float(active_trade.get("entry2_sweep") or (levels["SL"] if (levels and trade_dir == "BUY") else (levels["SH"] if levels else active_trade["entry"]))) if _strat_has_e2 else 0.0
@@ -1759,9 +1760,14 @@ elif active_section == "🎯 Execute":
             if not _strat_has_e2:
                 _init_norm["entry2_sweep"] = 0.0
 
-            if st.session_state.get(choice_tracker_key) != setup_tag or st.session_state.get(levels_tracker_key) != float(active_trade["entry"]):
+            if (
+                st.session_state.get(choice_tracker_key) != setup_tag
+                or st.session_state.get(levels_tracker_key) != float(active_trade["entry"])
+                or st.session_state.get(tp1_tracker_key) != float(_init_norm["tp1"])
+            ):
                 st.session_state[choice_tracker_key] = setup_tag
                 st.session_state[levels_tracker_key] = float(active_trade["entry"])
+                st.session_state[tp1_tracker_key] = float(_init_norm["tp1"])
                 st.session_state[entry_key] = float(_init_norm["entry"])
                 st.session_state[e2_key] = float(_init_norm["entry2_sweep"])
                 st.session_state[sl_key] = float(_init_norm["stop_loss"])
@@ -1836,17 +1842,51 @@ elif active_section == "🎯 Execute":
             _e2_lvl = float(active_trade.get("entry2_sweep") or custom_e2) if (active_strategy.id == "box_theory") else 0.0
             _has_e2 = (active_strategy.id == "box_theory") and (_e2_lvl > 0.0)
             _is_full_runner = (active_strategy.id == "ema9_retest")
-            _avg_2x = (active_trade["entry"] + float(_e2_lvl)) / 2.0 if _has_e2 else active_trade["entry"]
+            _cur_fill_mode = str(st.session_state.get(f"e1_fill_mode_{selected_pair}", "⚡ Market (Instant)"))
+            _user_custom_e1 = abs(float(active_trade["entry"]) - float(_init_norm["entry"])) > 1e-6
+            _user_custom_tp1 = abs(float(active_trade["tp1"]) - float(_init_norm["tp1"])) > 1e-6
+            _disp_trade = dict(active_trade)
+            if "Market" in _cur_fill_mode and float(cur_price) > 0 and not _user_custom_e1:
+                _mkt_norm = coindcx_engine.normalize_two_entry_runner_levels(
+                    pair=selected_pair,
+                    direction=trade_dir,
+                    entry1_px=float(cur_price),
+                    entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
+                    tp1_px=float(active_trade["tp1"]) if _user_custom_tp1 else None,
+                    tp2_px=float(active_trade["tp2"]),
+                    sl_px=float(active_trade["stop_loss"]),
+                    live_px=float(cur_price),
+                    levels=levels if _has_e2 else None,
+                )
+                _m_e1 = float(_mkt_norm["entry"])
+                _m_tp1 = float(_mkt_norm["tp1"])
+                _m_tp2 = float(_mkt_norm["tp2"])
+                _m_sl = float(_mkt_norm["stop_loss"])
+                _m_qty = format_order_quantity(selected_pair, ((trade_margin_inr * trade_leverage) / trade_usd_inr) / _m_e1) if _m_e1 > 0 else active_trade["crypto_qty"]
+                _disp_trade.update({
+                    "entry": _m_e1,
+                    "tp1": _m_tp1,
+                    "tp2": _m_tp2,
+                    "stop_loss": _m_sl,
+                    "crypto_qty": _m_qty,
+                    "roe_tp1": round((abs(_m_tp1 - _m_e1) / _m_e1) * trade_leverage * 100, 2) if _m_e1 > 0 else 0,
+                    "roe_tp2": round((abs(_m_tp2 - _m_e1) / _m_e1) * trade_leverage * 100, 2) if _m_e1 > 0 else 0,
+                    "roe_sl": round((abs(_m_e1 - _m_sl) / _m_e1) * trade_leverage * 100, 2) if _m_e1 > 0 else 0,
+                    "profit_tp1_inr": round(abs(_m_tp1 - _m_e1) * _m_qty * trade_usd_inr, 2),
+                    "profit_tp2_inr": round(abs(_m_tp2 - _m_e1) * _m_qty * trade_usd_inr, 2),
+                })
+
+            _avg_2x = (_disp_trade["entry"] + float(_e2_lvl)) / 2.0 if _has_e2 else _disp_trade["entry"]
             _tranche_m = trade_margin_inr * (0.5 if _has_e2 else 1.0)
-            _tranche_q = format_order_quantity(selected_pair, active_trade["crypto_qty"] * (0.5 if _has_e2 else 1.0))
+            _tranche_q = format_order_quantity(selected_pair, _disp_trade["crypto_qty"] * (0.5 if _has_e2 else 1.0))
             _tp1_half_q = 0.0 if _is_full_runner else format_order_quantity(selected_pair, _tranche_q * 0.5)
             _e2_q = format_order_quantity(selected_pair, ((trade_margin_inr * 0.5 * trade_leverage) / trade_usd_inr) / _e2_lvl) if _has_e2 else 0.0
-            _blended_profit = active_trade["profit_tp2_inr"] if _is_full_runner else (0.5 * active_trade["profit_tp1_inr"] + 0.5 * active_trade["profit_tp2_inr"])
-            _blended_roe = round(active_trade["roe_tp2"], 2) if _is_full_runner else round(0.5 * active_trade["roe_tp1"] + 0.5 * active_trade["roe_tp2"], 2)
+            _blended_profit = _disp_trade["profit_tp2_inr"] if _is_full_runner else (0.5 * _disp_trade["profit_tp1_inr"] + 0.5 * _disp_trade["profit_tp2_inr"])
+            _blended_roe = round(_disp_trade["roe_tp2"], 2) if _is_full_runner else round(0.5 * _disp_trade["roe_tp1"] + 0.5 * _disp_trade["roe_tp2"], 2)
             _fee_inr = cost_details["total_cost_inr"] if cost_details else 0.0
-            _be_px = cost_details["breakeven_price"] if cost_details else active_trade["entry"]
+            _be_px = cost_details["breakeven_price"] if cost_details else _disp_trade["entry"]
             _e2_display = f"{fmt_px(_e2_lvl)} ({_e2_q} {cur_asset} • Avg: {fmt_px(_avg_2x)})" if _has_e2 else "Disabled (100% Single Entry)"
-            _tp1_display = f"{fmt_px(active_trade['tp1'])} (SL Ratchet Only • 100% Runner)" if _is_full_runner else f"{fmt_px(active_trade['tp1'])} ({_tp1_half_q} {cur_asset} • +{active_trade['roe_tp1']}% ROE)"
+            _tp1_display = f"{fmt_px(_disp_trade['tp1'])} (SL Ratchet Only • 100% Runner)" if _is_full_runner else f"{fmt_px(_disp_trade['tp1'])} ({_tp1_half_q} {cur_asset} • +{_disp_trade['roe_tp1']}% ROE)"
 
             st.html(f"""
             <div class="pro-card" style="padding:14px;">
@@ -1856,7 +1896,7 @@ elif active_section == "🎯 Execute":
                 </div>
                 <div style="display:grid; grid-template-columns:1fr auto; row-gap:6px; font-size:0.86rem; color:{text_color};">
                     <span style="color:{subtext_color};">Entry 1 ({'50% Zone' if _has_e2 else '100% Single Entry'}):</span>
-                    <span style="text-align:right; font-weight:700;">{fmt_px(active_trade['entry'])} (₹{_tranche_m:,.0f} / {_tranche_q} {cur_asset})</span>
+                    <span style="text-align:right; font-weight:700;">{fmt_px(_disp_trade['entry'])} (₹{_tranche_m:,.0f} / {_tranche_q} {cur_asset})</span>
 
                     <span style="color:{subtext_color};">Entry 2 / Trade 2 (50% Sweep Limit):</span>
                     <span style="text-align:right; color:#8b5cf6; font-weight:700;">{_e2_display}</span>
@@ -1865,10 +1905,10 @@ elif active_section == "🎯 Execute":
                     <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
 
                     <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else '50% Position TP Runner'}):</span>
-                    <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(active_trade['tp2'])} (+{active_trade['roe_tp2']}% ROE)</span>
+                    <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(_disp_trade['tp2'])} (+{_disp_trade['roe_tp2']}% ROE)</span>
 
                     <span style="color:{subtext_color};">Catastrophe Stop Loss (Position SL):</span>
-                    <span style="text-align:right; color:#ef4444; font-weight:700;">{fmt_px(active_trade['stop_loss'])} (-{active_trade['roe_sl']}%)</span>
+                    <span style="text-align:right; color:#ef4444; font-weight:700;">{fmt_px(_disp_trade['stop_loss'])} (-{_disp_trade['roe_sl']}%)</span>
 
                     <span style="color:{subtext_color};">Est. Fee (incl. GST) / Breakeven:</span>
                     <span style="text-align:right; color:{subtext_color}; font-weight:600;">₹{_fee_inr:,.0f} • BE {fmt_px(_be_px)}</span>

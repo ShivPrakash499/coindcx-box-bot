@@ -2181,44 +2181,57 @@ def _get_live_15m_ema50(pair: str, fallback_val: float = 0.0) -> float:
 def _select_smart_hybrid_box_tp1(direction: str, entry: float, mid: float, ema50_15m: float, fallback_edge: float) -> tuple[float, str]:
     """
     Smart Hybrid Strategy 1 TP1 Rule:
-      - Selects the NEARER of `MID` or `15m 50 EMA` in the profitable direction (`>= 0.59%` minimum distance).
-      - Caps distance at `2.0%` price move (`10%` total-margin ROE at `5x` effective 50% tranche leverage)
-        and floors at `0.60%` price move (`3%` total-margin ROE).
+      - Selects the NEARER of `Midpoint(Entry 1, TP2)` (`(entry + TP2) / 2`) or `15m 50 EMA`
+        in the profitable direction.
+      - When `Entry 1` is at the box edge (`RL` / `RH`), `(Entry 1 + TP2) / 2` equals Box `MID`.
+      - When `Entry 1` is executed inside the box, `(Entry 1 + TP2) / 2` stays strictly halfway
+        between `Entry 1` and `TP2` (`RH` / `RL`), and `15m 50 EMA` is only eligible if it is at least
+        `max(0.8% of entry, 50% of distance to Midpoint(Entry 1, TP2))` away from `Entry 1` so TP1 is never set too near.
     """
     is_long = str(direction).upper() in ("BUY", "LONG")
     min_dist = entry * 0.0059
     if is_long:
-        raw_cands = []
-        if mid > entry:
-            raw_cands.append((mid - entry, mid, "MID"))
-        if ema50_15m > entry:
-            raw_cands.append((ema50_15m - entry, ema50_15m, "15m 50 EMA"))
-        valid_cands = [c for c in raw_cands if c[0] >= min_dist]
+        tp2_ref = fallback_edge if (fallback_edge > entry * 1.008) else (mid if mid > entry * 1.012 else entry * 1.024)
+        tp_mid = (entry + tp2_ref) / 2.0
+        mid_lbl = "MID" if (mid > 0 and abs(tp_mid - mid) / max(1e-9, entry) <= 0.002) else "Mid(Entry1,TP2)"
+        min_ema_dist = max(entry * 0.008, abs(tp_mid - entry) * 0.50)
+
+        valid_cands = []
+        if tp_mid > entry and (tp_mid - entry) >= min_dist:
+            valid_cands.append((tp_mid - entry, tp_mid, mid_lbl))
+        if ema50_15m > entry and (ema50_15m - entry) >= max(min_dist, min_ema_dist):
+            valid_cands.append((ema50_15m - entry, ema50_15m, "15m 50 EMA"))
+
         if valid_cands:
             _, struct_tp1, lbl = min(valid_cands, key=lambda c: c[0])
+        elif tp_mid > entry:
+            struct_tp1, lbl = tp_mid, mid_lbl
         elif fallback_edge > entry and (fallback_edge - entry) >= min_dist:
-            struct_tp1, lbl = fallback_edge, "RH"
-        elif raw_cands:
-            _, struct_tp1, lbl = max(raw_cands, key=lambda c: c[0])
+            struct_tp1, lbl = (entry + fallback_edge) / 2.0, mid_lbl
         else:
-            struct_tp1, lbl = (fallback_edge if fallback_edge > entry else entry * 1.015), "RH"
+            struct_tp1, lbl = entry * 1.012, mid_lbl
         tp1_dist = max(min(abs(struct_tp1 - entry), entry * 0.02), entry * 0.006)
         return entry + tp1_dist, lbl
     else:
-        raw_cands = []
-        if 0 < mid < entry:
-            raw_cands.append((entry - mid, mid, "MID"))
-        if 0 < ema50_15m < entry:
-            raw_cands.append((entry - ema50_15m, ema50_15m, "15m 50 EMA"))
-        valid_cands = [c for c in raw_cands if c[0] >= min_dist]
+        tp2_ref = fallback_edge if (0 < fallback_edge < entry * 0.992) else (mid if 0 < mid < entry * 0.988 else entry * 0.976)
+        tp_mid = (entry + tp2_ref) / 2.0
+        mid_lbl = "MID" if (mid > 0 and abs(tp_mid - mid) / max(1e-9, entry) <= 0.002) else "Mid(Entry1,TP2)"
+        min_ema_dist = max(entry * 0.008, abs(entry - tp_mid) * 0.50)
+
+        valid_cands = []
+        if 0 < tp_mid < entry and (entry - tp_mid) >= min_dist:
+            valid_cands.append((entry - tp_mid, tp_mid, mid_lbl))
+        if 0 < ema50_15m < entry and (entry - ema50_15m) >= max(min_dist, min_ema_dist):
+            valid_cands.append((entry - ema50_15m, ema50_15m, "15m 50 EMA"))
+
         if valid_cands:
             _, struct_tp1, lbl = min(valid_cands, key=lambda c: c[0])
+        elif 0 < tp_mid < entry:
+            struct_tp1, lbl = tp_mid, mid_lbl
         elif 0 < fallback_edge < entry and (entry - fallback_edge) >= min_dist:
-            struct_tp1, lbl = fallback_edge, "RL"
-        elif raw_cands:
-            _, struct_tp1, lbl = max(raw_cands, key=lambda c: c[0])
+            struct_tp1, lbl = (entry + fallback_edge) / 2.0, mid_lbl
         else:
-            struct_tp1, lbl = (fallback_edge if 0 < fallback_edge < entry else entry * 0.985), "RL"
+            struct_tp1, lbl = entry * 0.988, mid_lbl
         tp1_dist = max(min(abs(entry - struct_tp1), entry * 0.02), entry * 0.006)
         return entry - tp1_dist, lbl
 
@@ -3469,17 +3482,18 @@ def normalize_two_entry_runner_levels(
         if cand_sl <= 0 or cand_sl >= min_long_anchor * 0.999:
             cand_sl = min_long_anchor * 0.995
 
-        cand_tp1 = float(tp1_px or 0.0)
-        if cand_tp1 <= high_ref * 1.002:
-            if isinstance(levels, dict) and levels.get("MID"):
-                _m = float(levels.get("MID", 0.0) or 0.0)
-                _e50 = float(levels.get("EMA50_15m") or _get_live_15m_ema50(pair, _m))
-                _rh = float(levels.get("RH", high_ref * 1.02) or (high_ref * 1.02))
-                cand_tp1, _ = _select_smart_hybrid_box_tp1("BUY", high_ref, _m, _e50, _rh)
-            else:
-                cand_tp1 = high_ref * 1.012
-
         cand_tp2 = float(tp2_px or (levels.get("RH") if levels else 0.0) or 0.0)
+        cand_tp1 = float(tp1_px or 0.0)
+        if isinstance(levels, dict) and levels.get("MID"):
+            _m = float(levels.get("MID", 0.0) or 0.0)
+            _e50 = float(levels.get("EMA50_15m") or _get_live_15m_ema50(pair, _m))
+            _rh = cand_tp2 if cand_tp2 > high_ref * 1.008 else float(levels.get("RH", high_ref * 1.02) or (high_ref * 1.02))
+            _smart_tp1, _ = _select_smart_hybrid_box_tp1("BUY", high_ref, _m, _e50, _rh)
+            if cand_tp1 <= high_ref * 1.0059 or cand_tp1 < _smart_tp1 * 0.998:
+                cand_tp1 = _smart_tp1
+        elif cand_tp1 <= high_ref * 1.0059:
+            cand_tp1 = (high_ref + cand_tp2) / 2.0 if cand_tp2 > high_ref * 1.012 else high_ref * 1.012
+
         if cand_tp2 <= cand_tp1 * 1.002:
             cand_tp2 = max(cand_tp1 * 1.012, high_ref * 1.024)
     else:
@@ -3495,17 +3509,18 @@ def normalize_two_entry_runner_levels(
         if cand_sl <= 0 or cand_sl <= max_short_anchor * 1.001:
             cand_sl = max_short_anchor * 1.005
 
-        cand_tp1 = float(tp1_px or 0.0)
-        if cand_tp1 <= 0 or cand_tp1 >= low_ref * 0.998:
-            if isinstance(levels, dict) and levels.get("MID"):
-                _m = float(levels.get("MID", 0.0) or 0.0)
-                _e50 = float(levels.get("EMA50_15m") or _get_live_15m_ema50(pair, _m))
-                _rl = float(levels.get("RL", low_ref * 0.98) or (low_ref * 0.98))
-                cand_tp1, _ = _select_smart_hybrid_box_tp1("SELL", low_ref, _m, _e50, _rl)
-            else:
-                cand_tp1 = low_ref * 0.988
-
         cand_tp2 = float(tp2_px or (levels.get("RL") if levels else 0.0) or 0.0)
+        cand_tp1 = float(tp1_px or 0.0)
+        if isinstance(levels, dict) and levels.get("MID"):
+            _m = float(levels.get("MID", 0.0) or 0.0)
+            _e50 = float(levels.get("EMA50_15m") or _get_live_15m_ema50(pair, _m))
+            _rl = cand_tp2 if (0 < cand_tp2 < low_ref * 0.992) else float(levels.get("RL", low_ref * 0.98) or (low_ref * 0.98))
+            _smart_tp1, _ = _select_smart_hybrid_box_tp1("SELL", low_ref, _m, _e50, _rl)
+            if cand_tp1 <= 0 or cand_tp1 >= low_ref * 0.9941 or cand_tp1 > _smart_tp1 * 1.002:
+                cand_tp1 = _smart_tp1
+        elif cand_tp1 <= 0 or cand_tp1 >= low_ref * 0.9941:
+            cand_tp1 = (low_ref + cand_tp2) / 2.0 if (0 < cand_tp2 < low_ref * 0.988) else low_ref * 0.988
+
         if cand_tp2 <= 0 or cand_tp2 >= cand_tp1 * 0.998:
             cand_tp2 = min(cand_tp1 * 0.988, low_ref * 0.976)
 
@@ -3552,7 +3567,7 @@ def sync_full_2entry_runner_to_position(
     side = "BUY" if is_long else "SELL"
     opp_side = "SELL" if is_long else "BUY"
     pos_qty = float(matched_pos.get("quantity", 0.0) or 0.0)
-    pos_entry = float(entry1_px or matched_pos.get("entry_price", 0.0) or 0.0)
+    pos_entry = float(matched_pos.get("entry_price", 0.0) or entry1_px or 0.0)
     pos_mark = float(matched_pos.get("mark_price", pos_entry) or pos_entry)
     pos_lev = int(round(float(matched_pos.get("leverage") or leverage or 10)))
 
@@ -4012,14 +4027,8 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
         tranche1_m = cfg_m * 0.5
         partial_tp1_filled = (locked_m_inr > 0 and tranche1_m > 0 and locked_m_inr <= tranche1_m * 0.68)
 
-        # Effective TP1 trigger reference: check both Smart Hybrid `tp1_px` and `MID` (if >=0.3% from entry)
+        # Effective TP1 trigger reference: Smart Hybrid `tp1_px` (Nearer of Midpoint(Entry1, TP2) or 15m 50 EMA)
         eff_tp1_px = tp1_px
-        if isinstance(levels, dict) and levels.get("MID"):
-            mid_v = float(levels["MID"])
-            if is_long and mid_v >= entry_p * 1.003 and mid_v < eff_tp1_px:
-                eff_tp1_px = mid_v
-            elif (not is_long) and 0 < mid_v <= entry_p * 0.997 and mid_v > eff_tp1_px:
-                eff_tp1_px = mid_v
 
         hit_tp1 = already_in_profit_sl or partial_tp1_filled or ((mark_p >= eff_tp1_px) if is_long else (mark_p <= eff_tp1_px))
         wicked_tp1, prev_h, prev_l = _check_recent_15m_tp1_touch_and_prev_hl(pair, is_long, eff_tp1_px, opened_ts=time.time() - 2700.0)
@@ -4147,6 +4156,48 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         if lock.get("missing_count", 0) > 0:
                             lock["missing_count"] = 0
                             save_autotrade_config({"active_trade_lock": lock})
+                        # Auto-heal too-near TP1 (<0.59% from Entry 1) on an open position before TP1 has hit
+                        if not tp1_already_hit and l_entry > 0 and abs(l_tp1 - l_entry) / l_entry < 0.0059:
+                            try:
+                                _box_lvls = calculate_daily_box_levels(l_pair)
+                            except Exception:
+                                _box_lvls = None
+                            _fix_norm = normalize_two_entry_runner_levels(
+                                pair=l_pair,
+                                direction=l_dir,
+                                entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
+                                entry2_px=l_entry2,
+                                tp1_px=None,
+                                tp2_px=l_tp2,
+                                sl_px=l_sl,
+                                live_px=float(matched_live_pos.get("entry_price") or l_entry),
+                                levels=_box_lvls,
+                            )
+                            _new_tp1 = float(_fix_norm["tp1"])
+                            if abs(_new_tp1 - l_tp1) > 1e-6:
+                                _old_tp1_oid = str(lock.get("tp1_order_id", "") or "")
+                                _opp_s = "SELL" if l_dir in ("LONG", "BUY") else "BUY"
+                                if _old_tp1_oid and not _old_tp1_oid.startswith(("DAEMON_", "FULL_", "STRATEGY")):
+                                    cancel_coindcx_open_entry_orders(l_pair, _old_tp1_oid, side=_opp_s.lower())
+                                _pos_q = float(matched_live_pos.get("quantity", 0.0) or 0.0)
+                                _tp1_q = format_order_quantity(l_pair, _pos_q * 0.5)
+                                _pos_lev = int(round(float(matched_live_pos.get("leverage") or lock.get("leverage", 10) or 10)))
+                                if _tp1_q > 0 and str(lock.get("strategy_id", "box_theory")) != "ema9_retest":
+                                    _ok_tp1, _, _ext_tp1 = place_coindcx_futures_order(
+                                        pair=l_pair,
+                                        side=_opp_s,
+                                        quantity=_tp1_q,
+                                        leverage=_pos_lev,
+                                        order_type="limit_order",
+                                        price=_new_tp1,
+                                        margin_currency="INR",
+                                        post_only=False,
+                                    )
+                                    if _ok_tp1:
+                                        lock["tp1_order_id"] = str((_ext_tp1 or {}).get("order_id", "DAEMON_50PCT_REDUCE_AT_TP1"))
+                                l_tp1 = _new_tp1
+                                lock["tp1"] = _new_tp1
+                                save_autotrade_config({"active_trade_lock": lock})
                         # Auto-heal missing TP or SL on CoinDCX whenever either trigger is None
                         if matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None:
                             norm_lvls = normalize_two_entry_runner_levels(
