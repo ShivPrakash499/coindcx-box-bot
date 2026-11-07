@@ -88,7 +88,7 @@ def get_pair_lot_spec(pair: str) -> dict:
         "step_size": 0.001,
         "qty_decimals": 3,
         "min_qty": 0.001,
-        "tick_size": 0.01,
+        "tick_size": 0.0001,
         "min_notional_usd": 5.0
     })
 
@@ -130,16 +130,14 @@ def format_order_price(pair: str, raw_price: float) -> float:
 def round_asset_price(val, ref_price=None):
     """
     Rounds price dynamically based on asset magnitude (handles low-cost tokens like DOGE/PEPE).
+    Keeps 4 decimal places across standard assets (6 decimal places for < 0.001).
     """
     ref = ref_price if ref_price is not None else val
     if ref is None:
         return 0.0
     if abs(ref) < 0.001:
         return round(float(val), 6)
-    elif abs(ref) < 1.0:
-        return round(float(val), 4)
-    else:
-        return round(float(val), 2)
+    return round(float(val), 4)
 
 import sys as _sys
 import threading as _threading
@@ -3489,7 +3487,7 @@ def normalize_two_entry_runner_levels(
             _e50 = float(levels.get("EMA50_15m") or _get_live_15m_ema50(pair, _m))
             _rh = cand_tp2 if cand_tp2 > high_ref * 1.008 else float(levels.get("RH", high_ref * 1.02) or (high_ref * 1.02))
             _smart_tp1, _ = _select_smart_hybrid_box_tp1("BUY", high_ref, _m, _e50, _rh)
-            if cand_tp1 <= high_ref * 1.0059 or cand_tp1 < _smart_tp1 * 0.998:
+            if cand_tp1 <= high_ref * 1.0059:
                 cand_tp1 = _smart_tp1
         elif cand_tp1 <= high_ref * 1.0059:
             cand_tp1 = (high_ref + cand_tp2) / 2.0 if cand_tp2 > high_ref * 1.012 else high_ref * 1.012
@@ -3516,7 +3514,7 @@ def normalize_two_entry_runner_levels(
             _e50 = float(levels.get("EMA50_15m") or _get_live_15m_ema50(pair, _m))
             _rl = cand_tp2 if (0 < cand_tp2 < low_ref * 0.992) else float(levels.get("RL", low_ref * 0.98) or (low_ref * 0.98))
             _smart_tp1, _ = _select_smart_hybrid_box_tp1("SELL", low_ref, _m, _e50, _rl)
-            if cand_tp1 <= 0 or cand_tp1 >= low_ref * 0.9941 or cand_tp1 > _smart_tp1 * 1.002:
+            if cand_tp1 <= 0 or cand_tp1 >= low_ref * 0.9941:
                 cand_tp1 = _smart_tp1
         elif cand_tp1 <= 0 or cand_tp1 >= low_ref * 0.9941:
             cand_tp1 = (low_ref + cand_tp2) / 2.0 if (0 < cand_tp2 < low_ref * 0.988) else low_ref * 0.988
@@ -3525,11 +3523,11 @@ def normalize_two_entry_runner_levels(
             cand_tp2 = min(cand_tp1 * 0.988, low_ref * 0.976)
 
     return {
-        "entry": format_order_price(pair, e1),
-        "entry2_sweep": format_order_price(pair, cand_e2),
-        "tp1": format_order_price(pair, cand_tp1),
-        "tp2": format_order_price(pair, cand_tp2),
-        "stop_loss": format_order_price(pair, cand_sl),
+        "entry": round_asset_price(e1),
+        "entry2_sweep": round_asset_price(cand_e2, e1),
+        "tp1": round_asset_price(cand_tp1, e1),
+        "tp2": round_asset_price(cand_tp2, e1),
+        "stop_loss": round_asset_price(cand_sl, e1),
     }
 
 

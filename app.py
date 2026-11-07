@@ -368,11 +368,11 @@ def get_cached_signals_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: f
 
 def fmt_px(p):
     if p is None:
-        return "$0.00"
+        return "$0.0000"
     p_f = float(p)
     if p_f == 0:
-        return "$0.00"
-    return f"${p_f:,.4f}" if abs(p_f) < 1.0 else f"${p_f:,.2f}"
+        return "$0.0000"
+    return f"${p_f:,.6f}" if abs(p_f) < 0.001 else f"${p_f:,.4f}"
 
 def clean_sym(pair: str) -> str:
     return str(pair).replace("B-", "").replace("_USDT", "")
@@ -1800,8 +1800,8 @@ elif active_section == "🎯 Execute":
                     st.session_state[sl_key] = float(_formula_norm_for_e1["stop_loss"])
 
             p_ref = float(active_trade["entry"])
-            step_val = 0.5 if p_ref > 1.0 else (0.0001 if p_ref > 0.001 else 0.000001)
-            fmt_str = "%.2f" if p_ref > 1.0 else ("%.4f" if p_ref > 0.001 else "%.6f")
+            step_val = 0.0001 if p_ref >= 0.001 else 0.000001
+            fmt_str = "%.4f" if p_ref >= 0.001 else "%.6f"
 
             adj_col1, adj_col2 = st.columns(2)
             with adj_col1:
@@ -1816,6 +1816,7 @@ elif active_section == "🎯 Execute":
                 custom_tp2 = st.number_input(_tp2_label, value=float(st.session_state.get(tp2_key, _init_norm["tp2"])), step=step_val, format=fmt_str, key=tp2_key)
 
             # Ensure Entry 2, SL, TP1, TP2 are strictly on the valid side of Entry 1 for CoinDCX
+            # while keeping exact manual 4-decimal user values without rounding them off
             _live_norm = coindcx_engine.normalize_two_entry_runner_levels(
                 pair=selected_pair,
                 direction=trade_dir,
@@ -1827,10 +1828,15 @@ elif active_section == "🎯 Execute":
                 live_px=custom_entry,
                 levels=levels if _strat_has_e2 else None,
             )
-            custom_e2 = _live_norm["entry2_sweep"] if _strat_has_e2 else 0.0
-            custom_sl = _live_norm["stop_loss"]
-            custom_tp1 = _live_norm["tp1"]
-            custom_tp2 = _live_norm["tp2"]
+            _is_buy_t = (trade_dir == "BUY")
+            if _strat_has_e2:
+                custom_e2 = float(custom_e2) if ((0 < custom_e2 < custom_entry) if _is_buy_t else (custom_e2 > custom_entry)) else _live_norm["entry2_sweep"]
+            else:
+                custom_e2 = 0.0
+            _sl_anc = (min(custom_entry, custom_e2) if custom_e2 > 0 else custom_entry) if _is_buy_t else (max(custom_entry, custom_e2) if custom_e2 > 0 else custom_entry)
+            custom_sl = float(custom_sl) if ((0 < custom_sl < _sl_anc) if _is_buy_t else (custom_sl > _sl_anc)) else _live_norm["stop_loss"]
+            custom_tp1 = float(custom_tp1) if ((custom_tp1 > custom_entry) if _is_buy_t else (0 < custom_tp1 < custom_entry)) else _live_norm["tp1"]
+            custom_tp2 = float(custom_tp2) if ((custom_tp2 >= custom_tp1) if _is_buy_t else (0 < custom_tp2 <= custom_tp1)) else _live_norm["tp2"]
 
             pos_usd = (trade_margin_inr * trade_leverage) / trade_usd_inr
             c_qty = format_order_quantity(selected_pair, pos_usd / custom_entry) if custom_entry > 0 else 0
@@ -2034,7 +2040,8 @@ elif active_section == "🎯 Execute":
                         st.error(f"❌ Order value (₹{trade_notional_inr:,.0f}) is below CoinDCX minimum ₹2,448.")
                         order_placed_ok = False
                     elif shield_blocked:
-                        st.error(f"🛡️ Price Shield blocked order: Live {fmt_px(shield_live_px)} is {shield_dev:.2f}% from entry {fmt_px(active_trade['entry'])}.")
+                        _ps_msg = f"🛡️ Price Shield blocked order: Live {fmt_px(shield_live_px)} is {shield_dev:.2f}% from entry {fmt_px(active_trade['entry'])}."
+                        st.error(_ps_msg.replace("$", "\\$"))
                         order_placed_ok = False
                     else:
                         _use_market_e1 = "Market" in e1_fill_mode
@@ -2051,11 +2058,13 @@ elif active_section == "🎯 Execute":
                             live_px=(shield_live_px if (_use_market_e1 and shield_live_px > 0) else _ref_e1_px),
                             levels=levels if _has_e2 else None,
                         )
-                        _maker_px = _exec_norm["entry"]
-                        _e2_px = _exec_norm["entry2_sweep"] if _has_e2 else 0.0
-                        _tp1_px = _exec_norm["tp1"]
-                        _tp2_px = _exec_norm["tp2"]
-                        _sl_px = _exec_norm["stop_loss"]
+                        _is_buy_e = (trade_dir == "BUY")
+                        _maker_px = float(_ref_e1_px) if not _use_market_e1 else _exec_norm["entry"]
+                        _e2_px = (float(_e2_lvl) if ((0 < float(_e2_lvl) < _ref_e1_px) if _is_buy_e else (float(_e2_lvl) > _ref_e1_px)) else _exec_norm["entry2_sweep"]) if _has_e2 else 0.0
+                        _tp1_px = float(active_trade["tp1"]) if (_user_edited_tp1 and ((float(active_trade["tp1"]) > _ref_e1_px) if _is_buy_e else (0 < float(active_trade["tp1"]) < _ref_e1_px))) else _exec_norm["tp1"]
+                        _tp2_px = float(active_trade["tp2"]) if ((float(active_trade["tp2"]) >= _tp1_px) if _is_buy_e else (0 < float(active_trade["tp2"]) <= _tp1_px)) else _exec_norm["tp2"]
+                        _sl_anc_e = (min(_ref_e1_px, _e2_px) if _e2_px > 0 else _ref_e1_px) if _is_buy_e else (max(_ref_e1_px, _e2_px) if _e2_px > 0 else _ref_e1_px)
+                        _sl_px = float(active_trade["stop_loss"]) if ((0 < float(active_trade["stop_loss"]) < _sl_anc_e) if _is_buy_e else (float(active_trade["stop_loss"]) > _sl_anc_e)) else _exec_norm["stop_loss"]
 
                         _e1_qty = (_tranche_q if (_tranche_q * _maker_px * trade_usd_inr) >= 2448.0 else active_trade["crypto_qty"]) if _has_e2 else active_trade["crypto_qty"]
                         _e2_qty = format_order_quantity(selected_pair, (trade_margin_inr * 0.5 * trade_leverage / trade_usd_inr) / _e2_px) if (_has_e2 and _e2_px > 0) else 0.0

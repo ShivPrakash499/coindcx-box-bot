@@ -184,6 +184,22 @@ def test_4_strategy_and_two_entry_levels():
         f"Invalid SHORT level ordering: {short_lvls}"
     )
 
+    # Verify 4-decimal precision across round_asset_price and manual Execute level normalization (never rounded to 2 decimals)
+    assert eng.round_asset_price(1.1674) == 1.1674, f"Expected 1.1674, got {eng.round_asset_price(1.1674)}"
+    manual_4d = eng.normalize_two_entry_runner_levels(
+        pair="B-INJ_USDT",
+        direction="SHORT",
+        entry1_px=8.3245,
+        entry2_px=8.5985,
+        tp1_px=8.1725,
+        tp2_px=8.0315,
+        sl_px=8.6415,
+        live_px=8.3245,
+    )
+    assert manual_4d["entry"] == 8.3245 and manual_4d["tp1"] == 8.1725 and manual_4d["tp2"] == 8.0315 and manual_4d["stop_loss"] == 8.6415, (
+        f"Expected 4-decimal manual Execute levels preserved without rounding off, got: {manual_4d}"
+    )
+
     # Verify build_two_entry_runner_plan places Entry 2 at SH ($7.43) and Catastrophe SL beyond SH (> $7.43), never inside RH-SH
     inj_plan = strat.build_two_entry_runner_plan("SHORT", entry=7.30, sweep_level=7.43, struct_tp1=7.10, struct_tp2=6.89, leverage=10)
     assert inj_plan is not None
