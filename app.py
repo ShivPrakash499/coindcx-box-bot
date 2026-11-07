@@ -1952,12 +1952,14 @@ elif active_section == "🎯 Execute":
                     else:
                         _use_market_e1 = "Market" in e1_fill_mode
                         _ref_e1_px = shield_live_px if (_use_market_e1 and shield_live_px > 0) else float(active_trade["entry"])
+                        _entry_shifted = (_use_market_e1 and shield_live_px > 0 and abs(shield_live_px - float(active_trade["entry"])) / max(1e-9, float(active_trade["entry"])) > 0.003)
+                        _user_edited_tp1 = abs(float(active_trade["tp1"]) - float(_init_norm["tp1"])) > 1e-6
                         _exec_norm = coindcx_engine.normalize_two_entry_runner_levels(
                             pair=selected_pair,
                             direction=trade_dir,
                             entry1_px=_ref_e1_px,
                             entry2_px=float(_e2_lvl),
-                            tp1_px=float(active_trade["tp1"]),
+                            tp1_px=None if (_entry_shifted and not _user_edited_tp1) else float(active_trade["tp1"]),
                             tp2_px=float(active_trade["tp2"]),
                             sl_px=float(active_trade["stop_loss"]),
                             live_px=shield_live_px if shield_live_px > 0 else _ref_e1_px,
@@ -1973,6 +1975,7 @@ elif active_section == "🎯 Execute":
                         _e2_qty = format_order_quantity(selected_pair, (trade_margin_inr * 0.5 * trade_leverage / trade_usd_inr) / _e2_px) if _e2_px > 0 else 0.0
                         _e2_order_id = ""
                         _tp1_order_id = "DAEMON_50PCT_REDUCE_AT_TP1"
+                        _synced_live_lock = False
                         with st.spinner("Submitting Entry 1 + Position TP2/SL + TP1 Limit + Entry 2 Sweep Limit to CoinDCX..."):
                             ok, api_msg, api_extra = place_coindcx_futures_order(
                                 pair=selected_pair, side=trade_dir, quantity=_e1_qty,
@@ -1980,7 +1983,8 @@ elif active_section == "🎯 Execute":
                                 order_type="market_order" if _use_market_e1 else "limit_order",
                                 price=None if _use_market_e1 else _maker_px,
                                 post_only=False, margin_currency="INR",
-                                tp_price=_tp2_px, sl_price=_sl_px
+                                tp_price=None if _use_market_e1 else _tp2_px,
+                                sl_price=None if _use_market_e1 else _sl_px
                             )
                             if ok:
                                 # Synchronize Position TP2/SL + TP1 50% Limit Order + Entry 2 Sweep Limit Order
@@ -1997,6 +2001,7 @@ elif active_section == "🎯 Execute":
                                     usd_inr=trade_usd_inr,
                                 )
                                 if s_ok:
+                                    _synced_live_lock = True
                                     api_msg = f"{api_msg} | {s_msg}"
                                     _lock_d = s_det.get("lock") or {}
                                     _e2_order_id = str(_lock_d.get("entry2_order_id", ""))
@@ -2027,25 +2032,30 @@ elif active_section == "🎯 Execute":
                     is_live = "Live" in exec_mode
                     cur_market_px = float(get_cached_ticker(selected_pair).get("last_price", 0.0))
                     is_buy_dir = (trade_dir == "BUY")
-                    limit_entry_px = float(active_trade["entry"])
+                    limit_entry_px = _maker_px if is_live else float(active_trade["entry"])
+                    rec_sl = _sl_px if is_live else float(active_trade["stop_loss"])
+                    rec_tp1 = _tp1_px if is_live else float(active_trade["tp1"])
+                    rec_tp2 = _tp2_px if is_live else float(active_trade["tp2"])
+                    rec_e2 = _e2_px if is_live else float(_e2_lvl)
                     already_reached = (cur_market_px <= limit_entry_px) if is_buy_dir else (cur_market_px >= limit_entry_px) if cur_market_px > 0 else True
                     order_status = "LIVE_FILLED" if is_live else ("PAPER_FILLED" if already_reached else "PAPER_PENDING")
 
-                    coindcx_engine.register_app_trade_lock(
-                        pair=selected_pair, direction=trade_dir, entry=limit_entry_px,
-                        stop_loss=active_trade["stop_loss"], tp1=active_trade["tp1"], tp2=active_trade["tp2"],
-                        entry2_sweep=float(_e2_lvl),
-                        margin_inr=trade_margin_inr, leverage=trade_leverage, qty1=active_trade["crypto_qty"],
-                        mode="App/API Live Execution (2-Entry + Runner)" if is_live else "App/API Paper Execution",
-                        is_live_exchange=is_live,
-                        entry2_order_id=_e2_order_id if is_live else "",
-                        tp1_order_id=_tp1_order_id if is_live else "DAEMON_50PCT_REDUCE_AT_TP1",
-                    )
+                    if not (is_live and _synced_live_lock):
+                        coindcx_engine.register_app_trade_lock(
+                            pair=selected_pair, direction=trade_dir, entry=limit_entry_px,
+                            stop_loss=rec_sl, tp1=rec_tp1, tp2=rec_tp2,
+                            entry2_sweep=rec_e2,
+                            margin_inr=trade_margin_inr, leverage=trade_leverage, qty1=_e1_qty if is_live else active_trade["crypto_qty"],
+                            mode="App/API Live Execution (2-Entry + Runner)" if is_live else "App/API Paper Execution",
+                            is_live_exchange=is_live,
+                            entry2_order_id=_e2_order_id if is_live else "",
+                            tp1_order_id=_tp1_order_id if is_live else "DAEMON_50PCT_REDUCE_AT_TP1",
+                        )
 
                     order_record = {
                         "timestamp": exec_time, "pair": selected_pair, "signal": trade_dir, "direction": trade_dir,
                         "setup": active_trade.get("setup", "Box Setup"), "entry": limit_entry_px,
-                        "stop_loss": active_trade["stop_loss"], "tp1": active_trade["tp1"], "tp2": active_trade["tp2"],
+                        "stop_loss": rec_sl, "tp1": rec_tp1, "tp2": rec_tp2,
                         "crypto_qty": active_trade["crypto_qty"], "margin_inr": trade_margin_inr,
                         "leverage": trade_leverage, "usd_inr": trade_usd_inr,
                         "profit_tp1_inr": active_trade["profit_tp1_inr"], "loss_sl_inr": active_trade["loss_sl_inr"],
