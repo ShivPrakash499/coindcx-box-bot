@@ -3529,13 +3529,16 @@ def sync_full_2entry_runner_to_position(
     total_margin_inr: float = 20000.0,
     leverage: int = 10,
     usd_inr: float = None,
+    strategy_id: str = "box_theory",
 ) -> tuple[bool, str, dict]:
     """
-    Synchronizes all 4 components of the 2-Entry + 50/50 Runner setup onto an active CoinDCX position:
+    Synchronizes all components of the Smart Hybrid setup onto an active CoinDCX position:
       1. Position Bracket TP = TP2 (Runner) & SL = Catastrophe SL via `update_coindcx_position_tpsl`.
-      2. TP1 50% Partial Book resting opposite-side Limit Order (`0.5 * pos_qty` @ `tp1_px`) in Open Orders.
-      3. Entry 2 / Trade 2 resting same-side Limit Order (`50%` of `total_margin_inr` @ `entry2_px`) in Open Orders.
-      4. App Trade Lock registration so the 24/7 daemon manages TP1 -> Cancel Entry 2 -> Ratchet SL -> TP2.
+      2. TP1 50% Partial Book resting opposite-side Limit Order (`0.5 * pos_qty` @ `tp1_px`) for Strategy 1 & 2
+         (Strategy 3 `ema9_retest` keeps 100% Full Runner and ratchets SL at TP1).
+      3. Entry 2 / Trade 2 resting same-side Limit Order (`50%` of `total_margin_inr` @ `entry2_px`) for Strategy 1
+         (Strategy 2 & 3 use Single Entry with `entry2_px == 0`).
+      4. App Trade Lock registration so the 24/7 daemon manages TP1 -> Cancel Entry 2 -> Ratchet SL -> Smart Hybrid Runner.
     """
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
     positions = fetch_coindcx_active_positions(force_refresh=True)
@@ -3553,6 +3556,10 @@ def sync_full_2entry_runner_to_position(
     pos_mark = float(matched_pos.get("mark_price", pos_entry) or pos_entry)
     pos_lev = int(round(float(matched_pos.get("leverage") or leverage or 10)))
 
+    strat_id = str(strategy_id or "box_theory").strip() or "box_theory"
+    has_second_entry = (strat_id == "box_theory") and (entry2_px is None or float(entry2_px or 0.0) > 0.0)
+    use_full_s3_runner = (strat_id == "ema9_retest")
+
     levels = None
     try:
         levels = calculate_daily_box_levels(pair)
@@ -3563,7 +3570,7 @@ def sync_full_2entry_runner_to_position(
         pair=pair,
         direction=pos_dir,
         entry1_px=pos_entry,
-        entry2_px=entry2_px,
+        entry2_px=entry2_px if has_second_entry else None,
         tp1_px=tp1_px,
         tp2_px=tp2_px,
         sl_px=sl_px,
@@ -3571,10 +3578,10 @@ def sync_full_2entry_runner_to_position(
         levels=levels,
     )
     e1_val = norm["entry"]
-    e2_val = norm["entry2_sweep"]
+    e2_val = norm["entry2_sweep"] if has_second_entry else 0.0
     tp1_val = norm["tp1"]
     tp2_val = norm["tp2"]
-    sl_val = norm["stop_loss"]
+    sl_val = format_order_price(pair, float(sl_px)) if (not has_second_entry and sl_px and float(sl_px) > 0) else norm["stop_loss"]
 
     status_parts = []
     details = {"normalized_levels": norm}
@@ -3597,13 +3604,16 @@ def sync_full_2entry_runner_to_position(
             elif o_side == opp_side and not existing_opp_side_limit:
                 existing_opp_side_limit = o
 
-    # 2. Place TP1 (50% Partial Book) opposite-side Limit Order if not already open
+    # 2. Place TP1 (50% Partial Book) opposite-side Limit Order if not already open (Strategy 3 keeps 100% Full Runner)
     tp1_order_id = ""
-    tp1_qty = format_order_quantity(pair, pos_qty * 0.5)
-    if (tp1_qty * tp1_val * u_inr) < 2448.0 and (pos_qty * tp1_val * u_inr) >= 2448.0:
+    tp1_qty = format_order_quantity(pair, pos_qty * 0.5) if not use_full_s3_runner else 0.0
+    if not use_full_s3_runner and (tp1_qty * tp1_val * u_inr) < 2448.0 and (pos_qty * tp1_val * u_inr) >= 2448.0:
         tp1_qty = min(pos_qty, format_order_quantity(pair, (2500.0 / u_inr) / tp1_val))
 
-    if existing_opp_side_limit:
+    if use_full_s3_runner:
+        tp1_order_id = "STRATEGY3_FULL_RUNNER_SL_RATCHET"
+        status_parts.append(f"TP1 SL-Ratchet Armed @ ${tp1_val} (100% S3 Runner)")
+    elif existing_opp_side_limit:
         tp1_order_id = str(existing_opp_side_limit.get("id", ""))
         status_parts.append(f"TP1 Limit ({existing_opp_side_limit.get('total_quantity')} @ ${existing_opp_side_limit.get('price')}): Already Open")
     elif tp1_qty > 0 and (tp1_qty * tp1_val * u_inr) >= 2448.0:
@@ -3628,12 +3638,14 @@ def sync_full_2entry_runner_to_position(
         tp1_order_id = "DAEMON_50PCT_REDUCE_AT_TP1"
         status_parts.append(f"TP1 (Daemon 50% Reduce Armed @ ${tp1_val})")
 
-    # 3. Place Entry 2 / Trade 2 (50% Sweep Scale-In) same-side Limit Order if not already open
+    # 3. Place Entry 2 / Trade 2 (50% Sweep Scale-In) same-side Limit Order if Strategy 1 (has_second_entry)
     e2_order_id = ""
     tranche_m_inr = max(float(total_margin_inr or 20000.0) * 0.5, float(matched_pos.get("locked_margin_inr", 10000.0) or 10000.0))
-    qty2 = format_order_quantity(pair, ((tranche_m_inr * pos_lev) / u_inr) / e2_val) if e2_val > 0 else 0.0
+    qty2 = format_order_quantity(pair, ((tranche_m_inr * pos_lev) / u_inr) / e2_val) if (has_second_entry and e2_val > 0) else 0.0
 
-    if existing_same_side_limit:
+    if not has_second_entry:
+        status_parts.append("Single Entry (100% Margin on Entry 1)")
+    elif existing_same_side_limit:
         e2_order_id = str(existing_same_side_limit.get("id", ""))
         status_parts.append(f"Entry 2 Limit ({existing_same_side_limit.get('total_quantity')} @ ${existing_same_side_limit.get('price')}): Already Open")
     elif qty2 > 0 and (qty2 * e2_val * u_inr) >= 2448.0:
@@ -3663,14 +3675,15 @@ def sync_full_2entry_runner_to_position(
         tp1=tp1_val,
         tp2=tp2_val,
         entry2_sweep=e2_val,
-        margin_inr=float(total_margin_inr or tranche_m_inr * 2.0),
+        margin_inr=float(total_margin_inr or (tranche_m_inr * 2.0 if has_second_entry else tranche_m_inr)),
         leverage=pos_lev,
         qty1=pos_qty,
         qty2=qty2,
-        mode="App/API Live Execution (2-Entry + TP1/TP2/SL Synced)",
+        mode="App/API Live Execution (Smart Hybrid Synced)",
         is_live_exchange=True,
         entry2_order_id=e2_order_id,
         tp1_order_id=tp1_order_id or "DAEMON_50PCT_REDUCE_AT_TP1",
+        strategy_id=strat_id,
     )
     details["lock"] = lock_info
     _ACTIVE_POSITIONS_CACHE["data"] = None
@@ -3693,6 +3706,7 @@ def register_app_trade_lock(
     is_live_exchange: bool = False,
     entry2_order_id: str = "",
     tp1_order_id: str = "",
+    strategy_id: str = "box_theory",
 ) -> dict:
     """
     Registers an active 1-Crypto-at-a-Time lock strictly for trades executed via our App/API.
@@ -3702,8 +3716,9 @@ def register_app_trade_lock(
     lock_info = {
         "pair": pair,
         "direction": str(direction).upper(),
+        "strategy_id": str(strategy_id or "box_theory"),
         "entry": float(entry or 0.0),
-        "entry2_sweep": float(entry2_sweep or entry or 0.0),
+        "entry2_sweep": float(entry2_sweep or 0.0),
         "entry2_filled": False,
         "entry2_cancelled": False,
         "entry2_order_id": str(entry2_order_id or ""),
@@ -4233,7 +4248,9 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             lock["entry2_cancelled"] = True
 
                         # 2. Book 50% of the open CoinDCX position at TP1 if resting TP1 limit order hasn't already reduced it
-                        if is_live_ex and matched_live_pos:
+                        #    (Strategy 3 `ema9_retest` keeps 100% Full Runner and only ratchets SL at TP1)
+                        is_s3_lock = (str(lock.get("strategy_id", "")) == "ema9_retest") or (str(lock.get("tp1_order_id", "")) == "STRATEGY3_FULL_RUNNER_SL_RATCHET")
+                        if is_live_ex and matched_live_pos and not is_s3_lock:
                             open_pos_qty = float(matched_live_pos.get("quantity", 0.0) or 0.0)
                             init_qty1 = float(lock.get("qty1", open_pos_qty) or open_pos_qty)
                             tp1_oid = str(lock.get("tp1_order_id", ""))
@@ -4582,7 +4599,7 @@ def execute_autotrade_two_entry_signal(
             post_only=False,
         )
         if ok1:
-            # Synchronize Position TP2/SL + TP1 50% Limit Order + Entry 2 Sweep Limit Order onto the live position
+            # Synchronize Position TP2/SL + TP1 Limit Order + Entry 2 Sweep Limit Order onto the live position
             sync_ok, sync_msg, sync_details = sync_full_2entry_runner_to_position(
                 pair=pair,
                 direction=direction,
@@ -4594,6 +4611,7 @@ def execute_autotrade_two_entry_signal(
                 total_margin_inr=margin_inr,
                 leverage=lev,
                 usd_inr=u_inr,
+                strategy_id=sig_strat_id,
             )
             if not sync_ok:
                 time.sleep(0.8)
@@ -4608,6 +4626,7 @@ def execute_autotrade_two_entry_signal(
                     total_margin_inr=margin_inr,
                     leverage=lev,
                     usd_inr=u_inr,
+                    strategy_id=sig_strat_id,
                 )
             lock_obj = (sync_details or {}).get("lock")
             if not lock_obj:
@@ -4625,6 +4644,7 @@ def execute_autotrade_two_entry_signal(
                     qty2=qty2,
                     mode="App/API Live AutoTrade (Entry 1 Placed)",
                     is_live_exchange=True,
+                    strategy_id=sig_strat_id,
                 )
             return True, (
                 f"Live 2-Entry + Runner Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | {sync_msg}"
@@ -4642,6 +4662,7 @@ def execute_autotrade_two_entry_signal(
             tp1=tp1_px, tp2=tp2_px, entry2_sweep=entry2_px, margin_inr=margin_inr,
             leverage=lev, qty1=qty1, qty2=qty2,
             mode="App/API Simulated AutoTrade (2-Entry Armed)", is_live_exchange=False,
+            strategy_id=sig_strat_id,
         )
         return True, (
             f"AutoTrade Armed (Simulated): {direction} {pair} | "
