@@ -438,7 +438,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 18
+_REQUIRED_DAEMON_VERSION = 19
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -4693,9 +4693,14 @@ def execute_autotrade_two_entry_signal(
     else:
         daily_bias = "NEUTRAL"
 
-    # Daily Bias Guard (Applies to Strategy 1 Box Mean-Reversion AND Strategy 3 9 EMA Retest;
-    # confirmed Box BREAKOUT_CONTINUATION trades are allowed when price breaks out of the Daily Box & holds flip support):
+    # AutoTrade Strategy 1 Enforcement: AutoTrade strictly executes Strategy 1 (`box_theory`:
+    # RH/SH/RL/SL Sweep Reversals + Daily 50 EMA Rejection + SH/SL Breakout-Retest Continuation)
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
+    if sig_strat_id != "box_theory":
+        return False, (
+            f"AutoTrade Strategy Guard: AutoTrade is restricted to Strategy 1 (Box Theory Sweep + SH/SL Breakout Continuation); "
+            f"skipping {sig_strat_id} on {pair}."
+        ), {"strategy_id": sig_strat_id}
     sig_kind = str(sig.get("signal_kind") or "").upper()
     if sig_strat_id in ("box_theory", "ema9_retest") and sig_kind != "BREAKOUT_CONTINUATION" and (
         (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG")

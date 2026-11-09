@@ -74,13 +74,15 @@ def _save(state: dict) -> None:
 
 
 def enabled_strategy_ids() -> list:
-    """All registered strategies, optionally narrowed by ENABLED_STRATEGIES=box_theory,atr_reversal."""
+    """Defaults to Strategy 1 (`box_theory`: Box Theory Sweep + SH/SL Breakout Continuation) for AutoTrade & Backtest alignment, optionally overridden by ENABLED_STRATEGIES."""
     env = os.getenv("ENABLED_STRATEGIES", "").strip()
-    ids = [s.id for s in strat_registry.list_strategies()]
+    all_ids = [s.id for s in strat_registry.list_strategies()]
     if env:
         wanted = [x.strip() for x in env.split(",") if x.strip()]
-        ids = [i for i in ids if i in wanted] or ids
-    return ids
+        matched = [i for i in all_ids if i in wanted]
+        if matched:
+            return matched
+    return [strat_registry.DEFAULT_STRATEGY_ID]
 
 
 def scan_pair(pair: str, margin_inr: float, leverage: int, usd_inr: float, strategy_id: str = "box_theory"):
@@ -343,6 +345,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     msg = f"{msg} | 🛑 {daily_stop_msg}"
                 elif (
                     autotrade
+                    and s.id == strat_registry.DEFAULT_STRATEGY_ID
                     and not portfolio_occupied
                     and not already_autotraded_candle
                     and not already_autotraded_setup

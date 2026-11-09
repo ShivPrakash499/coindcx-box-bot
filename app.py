@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 18
+_DAEMON_VERSION = 19
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -222,13 +222,20 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
                     lev = int(auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
                     u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
                     watch_pairs = coindcx_engine.get_high_volatility_watchlist(top_n=12)
+                    _is_stg_worker = coindcx_engine.is_staging_environment()
+                    _auto_flag = (
+                        bool(auto_cfg.get("paper_autotrade_enabled", True))
+                        if _is_stg_worker
+                        else bool(auto_cfg.get("enabled", False))
+                    )
                     _safe_scan_and_alert(
                         pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
                         usd_inr=u_inr,
                         send=True,
-                        autotrade=bool(auto_cfg.get("enabled", False)),
+                        strategy_ids=[strategy_registry.DEFAULT_STRATEGY_ID],
+                        autotrade=_auto_flag,
                     )
             except Exception as e:
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
@@ -755,7 +762,8 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
     )
     monitor_on = st.toggle("24/7 Email Alerts", value=True, key="monitor_on")
     _strategy_names = [s.name for s in strategy_registry.list_strategies()]
-    monitor_strategy_names = st.multiselect("Active Strategies", _strategy_names, default=_strategy_names, key="monitor_strategies")
+    _default_strat_names = [strategy_registry.get_strategy(strategy_registry.DEFAULT_STRATEGY_ID).name]
+    monitor_strategy_names = st.multiselect("Active Strategies (AutoTrade = Strategy 1 Only)", _strategy_names, default=_default_strat_names, key="monitor_strategies")
     monitor_strategy_ids = [s.id for s in strategy_registry.list_strategies() if s.name in monitor_strategy_names]
     _default_watch = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
     monitor_pairs = st.multiselect(
@@ -1502,7 +1510,11 @@ if active_section == "⚡ Signals":
                 _open_set = set(_slot_status.get("active_pairs") or [])
                 if _slot_status.get("active_pair"):
                     _open_set.add(_slot_status.get("active_pair"))
-                _elig_signals = [r for r in active_signals if r.get("pair") not in _open_set]
+                _elig_signals = [
+                    r for r in active_signals
+                    if r.get("pair") not in _open_set
+                    and r.get("strategy_id", strategy_registry.DEFAULT_STRATEGY_ID) == strategy_registry.DEFAULT_STRATEGY_ID
+                ]
                 if not _elig_signals:
                     _top_r = None
                 else:
@@ -2634,6 +2646,10 @@ elif active_section == "📈 Chart & Levels":
 # ==============================================================================
 elif active_section == "🧪 Backtest":
     st.markdown("#### 🧪 3-Slot Portfolio High-Volatility Backtest (Up to 3 Concurrent Trades @ 10x Leverage)")
+    st.caption(
+        "🎯 **Strategy 1 Only (`Box Theory Sweep` + `SH`/`SL` Breakout-Retest Continuation)** — identical to 24/7 AutoTrade execution "
+        "(includes `RH`/`SH`/`RL`/`SL` Sweep Reversals, Broken-Box Guard, Daily 50 EMA Rejection, and `SH`/`SL` Breakout-Retest Continuation)."
+    )
     bc1, bc2, bc3 = st.columns(3)
     bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days"], index=0, key="bt_multi_dur")
     bt_capital = bc2.number_input("Single-Trade Margin (₹)", min_value=5000, value=int(margin_inr), step=5000, key="bt_multi_cap")
