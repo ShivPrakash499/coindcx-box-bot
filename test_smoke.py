@@ -810,6 +810,100 @@ def test_10_live_cloud_deployments_sync():
     print("  -> PASS: Both `staging` and `main` are online, rendering cleanly, and free of stale wallet/position caches.")
 
 
+def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
+    print("[10/10] Verifying Strategy 3 (4 Post-Mortem Improvements) + Staging Paper-Only AutoTrade...")
+    import coindcx_engine as eng
+    import strategies as strat
+
+    # Build a synthetic 12-candle 5m series for LONG 9 EMA cross -> touch & confirm (like SOL $86.33)
+    # Candles 0..6 below/around 85.40, candle 7..8 confirm cross above EMA9, candle 9 touches EMA9 & closes green
+    recs_long = [
+        {"open": 85.50, "high": 85.70, "low": 85.35, "close": 85.45, "EMA9": 85.60, "EMA50": 85.55},
+        {"open": 85.45, "high": 85.65, "low": 85.38, "close": 85.50, "EMA9": 85.58, "EMA50": 85.55},
+        {"open": 85.50, "high": 85.75, "low": 85.40, "close": 85.52, "EMA9": 85.56, "EMA50": 85.55},
+        {"open": 85.52, "high": 86.25, "low": 85.45, "close": 86.10, "EMA9": 85.70, "EMA50": 85.60},  # >=20% ATR move
+        {"open": 86.10, "high": 86.28, "low": 85.95, "close": 86.20, "EMA9": 85.85, "EMA50": 85.65},  # 2nd close > EMA9 (confirmed cross at idx 4)
+        {"open": 86.20, "high": 86.38, "low": 86.00, "close": 86.33, "EMA9": 86.01, "EMA50": 85.72},  # touches EMA9 (86.00 <= 86.01) & closes green > prev
+    ]
+    atr_sol = 3.30
+
+    # Improvement 2: Block LONG when Daily Bias is BEARISH (like SOL L[41])
+    sig_blocked_bear = strat.detect_ema9_retest_entry(
+        recs_long, 5, atr_sol,
+        box={"trend_bias": "BEARISH", "RH": 89.50, "RL": 84.00, "MID": 86.75, "SH": 91.0, "SL": 83.0},
+        ema50_15m=87.21,
+    )
+    assert sig_blocked_bear is None, f"Expected BEARISH Daily Bias to block LONG Strategy 3, got: {sig_blocked_bear}"
+
+    # Improvement 3B: Block LONG in top 20% of Daily Box [RL, RH]
+    sig_blocked_top20 = strat.detect_ema9_retest_entry(
+        recs_long, 5, atr_sol,
+        box={"trend_bias": "BULLISH", "RH": 86.60, "RL": 84.00, "MID": 85.30, "SH": 88.0, "SL": 83.0},
+        ema50_15m=88.00,
+    )
+    assert sig_blocked_top20 is None, f"Expected top-20% Box zone to block LONG Strategy 3, got: {sig_blocked_top20}"
+
+    # Improvement 1 & 4: Allowed in BULLISH/NEUTRAL bias, SL anchored below 12-candle swing low (85.35) & >=1.0% away,
+    # and TP1 capped inside opposing 15m 50 EMA ($87.21 * 0.999 = $87.1228) instead of $87.48!
+    sig_ok_long = strat.detect_ema9_retest_entry(
+        recs_long, 5, atr_sol,
+        box={"trend_bias": "NEUTRAL", "RH": 89.50, "RL": 84.00, "MID": 87.80, "SH": 91.0, "SL": 83.0},
+        ema50_15m=87.21,
+    )
+    assert sig_ok_long is not None and sig_ok_long["direction"] == "LONG", f"Expected valid LONG signal, got: {sig_ok_long}"
+    assert sig_ok_long["stop"] <= 85.35 * (1 - strat.SL_BUFFER) and sig_ok_long["stop"] <= 86.33 * 0.990, (
+        f"Expected 12-candle structural SL <= 85.18, got: {sig_ok_long['stop']}"
+    )
+    assert sig_ok_long["tp1"] <= 87.21, f"Expected TP1 capped inside 15m 50 EMA ($87.21), got: {sig_ok_long['tp1']}"
+
+    # Improvement 4B: Early 80% TP1 Breakeven SL Ratchet in get_active_portfolio_trade_status
+    fake_lock = {
+        "pair": "B-XRP_USDT",
+        "direction": "SHORT",
+        "strategy_id": "ema9_retest",
+        "entry": 1.0905,
+        "entry2_sweep": 0.0,
+        "tp1": 1.0749,
+        "tp2": 1.0562,
+        "stop_loss": 1.1020,
+        "tp1_hit": False,
+        "opened_ts": time.time() - 60.0,
+        "is_live_exchange": False,
+        "mode": "Staging Paper AutoTrade (Live Market)",
+    }
+    saved_locks = []
+    # Price reaches $1.0760 (93% of distance from 1.0905 to 1.0749, shy of TP1 by $0.0011)
+    with patch.object(eng, "get_autotrade_config", return_value={"active_trade_lock": dict(fake_lock)}),          patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.0760}),          patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)),          patch.object(eng, "save_autotrade_config", side_effect=lambda d: saved_locks.append(d) or {}):
+        st_res = eng.get_active_portfolio_trade_status(manage_exchange=True)
+        assert st_res["stop_loss"] < 1.0905 and abs(st_res["stop_loss"] - round(1.0905 * 0.9982, 4)) <= 0.0002, (
+            f"Expected 80% TP1 breakeven ratchet below entry 1.0905, got: {st_res['stop_loss']}"
+        )
+
+    # Staging Paper-Only AutoTrade Guard: verify place_coindcx_futures_order is NEVER called on staging
+    with patch.object(eng, "is_staging_environment", return_value=True),          patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}),          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]),          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}),          patch.object(eng, "place_coindcx_futures_order") as mock_live_order,          patch.object(eng, "save_autotrade_config", return_value={}),          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+        ok_stg, msg_stg, meta_stg = eng.execute_autotrade_two_entry_signal(
+            pair="B-AVAX_USDT",
+            sig={
+                "signal": "SHORT",
+                "strategy_id": "ema9_retest",
+                "entry": 9.01,
+                "entry2_sweep": 0.0,
+                "tp1": 8.91,
+                "tp2": 8.75,
+                "stop_loss": 9.12,
+                "levels": {"trend_bias": "BEARISH", "RH": 9.20, "RL": 8.60, "MID": 8.90},
+            },
+            single_trade_margin_inr=19500.0,
+            leverage=10,
+        )
+        assert ok_stg and meta_stg.get("paper_mode") is True, f"Expected Staging Paper AutoTrade success, got: {ok_stg} {msg_stg}"
+        assert not mock_live_order.called, "place_coindcx_futures_order MUST NEVER be called when is_staging_environment() is True!"
+        assert meta_stg["lock"]["is_live_exchange"] is False
+        assert meta_stg["lock"]["strategy_id"] == "ema9_retest"
+
+    print("  -> PASS: Strategy 3 (4 improvements), 80% TP1 breakeven SL ratchet, and Staging Paper-Only AutoTrade verified.")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -820,6 +914,7 @@ if __name__ == "__main__":
     test_7_ui_render_and_navigation_tabs_integrity()
     test_8_stale_cache_expiry_and_nat_pinner()
     test_9_ai_advisor_and_tick_precision()
+    test_10_strategy3_four_improvements_and_staging_paper_autotrade()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

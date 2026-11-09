@@ -126,7 +126,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
     if leverage is None or leverage <= 0:
         leverage = int(auto_cfg.get("leverage", 10))
     if autotrade is None:
-        autotrade = bool(auto_cfg.get("enabled", False))
+        if eng.is_staging_environment():
+            autotrade = bool(auto_cfg.get("paper_autotrade_enabled", True))
+        else:
+            autotrade = bool(auto_cfg.get("enabled", False))
 
     if not pairs:
         pairs = eng.get_high_volatility_watchlist(top_n=12)
@@ -191,7 +194,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
         # Live 5% Daily Loss Stop: if hit, keep scanning/alerting but place no new AutoTrades today
         daily_stop_hit, daily_stop_msg = False, ""
-        if autotrade:
+        if autotrade and not eng.is_staging_environment():
             try:
                 daily_stop_hit, daily_stop_msg, _ = eng.check_live_daily_loss_stop()
             except Exception as e:

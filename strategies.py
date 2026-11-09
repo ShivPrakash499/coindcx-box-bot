@@ -316,14 +316,14 @@ def build_single_entry_runner_plan(
 
     if is_long:
         raw_stop = struct_stop if (0 < struct_stop < entry) else entry * 0.992
-        stop_price = max(min(raw_stop, entry * 0.9965), entry * 0.988)
+        stop_price = max(min(raw_stop, entry * 0.9965), entry * 0.985)
         tp1_price = entry + tp1_dist
         raw_tp2_dist = (struct_tp2 - entry) if struct_tp2 > tp1_price else max(tp1_dist * 2.2, entry * 0.044)
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
         tp2_price = entry + tp2_dist
     else:
         raw_stop = struct_stop if (struct_stop > entry) else entry * 1.008
-        stop_price = min(max(raw_stop, entry * 1.0035), entry * 1.012)
+        stop_price = min(max(raw_stop, entry * 1.0035), entry * 1.015)
         tp1_price = entry - tp1_dist
         raw_tp2_dist = (entry - struct_tp2) if (0 < struct_tp2 < tp1_price) else max(tp1_dist * 2.2, entry * 0.044)
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
@@ -1384,17 +1384,43 @@ def _is_ema9_touch_and_confirm(recs, k: int, direction: str, atr: float) -> bool
         return bool(touched and confirmed)
 
 
-def detect_ema9_retest_entry(recs, k: int, atr: float):
+def detect_ema9_retest_entry(recs, k: int, atr: float, box: dict | None = None, ema50_15m: float = 0.0):
     """
-    Strategy 3 Fallback Entry:
+    Strategy 3 Fallback Entry (Upgraded with 4 Live-Trade Post-Mortem Protections):
       1. Earlier confirmed 9 EMA cross (2 consecutive closes across 9 EMA) — never enters on the cross itself.
       2. A subsequent candle `k` pulls back to touch the 9 EMA and confirms in the new direction.
-      3. First retest since the confirmed cross (`one trade per confirmed cross`).
+      3. First retest since the confirmed cross (`one trade per confirmed cross`), within <=30% Daily ATR of cross origin.
+      4. Daily 50 & 200 EMA Trend Bias Filter: BEARISH -> SHORT only; BULLISH -> LONG only; NEUTRAL -> both.
+      5. Daily Box [RL, RH] Outer 20% Exhaustion Guard: no SHORT in bottom 20% of [RL, RH]; no LONG in top 20% of [RL, RH].
+      6. Structural 1-Hour (12x5m) Swing + 5m 50 EMA SL Anchor (min 1.0% distance from entry).
+      7. Cap TP1 inside opposing 15m 50 EMA, Box MID, or RL/RH/SL/SH support/resistance floor.
     """
     if k < 3 or not atr or atr <= 0:
         return None
 
+    daily_bias = ""
+    rh = rl = sh = sl_box = mid = 0.0
+    if isinstance(box, dict) and box:
+        raw_bias = str(box.get("trend_bias") or box.get("bias") or "").upper()
+        if "BEARISH" in raw_bias:
+            daily_bias = "BEARISH"
+        elif "BULLISH" in raw_bias:
+            daily_bias = "BULLISH"
+        elif raw_bias:
+            daily_bias = "NEUTRAL"
+        rh = float(box.get("RH", 0.0) or 0.0)
+        rl = float(box.get("RL", 0.0) or 0.0)
+        sh = float(box.get("SH", 0.0) or 0.0)
+        sl_box = float(box.get("SL", 0.0) or 0.0)
+        mid = float(box.get("MID", 0.0) or 0.0)
+
     for direction in ("LONG", "SHORT"):
+        # Improvement 2: Strict Daily 50 & 200 EMA Trend Bias Filter
+        if daily_bias == "BEARISH" and direction != "SHORT":
+            continue
+        if daily_bias == "BULLISH" and direction != "LONG":
+            continue
+
         cross_idx = _has_confirmed_ema9_cross(recs, k, direction, atr=atr)
         if cross_idx is None:
             continue
@@ -1405,21 +1431,59 @@ def detect_ema9_retest_entry(recs, k: int, atr: float):
             continue
 
         cur = recs[k]
-        prev = recs[k - 1]
         entry = float(cur["close"])
         ema9 = float(cur["EMA9"])
+
+        # Improvement 3A: Overextended Cross-Origin Distance Guard (<= 30% Daily ATR from cross close)
+        cross_close = float(recs[cross_idx].get("close", entry))
+        if abs(entry - cross_close) > 0.30 * atr:
+            continue
+
+        # Improvement 3B: Daily Box [RL, RH] Outer 20% Exhaustion Guard
+        if rh > rl > 0:
+            box_span = rh - rl
+            if direction == "SHORT" and entry <= (rl + 0.20 * box_span):
+                continue
+            if direction == "LONG" and entry >= (rh - 0.20 * box_span):
+                continue
+
+        # Improvement 1: 1-Hour (12x5m) Structural Swing + 5m 50 EMA Stop Loss Anchor (min 1.0% buffer)
+        win12 = recs[max(0, k - 11):k + 1]
+        ema50_5m = float(cur.get("EMA50") or ema9)
+        tp1_move = max(min(0.35 * atr, entry * 0.015), entry * 0.0068)
+
         if direction == "LONG":
-            wick_low = min(float(cur["low"]), float(prev["low"]), ema9)
-            struct_stop = min(wick_low * (1 - SL_BUFFER), entry * 0.995)
-            tp1_move = max(min(0.35 * atr, entry * 0.015), entry * 0.0068)
+            swing_low_12 = min(float(x["low"]) for x in win12)
+            near_ema50_low = ema50_5m if (0 < ema50_5m < entry and (entry - ema50_5m) <= entry * 0.012) else swing_low_12
+            anchor_low = min(swing_low_12, near_ema50_low, ema9)
+            struct_stop = min(anchor_low * (1 - SL_BUFFER), entry * 0.990)
             struct_tp1 = entry + tp1_move
             struct_tp2 = entry + max(0.80 * atr, tp1_move * 2.2)
+
+            # Improvement 4 (LONG): Cap TP1 inside opposing 15m 50 EMA, Box MID, or RH/SH resistance ceiling
+            if rh > entry:
+                struct_tp1 = min(struct_tp1, rh * 0.9985)
+            elif sh > entry >= rh > 0:
+                struct_tp1 = min(struct_tp1, sh * 0.9975)
+            for ceil_lvl in (float(ema50_15m or 0.0), mid):
+                if ceil_lvl > 0 and (ceil_lvl * 0.999) >= (entry * 1.0062) and (ceil_lvl * 0.999) < struct_tp1:
+                    struct_tp1 = ceil_lvl * 0.999
         else:
-            wick_high = max(float(cur["high"]), float(prev["high"]), ema9)
-            struct_stop = max(wick_high * (1 + SL_BUFFER), entry * 1.005)
-            tp1_move = max(min(0.35 * atr, entry * 0.015), entry * 0.0068)
+            swing_high_12 = max(float(x["high"]) for x in win12)
+            near_ema50_high = ema50_5m if (ema50_5m > entry and (ema50_5m - entry) <= entry * 0.012) else swing_high_12
+            anchor_high = max(swing_high_12, near_ema50_high, ema9)
+            struct_stop = max(anchor_high * (1 + SL_BUFFER), entry * 1.010)
             struct_tp1 = entry - tp1_move
             struct_tp2 = entry - max(0.80 * atr, tp1_move * 2.2)
+
+            # Improvement 4 (SHORT): Cap TP1 inside opposing 15m 50 EMA, Box MID, or RL/SL support floor
+            if 0 < rl < entry:
+                struct_tp1 = max(struct_tp1, rl * 1.0015)
+            elif 0 < sl_box < entry <= rl:
+                struct_tp1 = max(struct_tp1, sl_box * 1.0025)
+            for floor_lvl in (float(ema50_15m or 0.0), mid):
+                if floor_lvl > 0 and (floor_lvl * 1.001) <= (entry * 0.9938) and (floor_lvl * 1.001) > struct_tp1:
+                    struct_tp1 = floor_lvl * 1.001
 
         plan = build_single_entry_runner_plan(
             direction, entry, struct_stop, struct_tp1, struct_tp2,
@@ -1451,41 +1515,66 @@ class Ema9RetestStrategy(Strategy):
         "Strategy 3 Fallback Entry & Active Trade Exit Engine: "
         "Only takes a new trade when Strategies 1 & 2 have no setup. "
         "Does NOT enter immediately on a 9 EMA cross; waits for a confirmed 5m 9 EMA cross (2 consecutive closes) "
-        "followed by a later 5m candle that touches the 9 EMA and confirms rejection (<20% Daily ATR)."
+        "followed by a later 5m candle that touches the 9 EMA and confirms rejection (<20% Daily ATR), "
+        "filtered by Daily 50/200 EMA Trend Bias, Daily Box outer-20% exhaustion guard, and 12-candle structural SL."
     )
-    daily_warmup_days = 220
+    daily_warmup_days = 1000
     tp1_name, tp2_name = "TP1 (50% Book)", "50% Runner (15m Trail + 9 EMA / 20% ATR Exit)"
     uses_live_price = False
 
     def compute_levels(self, pair):
+        box_lvls = eng.calculate_daily_box_levels(pair)
         d = eng.fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
         if d.empty or len(d) < SMA_PERIOD + 2:
-            return None
+            return box_lvls
         d_comp = daily_sma_atr(d.iloc[:-1].reset_index(drop=True))
         last_comp = d_comp.iloc[-1]
         if pd.isna(last_comp["ATR"]):
-            return None
+            return box_lvls
         close = float(last_comp["close"])
         atr = float(last_comp["ATR"])
+        ema50_d = float(last_comp["EMA50"])
+        ema200_d = float(last_comp["EMA200"])
+        trend_bias = classify_daily_ema_bias(close, ema50_d, ema200_d)
         df5 = _closed_5m(pair, 40)
         ema9_5m = float(df5["EMA9"].iloc[-1]) if (not df5.empty and "EMA9" in df5) else close
-        return {
+        df15 = _closed_15m(pair, 60)
+        ema50_15m = float(df15["EMA50"].iloc[-1]) if (not df15.empty and "EMA50" in df15) else close
+        base = dict(box_lvls) if isinstance(box_lvls, dict) else {}
+        base.update({
             "EMA9_5M": eng.round_asset_price(ema9_5m, close),
+            "EMA50_15M": eng.round_asset_price(ema50_15m, close),
             "ATR": round(atr, 6),
             "ATR20": round(0.20 * atr, 6),
             "daily_close": eng.round_asset_price(close, close),
+            "trend_bias": base.get("trend_bias") or trend_bias,
+            "bias": base.get("bias") or trend_bias,
             "prev_day_date": datetime.fromtimestamp(last_comp["timestamp"] / 1000, tz=IST).strftime("%Y-%m-%d"),
-        }
+        })
+        return base
 
     def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
+        if "RH" not in levels or "trend_bias" not in levels:
+            try:
+                box_extra = eng.calculate_daily_box_levels(pair) or {}
+                merged = dict(box_extra)
+                merged.update(levels)
+                levels = merged
+            except Exception:
+                pass
         df5 = _closed_5m(pair, 60)
         if df5.empty or len(df5) < 6:
             return None
         recs5 = df5.to_dict("records")
         last_c5 = recs5[-1]
+        ema50_15m = float(levels.get("EMA50_15M", 0.0) or 0.0)
+        if ema50_15m <= 0:
+            df15 = _closed_15m(pair, 60)
+            if not df15.empty and "EMA50" in df15:
+                ema50_15m = float(df15["EMA50"].iloc[-1])
         session = eng.get_current_session_info(datetime.now(IST))
         candle_time = datetime.fromtimestamp(last_c5["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
         entry_px = float(last_c5["close"])
@@ -1502,7 +1591,7 @@ class Ema9RetestStrategy(Strategy):
         }
         out.update(position_metrics(pair, entry_px, 0.0, entry_px, entry_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
 
-        sig3 = detect_ema9_retest_entry(recs5, len(recs5) - 1, float(levels["ATR"]))
+        sig3 = detect_ema9_retest_entry(recs5, len(recs5) - 1, float(levels["ATR"]), box=levels, ema50_15m=ema50_15m)
         if sig3:
             direction = sig3["direction"]
             word = "BUY (Long)" if direction == "LONG" else "SELL (Short)"
@@ -1523,14 +1612,34 @@ class Ema9RetestStrategy(Strategy):
 
     def prepare_backtest(self, df, df_daily):
         d = daily_sma_atr(df_daily.reset_index(drop=True))
+        ema50_15m_list = df["close"].ewm(span=50, adjust=False).mean().tolist() if (df is not None and not df.empty) else []
         stats = {}
         for i in range(1, len(d)):
             prev = d.iloc[i - 1]
             if pd.isna(prev["ATR"]):
                 continue
-            stats[d.iloc[i]["date_str"]] = {"atr": float(prev["ATR"])}
+            rh = float(prev["high"])
+            rl = float(prev["low"])
+            prev_close = float(prev["close"])
+            ema50_d = float(prev["EMA50"])
+            ema200_d = float(prev["EMA200"])
+            mid = (rh + rl) / 2.0
+            bias = classify_daily_ema_bias(prev_close, ema50_d, ema200_d)
+            swing = eng.compute_box_swing_levels(d.iloc[max(0, i - 30):i])
+            stats[d.iloc[i]["date_str"]] = {
+                "atr": float(prev["ATR"]),
+                "RH": eng.round_asset_price(rh),
+                "RL": eng.round_asset_price(rl),
+                "MID": eng.round_asset_price(mid, rh),
+                "SH": eng.round_asset_price(swing["SH"], rh),
+                "SL": eng.round_asset_price(swing["SL"], rl),
+                "EMA50": eng.round_asset_price(ema50_d, rh),
+                "EMA200": eng.round_asset_price(ema200_d, rh),
+                "bias": bias,
+                "trend_bias": bias,
+            }
 
-        # Use 5m candles attached to df.attrs["df_5m"] when available; otherwise compute EMA9 on df
+        # Use 5m candles attached to df.attrs["df_5m"] when available; otherwise compute EMA9/EMA50 on df
         df_5m = df.attrs.get("df_5m") if hasattr(df, "attrs") else None
         sub5_by_15m = {}
         recs5 = []
@@ -1538,6 +1647,8 @@ class Ema9RetestStrategy(Strategy):
             c5 = df_5m.copy().reset_index(drop=True)
             if "EMA9" not in c5:
                 c5["EMA9"] = c5["close"].ewm(span=9, adjust=False).mean()
+            if "EMA50" not in c5:
+                c5["EMA50"] = c5["close"].ewm(span=50, adjust=False).mean()
             recs5 = c5.to_dict("records")
             for idx5, r5 in enumerate(recs5):
                 bucket = (int(r5["timestamp"]) // 900000) * 900000
@@ -1545,12 +1656,14 @@ class Ema9RetestStrategy(Strategy):
         else:
             c15 = df.copy().reset_index(drop=True)
             c15["EMA9"] = c15["close"].ewm(span=9, adjust=False).mean()
+            if "EMA50" not in c15:
+                c15["EMA50"] = c15["close"].ewm(span=50, adjust=False).mean()
             recs5 = c15.to_dict("records")
             for idx15, r15 in enumerate(recs5):
                 bucket = (int(r15["timestamp"]) // 900000) * 900000
                 sub5_by_15m[bucket] = [idx15]
 
-        return {"daily": stats, "recs5": recs5, "sub5_by_15m": sub5_by_15m}
+        return {"daily": stats, "recs5": recs5, "sub5_by_15m": sub5_by_15m, "ema50_15m": ema50_15m_list}
 
     def backtest_has_context(self, candle, ctx):
         return candle["date_str"] in ctx["daily"]
@@ -1560,11 +1673,12 @@ class Ema9RetestStrategy(Strategy):
         if not day:
             return None
         atr = day["atr"]
+        ema50_15m = float(ctx["ema50_15m"][idx]) if idx < len(ctx.get("ema50_15m", [])) else float(day.get("MID", 0.0) or 0.0)
         bucket = (int(candle["timestamp"]) // 900000) * 900000
         idx5_list = ctx.get("sub5_by_15m", {}).get(bucket, [])
         recs5 = ctx.get("recs5", [])
         for k5 in idx5_list:
-            sig = detect_ema9_retest_entry(recs5, k5, atr)
+            sig = detect_ema9_retest_entry(recs5, k5, atr, box=day, ema50_15m=ema50_15m)
             if sig:
                 return sig
         return None

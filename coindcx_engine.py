@@ -438,7 +438,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 16
+_REQUIRED_DAEMON_VERSION = 17
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -3271,7 +3271,38 @@ _AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 
 
 
 # Keys that must survive a Streamlit Cloud restart (persisted per deployment to the Google Sheet)
-_DURABLE_AUTOTRADE_KEYS = ("enabled", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
+_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
+
+
+def get_git_branch_name() -> str:
+    """Returns the active git branch / deployment name ('staging', 'main', etc.) in both local and cloud runs."""
+    env_id = str(os.getenv("APP_DEPLOYMENT_ID", "") or os.getenv("STREAMLIT_BRANCH", "") or "").strip()
+    if env_id:
+        return env_id
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(here, ".git", "HEAD"), "r", encoding="utf-8") as fh:
+            head = fh.read().strip()
+        if head.startswith("ref: refs/heads/"):
+            return head.split("ref: refs/heads/", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def is_staging_environment() -> bool:
+    """
+    True when running on the `staging` branch or staging deployment (`np-shiv-prakash-trade-assistant`).
+    On staging, Live CoinDCX AutoTrade is disabled and AutoTrade executes strictly as Paper Trading
+    on live market data.
+    """
+    branch = get_git_branch_name().lower()
+    if branch == "staging" or "staging" in branch:
+        return True
+    host = str(os.getenv("HOSTNAME", "") or os.getenv("STREAMLIT_SERVER_ADDRESS", "") or "").lower()
+    if "np-shiv-prakash" in host or "staging" in host:
+        return True
+    return False
 
 
 def _get_deployment_id() -> str:
@@ -3285,14 +3316,7 @@ def _get_deployment_id() -> str:
     here = os.path.dirname(os.path.abspath(__file__))
     if not here.replace("\\", "/").startswith("/mount/src/"):
         return ""
-    try:
-        with open(os.path.join(here, ".git", "HEAD"), "r", encoding="utf-8") as fh:
-            head = fh.read().strip()
-        if head.startswith("ref: refs/heads/"):
-            return head.split("ref: refs/heads/", 1)[1].strip()
-    except Exception:
-        pass
-    return ""
+    return get_git_branch_name()
 
 
 def _restore_autotrade_state_once() -> None:
@@ -3344,8 +3368,11 @@ def get_autotrade_config() -> dict:
     _check_and_kill_obsolete_daemon()
     _restore_autotrade_state_once()
 
+    _is_stg = is_staging_environment()
     default_cfg = {
         "enabled": False,
+        "paper_autotrade_enabled": True if _is_stg else False,
+        "paper_only": _is_stg,
         "wallet_balance_inr": 47287.18,
         "single_trade_margin_inr": 15762.39,
         "leverage": 10,
@@ -3752,8 +3779,9 @@ def register_app_trade_lock(
     }
     cfg = get_autotrade_config()
     prev_lock = cfg.get("active_trade_lock") or {}
-    is_new_live_lock = bool(
-        is_live_exchange
+    is_paper_autotrade = ("Paper AutoTrade" in str(mode)) or (not is_live_exchange and is_staging_environment())
+    should_log_sheet = bool(
+        (is_live_exchange or is_paper_autotrade)
         and (
             prev_lock.get("pair") != pair
             or str(prev_lock.get("direction", "")).upper() != str(direction).upper()
@@ -3764,7 +3792,17 @@ def register_app_trade_lock(
     hist.insert(0, {**lock_info, "status": "APP_API_LOCK_SET"})
     save_autotrade_config({"active_trade_lock": lock_info, "history": hist[:30]})
 
-    if is_new_live_lock:
+    if should_log_sheet:
+        _strat_map = {
+            "box_theory": "Strategy 1: Box Theory Sweep",
+            "atr_reversal": "Strategy 2: 1-Candle 25% ATR Reversal",
+            "ema9_retest": "Strategy 3: 9 EMA Touch & Confirm",
+        }
+        _base_strat = _strat_map.get(str(strategy_id or "box_theory"), "Box Theory Sweep")
+        _tag_suffix = "Staging Paper AutoTrade" if not is_live_exchange else "App Live Order"
+        _sheet_strat_name = f"{_base_strat} ({_tag_suffix})"
+        _sheet_status = "PAPER_AUTOTRADE_OPEN" if not is_live_exchange else "LOGGED_PENDING"
+
         def _async_sheet_log():
             try:
                 import sheets_logger
@@ -3788,7 +3826,8 @@ def register_app_trade_lock(
                     "leverage": lev_f,
                     "profit_tp1_inr": proj_tp1,
                     "loss_sl_inr": proj_sl,
-                    "strategy_name": "Box Theory Sweep (App Live Order)",
+                    "status": _sheet_status,
+                    "strategy_name": _sheet_strat_name,
                     "trigger_reason": f"{mode} | E1: ${e_f}, E2: ${float(entry2_sweep or 0.0)}",
                 })
             except Exception as _se:
@@ -4071,9 +4110,20 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
             better = (cur_sl <= 0) or ((runner_sl > cur_sl) if is_long else (runner_sl < cur_sl))
             if better and runner_sl > 0:
                 update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=runner_sl, pair=pair)
-        elif cur_sl <= 0 or cur_tp <= 0:
-            # Position has NOT hit TP1 yet, but Stop Loss or Take Profit is missing (null) on CoinDCX -> attach immediately!
-            update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=cat_sl_px, pair=pair)
+        else:
+            # Early 80% TP1 Breakeven SL Ratchet: once price reaches >=80% of the distance to TP1, lock SL at fee-covered breakeven
+            tp1_dist80 = 0.80 * abs(eff_tp1_px - entry_p)
+            reached_80pct_tp1 = (mark_p >= (entry_p + tp1_dist80)) if is_long else (mark_p <= (entry_p - tp1_dist80))
+            if reached_80pct_tp1 and tp1_dist80 > 0:
+                be_sl = format_order_price(pair, entry_p * (1.0018 if is_long else 0.9982))
+                be_valid = (be_sl < mark_p * 0.999) if is_long else (be_sl > mark_p * 1.001)
+                be_better = (cur_sl <= 0) or ((be_sl > cur_sl) if is_long else (be_sl < cur_sl))
+                if be_valid and be_better and be_sl > 0:
+                    update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=be_sl, pair=pair)
+                    return
+            if cur_sl <= 0 or cur_tp <= 0:
+                # Position has NOT hit TP1 yet, but Stop Loss or Take Profit is missing (null) on CoinDCX -> attach immediately!
+                update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=cat_sl_px, pair=pair)
     except Exception:
         pass
 
@@ -4270,10 +4320,48 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                     hit_tp2 = (px >= l_tp2) if (is_long and l_tp2 > 0) else ((px <= l_tp2) if (not is_long and l_tp2 > 0) else False)
                     hit_sl = (px <= l_sl) if (is_long and l_sl > 0) else ((px >= l_sl) if (not is_long and l_sl > 0) else False)
 
+                    def _log_paper_close_async(exit_p: float, reason_str: str):
+                        if is_live_ex:
+                            return
+                        def _worker_close():
+                            try:
+                                import sheets_logger
+                                e_p = float(lock.get("entry", 0.0) or 0.0)
+                                m_inr = float(lock.get("margin_inr", 20000.0) or 20000.0)
+                                lev_v = int(lock.get("leverage", 10) or 10)
+                                raw_pct = ((exit_p - e_p) / e_p) if (is_long and e_p > 0) else (((e_p - exit_p) / e_p) if e_p > 0 else 0.0)
+                                # If TP1 was already hit on a 50/50 strategy, blend 50% at TP1 + 50% at exit_p
+                                is_s3_p = (str(lock.get("strategy_id", "")) == "ema9_retest")
+                                if lock.get("tp1_hit") and not is_s3_p and l_tp1 > 0 and e_p > 0:
+                                    tp1_pct = ((l_tp1 - e_p) / e_p) if is_long else ((e_p - l_tp1) / e_p)
+                                    raw_pct = 0.5 * tp1_pct + 0.5 * raw_pct
+                                roe_v = round((raw_pct * lev_v - 0.0118) * 100.0, 2)
+                                net_inr = round(m_inr * (roe_v / 100.0), 2)
+                                outcome_lbl = "PAPER_WIN" if net_inr >= 0 else "PAPER_LOSS"
+                                sign_s = "+" if net_inr >= 0 else "-"
+                                status_cell = f"{outcome_lbl} ({'+' if roe_v >= 0 else ''}{roe_v:.2f}% ROE | {sign_s}Rs.{abs(net_inr):,.0f} @ ${exit_p})"
+                                sheets_logger.log_trade_closed({
+                                    "exit_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+                                    "pair": l_pair,
+                                    "direction": l_dir,
+                                    "entry_price": e_p,
+                                    "stop_loss": l_sl,
+                                    "exit_price": exit_p,
+                                    "exit_reason": f"[STAGING PAPER] {reason_str}",
+                                    "net_pnl_inr": net_inr,
+                                    "update_live_sheet_status": status_cell,
+                                })
+                            except Exception as _ce:
+                                print(f"[Paper Close Log Notice]: {_ce}")
+                        _threading.Thread(target=_worker_close, daemon=True).start()
+
                     # Full Exit at TP2 or Stop Loss (Catastrophe SL or Ratcheted Runner SL)
                     if hit_tp2 or hit_sl:
                         if is_live_ex:
                             cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
+                        else:
+                            _exit_r = "TP2 Target Hit" if hit_tp2 else ("Profit-Locked SL Hit" if tp1_already_hit else ("80% TP1 Breakeven SL Hit" if lock.get("tp1_80pct_be_ratcheted") else "Stop Loss Hit"))
+                            _log_paper_close_async(px, _exit_r)
                         clear_autotrade_active_lock()
                         return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Completed)"}
 
@@ -4356,6 +4444,8 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         if should_exit_r:
                             if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
                                 exit_coindcx_position(matched_live_pos["id"], pair=l_pair)
+                            elif not is_live_ex:
+                                _log_paper_close_async(px, "Smart Hybrid Runner Exit (9 EMA / 20% ATR Pullback)")
                             clear_autotrade_active_lock()
                             return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Smart Hybrid Runner Exited)"}
 
@@ -4376,6 +4466,21 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             save_autotrade_config({"active_trade_lock": lock})
                             if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
                                 update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=next_runner_sl, pair=l_pair)
+
+                    # Pre-TP1 Stage: Early 80% TP1 Breakeven SL Ratchet (protects trades that stall 0.10% shy of TP1)
+                    elif not tp1_already_hit and l_tp1 > 0 and l_entry > 0:
+                        dist80 = 0.80 * abs(l_tp1 - l_entry)
+                        hit_80pct = (px >= (l_entry + dist80)) if is_long else (px <= (l_entry - dist80))
+                        if hit_80pct and not lock.get("tp1_80pct_be_ratcheted"):
+                            be_sl = round_asset_price(l_entry * (1.0018 if is_long else 0.9982), l_entry)
+                            be_improved = (l_sl <= 0) or ((be_sl > l_sl) if is_long else (be_sl < l_sl))
+                            if be_improved and be_sl > 0:
+                                lock["stop_loss"] = be_sl
+                                lock["tp1_80pct_be_ratcheted"] = True
+                                l_sl = be_sl
+                                save_autotrade_config({"active_trade_lock": lock})
+                                if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
+                                    update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=be_sl, pair=l_pair)
 
             # Also safeguard any OTHER live CoinDCX positions (e.g. if 2 positions exist like INJ + RENDER)
             if is_live_ex and live_positions:
@@ -4522,6 +4627,7 @@ def execute_autotrade_two_entry_signal(
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
 
     max_slots = int(cfg.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)
+    staging_paper_only = is_staging_environment() or bool(cfg.get("paper_only", False))
 
     # Live 5% Daily Loss Stop + wallet-aware sizing (never request more margin than the futures wallet holds)
     _wallet_now = fetch_coindcx_futures_balance()
@@ -4547,7 +4653,7 @@ def execute_autotrade_two_entry_signal(
 
     # Mandatory synchronous live CoinDCX position check: block duplicate pair or when >= max_slots (3) positions are open
     live_ex_pos = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
-    if live_ex_pos is None and os.getenv("COINDCX_API_KEY"):
+    if live_ex_pos is None and os.getenv("COINDCX_API_KEY") and not staging_paper_only:
         return False, (
             f"Portfolio Safety Guard: Could not verify live CoinDCX positions right now; "
             f"blocking {pair} AutoTrade until exchange positions are verified."
@@ -4587,9 +4693,9 @@ def execute_autotrade_two_entry_signal(
     else:
         daily_bias = "NEUTRAL"
 
-    # Daily Bias Guard (Applies to Strategy 1 Box Theory; Strategy 2 ATR Reversal & Strategy 3 9 EMA work both ways):
+    # Daily Bias Guard (Applies to Strategy 1 Box Theory AND Strategy 3 9 EMA Retest):
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
-    if sig_strat_id == "box_theory" and (
+    if sig_strat_id in ("box_theory", "ema9_retest") and (
         (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG")
     ):
         return False, (
@@ -4633,6 +4739,21 @@ def execute_autotrade_two_entry_signal(
 
     # 50% of Entry 1 quantity to book at TP1 (remaining 50% of Entry 1 rides to TP2)
     qty1_tp1_half = format_order_quantity(pair, qty1 * 0.5)
+
+    if staging_paper_only:
+        # Staging Environment: NEVER place live CoinDCX orders; execute strictly as Live-Market Paper AutoTrade!
+        lock_info = register_app_trade_lock(
+            pair=pair, direction=direction, entry=entry1_px, stop_loss=sl_px,
+            tp1=tp1_px, tp2=tp2_px, entry2_sweep=entry2_px, margin_inr=margin_inr,
+            leverage=lev, qty1=qty1, qty2=qty2,
+            mode="Staging Paper AutoTrade (Live Market)", is_live_exchange=False,
+            tp1_order_id="STRATEGY3_FULL_RUNNER_SL_RATCHET" if sig_strat_id == "ema9_retest" else "DAEMON_50PCT_REDUCE_AT_TP1",
+            strategy_id=sig_strat_id,
+        )
+        return True, (
+            f"Staging Paper AutoTrade Executed: {norm_dir} {pair} ({sig_strat_id}) | "
+            f"Entry 1: ${entry1_px} ({qty1}) | TP1: ${tp1_px} | TP2: ${tp2_px} | SL: ${sl_px} @ {lev}x"
+        ), {"lock": lock_info, "paper_mode": True}
 
     wallet = fetch_coindcx_futures_balance()
     api_key_now, api_secret_now = _get_coindcx_credentials()

@@ -137,7 +137,7 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
             leverage_val,
             trade_data["profit_tp1_inr"],
             trade_data["loss_sl_inr"],
-            "LOGGED_PENDING",
+            trade_data.get("status", "LOGGED_PENDING"),
             trade_data.get("strategy_name", "Box Theory Sweep"),
             trade_data.get("trigger_reason", "")
         ]
@@ -156,7 +156,7 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
 
 
 def log_trade_closed(trade: dict, return_details: bool = False):
-    """Logs the final result of a closed position to the 'Closed_Trades' worksheet."""
+    """Logs the final result of a closed position to the 'Closed_Trades' worksheet (and updates PAPER_AUTOTRADE_OPEN in Live_Trades)."""
     try:
         book = _client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
         ws = _get_ws(book, "Closed_Trades")
@@ -164,6 +164,17 @@ def log_trade_closed(trade: dict, return_details: bool = False):
             ws.append_row(["Exit Time", "Pair", "Direction", "Entry", "Stop Loss", "Exit", "Exit Reason", "Net PnL (INR)"])
         ws.append_row([trade.get(k, "") for k in ("exit_time", "pair", "direction", "entry_price", "stop_loss",
                                                   "exit_price", "exit_reason", "net_pnl_inr")])
+        if trade.get("update_live_sheet_status"):
+            try:
+                ws_live = _get_ws(book, "Live_Trades")
+                rows_live = ws_live.get_all_values()
+                for r_idx in range(len(rows_live), 1, -1):
+                    r = rows_live[r_idx - 1]
+                    if len(r) >= 13 and r[1] == str(trade.get("pair", "")) and str(r[12]).startswith(("PAPER_", "LOGGED_PENDING")):
+                        ws_live.update_cell(r_idx, 13, str(trade["update_live_sheet_status"]))
+                        break
+            except Exception:
+                pass
         return (True, "logged") if return_details else True
     except Exception as e:
         print(f"[!] Closed-trade log error: {e}")

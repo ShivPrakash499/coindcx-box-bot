@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 16
+_DAEMON_VERSION = 17
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -652,26 +652,53 @@ usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (3-Slot)")
-# Sync stale browser session toggle state if v9 disarmed AutoTrade on disk
-_disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
-if st.session_state.get("_autotrade_disarm_sync_v") != 9:
-    st.session_state["_autotrade_disarm_sync_v"] = 9
-    st.session_state["sidebar_autotrade_toggle"] = _disk_auto_enabled
+_is_staging_env = coindcx_engine.is_staging_environment()
 
+if _is_staging_env:
+    if _auto_cfg.get("enabled"):
+        _auto_cfg = coindcx_engine.save_autotrade_config({"enabled": False, "paper_autotrade_enabled": True})
+    st.sidebar.toggle(
+        "Enable AutoTrade (10x 2-Entry) [LIVE]",
+        value=False,
+        disabled=True,
+        key="sidebar_live_autotrade_disabled_staging",
+        help="Live CoinDCX AutoTrade is disabled on Staging (staging branch). Only Paper AutoTrade is permitted on Staging.",
+    )
+    _disk_paper_auto = bool(_auto_cfg.get("paper_autotrade_enabled", True))
 
-def _on_sidebar_autotrade_toggle_change():
-    new_val = bool(st.session_state.get("sidebar_autotrade_toggle", False))
-    coindcx_engine.save_autotrade_config({"enabled": new_val})
-    get_cached_signals_scan.clear()
-    get_cached_positions.clear()
+    def _on_sidebar_paper_autotrade_change():
+        new_p_val = bool(st.session_state.get("sidebar_paper_autotrade_toggle", True))
+        coindcx_engine.save_autotrade_config({"paper_autotrade_enabled": new_p_val, "enabled": False})
+        get_cached_signals_scan.clear()
+        get_cached_positions.clear()
 
+    autotrade_on = st.sidebar.toggle(
+        "📝 Enable AutoTrade (Paper Trading Only)",
+        value=_disk_paper_auto,
+        key="sidebar_paper_autotrade_toggle",
+        on_change=_on_sidebar_paper_autotrade_change,
+        help="Staging Mode: Executes AutoTrade strictly as Paper Trading on Live Market data and logs entries & results to Google Sheets.",
+    )
+    st.sidebar.caption("🧪 **Staging (`staging` branch):** Live AutoTrade is disabled. AutoTrade runs **strictly as Paper Trading** on Live Market data.")
+else:
+    # Sync stale browser session toggle state if v9 disarmed AutoTrade on disk
+    _disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
+    if st.session_state.get("_autotrade_disarm_sync_v") != 9:
+        st.session_state["_autotrade_disarm_sync_v"] = 9
+        st.session_state["sidebar_autotrade_toggle"] = _disk_auto_enabled
 
-autotrade_on = st.sidebar.toggle(
-    "Enable AutoTrade (10x 2-Entry)",
-    value=_disk_auto_enabled,
-    key="sidebar_autotrade_toggle",
-    on_change=_on_sidebar_autotrade_toggle_change,
-)
+    def _on_sidebar_autotrade_toggle_change():
+        new_val = bool(st.session_state.get("sidebar_autotrade_toggle", False))
+        coindcx_engine.save_autotrade_config({"enabled": new_val})
+        get_cached_signals_scan.clear()
+        get_cached_positions.clear()
+
+    autotrade_on = st.sidebar.toggle(
+        "Enable AutoTrade (10x 2-Entry)",
+        value=_disk_auto_enabled,
+        key="sidebar_autotrade_toggle",
+        on_change=_on_sidebar_autotrade_toggle_change,
+    )
 if (
     round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
@@ -1961,7 +1988,7 @@ elif active_section == "🎯 Execute":
                 exec_mode = st.radio(
                     "Target",
                     ["⚡ Live CoinDCX", "📝 Paper Trade"],
-                    index=0 if wallet["is_live_api"] else 1,
+                    index=1 if coindcx_engine.is_staging_environment() else (0 if wallet["is_live_api"] else 1),
                     horizontal=True,
                     key=f"exec_mode_choice_{selected_pair}",
                     label_visibility="collapsed"
