@@ -464,24 +464,22 @@ def _check_box_breakout_state(
     max_prior_high = max((float(x["high"]) for x in prior), default=c_high)
     min_prior_low = min((float(x["low"]) for x in prior), default=c_low)
     closes_above_sh = sum(1 for x in prior if float(x["close"]) > sh)
-    closes_above_rh = sum(1 for x in prior if float(x["close"]) > rh * 1.002)
-    closes_below_sl = sum(1 for x in prior if float(x["close"]) < sl)
-    closes_below_rl = sum(1 for x in prior if float(x["close"]) < rl * 0.998)
+    closes_below_sl = sum(1 for x in prior if sl > 0 and float(x["close"]) < sl)
 
-    recent4 = recs_15m[max(0, idx - 4):idx]
-    avg4_close = (sum(float(x["close"]) for x in recent4) / len(recent4)) if recent4 else c_close
-
+    # Outer Box [SL, SH] is only broken when price decisively breaks beyond the outer SH/SL boundary
+    # (>= 3 closed 15m candles beyond SH/SL + >= 0.8% extension + 15m EMA9/EMA50 alignment).
+    # Trading inside [RH, SH] (Sell Zone) or [SL, RL] (Buy Zone) is normal zone activity, NOT a broken box.
     upper_box_broken = bool(
-        max_prior_high > sh * 1.008
-        or closes_above_sh >= 2
-        or closes_above_rh >= 3
-        or (len(recent4) >= 3 and avg4_close > rh and ema9_15m > ema50_15m)
+        sh > 0
+        and closes_above_sh >= 3
+        and max_prior_high >= sh * 1.008
+        and ema9_15m > ema50_15m
     )
     lower_box_broken = bool(
-        (sl > 0 and min_prior_low < sl * 0.992)
-        or closes_below_sl >= 2
-        or closes_below_rl >= 3
-        or (len(recent4) >= 3 and avg4_close < rl and ema9_15m < ema50_15m)
+        sl > 0
+        and closes_below_sl >= 3
+        and min_prior_low <= sl * 0.992
+        and ema9_15m < ema50_15m
     )
 
     c_range = c_high - c_low
@@ -495,54 +493,60 @@ def _check_box_breakout_state(
     )
 
     # Bullish Box Breakout-Retest Continuation (LONG):
-    #   1. Prior confirmed upside breakout above RH/SH (`upper_box_broken` and peak >= max(RH*1.008, SH*1.002))
-    #   2. Pullback retests the [RH, SH] support flip zone from above without closing below RH
+    #   1. Fresh outer-box breakout above SH within the last 6 candles (90 mins) (`max_prior6_high >= sh * 1.008`)
+    #   2. Immediate pullback retests the [RH, SH] support flip zone (<= 1 close below SH) and closes back >= SH
     #   3. 15m bullish rejection bounce with 15m EMA9 > 15m EMA50
+    prior6 = recs_15m[max(0, idx - 6):idx]
+    max_prior6_high = max((float(x["high"]) for x in prior6), default=c_high)
+    min_prior6_low = min((float(x["low"]) for x in prior6), default=c_low)
+    closes_below_sh_6 = sum(1 for x in prior6 if float(x["close"]) < sh)
+    closes_above_sl_6 = sum(1 for x in prior6 if sl > 0 and float(x["close"]) > sl)
+
     retest_low = min(c_low, p_low)
     pullback_tested_rh_sh = (
         rh > 0
-        and retest_low >= rh * 0.995
-        and retest_low <= max(sh * 1.003, rh * 1.008)
-        and c_close > rh
+        and sh > 0
+        and retest_low >= rh * 0.998
+        and retest_low <= sh * 1.002
+        and c_close >= sh
         and p_close >= rh * 0.998
     )
-    pullback_step = (p_close <= p_open) or (p_low <= max(sh * 1.002, rh * 1.005)) or (c_low <= max(sh * 1.002, rh * 1.005))
+    pullback_step = (p_close <= p_open) or (p_low <= sh * 1.002) or (c_low <= sh * 1.002)
     bull_breakout_retest = bool(
         upper_box_broken
-        and closes_above_rh >= 2
-        and max_prior_high >= max(rh * 1.008, sh * 1.002)
-        and ema9_15m > ema50_15m
+        and max_prior6_high >= sh * 1.008
+        and closes_below_sh_6 <= 1
         and c_close >= ema50_15m
         and c_close >= ema9_15m * 0.9985
-        and c_close <= max(sh * 1.006, rh * 1.015)
-        and c_close <= max_prior_high * 0.992
+        and c_close <= sh * 1.006
+        and c_close <= max_prior6_high * 0.992
         and pullback_tested_rh_sh
         and pullback_step
         and has_bull_confirm
     )
 
     # Bearish Box Breakdown-Retest Continuation (SHORT):
-    #   1. Prior confirmed downside breakdown below RL/SL (`lower_box_broken` and trough <= min(RL*0.992, SL*0.998))
-    #   2. Pullback retests the [SL, RL] resistance flip zone from below without closing above RL
+    #   1. Fresh outer-box breakdown below SL within the last 6 candles (90 mins) (`min_prior6_low <= sl * 0.992`)
+    #   2. Immediate pullback retests the [SL, RL] resistance flip zone (<= 1 close above SL) and closes back <= SL
     #   3. 15m bearish rejection with 15m EMA9 < 15m EMA50, entering near the [SL, RL] zone
     retest_high = max(c_high, p_high)
     pullback_tested_rl_sl = (
         rl > 0
-        and retest_high <= rl * 1.005
-        and retest_high >= min(sl * 0.997 if sl > 0 else rl * 0.992, rl * 0.992)
-        and c_close < rl
+        and sl > 0
+        and retest_high <= rl * 1.002
+        and retest_high >= sl * 0.998
+        and c_close <= sl
         and p_close <= rl * 1.002
     )
-    pullback_step_s = (p_close >= p_open) or (p_high >= min(sl * 0.998 if sl > 0 else rl * 0.995, rl * 0.995)) or (c_high >= min(sl * 0.998 if sl > 0 else rl * 0.995, rl * 0.995))
+    pullback_step_s = (p_close >= p_open) or (p_high >= sl * 0.998) or (c_high >= sl * 0.998)
     bear_breakdown_retest = bool(
         lower_box_broken
-        and closes_below_rl >= 2
-        and min_prior_low <= min(rl * 0.992, sl * 0.998 if sl > 0 else rl * 0.992)
-        and ema9_15m < ema50_15m
+        and min_prior6_low <= sl * 0.992
+        and closes_above_sl_6 <= 1
         and c_close <= ema50_15m
         and c_close <= ema9_15m * 1.0015
-        and c_close >= min(sl * 0.994 if sl > 0 else rl * 0.985, rl * 0.985)
-        and c_close >= min_prior_low * 1.008
+        and c_close >= sl * 0.994
+        and c_close >= min_prior6_low * 1.008
         and pullback_tested_rl_sl
         and pullback_step_s
         and has_bear_confirm
