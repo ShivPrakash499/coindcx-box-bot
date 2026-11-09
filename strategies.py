@@ -427,8 +427,139 @@ class Strategy:
 
 
 # ----------------------------------------------------------------------------------------------
-# Strategy 1: Box Theory + 50/200 EMA Trend & 15m Rejection
+# Strategy 1: Box Theory + 50/200 EMA Trend, 15m Rejection & Box Breakout-Retest Continuation
 # ----------------------------------------------------------------------------------------------
+def _check_box_breakout_state(
+    recs_15m: list,
+    idx: int,
+    rh: float,
+    rl: float,
+    sh: float,
+    sl: float,
+    ema50_15m: float,
+    lookback: int = 16,
+) -> dict:
+    """
+    Inspects the prior `lookback` closed 15m candles (default 16 candles = 4 hours) before `idx` to:
+      1. Detect whether the upper box (`RH`/`SH`) or lower box (`RL`/`SL`) has already been broken out
+         earlier in the session (`upper_box_broken` / `lower_box_broken`), preventing top-down bullish
+         pullbacks from being mistaken for bottom-up bearish sweeps (and vice-versa).
+      2. Detect high-probability Box Breakout & Retest Continuation setups (`LONG` on `RH-SH` support flip
+         after upside breakout; `SHORT` on `SL-RL` resistance flip after downside breakdown).
+    """
+    cur = recs_15m[idx]
+    prev = recs_15m[idx - 1] if idx >= 1 else cur
+    prior = recs_15m[max(0, idx - lookback):idx]
+
+    c_open = float(cur.get("open", cur["close"]))
+    c_high = float(cur["high"])
+    c_low = float(cur["low"])
+    c_close = float(cur["close"])
+    p_open = float(prev.get("open", prev["close"]))
+    p_high = float(prev["high"])
+    p_low = float(prev["low"])
+    p_close = float(prev["close"])
+    ema9_15m = float(cur.get("EMA9", c_close) or c_close)
+
+    max_prior_high = max((float(x["high"]) for x in prior), default=c_high)
+    min_prior_low = min((float(x["low"]) for x in prior), default=c_low)
+    closes_above_sh = sum(1 for x in prior if float(x["close"]) > sh)
+    closes_above_rh = sum(1 for x in prior if float(x["close"]) > rh * 1.002)
+    closes_below_sl = sum(1 for x in prior if float(x["close"]) < sl)
+    closes_below_rl = sum(1 for x in prior if float(x["close"]) < rl * 0.998)
+
+    recent4 = recs_15m[max(0, idx - 4):idx]
+    avg4_close = (sum(float(x["close"]) for x in recent4) / len(recent4)) if recent4 else c_close
+
+    upper_box_broken = bool(
+        max_prior_high > sh * 1.008
+        or closes_above_sh >= 2
+        or closes_above_rh >= 3
+        or (len(recent4) >= 3 and avg4_close > rh and ema9_15m > ema50_15m)
+    )
+    lower_box_broken = bool(
+        (sl > 0 and min_prior_low < sl * 0.992)
+        or closes_below_sl >= 2
+        or closes_below_rl >= 3
+        or (len(recent4) >= 3 and avg4_close < rl and ema9_15m < ema50_15m)
+    )
+
+    c_range = c_high - c_low
+    lower_wick = min(c_open, c_close) - c_low
+    upper_wick = c_high - max(c_open, c_close)
+    has_bull_confirm = (c_close > c_open and c_close > p_close) or (
+        c_close > c_open and c_range > 0 and (lower_wick / c_range) >= 0.30
+    )
+    has_bear_confirm = (c_close < c_open and c_close < p_close) or (
+        c_close < c_open and c_range > 0 and (upper_wick / c_range) >= 0.30
+    )
+
+    # Bullish Box Breakout-Retest Continuation (LONG):
+    #   1. Prior confirmed upside breakout above RH/SH (`upper_box_broken` and peak >= max(RH*1.008, SH*1.002))
+    #   2. Pullback retests the [RH, SH] support flip zone from above without closing below RH
+    #   3. 15m bullish rejection bounce with 15m EMA9 > 15m EMA50
+    retest_low = min(c_low, p_low)
+    pullback_tested_rh_sh = (
+        rh > 0
+        and retest_low >= rh * 0.995
+        and retest_low <= max(sh * 1.003, rh * 1.008)
+        and c_close > rh
+        and p_close >= rh * 0.998
+    )
+    pullback_step = (p_close <= p_open) or (p_low <= max(sh * 1.002, rh * 1.005)) or (c_low <= max(sh * 1.002, rh * 1.005))
+    bull_breakout_retest = bool(
+        upper_box_broken
+        and closes_above_rh >= 2
+        and max_prior_high >= max(rh * 1.008, sh * 1.002)
+        and ema9_15m > ema50_15m
+        and c_close >= ema50_15m
+        and c_close >= ema9_15m * 0.9985
+        and c_close <= max(sh * 1.006, rh * 1.015)
+        and c_close <= max_prior_high * 0.992
+        and pullback_tested_rh_sh
+        and pullback_step
+        and has_bull_confirm
+    )
+
+    # Bearish Box Breakdown-Retest Continuation (SHORT):
+    #   1. Prior confirmed downside breakdown below RL/SL (`lower_box_broken` and trough <= min(RL*0.992, SL*0.998))
+    #   2. Pullback retests the [SL, RL] resistance flip zone from below without closing above RL
+    #   3. 15m bearish rejection with 15m EMA9 < 15m EMA50, entering near the [SL, RL] zone
+    retest_high = max(c_high, p_high)
+    pullback_tested_rl_sl = (
+        rl > 0
+        and retest_high <= rl * 1.005
+        and retest_high >= min(sl * 0.997 if sl > 0 else rl * 0.992, rl * 0.992)
+        and c_close < rl
+        and p_close <= rl * 1.002
+    )
+    pullback_step_s = (p_close >= p_open) or (p_high >= min(sl * 0.998 if sl > 0 else rl * 0.995, rl * 0.995)) or (c_high >= min(sl * 0.998 if sl > 0 else rl * 0.995, rl * 0.995))
+    bear_breakdown_retest = bool(
+        lower_box_broken
+        and closes_below_rl >= 2
+        and min_prior_low <= min(rl * 0.992, sl * 0.998 if sl > 0 else rl * 0.992)
+        and ema9_15m < ema50_15m
+        and c_close <= ema50_15m
+        and c_close <= ema9_15m * 1.0015
+        and c_close >= min(sl * 0.994 if sl > 0 else rl * 0.985, rl * 0.985)
+        and c_close >= min_prior_low * 1.008
+        and pullback_tested_rl_sl
+        and pullback_step_s
+        and has_bear_confirm
+    )
+
+    return {
+        "upper_box_broken": upper_box_broken,
+        "lower_box_broken": lower_box_broken,
+        "bull_breakout_retest": bull_breakout_retest,
+        "bear_breakdown_retest": bear_breakdown_retest,
+        "max_prior_high": max_prior_high,
+        "min_prior_low": min_prior_low,
+        "retest_low": retest_low,
+        "retest_high": retest_high,
+    }
+
+
 class BoxTheorySweep(Strategy):
     id = "box_theory"
     name = "Box Theory Sweep"
@@ -512,17 +643,82 @@ class BoxTheorySweep(Strategy):
         )
         out["daily_trend_summary"] = bias_label
 
+        brk_state = _check_box_breakout_state(recs_15m, len(recs_15m) - 1, rh, rl, sh, sl, ema50_15m)
+        upper_box_broken = brk_state["upper_box_broken"]
+        lower_box_broken = brk_state["lower_box_broken"]
+
         # ------------------------------------------------------------------
-        # 1. SHORT SETUPS (Strictly 15m Confirmation):
-        #    A: Outer Box RH or SH Liquidity Sweep + 15m Close Below RH/SH (in BEARISH & NEUTRAL)
+        # 0. BOX BREAKOUT & RETEST CONTINUATION SETUPS (15m Support/Resistance Flip):
+        #    - Bullish Breakout-Retest Continuation (LONG): Confirmed breakout above RH/SH -> pullback holds RH -> 15m bounce
+        #    - Bearish Breakdown-Retest Continuation (SHORT): Confirmed breakdown below RL/SL -> pullback holds RL -> 15m rejection
+        # ------------------------------------------------------------------
+        if brk_state["bull_breakout_retest"]:
+            entry = eng.round_asset_price(c15_close, rh)
+            scale_in_lvl = min(rh, brk_state["retest_low"], entry * 0.992)
+            struct_tp1 = max(brk_state["max_prior_high"], entry * 1.010)
+            box_exp_tp2 = rh + max(0.618 * (rh - rl), entry * 0.025)
+            struct_tp2 = daily_ema50 if (daily_ema50 > struct_tp1 * 1.008) else box_exp_tp2
+            plan = build_two_entry_runner_plan(
+                "LONG", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage, tp1_ref_name="Breakout High"
+            )
+            if plan and plan["stop"] < entry < plan["tp1"]:
+                stop = eng.round_asset_price(plan["stop"], rh)
+                tp1 = eng.round_asset_price(plan["tp1"], rh)
+                tp2 = eng.round_asset_price(plan["tp2"], rh)
+                entry2 = eng.round_asset_price(plan["entry2_sweep"], rh)
+                reason = (
+                    f"Box Breakout & Retest Continuation | Broke above RH (${rh:,.2f}) / SH (${sh:,.2f}) to ${brk_state['max_prior_high']:,.2f}, "
+                    f"held RH support flip & confirmed 15m bounce (Entry1 ${entry:,.2f} + Entry2 @ RH ${entry2:,.2f})"
+                )
+                out.update({
+                    "signal": "LONG", "signal_kind": "BREAKOUT_CONTINUATION", "trigger_zone": "Breakout Support Flip RH-SH",
+                    "trigger_reason": reason,
+                    "setup": f"BUY (Long Continuation): Box RH-SH Breakout & Support Retest ({session['name']})",
+                    "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                    "candle_ts": int(c15["timestamp"]),
+                })
+                out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
+                return self._stamp(out)
+
+        if brk_state["bear_breakdown_retest"]:
+            entry = eng.round_asset_price(c15_close, rl)
+            scale_in_lvl = max(rl, brk_state["retest_high"], entry * 1.008)
+            struct_tp1 = min(brk_state["min_prior_low"], entry * 0.990)
+            box_exp_tp2 = rl - max(0.618 * (rh - rl), entry * 0.025)
+            struct_tp2 = daily_ema50 if (0 < daily_ema50 < struct_tp1 * 0.992) else box_exp_tp2
+            plan = build_two_entry_runner_plan(
+                "SHORT", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage, tp1_ref_name="Breakdown Low"
+            )
+            if plan and plan["stop"] > entry > plan["tp1"]:
+                stop = eng.round_asset_price(plan["stop"], rl)
+                tp1 = eng.round_asset_price(plan["tp1"], rl)
+                tp2 = eng.round_asset_price(plan["tp2"], rl)
+                entry2 = eng.round_asset_price(plan["entry2_sweep"], rl)
+                reason = (
+                    f"Box Breakdown & Retest Continuation | Broke below RL (${rl:,.2f}) / SL (${sl:,.2f}) to ${brk_state['min_prior_low']:,.2f}, "
+                    f"rejected RL resistance flip on 15m (Entry1 ${entry:,.2f} + Entry2 @ RL ${entry2:,.2f})"
+                )
+                out.update({
+                    "signal": "SHORT", "signal_kind": "BREAKOUT_CONTINUATION", "trigger_zone": "Breakdown Resistance Flip SL-RL",
+                    "trigger_reason": reason,
+                    "setup": f"SELL (Short Continuation): Box RL-SL Breakdown & Resistance Retest ({session['name']})",
+                    "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                    "candle_ts": int(c15["timestamp"]),
+                })
+                out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
+                return self._stamp(out)
+
+        # ------------------------------------------------------------------
+        # 1. SHORT SETUPS (Strictly 15m Confirmation, only when Upper Box is NOT already broken):
+        #    A: Outer Box RH or SH Liquidity Sweep + 15m Close Below RH (in BEARISH & NEUTRAL)
         #    B: Daily 50 EMA Touch + 15m Bearish Rejection (in BEARISH, no 65% box filter)
         # ------------------------------------------------------------------
         upper_wick_15m = c15_high - max(c15_open, c15_close)
         has_bear_confirm_15m = (c15_close < c15_open and c15_close < prev_c15_close) or (
             c15_close < c15_open and c15_range > 0 and (upper_wick_15m / c15_range) >= 0.30
         )
-        swept_rh_15m = (prev_c15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(prev_c15_high, c15_high) <= sh * 1.005)
-        swept_sh_15m = (prev_c15_high >= sh or c15_high >= sh) and (c15_close < sh) and (max(prev_c15_high, c15_high) <= sh * 1.012)
+        swept_rh_15m = (not upper_box_broken) and (prev_c15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(prev_c15_high, c15_high) <= sh * 1.005)
+        swept_sh_15m = (not upper_box_broken) and (prev_c15_high >= sh or c15_high >= sh) and (c15_close < sh) and (c15_close <= rh * 1.001) and (max(prev_c15_high, c15_high) <= sh * 1.012)
 
         rejected_rh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_rh_15m and has_bear_confirm_15m
         rejected_sh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_sh_15m and has_bear_confirm_15m
@@ -606,8 +802,8 @@ class BoxTheorySweep(Strategy):
         has_bull_confirm_15m = (c15_close > c15_open and c15_close > prev_c15_close) or (
             c15_close > c15_open and c15_range > 0 and (lower_wick_15m / c15_range) >= 0.30
         )
-        swept_rl_15m = (prev_c15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(prev_c15_low, c15_low) >= sl * 0.995)
-        swept_sl_15m = (prev_c15_low <= sl or c15_low <= sl) and (c15_close > sl) and (min(prev_c15_low, c15_low) >= sl * 0.988)
+        swept_rl_15m = (not lower_box_broken) and (prev_c15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(prev_c15_low, c15_low) >= sl * 0.995)
+        swept_sl_15m = (not lower_box_broken) and (prev_c15_low <= sl or c15_low <= sl) and (c15_close > sl) and (c15_close >= rl * 0.999) and (min(prev_c15_low, c15_low) >= sl * 0.988)
 
         rejected_rl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_rl_15m and has_bull_confirm_15m
         rejected_sl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_sl_15m and has_bull_confirm_15m
@@ -746,6 +942,7 @@ class BoxTheorySweep(Strategy):
         daily_records = d.to_dict("records")
 
         ema50_15m_list = df["close"].ewm(span=50, adjust=False).mean().tolist()
+        ema9_15m_list = df["close"].ewm(span=9, adjust=False).mean().tolist()
 
         daily_boxes = {}
         for i in range(1, len(daily_records)):
@@ -772,7 +969,7 @@ class BoxTheorySweep(Strategy):
                 "EMA50": eng.round_asset_price(ema50, rh), "EMA200": eng.round_asset_price(ema200, rh),
                 "ATR": atr_val, "bias": bias
             }
-        return {"boxes": daily_boxes, "ema50_15m": ema50_15m_list}
+        return {"boxes": daily_boxes, "ema50_15m": ema50_15m_list, "ema9_15m": ema9_15m_list}
 
     def backtest_has_context(self, candle, ctx):
         return bool(ctx["boxes"].get(candle["date_str"]))
@@ -804,14 +1001,57 @@ class BoxTheorySweep(Strategy):
             else ("Daily >50/200 EMA" if bias == "BULLISH" else "Daily Range (Between 50/200 EMA)")
         )
 
-        # 1. SHORT SETUPS (Strictly 15m Confirmation):
+        if "EMA9" not in candle and idx < len(ctx.get("ema9_15m", [])):
+            candle["EMA9"] = float(ctx["ema9_15m"][idx])
+        brk_bt = _check_box_breakout_state(records, idx, rh, rl, sh, sl, ema50_15m)
+        upper_box_broken = brk_bt["upper_box_broken"]
+        lower_box_broken = brk_bt["lower_box_broken"]
+
+        # 0. BOX BREAKOUT & RETEST CONTINUATION SETUPS (15m Support/Resistance Flip)
+        if brk_bt["bull_breakout_retest"]:
+            scale_in_lvl = min(rh, brk_bt["retest_low"], c_close * 0.992)
+            struct_tp1 = max(brk_bt["max_prior_high"], c_close * 1.010)
+            box_exp_tp2 = rh + max(0.618 * (rh - rl), c_close * 0.025)
+            struct_tp2 = daily_ema50 if (daily_ema50 > struct_tp1 * 1.008) else box_exp_tp2
+            plan = build_two_entry_runner_plan(
+                "LONG", c_close, scale_in_lvl, struct_tp1, struct_tp2,
+                leverage=DEFAULT_LEVERAGE, tp1_ref_name="Breakout High",
+            )
+            if plan and plan["stop"] < c_close < plan["tp1"]:
+                return {
+                    "direction": "LONG", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
+                    "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
+                    "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
+                    "reason": f"{tag} + Box RH-SH Breakout & Support Retest Continuation",
+                    "strategy_tag": "Strategy 1 (Box Continuation)",
+                }
+
+        if brk_bt["bear_breakdown_retest"]:
+            scale_in_lvl = max(rl, brk_bt["retest_high"], c_close * 1.008)
+            struct_tp1 = min(brk_bt["min_prior_low"], c_close * 0.990)
+            box_exp_tp2 = rl - max(0.618 * (rh - rl), c_close * 0.025)
+            struct_tp2 = daily_ema50 if (0 < daily_ema50 < struct_tp1 * 0.992) else box_exp_tp2
+            plan = build_two_entry_runner_plan(
+                "SHORT", c_close, scale_in_lvl, struct_tp1, struct_tp2,
+                leverage=DEFAULT_LEVERAGE, tp1_ref_name="Breakdown Low",
+            )
+            if plan and plan["stop"] > c_close > plan["tp1"]:
+                return {
+                    "direction": "SHORT", "entry": c_close, "entry2_sweep": plan["entry2_sweep"],
+                    "stop": plan["stop"], "tp1": plan["tp1"], "tp2": plan["tp2"],
+                    "tp1_label": plan["tp1_label"], "tp2_label": plan["tp2_label"],
+                    "reason": f"{tag} + Box RL-SL Breakdown & Resistance Retest Continuation",
+                    "strategy_tag": "Strategy 1 (Box Continuation)",
+                }
+
+        # 1. SHORT SETUPS (Strictly 15m Confirmation, only when Upper Box is NOT already broken):
         #    A: Outer Box RH or SH Sweep + 15m Close Below RH/SH
         upper_wick = c_high - max(c_open, c_close)
         has_bear_confirm = (c_close < c_open and c_close < p_close) or (
             c_close < c_open and candle_range > 0 and (upper_wick / candle_range) >= 0.30
         )
-        swept_rh_seq = (p_high >= rh or c_high >= rh) and (c_close < rh) and (max(p_high, c_high) <= sh * 1.005)
-        swept_sh_seq = (p_high >= sh or c_high >= sh) and (c_close < sh) and (max(p_high, c_high) <= sh * 1.012)
+        swept_rh_seq = (not upper_box_broken) and (p_high >= rh or c_high >= rh) and (c_close < rh) and (max(p_high, c_high) <= sh * 1.005)
+        swept_sh_seq = (not upper_box_broken) and (p_high >= sh or c_high >= sh) and (c_close < sh) and (c_close <= rh * 1.001) and (max(p_high, c_high) <= sh * 1.012)
 
         swept_rh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_rh_seq and has_bear_confirm
         swept_sh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_sh_seq and has_bear_confirm
@@ -863,8 +1103,8 @@ class BoxTheorySweep(Strategy):
         has_bull_confirm = (c_close > c_open and c_close > p_close) or (
             c_close > c_open and candle_range > 0 and (lower_wick / candle_range) >= 0.30
         )
-        swept_rl_seq = (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
-        swept_sl_seq = (p_low <= sl or c_low <= sl) and (c_close > sl) and (min(p_low, c_low) >= sl * 0.988)
+        swept_rl_seq = (not lower_box_broken) and (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
+        swept_sl_seq = (not lower_box_broken) and (p_low <= sl or c_low <= sl) and (c_close > sl) and (c15_close >= rl * 0.999 if "c15_close" in locals() else c_close >= rl * 0.999) and (min(p_low, c_low) >= sl * 0.988)
 
         swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
         swept_sl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_sl_seq and has_bull_confirm

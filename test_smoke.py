@@ -901,7 +901,42 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         assert meta_stg["lock"]["is_live_exchange"] is False
         assert meta_stg["lock"]["strategy_id"] == "ema9_retest"
 
-    print("  -> PASS: Strategy 3 (4 improvements), 80% TP1 breakeven SL ratchet, and Staging Paper-Only AutoTrade verified.")
+    # Box Theory Sweep: Broken-Box Invalidation Guard & Box Breakout-Retest Continuation (RENDER 2026-11-09 scenario)
+    render_recs = [
+        {"open": 1.574, "high": 1.589, "low": 1.563, "close": 1.584, "EMA9": 1.556, "EMA50": 1.555},
+        {"open": 1.584, "high": 1.626, "low": 1.581, "close": 1.613, "EMA9": 1.567, "EMA50": 1.557},
+        {"open": 1.612, "high": 1.621, "low": 1.600, "close": 1.615, "EMA9": 1.577, "EMA50": 1.560},
+        {"open": 1.615, "high": 1.617, "low": 1.603, "close": 1.604, "EMA9": 1.582, "EMA50": 1.561},
+        {"open": 1.604, "high": 1.618, "low": 1.603, "close": 1.608, "EMA9": 1.587, "EMA50": 1.563},
+        {"open": 1.607, "high": 1.614, "low": 1.597, "close": 1.610, "EMA9": 1.592, "EMA50": 1.565},
+        {"open": 1.610, "high": 1.616, "low": 1.602, "close": 1.605, "EMA9": 1.595, "EMA50": 1.567},
+        {"open": 1.605, "high": 1.607, "low": 1.591, "close": 1.594, "EMA9": 1.594, "EMA50": 1.568},
+        {"open": 1.593, "high": 1.601, "low": 1.591, "close": 1.597, "EMA9": 1.595, "EMA50": 1.569},
+        {"open": 1.597, "high": 1.599, "low": 1.584, "close": 1.589, "EMA9": 1.594, "EMA50": 1.570},  # idx 9: 16:30 IST top-down pullback (must NOT short!)
+        {"open": 1.589, "high": 1.604, "low": 1.589, "close": 1.597, "EMA9": 1.595, "EMA50": 1.574},  # idx 10: 17:30 IST bullish support flip bounce (LONG continuation!)
+    ]
+    for r_c in render_recs:
+        r_c["date_str"] = "2026-11-09"
+    render_box = {
+        "RH": 1.580, "RL": 1.471, "MID": 1.5255, "SH": 1.594, "SL": 1.448,
+        "EMA50": 1.6937, "EMA200": 1.7106, "ATR": 0.1012, "bias": "BEARISH", "trend_bias": "BEARISH",
+    }
+    render_ctx = {
+        "boxes": {"2026-11-09": render_box},
+        "ema50_15m": [x["EMA50"] for x in render_recs],
+        "ema9_15m": [x["EMA9"] for x in render_recs],
+    }
+    s1_box = strat.BoxTheorySweep()
+    # 16:30 IST (idx 9): top-down pullback to $1.589 after $1.626 breakout must NOT trigger a SHORT reversal
+    sig_1630 = s1_box.backtest_entry(9, render_recs[9], render_ctx, render_recs)
+    assert sig_1630 is None, f"Expected broken-box guard to block top-down SHORT at 16:30 IST, got: {sig_1630}"
+
+    # 17:30 IST (idx 10): holding RH ($1.580) support flip and bouncing to $1.597 triggers LONG Breakout Continuation
+    sig_1730 = s1_box.backtest_entry(10, render_recs[10], render_ctx, render_recs)
+    assert sig_1730 is not None and sig_1730["direction"] == "LONG", f"Expected LONG Box Breakout Continuation at 17:30 IST, got: {sig_1730}"
+    assert abs(sig_1730["entry"] - 1.597) < 1e-4 and abs(sig_1730["entry2_sweep"] - 1.580) < 1e-4
+
+    print("  -> PASS: Strategy 3 (4 improvements), Box Broken-Level Guard, Box Breakout Continuation, and Staging Paper AutoTrade verified.")
 
 
 if __name__ == "__main__":
