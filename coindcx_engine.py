@@ -438,7 +438,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 21
+_REQUIRED_DAEMON_VERSION = 22
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -3430,6 +3430,20 @@ def save_autotrade_config(updates: dict) -> dict:
 
 def clear_autotrade_active_lock() -> dict:
     """Clears any local paper/autotrade active trade slot lock so the next coin can trade."""
+    try:
+        cfg = get_autotrade_config()
+        prev_lock = cfg.get("active_trade_lock")
+        hist = list(cfg.get("history") or [])
+        if isinstance(prev_lock, dict) and prev_lock.get("pair"):
+            p_pair = prev_lock.get("pair")
+            p_ts = float(prev_lock.get("opened_ts", 0.0) or 0.0)
+            for h in hist:
+                if isinstance(h, dict) and h.get("pair") == p_pair:
+                    if p_ts <= 0 or abs(float(h.get("opened_ts", 0.0) or 0.0) - p_ts) < 5.0:
+                        h["closed"] = True
+            return save_autotrade_config({"active_trade_lock": None, "history": hist[:30]})
+    except Exception:
+        pass
     return save_autotrade_config({"active_trade_lock": None})
 
 
@@ -3878,8 +3892,10 @@ def compute_tp1_profit_lock_sl(
 
 def _check_recent_15m_tp1_touch_and_prev_hl(pair: str, is_long: bool, tp1_px: float, opened_ts: float = 0.0) -> tuple[bool, float | None, float | None]:
     """
-    Checks recent 15m candles (since `opened_ts`) to detect whether price wicked through `tp1_px`
+    Checks 15m candles that opened AT OR AFTER `opened_ts` to detect whether price wicked through `tp1_px`
     between daemon ticks, and returns `(touched_tp1, prev_15m_high, prev_15m_low)`.
+    CRITICAL: Never look back before `opened_ts` (no `- 900.0` offset and no `tail(3)` fallback when `opened_ts <= 0`),
+    so pre-entry wicks on candles prior to trade entry can never falsely trigger TP1!
     """
     touched = False
     prev_h = None
@@ -3891,9 +3907,9 @@ def _check_recent_15m_tp1_touch_and_prev_hl(pair: str, is_long: bool, tp1_px: fl
                 prev_row = df_15m.iloc[-2]
                 prev_h = float(prev_row["high"])
                 prev_l = float(prev_row["low"])
-            if tp1_px > 0:
-                cutoff_ms = max(0.0, (float(opened_ts) - 900.0) * 1000.0) if opened_ts > 0 else 0.0
-                recent_df = df_15m[df_15m["timestamp"] >= cutoff_ms] if cutoff_ms > 0 else df_15m.tail(3)
+            if tp1_px > 0 and opened_ts > 0:
+                cutoff_ms = float(opened_ts) * 1000.0
+                recent_df = df_15m[df_15m["timestamp"] >= cutoff_ms]
                 if not recent_df.empty:
                     if is_long and float(recent_df["high"].max()) >= tp1_px:
                         touched = True
@@ -3914,31 +3930,35 @@ def _evaluate_smart_hybrid_runner_step(
 ) -> tuple[bool, float, str]:
     """
     Evaluates the Smart Hybrid Runner rules (matching `run_strategy_backtest`) once TP1 is reached:
-      1. Continuous 15m Closed-Candle Low/High Trailing SL (`prev_15m_l` / `prev_15m_h` once `prev_15m_c` clears `tp1_p`).
-      2. Strategy 3 Rule A on Closed 5m Candles: `>= 20%` of 14d Daily ATR candle in our favour ->
+      1. Continuous 15m Closed-Candle Low/High Trailing SL (`prev_15m_l` / `prev_15m_h` once `prev_15m_c` clears `tp1_p`),
+         strictly on candles opened `>= opened_ts` and strictly in profit above fee-covered breakeven.
+      2. Strategy 3 Rule A on Closed 5m Candles (opened `>= opened_ts`): `>= 20%` of 14d Daily ATR candle in our favour ->
          exit on `>= 30%` pullback close, or tighten SL to the `30%` pullback level (`pb_lvl`).
-      3. Strategy 3 Rule B on Closed 5m Candles: Once a closed 5m candle clears `tp1_p` on the favourable side
-         of `5m 9 EMA`, exit if `2` consecutive closed 5m candles close across `5m 9 EMA`.
+      3. Strategy 3 Rule B on Closed 5m Candles (opened `>= opened_ts`): Once a closed 5m candle clears `tp1_p` on the
+         favourable side of `5m 9 EMA`, exit if `2` consecutive closed 5m candles close across `5m 9 EMA`.
     Returns `(should_market_exit, tightened_sl, reason)`.
     """
     new_sl = float(cur_sl or 0.0)
+    if entry_p <= 0 or opened_ts <= 0:
+        return False, new_sl, ""
     now_ms = int(time.time() * 1000)
+    cutoff_ms = float(opened_ts) * 1000.0
+    min_long_profit_sl = entry_p * 1.0018
+    max_short_profit_sl = entry_p * 0.9982
 
-    # 1. Trailing 15m closed-candle Low/High Stop Loss
+    # 1. Trailing 15m closed-candle Low/High Stop Loss (strictly post-entry closed candles & strictly in profit)
     try:
         df15 = fetch_coindcx_candles(pair, interval="15m", limit=6, sync_live_price=False)
         if df15 is not None and not df15.empty:
-            c15 = df15[df15["timestamp"] + 900000 <= now_ms]
-            if c15.empty:
-                c15 = df15.iloc[:-1]
+            c15 = df15[(df15["timestamp"] + 900000 <= now_ms) & (df15["timestamp"] >= cutoff_ms)]
             if not c15.empty:
                 prev_15m = c15.iloc[-1]
                 p15_l = float(prev_15m["low"])
                 p15_h = float(prev_15m["high"])
                 p15_c = float(prev_15m["close"])
-                if is_long and p15_c >= tp1_p and p15_l < p15_c and (new_sl <= 0 or p15_l > new_sl):
+                if is_long and p15_c >= tp1_p and p15_l > min_long_profit_sl and p15_l < p15_c and (new_sl <= 0 or p15_l > new_sl):
                     new_sl = format_order_price(pair, p15_l)
-                elif (not is_long) and p15_c <= tp1_p and p15_h > p15_c and (new_sl <= 0 or p15_h < new_sl):
+                elif (not is_long) and p15_c <= tp1_p and p15_h < max_short_profit_sl and p15_h > p15_c and (new_sl <= 0 or p15_h < new_sl):
                     new_sl = format_order_price(pair, p15_h)
     except Exception:
         pass
@@ -3953,75 +3973,110 @@ def _evaluate_smart_hybrid_runner_step(
     except Exception:
         pass
 
-    # 3. Closed 5m candles for Strategy 3 Rule A (20% ATR 30% pullback) & Rule B (Confirmed 5m 9 EMA Cross)
+    # 3. Closed 5m candles strictly since `opened_ts` (never fall back to pre-entry candles!)
     try:
         df5 = fetch_coindcx_candles(pair, interval="5m", limit=40, sync_live_price=False)
         if df5 is not None and not df5.empty:
             c5 = df5[df5["timestamp"] + 300000 <= now_ms].copy()
-            if c5.empty:
-                c5 = df5.iloc[:-1].copy()
             if not c5.empty:
                 c5["EMA9"] = c5["close"].ewm(span=9, adjust=False).mean()
-                cutoff_ms = max(0.0, (float(opened_ts) - 300.0) * 1000.0) if opened_ts > 0 else float(now_ms - 3600 * 1000)
                 recent_5m = c5[c5["timestamp"] >= cutoff_ms]
-                if recent_5m.empty:
-                    recent_5m = c5.tail(6)
+                if not recent_5m.empty:
+                    ema9_armed = False
+                    wrong_streak = 0
+                    for idx_5, r5 in recent_5m.iterrows():
+                        s5_o = float(r5["open"])
+                        s5_h = float(r5["high"])
+                        s5_l = float(r5["low"])
+                        s5_c = float(r5["close"])
+                        s5_e9 = float(r5["EMA9"])
+                        s5_rng = s5_h - s5_l
+                        is_last_bar = (idx_5 == recent_5m.index[-1])
 
-                ema9_armed = False
-                wrong_streak = 0
-                for idx_5, r5 in recent_5m.iterrows():
-                    s5_o = float(r5["open"])
-                    s5_h = float(r5["high"])
-                    s5_l = float(r5["low"])
-                    s5_c = float(r5["close"])
-                    s5_e9 = float(r5["EMA9"])
-                    s5_rng = s5_h - s5_l
-                    is_last_bar = (idx_5 == recent_5m.index[-1])
+                        if daily_atr > 0 and s5_rng >= 0.20 * daily_atr:
+                            if is_long and s5_c > s5_o:
+                                pb_lvl = format_order_price(pair, s5_h - 0.30 * s5_rng)
+                                if is_last_bar and (s5_h - s5_c) >= 0.30 * s5_rng and s5_c > max(min_long_profit_sl, new_sl):
+                                    return True, new_sl, "Runner 5m >=20% ATR 30% Pullback"
+                                if pb_lvl > min_long_profit_sl and (new_sl <= 0 or pb_lvl > new_sl):
+                                    new_sl = pb_lvl
+                            elif (not is_long) and s5_c < s5_o:
+                                pb_lvl = format_order_price(pair, s5_l + 0.30 * s5_rng)
+                                if is_last_bar and (s5_c - s5_l) >= 0.30 * s5_rng and (new_sl <= 0 or s5_c < min(max_short_profit_sl, new_sl)):
+                                    return True, new_sl, "Runner 5m >=20% ATR 30% Pullback"
+                                if pb_lvl < max_short_profit_sl and (new_sl <= 0 or pb_lvl < new_sl):
+                                    new_sl = pb_lvl
 
-                    if daily_atr > 0 and s5_rng >= 0.20 * daily_atr:
-                        if is_long and s5_c > s5_o:
-                            pb_lvl = format_order_price(pair, s5_h - 0.30 * s5_rng)
-                            if is_last_bar and (s5_h - s5_c) >= 0.30 * s5_rng and s5_c > max(entry_p, new_sl):
-                                return True, new_sl, "Runner 5m >=20% ATR 30% Pullback"
-                            if pb_lvl > entry_p and (new_sl <= 0 or pb_lvl > new_sl):
-                                new_sl = pb_lvl
-                        elif (not is_long) and s5_c < s5_o:
-                            pb_lvl = format_order_price(pair, s5_l + 0.30 * s5_rng)
-                            if is_last_bar and (s5_c - s5_l) >= 0.30 * s5_rng and (new_sl <= 0 or s5_c < min(entry_p, new_sl)):
-                                return True, new_sl, "Runner 5m >=20% ATR 30% Pullback"
-                            if pb_lvl < entry_p and (new_sl <= 0 or pb_lvl < new_sl):
-                                new_sl = pb_lvl
+                        if is_long:
+                            if s5_c > s5_e9 and s5_c >= tp1_p:
+                                ema9_armed = True
+                                wrong_streak = 0
+                            elif ema9_armed and s5_c < s5_e9:
+                                wrong_streak += 1
+                        else:
+                            if s5_c < s5_e9 and s5_c <= tp1_p:
+                                ema9_armed = True
+                                wrong_streak = 0
+                            elif ema9_armed and s5_c > s5_e9:
+                                wrong_streak += 1
 
-                    if is_long:
-                        if s5_c > s5_e9 and s5_c >= tp1_p:
-                            ema9_armed = True
-                            wrong_streak = 0
-                        elif ema9_armed and s5_c < s5_e9:
-                            wrong_streak += 1
-                    else:
-                        if s5_c < s5_e9 and s5_c <= tp1_p:
-                            ema9_armed = True
-                            wrong_streak = 0
-                        elif ema9_armed and s5_c > s5_e9:
-                            wrong_streak += 1
-
-                if ema9_armed and wrong_streak >= 2:
-                    return True, new_sl, "Runner Confirmed 5m 9 EMA Cross"
+                    if ema9_armed and wrong_streak >= 2:
+                        return True, new_sl, "Runner Confirmed 5m 9 EMA Cross"
     except Exception:
         pass
 
     return False, new_sl, ""
 
 
+def _find_matching_app_trade_record(pos: dict) -> dict | None:
+    """
+    Returns the matching App/AutoTrade lock or unclosed recent history record (opened within 8h)
+    if `pos` was originated by our App/AutoTrade.
+    Returns `None` for manual positions opened directly by the user on CoinDCX.
+    """
+    pair = str(pos.get("pair", "") or "").strip()
+    if not pair:
+        return None
+    direction = str(pos.get("direction", "LONG")).upper()
+    is_long = direction in ("LONG", "BUY")
+    entry_p = float(pos.get("entry_price", 0.0) or 0.0)
+    now_ts = time.time()
+
+    cfg = get_autotrade_config()
+    lock = cfg.get("active_trade_lock")
+    if isinstance(lock, dict) and lock.get("pair") == pair:
+        l_dir = str(lock.get("direction", "LONG")).upper()
+        if (l_dir in ("LONG", "BUY")) == is_long:
+            return lock
+
+    for h in (cfg.get("history") or [])[:15]:
+        if not isinstance(h, dict) or h.get("pair") != pair:
+            continue
+        if h.get("closed") or not bool(h.get("is_live_exchange", False)):
+            continue
+        h_ts = float(h.get("opened_ts", 0.0) or 0.0)
+        if h_ts <= 0 or (now_ts - h_ts) > 8 * 3600:
+            continue
+        h_dir = str(h.get("direction", "LONG")).upper()
+        if (h_dir in ("LONG", "BUY")) != is_long:
+            continue
+        h_entry = float(h.get("entry", 0.0) or 0.0)
+        if entry_p > 0 and h_entry > 0 and abs(entry_p - h_entry) / entry_p <= 0.005:
+            return h
+    return None
+
+
 def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
     """
-    Safeguards any live CoinDCX position (even if `active_trade_lock` was cleared by a container restart
-    or multiple positions are open) by:
-      1. Always attaching a missing Stop Loss (`cur_sl <= 0`) on CoinDCX immediately.
-      2. Detecting whether TP1 (50% Partial Book) was reached (by mark price, recent 15m candle high/low,
-         or position locked margin already being reduced by ~50%), cancelling any unfilled Entry 2 limit order,
-         and managing the remaining 50% Runner with Smart Hybrid rules (Profit-Lock SL + 15m Candle H/L Trail +
-         5m >=20% ATR 30% Pullback + Confirmed 5m 9 EMA Cross).
+    Safeguards open CoinDCX positions while strictly respecting Manual CoinDCX Trades:
+      1. MANUAL COINDCX TRADES (`_find_matching_app_trade_record(pos) is None`):
+         - NEVER overwrite, ratchet, or modify `cur_sl` or `cur_tp` if the user already has a Stop Loss (`cur_sl > 0`).
+         - NEVER cancel open orders or market-exit a manual trade.
+         - Only if the user left `cur_sl <= 0` (no SL set at all on CoinDCX), attach a catastrophe safety SL
+           while preserving the user's `cur_tp`.
+      2. APP / AUTOTRADE POSITIONS (`app_rec is not None`):
+         - Uses the exact `opened_ts`, `tp1`, `tp2`, and `qty1` from `app_rec` (never looking back 45m before entry).
+         - Never clamps `runner_sl` onto the losing (negative) side of `entry_p`.
     """
     try:
         pid = pos.get("id")
@@ -4034,41 +4089,70 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
         mark_p = float(pos.get("mark_price", entry_p) or entry_p)
         cur_sl = float(pos.get("stop_loss", 0.0) or 0.0)
         cur_tp = float(pos.get("take_profit", 0.0) or 0.0)
-        locked_m_inr = float(pos.get("locked_margin_inr", 0.0) or 0.0)
+        pos_qty = float(pos.get("quantity", 0.0) or 0.0)
         if entry_p <= 0:
             return
 
-        already_in_profit_sl = (cur_sl > entry_p) if (is_long and cur_sl > 0) else ((cur_sl < entry_p) if (not is_long and cur_sl > 0) else False)
+        app_rec = _find_matching_app_trade_record(pos)
+
+        # CRITICAL GUARD 1: Manual CoinDCX Trade -> NEVER touch user's TP or SL if SL is already set!
+        if app_rec is None:
+            if cur_sl > 0:
+                return
+            # Manual position has NO Stop Loss at all (cur_sl <= 0): attach catastrophe SL only, keeping user's cur_tp untouched
+            levels = None
+            try:
+                levels = calculate_daily_box_levels(pair)
+            except Exception:
+                pass
+            norm = normalize_two_entry_runner_levels(
+                pair=pair,
+                direction=direction,
+                entry1_px=entry_p,
+                tp2_px=cur_tp if cur_tp > 0 else None,
+                sl_px=None,
+                live_px=entry_p,
+                levels=levels,
+            )
+            cat_sl_px = float(norm["stop_loss"])
+            valid_cat = (cat_sl_px < mark_p * 0.999) if is_long else (cat_sl_px > mark_p * 1.001)
+            if valid_cat and cat_sl_px > 0:
+                update_coindcx_position_tpsl(pid, tp_price=cur_tp if cur_tp > 0 else None, sl_price=cat_sl_px, pair=pair)
+            return
+
+        # App/AutoTrade-originated position management
+        opened_ts = float(app_rec.get("opened_ts", 0.0) or 0.0)
+        rec_tp1 = float(app_rec.get("tp1", 0.0) or 0.0)
+        rec_tp2 = float(app_rec.get("tp2", 0.0) or 0.0)
+        init_qty1 = float(app_rec.get("qty1", 0.0) or 0.0)
+
+        min_profit_sl = format_order_price(pair, entry_p * (1.0018 if is_long else 0.9982))
+        already_in_profit_sl = (cur_sl >= min_profit_sl) if (is_long and cur_sl > 0) else ((cur_sl <= min_profit_sl) if (not is_long and cur_sl > 0) else False)
 
         levels = None
         try:
             levels = calculate_daily_box_levels(pair)
         except Exception:
             pass
-        # CRITICAL: Pass `live_px=entry_p` (NOT `mark_p`) so baseline `tp1_px` is anchored to `entry_p`!
         norm = normalize_two_entry_runner_levels(
             pair=pair,
             direction=direction,
             entry1_px=entry_p,
-            tp2_px=cur_tp if cur_tp > 0 else None,
+            tp1_px=rec_tp1 if rec_tp1 > 0 else None,
+            tp2_px=cur_tp if cur_tp > 0 else (rec_tp2 if rec_tp2 > 0 else None),
             sl_px=cur_sl if cur_sl > 0 else None,
             live_px=entry_p,
             levels=levels,
         )
-        tp1_px = float(norm["tp1"])
-        tp2_px = float(cur_tp if cur_tp > 0 else norm["tp2"])
+        eff_tp1_px = rec_tp1 if rec_tp1 > 0 else float(norm["tp1"])
+        tp2_px = float(cur_tp if cur_tp > 0 else (rec_tp2 if rec_tp2 > 0 else norm["tp2"]))
         cat_sl_px = float(norm["stop_loss"])
 
-        # Detect if 50% TP1 partial order already filled (locked margin is <= 68% of single-tranche 50% margin)
-        cfg_m = float(get_autotrade_config().get("single_trade_margin_inr", 19500.0) or 19500.0)
-        tranche1_m = cfg_m * 0.5
-        partial_tp1_filled = (locked_m_inr > 0 and tranche1_m > 0 and locked_m_inr <= tranche1_m * 0.68)
-
-        # Effective TP1 trigger reference: Smart Hybrid `tp1_px` (Nearer of Midpoint(Entry1, TP2) or 15m 50 EMA)
-        eff_tp1_px = tp1_px
+        # Only detect partial TP1 fill by comparing live crypto quantity against recorded App trade qty1 (never INR margin)
+        partial_tp1_filled = (init_qty1 > 0 and pos_qty > 0 and pos_qty <= init_qty1 * 0.68)
 
         hit_tp1 = already_in_profit_sl or partial_tp1_filled or ((mark_p >= eff_tp1_px) if is_long else (mark_p <= eff_tp1_px))
-        wicked_tp1, prev_h, prev_l = _check_recent_15m_tp1_touch_and_prev_hl(pair, is_long, eff_tp1_px, opened_ts=time.time() - 2700.0)
+        wicked_tp1, prev_h, prev_l = _check_recent_15m_tp1_touch_and_prev_hl(pair, is_long, eff_tp1_px, opened_ts=opened_ts)
         if hit_tp1 or wicked_tp1:
             entry_side = "buy" if is_long else "sell"
             cancel_coindcx_open_entry_orders(pair, side=entry_side)
@@ -4080,7 +4164,7 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
                 prev_candle_high=prev_h,
                 prev_candle_low=prev_l,
             )
-            if cur_sl > 0:
+            if cur_sl > 0 and already_in_profit_sl:
                 base_sl = max(base_sl, cur_sl) if is_long else min(base_sl, cur_sl)
 
             should_exit, runner_sl, _ = _evaluate_smart_hybrid_runner_step(
@@ -4089,7 +4173,7 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
                 entry_p=entry_p,
                 tp1_p=eff_tp1_px,
                 cur_sl=base_sl,
-                opened_ts=time.time() - 2700.0,
+                opened_ts=opened_ts,
             )
             if should_exit:
                 exit_coindcx_position(pid, pair=pair)
@@ -4101,28 +4185,25 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
             elif (not is_long) and mark_p <= mid_runner and runner_sl > eff_tp1_px:
                 runner_sl = format_order_price(pair, eff_tp1_px)
 
-            # Ensure SL is strictly on the valid side of live mark price for CoinDCX `create_tpsl`
-            if is_long and runner_sl >= mark_p * 0.999:
-                runner_sl = format_order_price(pair, min(base_sl, mark_p * 0.997))
-            elif (not is_long) and runner_sl <= mark_p * 1.001:
-                runner_sl = format_order_price(pair, max(base_sl, mark_p * 1.003))
-
+            # CRITICAL GUARD 2: Never clamp runner_sl onto the losing side of entry_p!
+            # Require runner_sl to be strictly in profit AND on the valid side of live mark_p.
+            in_profit = (runner_sl >= min_profit_sl) if is_long else (runner_sl <= min_profit_sl)
+            valid_side = (runner_sl < mark_p * 0.999) if is_long else (runner_sl > mark_p * 1.001)
             better = (cur_sl <= 0) or ((runner_sl > cur_sl) if is_long else (runner_sl < cur_sl))
-            if better and runner_sl > 0:
+            if in_profit and valid_side and better and runner_sl > 0:
                 update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=runner_sl, pair=pair)
         else:
-            # Early 80% TP1 Breakeven SL Ratchet: once price reaches >=80% of the distance to TP1, lock SL at fee-covered breakeven
+            # Early 80% TP1 Breakeven SL Ratchet (only for App-originated trades)
             tp1_dist80 = 0.80 * abs(eff_tp1_px - entry_p)
             reached_80pct_tp1 = (mark_p >= (entry_p + tp1_dist80)) if is_long else (mark_p <= (entry_p - tp1_dist80))
             if reached_80pct_tp1 and tp1_dist80 > 0:
-                be_sl = format_order_price(pair, entry_p * (1.0018 if is_long else 0.9982))
+                be_sl = min_profit_sl
                 be_valid = (be_sl < mark_p * 0.999) if is_long else (be_sl > mark_p * 1.001)
                 be_better = (cur_sl <= 0) or ((be_sl > cur_sl) if is_long else (be_sl < cur_sl))
                 if be_valid and be_better and be_sl > 0:
                     update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=be_sl, pair=pair)
                     return
             if cur_sl <= 0 or cur_tp <= 0:
-                # Position has NOT hit TP1 yet, but Stop Loss or Take Profit is missing (null) on CoinDCX -> attach immediately!
                 update_coindcx_position_tpsl(pid, tp_price=tp2_px, sl_price=cat_sl_px, pair=pair)
     except Exception:
         pass
@@ -4427,8 +4508,11 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         l_sl = ratcheted_sl
                         save_autotrade_config({"active_trade_lock": lock})
 
-                        # Update SL on CoinDCX position while keeping single native TP at TP2
-                        if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
+                        # Update SL on CoinDCX position while keeping single native TP at TP2 (strictly in profit & valid side of px)
+                        min_prof_sl = round_asset_price(l_entry * (1.0018 if is_long else 0.9982), l_entry)
+                        r_in_prof = (ratcheted_sl >= min_prof_sl) if is_long else (ratcheted_sl <= min_prof_sl)
+                        r_valid_px = (ratcheted_sl < px * 0.999) if is_long else (ratcheted_sl > px * 1.001)
+                        if is_live_ex and matched_live_pos and matched_live_pos.get("id") and r_in_prof and r_valid_px:
                             update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=ratcheted_sl, pair=l_pair)
 
                     # Stage 2 (Smart Hybrid Runner): Continuous 15m H/L Trail + 5m >=20% ATR 30% Pullback + Confirmed 5m 9 EMA Cross
@@ -4459,8 +4543,11 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                 elif (not is_long) and (next_runner_sl <= 0 or next_runner_sl > l_tp1):
                                     next_runner_sl = l_tp1
 
+                        min_prof_sl = round_asset_price(l_entry * (1.0018 if is_long else 0.9982), l_entry)
+                        nr_in_prof = (next_runner_sl >= min_prof_sl) if is_long else (next_runner_sl <= min_prof_sl)
+                        nr_valid_px = (next_runner_sl < px * 0.999) if is_long else (next_runner_sl > px * 1.001)
                         sl_improved = (l_sl <= 0) or ((next_runner_sl > l_sl) if is_long else (next_runner_sl < l_sl))
-                        if next_runner_sl > 0 and (sl_improved or (matched_live_pos and matched_live_pos.get("stop_loss") is None)):
+                        if next_runner_sl > 0 and nr_in_prof and nr_valid_px and (sl_improved or (matched_live_pos and matched_live_pos.get("stop_loss") is None)):
                             lock["stop_loss"] = next_runner_sl
                             l_sl = next_runner_sl
                             save_autotrade_config({"active_trade_lock": lock})
@@ -4473,8 +4560,9 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         hit_80pct = (px >= (l_entry + dist80)) if is_long else (px <= (l_entry - dist80))
                         if hit_80pct and not lock.get("tp1_80pct_be_ratcheted"):
                             be_sl = round_asset_price(l_entry * (1.0018 if is_long else 0.9982), l_entry)
+                            be_valid_px = (be_sl < px * 0.999) if is_long else (be_sl > px * 1.001)
                             be_improved = (l_sl <= 0) or ((be_sl > l_sl) if is_long else (be_sl < l_sl))
-                            if be_improved and be_sl > 0:
+                            if be_valid_px and be_improved and be_sl > 0:
                                 lock["stop_loss"] = be_sl
                                 lock["tp1_80pct_be_ratcheted"] = True
                                 l_sl = be_sl
@@ -5395,6 +5483,10 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "execute_autotrade_two_entry_signal": execute_autotrade_two_entry_signal,
             "get_active_portfolio_trade_status": get_active_portfolio_trade_status,
             "compute_tp1_profit_lock_sl": compute_tp1_profit_lock_sl,
+            "_check_recent_15m_tp1_touch_and_prev_hl": _check_recent_15m_tp1_touch_and_prev_hl,
+            "_evaluate_smart_hybrid_runner_step": _evaluate_smart_hybrid_runner_step,
+            "_find_matching_app_trade_record": _find_matching_app_trade_record,
+            "_auto_protect_live_position_tp1_sl": _auto_protect_live_position_tp1_sl,
         }
         cur_globals = globals()
         for obj in gc.get_objects():
