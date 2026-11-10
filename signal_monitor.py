@@ -132,6 +132,9 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
             autotrade = bool(auto_cfg.get("paper_autotrade_enabled", True))
         else:
             autotrade = bool(auto_cfg.get("enabled", False))
+    # Always honor saved `email_alerts_enabled` setting (defaults to False on staging so staging never duplicates main emails)
+    email_cfg_enabled = bool(auto_cfg.get("email_alerts_enabled", False if eng.is_staging_environment() else True))
+    send = bool(send) and email_cfg_enabled
 
     if not pairs:
         pairs = eng.get_high_volatility_watchlist(top_n=12)
@@ -375,13 +378,15 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         autotrade_daily_count += 1
                         state[autotrade_daily_key] = autotrade_daily_count
                         _save(state)
-                        email_notifier.send_trade_email(
-                            pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
-                            tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=margin_inr, leverage=leverage,
-                            zone=sig.get("trigger_zone") or "", kind="EXECUTED", note=auto_msg,
-                            strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
-                            levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0)
-                        )
+                        # Only send an EXECUTED email if `send` (24/7 Email Alerts) is ON and we did NOT already send a SIGNAL email on this tick!
+                        if send and not emailed:
+                            emailed, _ = email_notifier.send_trade_email(
+                                pair=pair, direction=sig["signal"], entry=sig["entry"], stop_loss=sig["stop_loss"],
+                                tp1=sig["tp1"], tp2=sig["tp2"], margin_inr=margin_inr, leverage=leverage,
+                                zone=sig.get("trigger_zone") or "", kind="EXECUTED", note=auto_msg,
+                                strategy_name=s.name, strategy_id=s.id, trigger_reason=sig.get("trigger_reason", ""),
+                                levels=sig.get("levels"), entry2_sweep=sig.get("entry2_sweep", 0.0)
+                            )
                     else:
                         autotrade_error = auto_msg
                 results.append({**row, "emailed": emailed, "autotraded": autotraded, "autotrade_error": autotrade_error, "message": msg})

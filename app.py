@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 22
+_DAEMON_VERSION = 23
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -228,12 +228,13 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
                         if _is_stg_worker
                         else bool(auto_cfg.get("enabled", False))
                     )
+                    _send_flag = bool(auto_cfg.get("email_alerts_enabled", False if _is_stg_worker else True))
                     _safe_scan_and_alert(
                         pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
                         usd_inr=u_inr,
-                        send=True,
+                        send=_send_flag,
                         strategy_ids=[strategy_registry.DEFAULT_STRATEGY_ID],
                         autotrade=_auto_flag,
                     )
@@ -822,7 +823,22 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
         ["🌙 Dark Pro Terminal", "☀️ Crisp Light Theme"],
         index=0
     )
-    monitor_on = st.toggle("24/7 Email Alerts", value=True, key="monitor_on")
+    _saved_email_on = bool(_auto_cfg.get("email_alerts_enabled", False if _is_staging_env else True))
+    if "monitor_on" not in st.session_state:
+        st.session_state["monitor_on"] = _saved_email_on
+
+    def _on_monitor_email_toggle_change():
+        new_em_val = bool(st.session_state.get("monitor_on", False))
+        coindcx_engine.save_autotrade_config({"email_alerts_enabled": new_em_val})
+        get_cached_signals_scan.clear()
+
+    monitor_on = st.toggle(
+        "24/7 Email Alerts",
+        value=_saved_email_on,
+        key="monitor_on",
+        on_change=_on_monitor_email_toggle_change,
+        help="Persisted across logins & restarts. Defaults to OFF on Staging so Staging never sends duplicate emails alongside Main.",
+    )
     _strategy_names = [s.name for s in strategy_registry.list_strategies()]
     _default_strat_names = [strategy_registry.get_strategy(strategy_registry.DEFAULT_STRATEGY_ID).name]
     monitor_strategy_names = st.multiselect("Active Strategies (AutoTrade = Strategy 1 Only)", _strategy_names, default=_default_strat_names, key="monitor_strategies")

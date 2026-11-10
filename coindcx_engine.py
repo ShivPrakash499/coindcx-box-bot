@@ -438,7 +438,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 22
+_REQUIRED_DAEMON_VERSION = 23
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -3271,7 +3271,7 @@ _AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 
 
 
 # Keys that must survive a Streamlit Cloud restart (persisted per deployment to the Google Sheet)
-_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
+_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "email_alerts_enabled", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
 
 
 def get_git_branch_name() -> str:
@@ -3372,6 +3372,7 @@ def get_autotrade_config() -> dict:
     default_cfg = {
         "enabled": False,
         "paper_autotrade_enabled": True if _is_stg else False,
+        "email_alerts_enabled": False if _is_stg else True,
         "paper_only": _is_stg,
         "wallet_balance_inr": 47287.18,
         "single_trade_margin_inr": 15762.39,
