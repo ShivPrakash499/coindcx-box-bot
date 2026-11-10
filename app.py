@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 20
+_DAEMON_VERSION = 21
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -263,8 +263,7 @@ def check_authentication():
     try:
         _pre_qp = st.query_params
         _raw_push_alert = _pre_qp.get("coindcx_alert") or _pre_qp.get("alert") or ""
-        if _raw_push_alert and st.session_state.get("_last_recorded_push_alert") != _raw_push_alert:
-            st.session_state["_last_recorded_push_alert"] = _raw_push_alert
+        if _raw_push_alert:
             _auto_cfg_pre = coindcx_engine.get_autotrade_config()
             _m_pre = float(_auto_cfg_pre.get("single_trade_margin_inr", 20000.0) or 20000.0)
             _l_pre = int(_auto_cfg_pre.get("leverage", 10) or 10)
@@ -272,6 +271,14 @@ def check_authentication():
                 _raw_push_alert, margin_inr=_m_pre, leverage=_l_pre
             )
             st.session_state["incoming_coindcx_push"] = _parsed_push
+            st.session_state["_applied_push_ts"] = ""
+            try:
+                if "coindcx_alert" in st.query_params:
+                    del st.query_params["coindcx_alert"]
+                if "alert" in st.query_params:
+                    del st.query_params["alert"]
+            except Exception:
+                pass
         _url_pin = str(_pre_qp.get("pin", "")).strip()
         if _url_pin and _url_pin == required_pin:
             st.session_state.authenticated = True
@@ -473,15 +480,17 @@ def _detect_active_trade_pair() -> str | None:
 # Process URL query parameters first (e.g. from trade alert email action button or iPhone Air Shortcut ?coindcx_alert=...)
 _qp = st.query_params
 _push_obj = st.session_state.get("incoming_coindcx_push")
-if _push_obj and _push_obj.get("ok") and st.session_state.get("_applied_push_ts") != _push_obj.get("timestamp"):
-    st.session_state["_applied_push_ts"] = _push_obj.get("timestamp")
+_push_uid = str(_push_obj.get("push_id") or _push_obj.get("timestamp") or "") if isinstance(_push_obj, dict) else ""
+if _push_obj and _push_obj.get("ok") and st.session_state.get("_applied_push_ts") != _push_uid:
+    st.session_state["_applied_push_ts"] = _push_uid
     _p_push = _push_obj["pair"]
     st.session_state.selected_pair = _p_push
     st.session_state.pair_selector_widget = _p_push
     st.session_state["_pair_auto_synced"] = True
     st.session_state["_user_manual_pair_selected"] = True
     st.session_state.active_nav_section = "🎯 Execute"
-    st.session_state["exec_strategy_mode"] = f"{strategy_registry.get_strategy('box_theory').name} Only"
+    _box_mode_lbl = f"{strategy_registry.get_strategy('box_theory').name} Only"
+    st.session_state["exec_strategy_mode"] = _box_mode_lbl
     st.session_state["url_prefill"] = {
         "pair": _p_push,
         "strategy_id": "box_theory",
@@ -491,7 +500,20 @@ if _push_obj and _push_obj.get("ok") and st.session_state.get("_applied_push_ts"
         "stop_loss": float(_push_obj["stop_loss"]),
         "tp1": float(_push_obj["tp1"]),
         "tp2": float(_push_obj["tp2"]),
+        "trigger_reason": _push_obj.get("trigger_reason", "📲 iPhone Air CoinDCX Alert"),
+        "raw_text": _push_obj.get("raw_text", ""),
+        "timestamp": _push_obj.get("timestamp", ""),
     }
+    # Force-reset the Execute tab ticket radio & price input widgets so stale/old setups are never shown
+    _email_tag = strategy_registry.setup_tag("box_theory", "EMAIL")
+    _lbl_alert = f"📧 Alert {_push_obj['direction']} ({fmt_px(_push_obj['entry'])})"
+    st.session_state[f"trade_choice_exec_{_p_push}_{_box_mode_lbl}"] = _lbl_alert
+    st.session_state[f"last_setup_tag_{_p_push}"] = ""
+    st.session_state[f"custom_entry_{_p_push}_{_email_tag}"] = float(_push_obj["entry"])
+    st.session_state[f"custom_e2_{_p_push}_{_email_tag}"] = float(_push_obj.get("entry2_sweep", 0.0))
+    st.session_state[f"custom_sl_{_p_push}_{_email_tag}"] = float(_push_obj["stop_loss"])
+    st.session_state[f"custom_tp1_{_p_push}_{_email_tag}"] = float(_push_obj["tp1"])
+    st.session_state[f"custom_tp2_{_p_push}_{_email_tag}"] = float(_push_obj["tp2"])
 
 _url_pair = _qp.get("pair")
 if _url_pair and _url_pair in GLOBAL_FUTURES_PAIRS:
@@ -1852,6 +1874,11 @@ elif active_section == "🎯 Execute":
         choices = []
         _pref = st.session_state.get("url_prefill")
         if _pref and _pref.get("pair") == selected_pair:
+            if _pref.get("raw_text"):
+                st.info(
+                    f"📲 **Latest iPhone CoinDCX Alert Loaded (`{_pref.get('timestamp', 'Just now')}`):** "
+                    f"`{_pref.get('raw_text', '')[:160]}`"
+                )
             _ps = strategy_registry.get_strategy(_pref["strategy_id"])
             if _ps.id in [s.id for s in armed_strats]:
                 _pm = strategy_registry.position_metrics(

@@ -438,7 +438,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 20
+_REQUIRED_DAEMON_VERSION = 21
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -5026,6 +5026,77 @@ def run_portfolio_single_slot_backtest(
     }
 
 
+def _isolate_latest_iphone_notification(raw_text: str) -> str:
+    """
+    Given full-screen iPhone OCR text (which may contain the iPhone status bar at the very top,
+    the LATEST notification banner / top Notification Center card first, and older notifications
+    or the background Safari Trade Pro app below it), isolates ONLY the single latest notification.
+    """
+    import re as _re
+    import urllib.parse as _urlparse
+
+    txt = str(raw_text or "").strip()
+    if "%" in txt and ("20" in txt or "0A" in txt or "3A" in txt):
+        try:
+            txt = _urlparse.unquote(txt)
+        except Exception:
+            pass
+
+    # 1. Strip out any background Trade Pro Terminal UI text if the screenshot was taken over Safari
+    app_ui_markers = (
+        "SWITCH CRYPTO ASSET",
+        "1-TAP SWITCH ASSET",
+        "PRO TERMINAL SETUP",
+        "FUTURES WALLET",
+        "SINGLE-TRADE MARGIN",
+        "SMART HYBRID EXECUTION TICKET",
+        "ORDER SETUP",
+        "SELECT TICKET",
+        "CATASTROPHE SL",
+        "COINDCX IPHONE AIR NOTIFICATION READER",
+        "HIGH-VOLATILITY WATCHLIST MATRIX",
+        "ACTIVE CONFIRMED SIGNALS",
+    )
+    up_full = txt.upper()
+    cut_idx = len(txt)
+    for marker in app_ui_markers:
+        pos = up_full.find(marker)
+        if pos != -1 and pos < cut_idx:
+            cut_idx = pos
+    txt = txt[:cut_idx].strip()
+
+    # 2. Strip iPhone status bar prefixes at the very start (carrier, 5G/WiFi, clock)
+    txt = _re.sub(
+        r"^\s*(?:JIO|AIRTEL|VI|BSNL|5G|LTE|WIFI|WI-FI|\d{1,2}:\d{2}\s*(?:AM|PM)?|\d{1,3}%|[\s•|·-])+\s*",
+        "",
+        txt,
+        flags=_re.IGNORECASE,
+    ).strip()
+
+    # 3. If 'CoinDCX' header appears in Notification Center, isolate ONLY the FIRST (top-most = latest) CoinDCX card!
+    #    In iOS Notification Center, notifications are ordered strictly newest-at-top -> oldest-at-bottom.
+    coindcx_matches = list(_re.finditer(r"\bCOINDCX\b", txt, flags=_re.IGNORECASE))
+    if coindcx_matches:
+        start_pos = coindcx_matches[0].start()
+        # End at the 2nd 'CoinDCX' notification card (if multiple CoinDCX notifications are stacked)
+        end_pos = coindcx_matches[1].start() if len(coindcx_matches) > 1 else len(txt)
+        snippet = txt[start_pos:end_pos].strip()
+    else:
+        snippet = txt
+
+    # 4. Also stop if another app's notification card or older timestamp header starts below the first notification
+    other_card_split = _re.search(
+        r"\b(?:NOTIFICATION CENTER|OLDER NOTIFICATIONS|GMAIL\s+\d|MESSAGES\s+\d|WHATSAPP\s+\d|TELEGRAM\s+\d|-\s*BOX THEORY SWEEP\s*-\s*TRADE NOTIFICATION)\b",
+        snippet[25:],
+        flags=_re.IGNORECASE,
+    )
+    if other_card_split:
+        snippet = snippet[: 25 + other_card_split.start()].strip()
+
+    # Cap to the top notification card (~260 chars max) so older cards further down the screen are never read
+    return snippet[:260].strip() or txt[:260].strip()
+
+
 def parse_coindcx_notification_text(
     raw_text: str,
     margin_inr: float = 20000.0,
@@ -5033,58 +5104,64 @@ def parse_coindcx_notification_text(
     usd_inr: float = None,
 ) -> dict:
     """
-    Parses a CoinDCX mobile push notification (captured via iPhone Air Shortcut OCR or pasted text)
+    Parses ONLY the latest (top-most) CoinDCX mobile push notification from iPhone Air Shortcut OCR
     and constructs a full Smart Hybrid 2-Entry + Runner trade setup:
-      1. Identifies the Futures Pair across all 30+ GLOBAL_FUTURES_PAIRS (e.g. SOL, RENDER, INJ, BTC, ETH, SUI, etc.).
-      2. Detects direction (LONG/BUY vs SHORT/SELL) from notification keywords or percentage move (+X% / -X%),
-         falling back to Daily 50/200 EMA bias + live 15m momentum if no directional keyword is present.
-      3. Extracts any explicit Entry / TP / SL numbers in the notification text, and normalizes them with
-         our Daily Box (`SH`, `RH`, `MID`, `RL`, `SL`) + Smart Hybrid 2-Entry + Runner rules.
+      1. Isolates the top-most notification card (ignoring older notifications below it or background app UI).
+      2. Identifies the FIRST (earliest-occurring) Futures Pair in that latest notification.
+      3. Detects direction (LONG/BUY vs SHORT/SELL) strictly from that latest notification.
+      4. Extracts any explicit Entry / TP / SL numbers in the latest notification, or computes fresh
+         Smart Hybrid 2-Entry + Runner + Daily Box levels at the live market price.
     """
     import re as _re
-    txt = str(raw_text or "").strip()
-    if not txt:
+    full_txt = str(raw_text or "").strip()
+    if not full_txt:
         return {"ok": False, "error": "Empty notification text"}
 
+    txt = _isolate_latest_iphone_notification(full_txt)
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
     up_txt = txt.upper()
 
-    # 1. Detect Crypto Symbol -> CoinDCX Futures Pair
-    matched_pair = None
-    # Check full B-XXX_USDT or XXXUSDT first
+    # 1. Detect Crypto Symbol -> CoinDCX Futures Pair by EARLIEST position in the latest notification!
+    #    (Never loop in fixed BTC/ETH array order, which previously matched older notifications lower on screen.)
+    candidates = []
     for p in GLOBAL_FUTURES_PAIRS:
         sym = p.replace("B-", "").replace("_USDT", "")
-        if p in up_txt or f"{sym}USDT" in up_txt or f"{sym}/USDT" in up_txt or f"{sym}-USDT" in up_txt:
-            matched_pair = p
-            break
-    if not matched_pair:
-        # Match standalone ticker word boundary (prioritizing high-vol universe first, then all global pairs)
-        search_order = list(HIGH_VOL_FUTURES_UNIVERSE) + [p for p in GLOBAL_FUTURES_PAIRS if p not in HIGH_VOL_FUTURES_UNIVERSE]
-        for p in search_order:
-            sym = p.replace("B-", "").replace("_USDT", "")
-            if _re.search(rf"\b{_re.escape(sym)}\b", up_txt):
-                matched_pair = p
+        # Explicit pair forms (e.g. SOL/USDT, SOLUSDT, SOL-USDT, B-SOL_USDT)
+        for pat in (rf"\b{_re.escape(p)}\b", rf"\b{_re.escape(sym)}\s*[/\-_]?\s*USDT\b", rf"\b{_re.escape(sym)}\s*[/\-_]?\s*INR\b"):
+            m = _re.search(pat, up_txt)
+            if m:
+                candidates.append((m.start(), 0, p))
                 break
-    # Common full-name aliases in CoinDCX push notifications
-    if not matched_pair:
-        name_map = {
-            "BITCOIN": "B-BTC_USDT", "ETHEREUM": "B-ETH_USDT", "SOLANA": "B-SOL_USDT",
-            "RIPPLE": "B-XRP_USDT", "DOGECOIN": "B-DOGE_USDT", "AVALANCHE": "B-AVAX_USDT",
-            "INJECTIVE": "B-INJ_USDT", "APTOS": "B-APT_USDT", "FETCH": "B-FET_USDT",
-            "CARDANO": "B-ADA_USDT", "CHAINLINK": "B-LINK_USDT", "POLKADOT": "B-DOT_USDT",
-            "LITECOIN": "B-LTC_USDT", "TONCOIN": "B-TON_USDT", "UNISWAP": "B-UNI_USDT",
-        }
-        for cname, cpair in name_map.items():
-            if cname in up_txt:
-                matched_pair = cpair
-                break
+        # Standalone ticker symbol word boundary (e.g. 'SOL', 'RENDER', 'INJ', 'DOGE')
+        m_sym = _re.search(rf"\b{_re.escape(sym)}\b", up_txt)
+        if m_sym:
+            candidates.append((m_sym.start(), 1, p))
 
-    if not matched_pair:
+    name_map = {
+        "BITCOIN": "B-BTC_USDT", "ETHEREUM": "B-ETH_USDT", "SOLANA": "B-SOL_USDT",
+        "RIPPLE": "B-XRP_USDT", "DOGECOIN": "B-DOGE_USDT", "AVALANCHE": "B-AVAX_USDT",
+        "INJECTIVE": "B-INJ_USDT", "APTOS": "B-APT_USDT", "FETCH": "B-FET_USDT",
+        "CARDANO": "B-ADA_USDT", "CHAINLINK": "B-LINK_USDT", "POLKADOT": "B-DOT_USDT",
+        "LITECOIN": "B-LTC_USDT", "TONCOIN": "B-TON_USDT", "UNISWAP": "B-UNI_USDT",
+    }
+    for cname, cpair in name_map.items():
+        m_name = _re.search(rf"\b{cname}\b", up_txt)
+        if m_name:
+            candidates.append((m_name.start(), 1, cpair))
+
+    if not candidates:
         return {
             "ok": False,
-            "error": "Could not detect a supported Futures coin symbol (e.g. SOL, RENDER, INJ, ETH, BTC) in notification.",
+            "error": "Could not detect a supported Futures coin symbol (e.g. SOL, RENDER, INJ, ETH, BTC) in the latest notification.",
             "raw_text": txt,
         }
+
+    # Pick the coin that appears EARLIEST (top-most) in the latest notification card
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    matched_pair = candidates[0][2]
+    first_coin_pos = candidates[0][0]
+    # Narrow analysis window to the text around this first coin (up to 180 chars after it)
+    up_txt = up_txt[max(0, first_coin_pos - 40) : first_coin_pos + 180]
 
     # 2. Fetch live price, Daily Box levels, and Daily 50/200 EMA bias
     tk = fetch_live_ticker(matched_pair)
@@ -5221,20 +5298,23 @@ def record_coindcx_push_notification(
     to the `CoinDCX_Notifications` tab in `Crypto_Trades_Journal`.
     """
     parsed = parse_coindcx_notification_text(raw_text, margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr)
+    parsed["push_id"] = int(time.time() * 1000)
     alerts_list = _PERSIST.setdefault("coindcx_push_alerts", [])
-    # Deduplicate identical raw_text within last 60 seconds
-    if not alerts_list or alerts_list[0].get("raw_text") != str(raw_text).strip():
+    isolated_txt = parsed.get("raw_text") or str(raw_text).strip()
+    if not alerts_list or alerts_list[0].get("raw_text") != isolated_txt:
         alerts_list.insert(0, parsed)
         del alerts_list[20:]
 
         def _bg_log():
             try:
                 import sheets_logger as _sl
-                _sl.log_coindcx_notification_to_sheet(raw_text, parsed)
+                _sl.log_coindcx_notification_to_sheet(isolated_txt, parsed)
             except Exception:
                 pass
 
         _threading.Thread(target=_bg_log, daemon=True, name="CoinDCXPushSheetLog").start()
+    else:
+        alerts_list[0] = parsed
     return parsed
 
 
