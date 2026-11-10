@@ -438,7 +438,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 19
+_REQUIRED_DAEMON_VERSION = 20
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -5024,6 +5024,250 @@ def run_portfolio_single_slot_backtest(
         "leverage": leverage,
         "duration_days": duration_days,
     }
+
+
+def parse_coindcx_notification_text(
+    raw_text: str,
+    margin_inr: float = 20000.0,
+    leverage: int = 10,
+    usd_inr: float = None,
+) -> dict:
+    """
+    Parses a CoinDCX mobile push notification (captured via iPhone Air Shortcut OCR or pasted text)
+    and constructs a full Smart Hybrid 2-Entry + Runner trade setup:
+      1. Identifies the Futures Pair across all 30+ GLOBAL_FUTURES_PAIRS (e.g. SOL, RENDER, INJ, BTC, ETH, SUI, etc.).
+      2. Detects direction (LONG/BUY vs SHORT/SELL) from notification keywords or percentage move (+X% / -X%),
+         falling back to Daily 50/200 EMA bias + live 15m momentum if no directional keyword is present.
+      3. Extracts any explicit Entry / TP / SL numbers in the notification text, and normalizes them with
+         our Daily Box (`SH`, `RH`, `MID`, `RL`, `SL`) + Smart Hybrid 2-Entry + Runner rules.
+    """
+    import re as _re
+    txt = str(raw_text or "").strip()
+    if not txt:
+        return {"ok": False, "error": "Empty notification text"}
+
+    u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
+    up_txt = txt.upper()
+
+    # 1. Detect Crypto Symbol -> CoinDCX Futures Pair
+    matched_pair = None
+    # Check full B-XXX_USDT or XXXUSDT first
+    for p in GLOBAL_FUTURES_PAIRS:
+        sym = p.replace("B-", "").replace("_USDT", "")
+        if p in up_txt or f"{sym}USDT" in up_txt or f"{sym}/USDT" in up_txt or f"{sym}-USDT" in up_txt:
+            matched_pair = p
+            break
+    if not matched_pair:
+        # Match standalone ticker word boundary (prioritizing high-vol universe first, then all global pairs)
+        search_order = list(HIGH_VOL_FUTURES_UNIVERSE) + [p for p in GLOBAL_FUTURES_PAIRS if p not in HIGH_VOL_FUTURES_UNIVERSE]
+        for p in search_order:
+            sym = p.replace("B-", "").replace("_USDT", "")
+            if _re.search(rf"\b{_re.escape(sym)}\b", up_txt):
+                matched_pair = p
+                break
+    # Common full-name aliases in CoinDCX push notifications
+    if not matched_pair:
+        name_map = {
+            "BITCOIN": "B-BTC_USDT", "ETHEREUM": "B-ETH_USDT", "SOLANA": "B-SOL_USDT",
+            "RIPPLE": "B-XRP_USDT", "DOGECOIN": "B-DOGE_USDT", "AVALANCHE": "B-AVAX_USDT",
+            "INJECTIVE": "B-INJ_USDT", "APTOS": "B-APT_USDT", "FETCH": "B-FET_USDT",
+            "CARDANO": "B-ADA_USDT", "CHAINLINK": "B-LINK_USDT", "POLKADOT": "B-DOT_USDT",
+            "LITECOIN": "B-LTC_USDT", "TONCOIN": "B-TON_USDT", "UNISWAP": "B-UNI_USDT",
+        }
+        for cname, cpair in name_map.items():
+            if cname in up_txt:
+                matched_pair = cpair
+                break
+
+    if not matched_pair:
+        return {
+            "ok": False,
+            "error": "Could not detect a supported Futures coin symbol (e.g. SOL, RENDER, INJ, ETH, BTC) in notification.",
+            "raw_text": txt,
+        }
+
+    # 2. Fetch live price, Daily Box levels, and Daily 50/200 EMA bias
+    tk = fetch_live_ticker(matched_pair)
+    live_px = float(tk.get("last_price", 0.0) or 0.0)
+    levels = calculate_daily_box_levels(matched_pair) or {}
+    bias_info = compute_market_bias(matched_pair, live_px)
+    daily_bias = str(bias_info.get("bias", "NEUTRAL / RANGE")).upper()
+
+    # 3. Detect Direction (LONG vs SHORT) from notification text
+    bull_words = ("LONG", "BUY", "BULLISH", "BREAKOUT", "SURGE", "SURGED", "SURGING", "PUMP", "RALLY", "GAIN", "GAINED", "UP ", "HIGHER", "OVERSOLD", "SUPPORT", "BOUNCE")
+    bear_words = ("SHORT", "SELL", "BEARISH", "BREAKDOWN", "DROP", "DROPPED", "DROPPING", "DUMP", "CRASH", "FALL", "FELL", "DOWN ", "LOWER", "OVERBOUGHT", "RESISTANCE", "REJECTION")
+    bull_hits = sum(1 for w in bull_words if w in up_txt)
+    bear_hits = sum(1 for w in bear_words if w in up_txt)
+
+    # Also check signed percentage e.g. "+6.5%" vs "-5.2%"
+    pct_matches = _re.findall(r"([+-]\d+(?:\.\d+)?)\s*%", up_txt)
+    for pm in pct_matches:
+        try:
+            pv = float(pm)
+            if pv >= 1.5:
+                bull_hits += 2
+            elif pv <= -1.5:
+                bear_hits += 2
+        except Exception:
+            pass
+
+    if bull_hits > bear_hits:
+        direction = "LONG"
+        dir_source = "Notification Bullish Signal"
+    elif bear_hits > bull_hits:
+        direction = "SHORT"
+        dir_source = "Notification Bearish Signal"
+    else:
+        if "BEARISH" in daily_bias:
+            direction = "SHORT"
+            dir_source = f"Daily Bias ({daily_bias})"
+        elif "BULLISH" in daily_bias:
+            direction = "LONG"
+            dir_source = f"Daily Bias ({daily_bias})"
+        else:
+            chg_24h = float(tk.get("change_24h", 0.0) or 0.0)
+            direction = "LONG" if chg_24h >= 0 else "SHORT"
+            dir_source = f"24h Momentum ({chg_24h:+.2f}%)"
+
+    trade_dir = "BUY" if direction == "LONG" else "SELL"
+
+    # 4. Extract any explicit Entry / TP / SL numbers if CoinDCX notification includes them
+    def _extract_labeled_price(pattern: str) -> float | None:
+        m = _re.search(pattern, up_txt)
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+                if val > 0:
+                    return val
+            except Exception:
+                pass
+        return None
+
+    exp_entry = _extract_labeled_price(r"(?:ENTRY|BUY AT|SELL AT|PRICE)[:\s@\$]*([0-9]+(?:\.[0-9]+)?)")
+    exp_tp1 = _extract_labeled_price(r"(?:TP1|TARGET 1|TARGET|TAKE PROFIT)[:\s@\$]*([0-9]+(?:\.[0-9]+)?)")
+    exp_tp2 = _extract_labeled_price(r"(?:TP2|TARGET 2)[:\s@\$]*([0-9]+(?:\.[0-9]+)?)")
+    exp_sl = _extract_labeled_price(r"(?:SL|STOP LOSS|STOPLOSS|STOP)[:\s@\$]*([0-9]+(?:\.[0-9]+)?)")
+
+    ref_e1 = exp_entry if (exp_entry and exp_entry > 0) else (live_px if live_px > 0 else float(levels.get("MID", 100.0) or 100.0))
+    norm = normalize_two_entry_runner_levels(
+        pair=matched_pair,
+        direction=trade_dir,
+        entry1_px=ref_e1,
+        entry2_px=None,
+        tp1_px=exp_tp1,
+        tp2_px=exp_tp2,
+        sl_px=exp_sl,
+        live_px=live_px if live_px > 0 else ref_e1,
+        levels=levels if levels else None,
+    )
+
+    e1 = norm["entry"]
+    e2 = norm["entry2_sweep"]
+    tp1 = norm["tp1"]
+    tp2 = norm["tp2"]
+    sl = norm["stop_loss"]
+
+    pos_usd = (float(margin_inr) * int(leverage)) / u_inr
+    qty = format_order_quantity(matched_pair, pos_usd / e1) if e1 > 0 else 0.0
+    roe_tp1 = round((abs(tp1 - e1) / e1) * int(leverage) * 100.0, 2) if e1 > 0 else 0.0
+    roe_tp2 = round((abs(tp2 - e1) / e1) * int(leverage) * 100.0, 2) if e1 > 0 else 0.0
+    roe_sl = round((abs(e1 - sl) / e1) * int(leverage) * 100.0, 2) if e1 > 0 else 0.0
+
+    sym_clean = matched_pair.replace("B-", "").replace("_USDT", "")
+    summary = f"📲 CoinDCX Push ({sym_clean} {direction} via {dir_source})"
+
+    return {
+        "ok": True,
+        "pair": matched_pair,
+        "symbol": sym_clean,
+        "signal": direction,
+        "direction": trade_dir,
+        "entry": e1,
+        "entry2_sweep": e2,
+        "tp1": tp1,
+        "tp2": tp2,
+        "stop_loss": sl,
+        "crypto_qty": qty,
+        "margin_inr": float(margin_inr),
+        "leverage": int(leverage),
+        "roe_tp1": roe_tp1,
+        "roe_tp2": roe_tp2,
+        "roe_sl": roe_sl,
+        "profit_tp1_inr": round(abs(tp1 - e1) * qty * u_inr, 2),
+        "profit_tp2_inr": round(abs(tp2 - e1) * qty * u_inr, 2),
+        "loss_sl_inr": round(abs(e1 - sl) * qty * u_inr, 2),
+        "daily_bias": daily_bias,
+        "levels": levels,
+        "strategy_id": "box_theory",
+        "strategy_name": "Box Theory Sweep (CoinDCX Push Alert)",
+        "signal_kind": "COINDCX_PUSH_NOTIFICATION",
+        "trigger_zone": f"CoinDCX iPhone Alert ({dir_source})",
+        "trigger_reason": f"{summary}: {txt[:140]}",
+        "summary": summary,
+        "raw_text": txt,
+        "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+    }
+
+
+def record_coindcx_push_notification(
+    raw_text: str,
+    margin_inr: float = 20000.0,
+    leverage: int = 10,
+    usd_inr: float = None,
+) -> dict:
+    """
+    Parses an incoming CoinDCX notification from the user's iPhone Air Shortcut, stores it in
+    in-memory `_PERSIST['coindcx_push_alerts']` for instant UI display, and logs it asynchronously
+    to the `CoinDCX_Notifications` tab in `Crypto_Trades_Journal`.
+    """
+    parsed = parse_coindcx_notification_text(raw_text, margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr)
+    alerts_list = _PERSIST.setdefault("coindcx_push_alerts", [])
+    # Deduplicate identical raw_text within last 60 seconds
+    if not alerts_list or alerts_list[0].get("raw_text") != str(raw_text).strip():
+        alerts_list.insert(0, parsed)
+        del alerts_list[20:]
+
+        def _bg_log():
+            try:
+                import sheets_logger as _sl
+                _sl.log_coindcx_notification_to_sheet(raw_text, parsed)
+            except Exception:
+                pass
+
+        _threading.Thread(target=_bg_log, daemon=True, name="CoinDCXPushSheetLog").start()
+    return parsed
+
+
+def get_recent_coindcx_notifications(limit: int = 10) -> list[dict]:
+    """Returns recent CoinDCX push notifications from memory or Google Sheets."""
+    mem = _PERSIST.get("coindcx_push_alerts") or []
+    if mem:
+        return list(mem[:limit])
+    try:
+        import sheets_logger as _sl
+        rows = _sl.fetch_coindcx_notifications_from_sheet(limit=limit)
+        out = []
+        for r in rows:
+            out.append({
+                "ok": bool(r.get("Parsed Pair")),
+                "timestamp": r.get("Timestamp (IST)", ""),
+                "raw_text": r.get("Raw Notification Text", ""),
+                "pair": r.get("Parsed Pair", ""),
+                "direction": r.get("Direction", "BUY"),
+                "signal": "LONG" if str(r.get("Direction", "BUY")).upper() in ("LONG", "BUY") else "SHORT",
+                "entry": float(r.get("Entry ($)") or 0.0),
+                "entry2_sweep": float(r.get("Entry 2 Sweep ($)") or 0.0),
+                "tp1": float(r.get("TP1 ($)") or 0.0),
+                "tp2": float(r.get("TP2 ($)") or 0.0),
+                "stop_loss": float(r.get("Stop Loss ($)") or 0.0),
+                "daily_bias": r.get("Daily Bias", ""),
+                "summary": r.get("Source / Summary", "iPhone Air Shortcut"),
+            })
+        if out:
+            _PERSIST["coindcx_push_alerts"] = out
+        return out
+    except Exception:
+        return []
 
 
 def get_rotational_margin_inr(leverage: int = 10) -> dict:

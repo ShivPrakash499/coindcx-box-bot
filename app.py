@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 19
+_DAEMON_VERSION = 20
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -257,10 +257,29 @@ def get_security_pin():
     return os.getenv("APP_PIN", "1234").strip()
 
 def check_authentication():
+    required_pin = get_security_pin()
+    # Allow iPhone Air Shortcut (?coindcx_alert=...) to record the notification BEFORE the PIN gate
+    # so even a background Shortcut call or locked browser session logs it to Google Sheets + memory!
+    try:
+        _pre_qp = st.query_params
+        _raw_push_alert = _pre_qp.get("coindcx_alert") or _pre_qp.get("alert") or ""
+        if _raw_push_alert and st.session_state.get("_last_recorded_push_alert") != _raw_push_alert:
+            st.session_state["_last_recorded_push_alert"] = _raw_push_alert
+            _auto_cfg_pre = coindcx_engine.get_autotrade_config()
+            _m_pre = float(_auto_cfg_pre.get("single_trade_margin_inr", 20000.0) or 20000.0)
+            _l_pre = int(_auto_cfg_pre.get("leverage", 10) or 10)
+            _parsed_push = coindcx_engine.record_coindcx_push_notification(
+                _raw_push_alert, margin_inr=_m_pre, leverage=_l_pre
+            )
+            st.session_state["incoming_coindcx_push"] = _parsed_push
+        _url_pin = str(_pre_qp.get("pin", "")).strip()
+        if _url_pin and _url_pin == required_pin:
+            st.session_state.authenticated = True
+    except Exception:
+        pass
+
     if st.session_state.get("authenticated", False):
         return True
-
-    required_pin = get_security_pin()
     _pre_bal = fetch_coindcx_futures_balance(force_refresh=False) or {}
     _pre_pos = fetch_coindcx_active_positions(force_refresh=False) or []
     _pre_k, _pre_s = coindcx_engine._get_coindcx_credentials()
@@ -451,8 +470,29 @@ def _detect_active_trade_pair() -> str | None:
         return pos.get("pair")
     return None
 
-# Process URL query parameters first (e.g. from trade alert email action button)
+# Process URL query parameters first (e.g. from trade alert email action button or iPhone Air Shortcut ?coindcx_alert=...)
 _qp = st.query_params
+_push_obj = st.session_state.get("incoming_coindcx_push")
+if _push_obj and _push_obj.get("ok") and st.session_state.get("_applied_push_ts") != _push_obj.get("timestamp"):
+    st.session_state["_applied_push_ts"] = _push_obj.get("timestamp")
+    _p_push = _push_obj["pair"]
+    st.session_state.selected_pair = _p_push
+    st.session_state.pair_selector_widget = _p_push
+    st.session_state["_pair_auto_synced"] = True
+    st.session_state["_user_manual_pair_selected"] = True
+    st.session_state.active_nav_section = "🎯 Execute"
+    st.session_state["exec_strategy_mode"] = f"{strategy_registry.get_strategy('box_theory').name} Only"
+    st.session_state["url_prefill"] = {
+        "pair": _p_push,
+        "strategy_id": "box_theory",
+        "direction": _push_obj["direction"],
+        "entry": float(_push_obj["entry"]),
+        "entry2_sweep": float(_push_obj.get("entry2_sweep", 0.0)),
+        "stop_loss": float(_push_obj["stop_loss"]),
+        "tp1": float(_push_obj["tp1"]),
+        "tp2": float(_push_obj["tp2"]),
+    }
+
 _url_pair = _qp.get("pair")
 if _url_pair and _url_pair in GLOBAL_FUTURES_PAIRS:
     st.session_state.selected_pair = _url_pair
@@ -1544,6 +1584,92 @@ if active_section == "⚡ Signals":
         for _err_r in active_signals:
             if _err_r.get("autotrade_error"):
                 st.warning(f"⚠️ **AutoTrade Notice ({clean_sym(_err_r['pair'])}):** {_err_r['autotrade_error']}")
+
+        # 📲 iPhone Air CoinDCX Push Notification Reader & Synced Feed
+        _recent_push_list = coindcx_engine.get_recent_coindcx_notifications(limit=5)
+        with st.expander(
+            f"📲 CoinDCX iPhone Air Notification Reader ({len(_recent_push_list)} Recent)",
+            expanded=bool(_recent_push_list),
+        ):
+            st.caption(
+                "Captures CoinDCX mobile push notifications from your **iPhone Air Shortcut** (`?coindcx_alert=...`) "
+                "or pasted text below, converts them into our **Smart Hybrid 2-Entry + Runner + Daily Box** setup, "
+                "and syncs them to the `CoinDCX_Notifications` tab in Google Sheets so you can view & execute from iPhone or Desktop."
+            )
+            _p_col1, _p_col2 = st.columns([3.2, 1.0])
+            with _p_col1:
+                _manual_push_txt = st.text_input(
+                    "Paste or Test a CoinDCX Notification",
+                    placeholder="e.g. 🚀 SOL/USDT surged +5.8% in 1h — Futures Bullish Breakout!",
+                    key="manual_coindcx_push_input",
+                    label_visibility="collapsed",
+                )
+            with _p_col2:
+                if st.button("📲 Parse & Load", key="btn_parse_manual_push", type="primary", use_container_width=True):
+                    if _manual_push_txt and _manual_push_txt.strip():
+                        _res_p = coindcx_engine.record_coindcx_push_notification(
+                            _manual_push_txt.strip(),
+                            margin_inr=float(margin_inr),
+                            leverage=int(leverage),
+                            usd_inr=float(usd_inr),
+                        )
+                        if _res_p.get("ok"):
+                            st.session_state["incoming_coindcx_push"] = _res_p
+                            st.rerun()
+                        else:
+                            st.error(_res_p.get("error", "Could not parse notification."))
+            if _recent_push_list:
+                for _idx_p, _item_p in enumerate(_recent_push_list[:3]):
+                    if not _item_p.get("ok"):
+                        st.info(f"🕒 `{_item_p.get('timestamp', '')}` — Raw: `{_item_p.get('raw_text', '')}` ({_item_p.get('error', '')})")
+                        continue
+                    _p_pair = _item_p["pair"]
+                    _p_sym = clean_sym(_p_pair)
+                    _p_sig = _item_p.get("signal", "LONG")
+                    _p_badge = "badge-buy" if _p_sig == "LONG" else "badge-sell"
+                    _raw_clean = str(_item_p.get("raw_text", "")).replace("$", "&#36;")
+                    with st.container(border=True):
+                        st.markdown(
+                            f"<span class='{_p_badge}'>{_p_sig} {_p_sym}/USDT</span> &nbsp; "
+                            f"**📲 iPhone Air CoinDCX Alert** (`{_item_p.get('timestamp', '')}`) • Bias: **{_item_p.get('daily_bias', 'RANGE')}**<br>"
+                            f"<span style='font-size:0.82rem;opacity:0.85;'>Raw Notification: <code>{_raw_clean[:180]}</code></span>",
+                            unsafe_allow_html=True,
+                        )
+                        pm1, pm2, pm3, pm4, pm5 = st.columns(5)
+                        pm1.metric("Entry 1 (50%)", fmt_px(_item_p["entry"]))
+                        pm2.metric("Entry 2 @ Sweep", fmt_px(_item_p.get("entry2_sweep", _item_p["entry"])))
+                        pm3.metric("TP1 (50% Book)", fmt_px(_item_p["tp1"]))
+                        pm4.metric("TP2 (50% Runner)", fmt_px(_item_p["tp2"]))
+                        pm5.metric("Catastrophe SL", fmt_px(_item_p["stop_loss"]))
+                        pb1, pb2 = st.columns(2)
+                        if pb1.button(
+                            f"🎯 Load {_p_sym} into Execute",
+                            key=f"btn_load_push_{_idx_p}_{_p_pair}",
+                            use_container_width=True,
+                        ):
+                            st.session_state["incoming_coindcx_push"] = _item_p
+                            st.session_state["_applied_push_ts"] = ""
+                            st.rerun()
+                        if pb2.button(
+                            f"🤖 Execute {_p_sym} 2-Entry + Runner (₹{margin_inr:,.0f} @ {leverage}x)",
+                            key=f"btn_exec_push_{_idx_p}_{_p_pair}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            _ok_p, _msg_p, _ = coindcx_engine.execute_autotrade_two_entry_signal(
+                                pair=_p_pair,
+                                sig=_item_p,
+                                single_trade_margin_inr=float(margin_inr),
+                                leverage=int(leverage),
+                                usd_inr=float(usd_inr),
+                            )
+                            if _ok_p:
+                                st.session_state["last_autotrade_banner"] = f"🚀 **Executed CoinDCX Push Alert ({_p_sym}):** {_msg_p}"
+                                get_cached_positions.clear()
+                                get_cached_balance.clear()
+                                st.rerun()
+                            else:
+                                st.error(_msg_p)
 
         if active_signals:
             st.markdown(f"#### 🔥 Active Confirmed Signals ({len(active_signals)})")

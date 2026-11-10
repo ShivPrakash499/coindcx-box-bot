@@ -724,3 +724,49 @@ def load_autotrade_state_from_sheet(deployment_id: str) -> dict | None:
         return None
     except Exception:
         return None
+
+
+def log_coindcx_notification_to_sheet(raw_text: str, parsed: dict) -> tuple[bool, str]:
+    """Logs an incoming CoinDCX mobile push notification (from iPhone Air Shortcut or UI) to 'CoinDCX_Notifications'."""
+    try:
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = _client().open(target_sheet)
+        ws = _get_ws(book, "CoinDCX_Notifications")
+        vals = ws.get_all_values()
+        headers = [
+            "Timestamp (IST)", "Raw Notification Text", "Parsed Pair", "Direction",
+            "Entry ($)", "Entry 2 Sweep ($)", "TP1 ($)", "TP2 ($)", "Stop Loss ($)",
+            "Daily Bias", "Source / Summary"
+        ]
+        if not vals:
+            ws.append_row(headers)
+        ist_str = _dt.now(_IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        row = [
+            ist_str,
+            str(raw_text or "").strip()[:500],
+            str(parsed.get("pair", "")),
+            str(parsed.get("direction", "")),
+            str(parsed.get("entry", "")),
+            str(parsed.get("entry2_sweep", "")),
+            str(parsed.get("tp1", "")),
+            str(parsed.get("tp2", "")),
+            str(parsed.get("stop_loss", "")),
+            str(parsed.get("daily_bias", "")),
+            str(parsed.get("summary", "iPhone Air Shortcut")),
+        ]
+        ws.append_row(row)
+        return True, "Logged to CoinDCX_Notifications tab"
+    except Exception as e:
+        return False, str(e)
+
+
+def fetch_coindcx_notifications_from_sheet(limit: int = 15) -> list[dict]:
+    """Fetches the most recent CoinDCX push notifications logged from the user's iPhone Air."""
+    try:
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = _client().open(target_sheet)
+        ws = book.worksheet("CoinDCX_Notifications")
+        rows = ws.get_all_records()
+        return list(reversed(rows[-limit:])) if rows else []
+    except Exception:
+        return []
