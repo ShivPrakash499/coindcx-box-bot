@@ -1589,7 +1589,7 @@ if active_section == "⚡ Signals":
         _recent_push_list = coindcx_engine.get_recent_coindcx_notifications(limit=5)
         with st.expander(
             f"📲 CoinDCX iPhone Air Notification Reader ({len(_recent_push_list)} Recent)",
-            expanded=bool(_recent_push_list),
+            expanded=True,
         ):
             st.caption(
                 "Captures CoinDCX mobile push notifications from your **iPhone Air Shortcut** (`?coindcx_alert=...`) "
