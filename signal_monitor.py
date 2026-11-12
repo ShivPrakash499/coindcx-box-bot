@@ -100,13 +100,19 @@ def _state_key(strategy_id: str, pair: str, sig: dict) -> str:
 
 def _note(strategy_id: str, sig: dict) -> str:
     e1 = sig.get("entry", 0.0)
-    e2 = sig.get("entry2_sweep", 0.0)
+    e2 = float(sig.get("entry2_sweep", 0.0) or 0.0)
     tp1 = sig.get("tp1", 0.0)
     tp2 = sig.get("tp2", 0.0)
+    if e2 > 0:
+        return (
+            f"2-Entry + Runner Plan: Enter 50% (Tranche 1) at ${e1:,.2f} and place an equal 50% Limit Order (Tranche 2) "
+            f"at the Sweep Level (${e2:,.2f}). Book 50% early profit at TP1 (${tp1:,.2f}) & lock SL in profit; "
+            f"hold the remaining 50% Runner to TP2 (${tp2:,.2f})!"
+        )
     return (
-        f"2-Entry + Runner Plan: Enter 50% (Tranche 1) at ${e1:,.2f} and place an equal 50% Limit Order (Tranche 2) "
-        f"at the Sweep Level (${e2:,.2f}). Book 50% early profit at TP1 (${tp1:,.2f}) & move SL to Breakeven; "
-        f"hold the remaining 50% risk-free Runner to TP2 (${tp2:,.2f}) to capture the big drop/move!"
+        f"100% Single-Slot Maker Limit + Structural Runner Plan: Place 100% Slot Maker Limit Order at ${e1:,.2f}. "
+        f"Book 50% early profit at TP1 (${tp1:,.2f}) & lock SL in profit; "
+        f"ratchet SL to TP1 halfway to TP2 and hold the remaining 50% Runner to TP2 (${tp2:,.2f})!"
     )
 
 

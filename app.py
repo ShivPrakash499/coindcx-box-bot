@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 25
+_DAEMON_VERSION = 26
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -1673,12 +1673,11 @@ if active_section == "⚡ Signals":
                             f"<span style='font-size:0.82rem;opacity:0.85;'>Raw Notification: <code>{_raw_clean[:180]}</code></span>",
                             unsafe_allow_html=True,
                         )
-                        pm1, pm2, pm3, pm4, pm5 = st.columns(5)
-                        pm1.metric("Entry 1 (50%)", fmt_px(_item_p["entry"]))
-                        pm2.metric("Entry 2 @ Sweep", fmt_px(_item_p.get("entry2_sweep", _item_p["entry"])))
-                        pm3.metric("TP1 (50% Book)", fmt_px(_item_p["tp1"]))
-                        pm4.metric("TP2 (50% Runner)", fmt_px(_item_p["tp2"]))
-                        pm5.metric("Catastrophe SL", fmt_px(_item_p["stop_loss"]))
+                        pm1, pm2, pm3, pm4 = st.columns(4)
+                        pm1.metric("Entry (100% Limit)", fmt_px(_item_p["entry"]))
+                        pm2.metric("TP1 (50% Book)", fmt_px(_item_p["tp1"]))
+                        pm3.metric("TP2 (50% Runner)", fmt_px(_item_p["tp2"]))
+                        pm4.metric("Catastrophe SL", fmt_px(_item_p["stop_loss"]))
                         pb1, pb2 = st.columns(2)
                         if pb1.button(
                             f"🎯 Load {_p_sym} into Execute",
@@ -1689,7 +1688,7 @@ if active_section == "⚡ Signals":
                             st.session_state["_applied_push_ts"] = ""
                             st.rerun()
                         if pb2.button(
-                            f"🤖 Execute {_p_sym} 2-Entry + Runner (₹{margin_inr:,.0f} @ {leverage}x)",
+                            f"🤖 Execute {_p_sym} 100% Limit + Runner (₹{margin_inr:,.0f} @ {leverage}x)",
                             key=f"btn_exec_push_{_idx_p}_{_p_pair}",
                             type="primary",
                             use_container_width=True,
@@ -1724,12 +1723,11 @@ if active_section == "⚡ Signals":
                         f"**{r['strategy_name']}** • {_trig_txt}",
                         unsafe_allow_html=True
                     )
-                    m1, m2, m3, m4, m5 = st.columns(5)
-                    m1.metric("Entry 1 (50%)", fmt_px(sig["entry"]))
-                    m2.metric("Entry 2 @ Sweep", fmt_px(sig.get("entry2_sweep", sig["entry"])))
-                    m3.metric("TP1 (50% -> BE)", fmt_px(sig["tp1"]), f"+{sig['roe_tp1']}% ROE")
-                    m4.metric("TP2 (50% Runner)", fmt_px(sig["tp2"]), f"+{sig['roe_tp2']}% ROE")
-                    m5.metric("Catastrophe SL", fmt_px(sig["stop_loss"]), f"-{sig['roe_sl']}% ROE")
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Entry (100% Limit)", fmt_px(sig["entry"]))
+                    m2.metric("TP1 (50% -> Lock SL)", fmt_px(sig["tp1"]), f"+{sig['roe_tp1']}% ROE")
+                    m3.metric("TP2 (50% Runner)", fmt_px(sig["tp2"]), f"+{sig['roe_tp2']}% ROE")
+                    m4.metric("Catastrophe SL", fmt_px(sig["stop_loss"]), f"-{sig['roe_sl']}% ROE")
 
                     b1, b2 = st.columns(2)
                     b1.button(
@@ -1955,21 +1953,21 @@ elif active_section == "🎯 Execute":
             tp1_tracker_key = f"last_formula_tp1_{selected_pair}_{setup_tag}"
             custom_e1_tracker_key = f"last_custom_entry_{selected_pair}_{setup_tag}"
 
-            _strat_has_e2 = (active_strategy.id == "box_theory")
-            _raw_e2_default = float(active_trade.get("entry2_sweep") or (levels["SL"] if (levels and trade_dir == "BUY") else (levels["SH"] if levels else active_trade["entry"]))) if _strat_has_e2 else 0.0
+            _is_box_strat = (active_strategy.id == "box_theory")
+            _strat_has_e2 = False  # Entry 2 removed: 100% Single-Slot Maker Limit sizing across all strategies
+            _raw_e2_default = 0.0
             _init_norm = coindcx_engine.normalize_two_entry_runner_levels(
                 pair=selected_pair,
                 direction=trade_dir,
                 entry1_px=float(active_trade["entry"]),
-                entry2_px=_raw_e2_default,
-                tp1_px=None if _strat_has_e2 else float(active_trade["tp1"]),
+                entry2_px=None,
+                tp1_px=None if _is_box_strat else float(active_trade["tp1"]),
                 tp2_px=float(active_trade["tp2"]),
                 sl_px=float(active_trade["stop_loss"]),
                 live_px=float(active_trade["entry"]),
-                levels=levels if _strat_has_e2 else None,
+                levels=levels if _is_box_strat else None,
             )
-            if not _strat_has_e2:
-                _init_norm["entry2_sweep"] = 0.0
+            _init_norm["entry2_sweep"] = 0.0
 
             if (
                 st.session_state.get(choice_tracker_key) != setup_tag
@@ -1981,30 +1979,29 @@ elif active_section == "🎯 Execute":
                 st.session_state[tp1_tracker_key] = float(_init_norm["tp1"])
                 st.session_state[custom_e1_tracker_key] = float(_init_norm["entry"])
                 st.session_state[entry_key] = float(_init_norm["entry"])
-                st.session_state[e2_key] = float(_init_norm["entry2_sweep"])
+                st.session_state[e2_key] = 0.0
                 st.session_state[sl_key] = float(_init_norm["stop_loss"])
                 st.session_state[tp1_key] = float(_init_norm["tp1"])
                 st.session_state[tp2_key] = float(_init_norm["tp2"])
 
-            # If the user changed Limit Entry 1 (`entry_key`), automatically recalculate TP1 (Midpoint(Entry1, TP2) vs 15m 50 EMA), Entry 2, and SL
+            # If the user changed Limit Entry 1 (`entry_key`), automatically recalculate TP1 (Midpoint(Entry1, TP2) vs 15m 50 EMA) and SL
             _pending_e1 = float(st.session_state.get(entry_key, _init_norm["entry"]))
             _formula_norm_for_e1 = coindcx_engine.normalize_two_entry_runner_levels(
                 pair=selected_pair,
                 direction=trade_dir,
                 entry1_px=_pending_e1,
-                entry2_px=_raw_e2_default,
-                tp1_px=None if _strat_has_e2 else float(active_trade["tp1"]),
+                entry2_px=None,
+                tp1_px=None if _is_box_strat else float(active_trade["tp1"]),
                 tp2_px=float(st.session_state.get(tp2_key, _init_norm["tp2"])),
                 sl_px=float(st.session_state.get(sl_key, _init_norm["stop_loss"])),
                 live_px=_pending_e1,
-                levels=levels if _strat_has_e2 else None,
+                levels=levels if _is_box_strat else None,
             )
             if abs(_pending_e1 - float(st.session_state.get(custom_e1_tracker_key, _init_norm["entry"]))) > 1e-6:
                 st.session_state[custom_e1_tracker_key] = _pending_e1
                 st.session_state[tp1_key] = float(_formula_norm_for_e1["tp1"])
                 st.session_state[tp2_key] = float(_formula_norm_for_e1["tp2"])
-                if _strat_has_e2:
-                    st.session_state[e2_key] = float(_formula_norm_for_e1["entry2_sweep"])
+                if _is_box_strat:
                     st.session_state[sl_key] = float(_formula_norm_for_e1["stop_loss"])
 
             p_ref = float(active_trade["entry"])
@@ -2029,12 +2026,12 @@ elif active_section == "🎯 Execute":
                 pair=selected_pair,
                 direction=trade_dir,
                 entry1_px=custom_entry,
-                entry2_px=custom_e2 if _strat_has_e2 else 0.0,
+                entry2_px=None,
                 tp1_px=custom_tp1,
                 tp2_px=custom_tp2,
                 sl_px=custom_sl,
                 live_px=custom_entry,
-                levels=levels if _strat_has_e2 else None,
+                levels=levels if _is_box_strat else None,
             )
             _is_buy_t = (trade_dir == "BUY")
             if _strat_has_e2:
@@ -2078,10 +2075,10 @@ elif active_section == "🎯 Execute":
     with exec_right:
         if active_trade:
             st.markdown("#### 🎫 Smart Hybrid Execution Ticket")
-            _e2_lvl = float(active_trade.get("entry2_sweep") or custom_e2) if (active_strategy.id == "box_theory") else 0.0
-            _has_e2 = (active_strategy.id == "box_theory") and (_e2_lvl > 0.0)
+            _e2_lvl = 0.0
+            _has_e2 = False
             _is_full_runner = (active_strategy.id == "ema9_retest")
-            _cur_fill_mode = str(st.session_state.get(f"e1_fill_mode_{selected_pair}", "⚡ Market (Instant)"))
+            _cur_fill_mode = str(st.session_state.get(f"e1_fill_mode_{selected_pair}", "📌 Limit"))
             _user_custom_e1 = abs(float(active_trade["entry"]) - float(_init_norm["entry"])) > 1e-6
             _user_custom_tp1 = abs(float(active_trade["tp1"]) - float(_formula_norm_for_e1["tp1"])) > 1e-6
             _disp_trade = dict(active_trade)
@@ -2090,12 +2087,12 @@ elif active_section == "🎯 Execute":
                     pair=selected_pair,
                     direction=trade_dir,
                     entry1_px=float(cur_price),
-                    entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
+                    entry2_px=None,
                     tp1_px=float(active_trade["tp1"]) if _user_custom_tp1 else None,
                     tp2_px=float(active_trade["tp2"]),
                     sl_px=float(active_trade["stop_loss"]),
                     live_px=float(cur_price),
-                    levels=levels if _has_e2 else None,
+                    levels=levels if (active_strategy.id == "box_theory") else None,
                 )
                 _m_e1 = float(_mkt_norm["entry"])
                 _m_tp1 = float(_mkt_norm["tp1"])
@@ -2259,12 +2256,12 @@ elif active_section == "🎯 Execute":
                             pair=selected_pair,
                             direction=trade_dir,
                             entry1_px=_ref_e1_px,
-                            entry2_px=float(_e2_lvl) if _has_e2 else 0.0,
+                            entry2_px=None,
                             tp1_px=None if (not _user_edited_tp1 and active_strategy.id == "box_theory") else float(active_trade["tp1"]),
                             tp2_px=float(active_trade["tp2"]),
                             sl_px=float(active_trade["stop_loss"]),
                             live_px=(shield_live_px if (_use_market_e1 and shield_live_px > 0) else _ref_e1_px),
-                            levels=levels if _has_e2 else None,
+                            levels=levels if (active_strategy.id == "box_theory") else None,
                         )
                         _is_buy_e = (trade_dir == "BUY")
                         _maker_px = float(_ref_e1_px) if not _use_market_e1 else _exec_norm["entry"]

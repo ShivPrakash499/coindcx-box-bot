@@ -442,7 +442,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 25
+_REQUIRED_DAEMON_VERSION = 26
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 
 
@@ -2307,12 +2307,11 @@ def _select_smart_hybrid_box_tp1(direction: str, entry: float, mid: float, ema50
 def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, margin_inr=100000, leverage=5, usd_inr=85.0, pair="B-ETH_USDT"):
     """
     Calculates specific BUY (Long at Range Low / Swing Low) or SELL (Short at Range High / Swing High)
-    Smart Hybrid 2-Entry + Runner trade setup parameters:
-      - Entry 1 (50% Margin): RL / RH rejection price
-      - Entry 2 (50% Margin — Same Amount): SL / SH sweep scale-in level
-      - Catastrophe SL: 0.5% beyond Entry 2 (SL / SH)
-      - TP1 (50% Early Book + Move SL to Profit Lock): Nearer of MID or 15m 50 EMA (capped at 2.0% move)
-      - TP2 (50% Risk-Free Runner): Opposite Box Edge (RH / RL), managed by 15m Trail + Strategy 3
+    100% Single-Slot Maker Limit + Structural Runner trade setup parameters:
+      - Entry 1 (100% Slot Margin): RL / RH rejection price (Maker Limit Order; Entry 2 removed)
+      - Catastrophe SL: 0.5% beyond SL / SH sweep level
+      - TP1 (50% Early Book + Lock Profit SL): Nearer of MID or 15m 50 EMA (capped at 2.0% move)
+      - TP2 (50% Structural Runner): Opposite Box Edge (RH / RL), with Halfway-to-TP2 SL Ratchet to TP1
     """
     if not levels:
         return None
@@ -2326,39 +2325,41 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
     if direction.upper() in ["BUY", "LONG"]:
         dir_name = "BUY"
         entry = round_asset_price(live_price if live_price > 0 and live_price <= rl else rl, rh)
-        entry2_sweep = round_asset_price(min(sl, entry * 0.992), rh)
-        avg_entry_2x = round_asset_price((entry + entry2_sweep) / 2.0, rh)
-        stop_loss = round_asset_price(min(entry2_sweep * 0.995, sl * 0.995), rh)
+        sweep_anchor = round_asset_price(min(sl, entry * 0.992), rh)
+        entry2_sweep = 0.0
+        avg_entry_2x = entry
+        stop_loss = round_asset_price(min(sweep_anchor * 0.995, sl * 0.995), rh)
         raw_tp1, tp1_lbl = _select_smart_hybrid_box_tp1("BUY", entry, mid, ema50_15m, rh)
         tp1 = round_asset_price(raw_tp1, rh)
         tp1_dist = abs(tp1 - entry)
         tp2_target = rh if entry < rh * 0.988 else sh
         tp2 = round_asset_price(max(tp2_target, entry + tp1_dist * 1.6), rh)
         setup_desc = (
-            f"BUY (Long): 2-Entry Sweep + Smart Hybrid Runner — Entry1 ${entry:,.2f} + Entry2 @ SL ${entry2_sweep:,.2f} | "
-            f"TP1 @ {tp1_lbl} (${tp1:,.2f}) -> TP2 Runner to RH (${tp2:,.2f})"
+            f"BUY (Long): 100% Single-Slot Maker Limit @ ${entry:,.2f} | SL ${stop_loss:,.2f} | "
+            f"TP1 @ {tp1_lbl} (${tp1:,.2f}) -> TP2 Structural Runner to RH (${tp2:,.2f})"
         )
     else:
         dir_name = "SELL"
         entry = round_asset_price(live_price if live_price > 0 and live_price >= rh else rh, rh)
-        entry2_sweep = round_asset_price(max(sh, entry * 1.008), rh)
-        avg_entry_2x = round_asset_price((entry + entry2_sweep) / 2.0, rh)
-        stop_loss = round_asset_price(max(entry2_sweep * 1.005, sh * 1.005), rh)
+        sweep_anchor = round_asset_price(max(sh, entry * 1.008), rh)
+        entry2_sweep = 0.0
+        avg_entry_2x = entry
+        stop_loss = round_asset_price(max(sweep_anchor * 1.005, sh * 1.005), rh)
         raw_tp1, tp1_lbl = _select_smart_hybrid_box_tp1("SELL", entry, mid, ema50_15m, rl)
         tp1 = round_asset_price(raw_tp1, rh)
         tp1_dist = abs(entry - tp1)
         tp2_target = rl if entry > rl * 1.012 else sl
         tp2 = round_asset_price(min(tp2_target, entry - tp1_dist * 1.6), rh)
         setup_desc = (
-            f"SELL (Short): 2-Entry Sweep + Smart Hybrid Runner — Entry1 ${entry:,.2f} + Entry2 @ SH ${entry2_sweep:,.2f} | "
-            f"TP1 @ {tp1_lbl} (${tp1:,.2f}) -> TP2 Runner to RL (${tp2:,.2f})"
+            f"SELL (Short): 100% Single-Slot Maker Limit @ ${entry:,.2f} | SL ${stop_loss:,.2f} | "
+            f"TP1 @ {tp1_lbl} (${tp1:,.2f}) -> TP2 Structural Runner to RL (${tp2:,.2f})"
         )
 
     margin_usd = margin_inr / usd_inr
     position_usd = margin_usd * leverage
     raw_qty = position_usd / entry if entry > 0 else 0
     crypto_qty = format_order_quantity(pair, raw_qty)
-    tranche_qty = format_order_quantity(pair, (position_usd * 0.5) / entry) if entry > 0 else 0
+    tranche_qty = crypto_qty
 
     risk_per_unit = abs(entry - stop_loss) if stop_loss > 0 else 0
     reward_tp1 = abs(entry - tp1)
@@ -2381,7 +2382,7 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
         "entry2_sweep": entry2_sweep,
         "avg_entry_2x": avg_entry_2x,
         "tranche_qty": tranche_qty,
-        "tranche_margin_inr": round(margin_inr * 0.5, 2),
+        "tranche_margin_inr": round(margin_inr, 2),
         "stop_loss": stop_loss,
         "tp1": tp1,
         "tp2": tp2,
@@ -2404,30 +2405,30 @@ def calculate_trade_setup_details(direction="BUY", levels=None, live_price=0.0, 
 def detect_zone_signal(levels: dict, o: float, h: float, l: float, c: float):
     """
     Classifies ONE CLOSED candle against the daily box zones (RH/SH and RL/SL),
-    returning the 2-Entry + Runner levels (TP1 = min(10% ROE, MID) for 50% book, TP2 = RL/RH for 50% runner).
+    returning Single-Entry + Structural Runner levels (TP1 = min(2% move, MID) for 50% book, TP2 = RL/RH for 50% runner).
     """
     rh, rl, sh, sl, mid = levels["RH"], levels["RL"], levels["SH"], levels["SL"], levels["MID"]
 
     if (h >= rh and c < rh) or (h >= sh and c < sh):
-        entry2 = max(sh, h, c * 1.008)
-        stop_p = round(entry2 * 1.008, 4)
+        sweep_anc = max(sh, h, c * 1.008)
+        stop_p = round(sweep_anc * 1.005, 4)
         tp1_dist = min(abs(c - mid), c * 0.02)
         if tp1_dist < c * 0.0058:
             return None
         tp1_p = round(c - tp1_dist, 4)
         tp2_p = round(min(rl if c > rl * 1.012 else sl, c - tp1_dist * 2.0), 4)
         return {"kind": "REVERSAL", "direction": "SHORT", "zone": "Sell Zone RH-SH",
-                "entry2_sweep": round(entry2, 4), "stop": stop_p, "tp1": tp1_p, "tp2": tp2_p}
+                "entry2_sweep": 0.0, "stop": stop_p, "tp1": tp1_p, "tp2": tp2_p}
     if (l <= rl and c > rl) or (l <= sl and c > sl):
-        entry2 = min(sl, l, c * 0.992)
-        stop_p = round(entry2 * 0.992, 4)
+        sweep_anc = min(sl, l, c * 0.992)
+        stop_p = round(sweep_anc * 0.995, 4)
         tp1_dist = min(abs(mid - c), c * 0.02)
         if tp1_dist < c * 0.0058:
             return None
         tp1_p = round(c + tp1_dist, 4)
         tp2_p = round(max(rh if c < rh * 0.988 else sh, c + tp1_dist * 2.0), 4)
         return {"kind": "REVERSAL", "direction": "LONG", "zone": "Buy Zone RL-SL",
-                "entry2_sweep": round(entry2, 4), "stop": stop_p, "tp1": tp1_p, "tp2": tp2_p}
+                "entry2_sweep": 0.0, "stop": stop_p, "tp1": tp1_p, "tp2": tp2_p}
     return None
 
 
@@ -2689,7 +2690,8 @@ def run_strategy_backtest(
     first_candle_time = df['dt_ist'].iloc[0].strftime("%Y-%m-%d %H:%M")
     equity_curve = [{"timestamp": first_candle_time, "equity_inr": initial_capital, "pnl_inr": 0.0}]
 
-    taker_fee_rate = 0.0005 * 1.18  # 0.05% + 18% GST
+    taker_fee_rate = 0.0005 * 1.18  # 0.05% + 18% GST (Stop Loss / Market exit)
+    maker_fee_rate = 0.0002 * 1.18  # 0.02% + 18% GST (Maker Limit Entry 1 & TP1 Limit Order)
     day_trade_count = {}
     day_realized_pnl = {}
     day_locked = set()
@@ -2724,8 +2726,15 @@ def run_strategy_backtest(
             notional_inr = active_trade["notional_inr"]
             deployed_margin_inr = active_trade["deployed_margin_inr"]
 
-            # Trailing 15m Candle High/Low Stop Loss (ratchets to previous closed 15m candle L/H once runner closes beyond TP1)
-            if idx > active_trade["entry_idx"]:
+            is_s3_active = (
+                "Strategy 3" in str(active_trade.get("strategy", ""))
+                or strategy_id == "ema9_retest"
+            )
+            use_full_s3_mode = (exit_mode == "strategy3_full") or (exit_mode == "smart_hybrid" and is_s3_active)
+
+            # Trailing 15m Candle High/Low Stop Loss is used only in Strategy 3 full-runner mode;
+            # Strategy 1 & 2 use Profit-Locked SL + Halfway-to-TP2 SL Ratchet + Fixed TP2 (no early runner choke).
+            if use_full_s3_mode and idx > active_trade["entry_idx"]:
                 prev_15m = df_records[idx - 1]
                 prev_15m_l = float(prev_15m["low"])
                 prev_15m_h = float(prev_15m["high"])
@@ -2863,19 +2872,17 @@ def run_strategy_backtest(
                                     break
 
                 else:
-                    # Variant 2 (Hybrid Default): Book 50% at TP1, then manage remaining 50% runner with
-                    # Trailing 15m H/L SL + Strategy 3 (>=20% ATR 30% Pullback / Confirmed 5m 9 EMA Cross)
+                    # Variant 2 (Default Structural Runner): Book 50% at TP1, lock runner SL in profit
+                    # (`compute_tp1_profit_lock_sl`), ratchet SL to TP1 halfway to TP2, and hold 50% runner for TP2
+                    # (5m 9 EMA Cross & 20% ATR early runner chokes removed).
                     if not active_trade.get("tp1_hit", False):
                         if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
                             exit_triggered = True
                             exit_price = sl_p
-                            r_lbl = "20% ATR 30% Pullback SL" if active_trade.get("atr20_pb_armed") else "Catastrophe Stop Loss"
-                            exit_reason = f"{r_lbl}{scale_tag}"
+                            exit_reason = f"Catastrophe Stop Loss{scale_tag}"
                             break
                         if (pos_dir == "LONG" and s5_high >= tp1_p) or (pos_dir == "SHORT" and s5_low <= tp1_p):
                             active_trade["tp1_hit"] = True
-                            active_trade["ema9_armed"] = False
-                            active_trade["wrong_ema9_streak"] = 0
                             prev_c = df_records[idx - 1] if idx > 0 else candle
                             new_sl = compute_tp1_profit_lock_sl(
                                 pair, pos_dir, entry_p, tp1_p,
@@ -2883,90 +2890,47 @@ def run_strategy_backtest(
                             )
                             sl_p = new_sl
                             active_trade["stop_loss"] = sl_p
-                            if daily_atr > 0 and s5_range >= 0.20 * daily_atr:
-                                if pos_dir == "LONG" and s5_close > s5_open:
-                                    pb_lvl = s5_high - 0.30 * s5_range
-                                    if pb_lvl > sl_p:
-                                        sl_p = pb_lvl
-                                        active_trade["stop_loss"] = sl_p
-                                        active_trade["atr20_pb_armed"] = True
-                                elif pos_dir == "SHORT" and s5_close < s5_open:
-                                    pb_lvl = s5_low + 0.30 * s5_range
-                                    if pb_lvl < sl_p:
-                                        sl_p = pb_lvl
-                                        active_trade["stop_loss"] = sl_p
-                                        active_trade["atr20_pb_armed"] = True
+                            if (pos_dir == "LONG" and tp2_p > 0 and s5_high >= tp2_p) or (pos_dir == "SHORT" and tp2_p > 0 and s5_low <= tp2_p):
+                                exit_triggered = True
+                                exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                                active_trade["tp2_hit"] = True
+                                exit_reason = f"TP1 (50% Booked) + 50% TP2 Target Hit{scale_tag}"
+                                break
+                            if tp2_p > 0:
+                                half_tp2 = 0.5 * (tp1_p + tp2_p)
+                                if pos_dir == "LONG" and s5_high >= half_tp2 and tp1_p > sl_p:
+                                    sl_p = tp1_p
+                                    active_trade["stop_loss"] = sl_p
+                                    active_trade["halfway_ratcheted"] = True
+                                elif pos_dir == "SHORT" and s5_low <= half_tp2 and tp1_p < sl_p:
+                                    sl_p = tp1_p
+                                    active_trade["stop_loss"] = sl_p
+                                    active_trade["halfway_ratcheted"] = True
                             continue
-                        if daily_atr > 0 and s5_range >= 0.20 * daily_atr:
-                            if pos_dir == "LONG" and s5_close > s5_open:
-                                pb_lvl = s5_high - 0.30 * s5_range
-                                if pb_lvl > sl_p and pb_lvl > entry_p:
-                                    sl_p = pb_lvl
-                                    active_trade["stop_loss"] = sl_p
-                                    active_trade["atr20_pb_armed"] = True
-                            elif pos_dir == "SHORT" and s5_close < s5_open:
-                                pb_lvl = s5_low + 0.30 * s5_range
-                                if pb_lvl < sl_p and pb_lvl < entry_p:
-                                    sl_p = pb_lvl
-                                    active_trade["stop_loss"] = sl_p
-                                    active_trade["atr20_pb_armed"] = True
                     else:
-                        # TP1 (50%) already booked; managing the remaining 50% Runner
+                        # TP1 (50%) already booked; managing the remaining 50% Structural Runner
                         if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
                             exit_triggered = True
                             exit_price = 0.5 * tp1_p + 0.5 * sl_p
-                            r_lbl = "Runner 20% ATR 30% Pullback SL" if active_trade.get("atr20_pb_armed") else "Runner Trailing 15m SL"
+                            r_lbl = "Runner Halfway-Ratchet SL" if active_trade.get("halfway_ratcheted") else "Runner Profit-Locked SL"
                             exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
                             break
-
-                        # Strategy 3 Rule A on Runner: >=20% Daily ATR 5m candle -> 30% pullback exit
-                        if daily_atr > 0 and s5_range >= 0.20 * daily_atr:
-                            if pos_dir == "LONG" and s5_close > s5_open:
-                                pb_lvl = s5_high - 0.30 * s5_range
-                                if (s5_high - s5_close) >= 0.30 * s5_range and s5_close > sl_p:
-                                    exit_triggered = True
-                                    exit_price = 0.5 * tp1_p + 0.5 * max(s5_close, pb_lvl)
-                                    exit_reason = f"TP1 (50% Booked) + 50% Runner 20% ATR 30% Pullback{scale_tag}"
-                                    break
-                                if pb_lvl > sl_p:
-                                    sl_p = pb_lvl
-                                    active_trade["stop_loss"] = sl_p
-                                    active_trade["atr20_pb_armed"] = True
-                            elif pos_dir == "SHORT" and s5_close < s5_open:
-                                pb_lvl = s5_low + 0.30 * s5_range
-                                if (s5_close - s5_low) >= 0.30 * s5_range and s5_close < sl_p:
-                                    exit_triggered = True
-                                    exit_price = 0.5 * tp1_p + 0.5 * min(s5_close, pb_lvl)
-                                    exit_reason = f"TP1 (50% Booked) + 50% Runner 20% ATR 30% Pullback{scale_tag}"
-                                    break
-                                if pb_lvl < sl_p:
-                                    sl_p = pb_lvl
-                                    active_trade["stop_loss"] = sl_p
-                                    active_trade["atr20_pb_armed"] = True
-
-                        # Strategy 3 Rule B on Runner: Confirmed 5m 9 EMA cross once runner extends past TP1
-                        if pos_dir == "LONG":
-                            if s5_close > s5_ema9 and s5_close >= tp1_p:
-                                active_trade["ema9_armed"] = True
-                                active_trade["wrong_ema9_streak"] = 0
-                            elif active_trade.get("ema9_armed", False) and s5_close < s5_ema9:
-                                active_trade["wrong_ema9_streak"] = int(active_trade.get("wrong_ema9_streak", 0)) + 1
-                                if active_trade["wrong_ema9_streak"] >= 2:
-                                    exit_triggered = True
-                                    exit_price = 0.5 * tp1_p + 0.5 * max(s5_close, sl_p)
-                                    exit_reason = f"TP1 (50% Booked) + 50% Runner Confirmed 5m 9 EMA Cross{scale_tag}"
-                                    break
-                        else:
-                            if s5_close < s5_ema9 and s5_close <= tp1_p:
-                                active_trade["ema9_armed"] = True
-                                active_trade["wrong_ema9_streak"] = 0
-                            elif active_trade.get("ema9_armed", False) and s5_close > s5_ema9:
-                                active_trade["wrong_ema9_streak"] = int(active_trade.get("wrong_ema9_streak", 0)) + 1
-                                if active_trade["wrong_ema9_streak"] >= 2:
-                                    exit_triggered = True
-                                    exit_price = 0.5 * tp1_p + 0.5 * min(s5_close, sl_p)
-                                    exit_reason = f"TP1 (50% Booked) + 50% Runner Confirmed 5m 9 EMA Cross{scale_tag}"
-                                    break
+                        if (pos_dir == "LONG" and tp2_p > 0 and s5_high >= tp2_p) or (pos_dir == "SHORT" and tp2_p > 0 and s5_low <= tp2_p):
+                            exit_triggered = True
+                            exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                            active_trade["tp2_hit"] = True
+                            exit_reason = f"TP1 (50% Booked) + 50% TP2 Target Hit{scale_tag}"
+                            break
+                        if tp2_p > 0:
+                            half_tp2 = 0.5 * (tp1_p + tp2_p)
+                            if pos_dir == "LONG" and s5_high >= half_tp2 and tp1_p > sl_p:
+                                sl_p = tp1_p
+                                active_trade["stop_loss"] = sl_p
+                                active_trade["halfway_ratcheted"] = True
+                            elif pos_dir == "SHORT" and s5_low <= half_tp2 and tp1_p < sl_p:
+                                sl_p = tp1_p
+                                active_trade["stop_loss"] = sl_p
+                                active_trade["halfway_ratcheted"] = True
 
             if exit_triggered:
                 if pos_dir == "LONG":
@@ -2975,9 +2939,13 @@ def run_strategy_backtest(
                     gross_pnl_usd = (entry_p - exit_price) * qty
 
                 gross_pnl_inr = gross_pnl_usd * usd_inr
-                entry_fee_inr = notional_inr * taker_fee_rate
+                entry_fee_inr = notional_inr * maker_fee_rate
                 exit_notional_inr = (qty * exit_price) * usd_inr
-                exit_fee_inr = exit_notional_inr * taker_fee_rate
+                if active_trade.get("tp1_hit", False) and not use_full_s3_mode:
+                    tp1_notional_inr = (0.5 * qty * tp1_p) * usd_inr
+                    exit_fee_inr = (tp1_notional_inr * maker_fee_rate) + (max(0.0, exit_notional_inr - tp1_notional_inr) * taker_fee_rate)
+                else:
+                    exit_fee_inr = exit_notional_inr * taker_fee_rate
                 total_fees_inr = entry_fee_inr + exit_fee_inr
                 net_pnl_inr = gross_pnl_inr - total_fees_inr
                 roe_pct = (net_pnl_inr / deployed_margin_inr) * 100.0 if deployed_margin_inr > 0 else 0.0
@@ -3578,17 +3546,19 @@ def normalize_two_entry_runner_levels(
     cur_p = float(live_px or e1)
     if e1 <= 0:
         e1 = cur_p
+    has_explicit_e2 = (entry2_px is not None) and (float(entry2_px or 0.0) > 0.0)
 
     if is_long:
         high_ref = max(e1, cur_p) if cur_p > 0 else e1
         low_ref = min(e1, cur_p) if cur_p > 0 else e1
 
-        cand_e2 = float(entry2_px or (levels.get("SL") if levels else 0.0) or 0.0)
-        if cand_e2 <= 0 or cand_e2 >= low_ref * 0.9992:
-            cand_e2 = low_ref * 0.992
+        sl_sweep_ref = float(entry2_px if has_explicit_e2 else ((levels.get("SL") if levels else 0.0) or 0.0))
+        if sl_sweep_ref <= 0 or sl_sweep_ref >= low_ref * 0.9992:
+            sl_sweep_ref = low_ref * 0.992
+        cand_e2 = sl_sweep_ref if has_explicit_e2 else 0.0
 
         cand_sl = float(sl_px or 0.0)
-        min_long_anchor = min(low_ref, cand_e2)
+        min_long_anchor = min(low_ref, sl_sweep_ref)
         if cand_sl <= 0 or cand_sl >= min_long_anchor * 0.999:
             cand_sl = min_long_anchor * 0.995
 
@@ -3610,12 +3580,13 @@ def normalize_two_entry_runner_levels(
         low_ref = min(e1, cur_p) if cur_p > 0 else e1
         high_ref = max(e1, cur_p) if cur_p > 0 else e1
 
-        cand_e2 = float(entry2_px or (levels.get("SH") if levels else 0.0) or 0.0)
-        if cand_e2 <= 0 or cand_e2 <= high_ref * 1.0008:
-            cand_e2 = high_ref * 1.008
+        sh_sweep_ref = float(entry2_px if has_explicit_e2 else ((levels.get("SH") if levels else 0.0) or 0.0))
+        if sh_sweep_ref <= 0 or sh_sweep_ref <= high_ref * 1.0008:
+            sh_sweep_ref = high_ref * 1.008
+        cand_e2 = sh_sweep_ref if has_explicit_e2 else 0.0
 
         cand_sl = float(sl_px or 0.0)
-        max_short_anchor = max(high_ref, cand_e2)
+        max_short_anchor = max(high_ref, sh_sweep_ref)
         if cand_sl <= 0 or cand_sl <= max_short_anchor * 1.001:
             cand_sl = max_short_anchor * 1.005
 
@@ -3636,7 +3607,7 @@ def normalize_two_entry_runner_levels(
 
     return {
         "entry": round_asset_price(e1),
-        "entry2_sweep": round_asset_price(cand_e2, e1),
+        "entry2_sweep": round_asset_price(cand_e2, e1) if cand_e2 > 0 else 0.0,
         "tp1": round_asset_price(cand_tp1, e1),
         "tp2": round_asset_price(cand_tp2, e1),
         "stop_loss": round_asset_price(cand_sl, e1),
@@ -3682,7 +3653,7 @@ def sync_full_2entry_runner_to_position(
     pos_lev = int(round(float(matched_pos.get("leverage") or leverage or 10)))
 
     strat_id = str(strategy_id or "box_theory").strip() or "box_theory"
-    has_second_entry = (strat_id == "box_theory") and (entry2_px is None or float(entry2_px or 0.0) > 0.0)
+    has_second_entry = (strat_id == "box_theory") and (entry2_px is not None and float(entry2_px or 0.0) > 0.0)
     use_full_s3_runner = (strat_id == "ema9_retest")
 
     levels = None
@@ -4013,19 +3984,22 @@ def _evaluate_smart_hybrid_runner_step(
     tp1_p: float,
     cur_sl: float,
     opened_ts: float = 0.0,
+    strategy_id: str = "box_theory",
 ) -> tuple[bool, float, str]:
     """
-    Evaluates the Smart Hybrid Runner rules (matching `run_strategy_backtest`) once TP1 is reached:
-      1. Continuous 15m Closed-Candle Low/High Trailing SL (`prev_15m_l` / `prev_15m_h` once `prev_15m_c` clears `tp1_p`),
-         strictly on candles opened `>= opened_ts` and strictly in profit above fee-covered breakeven.
-      2. Strategy 3 Rule A on Closed 5m Candles (opened `>= opened_ts`): `>= 20%` of 14d Daily ATR candle in our favour ->
-         exit on `>= 30%` pullback close, or tighten SL to the `30%` pullback level (`pb_lvl`).
-      3. Strategy 3 Rule B on Closed 5m Candles (opened `>= opened_ts`): Once a closed 5m candle clears `tp1_p` on the
-         favourable side of `5m 9 EMA`, exit if `2` consecutive closed 5m candles close across `5m 9 EMA`.
+    Evaluates post-TP1 runner rules (matching `run_strategy_backtest`):
+      - For Strategy 1 (`box_theory`) and Strategy 2 (`atr_reversal`):
+        5m 9 EMA Cross & 20% ATR early runner chokes are REMOVED (proven +24.1% higher 30d net profit,
+        PF 1.33 -> 1.49, TP2 hits 10 -> 19). The 50% runner holds with Profit-Locked SL + Halfway-to-TP2
+        SL Ratchet (`SL -> TP1`) + Fixed CoinDCX `TP2` Target.
+      - For Strategy 3 (`ema9_retest` 100% Full Runner):
+        Evaluates 15m Closed-Candle Low/High Trail + 20% Daily ATR 30% Pullback + Confirmed 5m 9 EMA Cross.
     Returns `(should_market_exit, tightened_sl, reason)`.
     """
     new_sl = float(cur_sl or 0.0)
     if entry_p <= 0 or opened_ts <= 0:
+        return False, new_sl, ""
+    if str(strategy_id or "box_theory").strip() != "ema9_retest":
         return False, new_sl, ""
     now_ms = int(time.time() * 1000)
     cutoff_ms = float(opened_ts) * 1000.0
@@ -4260,6 +4234,7 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
                 tp1_p=eff_tp1_px,
                 cur_sl=base_sl,
                 opened_ts=opened_ts,
+                strategy_id=str(app_rec.get("strategy_id") or "box_theory"),
             )
             if should_exit:
                 exit_coindcx_position(pid, pair=pair)
@@ -4689,7 +4664,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         if is_live_ex and matched_live_pos and matched_live_pos.get("id") and r_in_prof and r_valid_px:
                             update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=ratcheted_sl, pair=l_pair)
 
-                    # Stage 2 (Smart Hybrid Runner): Continuous 15m H/L Trail + 5m >=20% ATR 30% Pullback + Confirmed 5m 9 EMA Cross
+                    # Stage 2 (Structural Runner): Halfway-to-TP2 SL Ratchet -> TP2 Target (Strategy 3 also runs 5m runner check)
                     elif tp1_already_hit and l_tp1 > 0:
                         should_exit_r, next_runner_sl, _ = _evaluate_smart_hybrid_runner_step(
                             pair=l_pair,
@@ -4698,6 +4673,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             tp1_p=l_tp1,
                             cur_sl=l_sl,
                             opened_ts=l_ts,
+                            strategy_id=str(lock.get("strategy_id") or "box_theory"),
                         )
                         if should_exit_r:
                             if is_live_ex and matched_live_pos and matched_live_pos.get("id"):
@@ -4974,11 +4950,13 @@ def execute_autotrade_two_entry_signal(
     opp_side = "SELL" if side == "BUY" else "BUY"
     live_tk_obj = fetch_live_ticker(pair)
     live_tk_px = float((live_tk_obj or {}).get("last_price", 0.0) or 0.0)
+    raw_e2 = float(sig.get("entry2_sweep") or 0.0)
+    has_second_entry = False  # Entry 2 removed: 100% Single-Slot Maker Limit sizing on Entry 1
     norm = normalize_two_entry_runner_levels(
         pair=pair,
         direction=direction,
         entry1_px=float(sig["entry"]),
-        entry2_px=float(sig.get("entry2_sweep") or sig["entry"]),
+        entry2_px=None,
         tp1_px=float(sig["tp1"]),
         tp2_px=float(sig["tp2"]),
         sl_px=float(sig["stop_loss"]),
@@ -4986,17 +4964,10 @@ def execute_autotrade_two_entry_signal(
         levels=sig.get("levels"),
     )
     entry1_px = norm["entry"]
-    entry2_px = norm["entry2_sweep"]
+    entry2_px = 0.0
     tp1_px = norm["tp1"]
     tp2_px = norm["tp2"]
     sl_px = norm["stop_loss"]
-
-    # Strategy 1 (Box) splits single-trade margin 50%/50% across Entry 1 & Entry 2;
-    # Strategy 2 (ATR Reversal) & Strategy 3 (9 EMA Retest) use Single Entry (100% of single-trade margin on Entry 1)
-    raw_e2 = float(sig.get("entry2_sweep") or 0.0)
-    has_second_entry = (raw_e2 > 0.0) and (sig_strat_id == "box_theory")
-    if not has_second_entry:
-        entry2_px = 0.0
 
     # Price Entry 1 strictly as a non-crossing Maker Limit Order (0.0236% Maker fee vs 0.059% Market Taker fee)
     maker_e1_px = compute_maker_limit_entry_price(
@@ -5175,13 +5146,12 @@ def execute_autotrade_two_entry_signal(
             pair=pair, direction=direction, entry=entry1_px, stop_loss=sl_px,
             tp1=tp1_px, tp2=tp2_px, entry2_sweep=entry2_px, margin_inr=margin_inr,
             leverage=lev, qty1=qty1, qty2=qty2,
-            mode="App/API Simulated AutoTrade (2-Entry Armed)", is_live_exchange=False,
+            mode="App/API Simulated AutoTrade (100% Maker Limit Armed)", is_live_exchange=False,
             strategy_id=sig_strat_id,
         )
         return True, (
             f"AutoTrade Armed (Simulated): {direction} {pair} | "
-            f"Entry 1 (50%): ${entry1_px} ({qty1}) -> 50% books at TP1 ${tp1_px} ({qty1_tp1_half}) & 50% rides to TP2 ${tp2_px} | "
-            f"Entry 2 @ Sweep (50%): ${entry2_px} ({qty2}) @ {lev}x"
+            f"Entry 1 (100% Slot Maker Limit): ${entry1_px} ({qty1}) -> 50% books at TP1 ${tp1_px} ({qty1_tp1_half}) & 50% rides to TP2 ${tp2_px} @ {lev}x"
         ), {"lock": lock_info}
 
 

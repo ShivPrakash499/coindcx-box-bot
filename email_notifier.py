@@ -124,12 +124,9 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     base_url = (app_url or _cfg("APP_WEB_URL", "https://shiv-prakash-trade-assistant.streamlit.app")).rstrip("/")
 
     lv = levels or {}
-    if entry2_sweep <= 0 and entry > 0:
-        sh_lv = float(lv.get("SH") or (entry * 1.01))
-        sl_lv = float(lv.get("SL") or (entry * 0.99))
-        entry2_sweep = min(sl_lv, entry * 0.992) if is_long else max(sh_lv, entry * 1.008)
-    avg_entry_2x = (entry + entry2_sweep) / 2.0 if entry2_sweep > 0 else entry
-    tranche_margin_inr = margin_inr * 0.5
+    has_e2 = float(entry2_sweep or 0.0) > 0.0
+    avg_entry_2x = (entry + entry2_sweep) / 2.0 if has_e2 else entry
+    tranche_margin_inr = margin_inr * 0.5 if has_e2 else margin_inr
 
     # Action URL with pre-filled parameters to open execution tab
     action_url = (
@@ -199,14 +196,19 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
         rows.append(("Daily 50 EMA / 200 EMA", f"${float(ema50):,.2f}  /  ${float(ema200):,.2f}"))
     if trigger_reason:
         rows.append(("Trigger Reason", trigger_reason))
+    if has_e2:
+        rows += [
+            ("Entry 1 (50% Margin — Zone Rejection)", f"${entry:,.4f}  (₹{tranche_margin_inr:,.0f})"),
+            (f"Entry 2 (50% Margin — Equal Limit @ {'SL' if is_long else 'SH'} Sweep)", f"${entry2_sweep:,.4f}  (₹{tranche_margin_inr:,.0f})"),
+            ("Averaged Entry (If Both Orders Fill)", f"${avg_entry_2x:,.4f}"),
+        ]
+    else:
+        rows.append(("Entry (100% Slot — Maker Limit Order)", f"${entry:,.4f}  (₹{margin_inr:,.0f})"))
     rows += [
-        ("Entry 1 (50% Margin — Zone Rejection)", f"${entry:,.4f}  (₹{tranche_margin_inr:,.0f})"),
-        (f"Entry 2 (50% Margin — Equal Limit @ {'SL' if is_long else 'SH'} Sweep)", f"${entry2_sweep:,.4f}  (₹{tranche_margin_inr:,.0f})"),
-        ("Averaged Entry (If Both Orders Fill)", f"${avg_entry_2x:,.4f}"),
-        ("TP1 — Close 50% (Book Profit & Move SL to BE)", f"${tp1:,.4f}  (+{tp1_roe:.2f}% ROE)"),
-        ("TP2 — Hold 50% Runner (Catch Big Drop/Move)", f"${tp2:,.4f}  (+{tp2_roe:.2f}% ROE)"),
-        ("Catastrophe SL (Beyond Entry 2 Sweep)", f"${stop_loss:,.4f}  (-{sl_roe:.2f}% ROE)"),
-        ("Total Margin (Tranche 1 + Tranche 2)", f"₹{margin_inr:,.0f} INR  (2 x ₹{tranche_margin_inr:,.0f})"),
+        ("TP1 — Close 50% (Book Profit & Lock Runner SL)", f"${tp1:,.4f}  (+{tp1_roe:.2f}% ROE)"),
+        ("TP2 — Hold 50% Structural Runner (Halfway Ratchet -> TP2)", f"${tp2:,.4f}  (+{tp2_roe:.2f}% ROE)"),
+        (f"Catastrophe SL (Beyond {'SL' if is_long else 'SH'} Sweep)", f"${stop_loss:,.4f}  (-{sl_roe:.2f}% ROE)"),
+        ("Single-Trade Margin", f"₹{margin_inr:,.0f} INR  (100% Slot)" if not has_e2 else f"₹{margin_inr:,.0f} INR  (2 x ₹{tranche_margin_inr:,.0f})"),
         ("Leverage", f"{leverage}x"),
         ("Timestamp (IST)", now),
     ]

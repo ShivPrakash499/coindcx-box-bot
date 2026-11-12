@@ -31,27 +31,21 @@ IST = eng.IST
 # ----------------------------------------------------------------------------------------------
 def position_metrics(pair: str, entry: float, stop: float, tp1: float, tp2: float,
                      margin_inr: float, leverage: int, usd_inr: float,
-                     entry2_sweep: float | None = None) -> dict:
-    """Quantity, ROE and INR projections for a 2-Entry + Runner setup (or Single-Entry when entry2_sweep == 0.0)."""
+                     entry2_sweep: float | None = 0.0) -> dict:
+    """Quantity, ROE and INR projections for a Single-Entry (100% Slot) or 2-Entry + Runner setup."""
     margin_usd = margin_inr / usd_inr if usd_inr else 0.0
     position_usd = margin_usd * leverage
     qty = eng.format_order_quantity(pair, position_usd / entry) if entry > 0 else 0
 
-    if entry2_sweep is None:
-        if entry > 0:
-            is_long = tp1 >= entry
-            entry2_sweep = eng.round_asset_price(entry * (0.99 if is_long else 1.01), entry)
-        else:
-            entry2_sweep = 0.0
-
-    has_entry2 = float(entry2_sweep or 0.0) > 0.0
+    entry2_val = float(entry2_sweep or 0.0)
+    has_entry2 = entry2_val > 0.0
     tranche_qty = (
         eng.format_order_quantity(pair, (position_usd * 0.5) / entry)
         if (entry > 0 and has_entry2)
         else qty
     )
     tranche_margin_inr = round(margin_inr * 0.5, 2) if has_entry2 else round(margin_inr, 2)
-    avg_entry_2x = eng.round_asset_price((entry + entry2_sweep) / 2.0, entry) if has_entry2 else entry
+    avg_entry_2x = eng.round_asset_price((entry + entry2_val) / 2.0, entry) if has_entry2 else entry
 
     risk = abs(entry - stop) if stop > 0 else 0
     r1 = abs(entry - tp1)
@@ -70,7 +64,7 @@ def position_metrics(pair: str, entry: float, stop: float, tp1: float, tp2: floa
         "crypto_qty": qty,
         "tranche_qty": tranche_qty,
         "tranche_margin_inr": tranche_margin_inr,
-        "entry2_sweep": eng.round_asset_price(entry2_sweep, entry) if has_entry2 else 0.0,
+        "entry2_sweep": eng.round_asset_price(entry2_val, entry) if has_entry2 else 0.0,
         "avg_entry_2x": avg_entry_2x,
         "position_usd": round(position_usd, 2),
         "margin_inr": margin_inr,
@@ -222,20 +216,23 @@ def build_two_entry_runner_plan(
     min_tp1_roe: float = MIN_TP_ROE_PCT,
     enforce_min_tp: bool = True,
     tp1_ref_name: str = "MID",
+    include_entry2: bool = False,
 ) -> dict | None:
     """
-    2-Entry Sweep Scale-In + Runner Plan (10x Leverage, 50/50 Tranche Split for Box Strategy):
-      - Entry 1 (50% Margin): Confirmed 15m rejection close price (`entry`).
-      - Entry 2 (50% Margin — Same Amount): Placed at the `SH` / `SL` / wick sweep level (`sweep_level`).
-      - Emergency Catastrophe SL (`stop_price`): Placed 0.5% beyond `Entry 2` (`SH`/`SL`).
-        NOTE: no 1% cap is applied — SL distance from Entry 1 grows with the sweep-level distance.
-      - TP1 (Close 50% / Book Early Profit): Nearer of `MID` or `15m 50 EMA` (capped at 2.0% price move).
-      - Remaining 50% Runner: Managed by Trailing 15m H/L SL + Strategy 3 (20% ATR 30% Pullback / Confirmed 5m 9 EMA Cross).
+    100% Single-Slot Maker Limit Entry + Structural Runner Plan (10x Leverage for Box Strategy):
+      - Entry 1 (100% Slot Margin): Confirmed 15m rejection close price (`entry`) placed as Maker Limit.
+      - Entry 2 Removed (`entry2_sweep = 0.0` by default): Eliminates doubling into failed breakouts.
+      - Emergency Catastrophe SL (`stop_price`): Placed 0.5% beyond the `SH` / `SL` / wick `sweep_level`
+        so genuine liquidity sweeps inside `[RH, SH]` / `[SL, RL]` have structural room to reverse.
+      - TP1 (Close 50% / Book Early Profit): Nearer of `MID` or `15m 50 EMA` (capped at 2.0% price move),
+        ratcheting SL into guaranteed profit (`compute_tp1_profit_lock_sl`).
+      - Remaining 50% Structural Runner: Holds with Profit-Locked SL -> Halfway Ratchet to TP1 -> Fixed `TP2`
+        (no premature 5m 9 EMA cross choke).
     """
     if entry <= 0:
         return None
     lev = max(1, int(leverage))
-    eff_lev = 5.0  # 50% Tranche 1 @ 10x leverage = 5x effective leverage on total trade margin
+    eff_lev = 5.0  # Preserves proven 0.6% min / 2.0% max TP1 structural distance geometry
     is_long = direction.upper() in ("LONG", "BUY")
 
     struct_tp1_dist = abs(struct_tp1 - entry)
@@ -247,30 +244,31 @@ def build_two_entry_runner_plan(
         return None
 
     if is_long:
-        entry2 = min(sweep_level, entry * 0.992) if (0 < sweep_level < entry) else entry * 0.992
-        avg_entry = (entry + entry2) / 2.0
-        stop_price = min(entry2 * 0.995, sweep_level * 0.995 if sweep_level > 0 else entry2 * 0.995)
+        sweep_anchor = min(sweep_level, entry * 0.992) if (0 < sweep_level < entry) else entry * 0.992
+        stop_price = min(sweep_anchor * 0.995, sweep_level * 0.995 if sweep_level > 0 else sweep_anchor * 0.995)
         tp1_price = entry + tp1_dist
         raw_tp2_dist = (struct_tp2 - entry) if struct_tp2 > tp1_price else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / eff_lev))
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
         tp2_price = entry + tp2_dist
     else:
-        entry2 = max(sweep_level, entry * 1.008) if (sweep_level > entry) else entry * 1.008
-        avg_entry = (entry + entry2) / 2.0
-        stop_price = max(entry2 * 1.005, sweep_level * 1.005 if sweep_level > 0 else entry2 * 1.005)
+        sweep_anchor = max(sweep_level, entry * 1.008) if (sweep_level > entry) else entry * 1.008
+        stop_price = max(sweep_anchor * 1.005, sweep_level * 1.005 if sweep_level > 0 else sweep_anchor * 1.005)
         tp1_price = entry - tp1_dist
         raw_tp2_dist = (entry - struct_tp2) if (0 < struct_tp2 < tp1_price) else max(tp1_dist * 2.2, entry * (22.0 / 100.0 / eff_lev))
         tp2_dist = max(raw_tp2_dist, tp1_dist * 1.6)
         tp2_price = entry - tp2_dist
 
+    entry2 = sweep_anchor if include_entry2 else 0.0
+    avg_entry = ((entry + entry2) / 2.0) if include_entry2 else entry
+
     tp1_roe = round((tp1_dist / entry) * lev * 100.0, 1)
     tp2_roe = round((tp2_dist / entry) * lev * 100.0, 1)
     tp1_label = (
-        f"50% Book ({tp1_roe:.0f}% ROE -> 15m Trail)"
+        f"50% Book ({tp1_roe:.0f}% ROE -> Profit-Lock SL)"
         if tp1_dist < struct_tp1_dist
-        else f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> 15m Trail)"
+        else f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)"
     )
-    tp2_label = f"50% Runner (15m Trail + 9 EMA / 20% ATR Exit, ref {tp2_roe:.0f}% ROE)"
+    tp2_label = f"50% Structural Runner (Halfway Ratchet -> TP2, ref {tp2_roe:.0f}% ROE)"
 
     return {
         "entry": entry,
@@ -493,14 +491,15 @@ class BoxTheorySweep(Strategy):
     short = "Box"
     timeframe = "Daily 50/200 EMA Bias -> Strictly 15m Zone or 50 EMA Rejection"
     description = (
-        "Daily 50 EMA & 200 EMA trend-filtered Box strategy using strictly 15m candle confirmation: "
+        "Daily 50 EMA & 200 EMA trend-filtered Box strategy using strictly 15m candle confirmation "
+        "and 100% Single-Slot Maker Limit sizing (Entry 2 removed): "
         "(A/C) Sweeps RH/SH (Short) or RL/SL (Long) and closes back inside on 15m candle; "
         "(B/D) Touches Daily 50 EMA and rejects on 15m candle (no 65% box-zone restriction). "
-        "TP1 is placed at Box Midpoint (MID) or 15m 50 EMA, whichever is nearer; "
-        "remaining 50% runner uses Trailing 15m H/L SL + Strategy 3 (20% ATR 30% pullback / confirmed 5m 9 EMA cross)."
+        "TP1 books 50% at Box Midpoint (MID) or 15m 50 EMA (whichever is nearer) and locks SL into profit; "
+        "remaining 50% runner holds with Halfway-to-TP2 SL Ratchet toward full TP2 (no 5m 9 EMA cross choke)."
     )
     daily_warmup_days = 1000  # match live 1000-candle Daily EMA200
-    tp1_name, tp2_name = "TP1 (50% Book Nearer of MID / 15m 50 EMA)", "50% Runner (15m Trail + 9 EMA / 20% ATR Exit)"
+    tp1_name, tp2_name = "TP1 (50% Book Nearer of MID / 15m 50 EMA)", "50% Structural Runner (Profit-Lock SL -> Halfway Ratchet -> TP2)"
     uses_live_price = True
 
     def compute_levels(self, pair):
@@ -601,20 +600,19 @@ class BoxTheorySweep(Strategy):
                 stop = eng.round_asset_price(plan["stop"], rh)
                 tp1 = eng.round_asset_price(plan["tp1"], rh)
                 tp2 = eng.round_asset_price(plan["tp2"], rh)
-                entry2 = eng.round_asset_price(plan["entry2_sweep"], rh)
                 lvl_tag = f"SH (${sh:,.2f})" if rejected_sh_15m else f"RH (${rh:,.2f})"
                 reason = (
                     f"{bias_label} | Swept {lvl_tag} + 15m rejection "
-                    f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
+                    f"(100% Maker Limit @ ${entry:,.2f} | SL ${stop:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
                     "signal": "SHORT", "signal_kind": "REVERSAL", "trigger_zone": "Sell Zone RH-SH",
                     "trigger_reason": reason,
                     "setup": f"SELL (Short): {lvl_tag} Sweep + 15m Rejection ({session['name']})",
-                    "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                    "entry": entry, "entry2_sweep": 0.0, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
                     "candle_ts": int(c15["timestamp"]),
                 })
-                out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
+                out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                 return self._stamp(out)
 
         if trend_bias == "BEARISH":
@@ -643,20 +641,19 @@ class BoxTheorySweep(Strategy):
                     stop = eng.round_asset_price(plan["stop"], rh)
                     tp1 = eng.round_asset_price(plan["tp1"], rh)
                     tp2 = eng.round_asset_price(plan["tp2"], rh)
-                    entry2 = eng.round_asset_price(plan["entry2_sweep"], rh)
                     if stop > entry > tp1:
                         reason = (
                             f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + 15m "
-                            f"bearish rejection (Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
+                            f"bearish rejection (100% Maker Limit @ ${entry:,.2f} | SL ${stop:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                         )
                         out.update({
                             "signal": "SHORT", "signal_kind": "EMA50_REJECTION", "trigger_zone": "Daily 50 EMA Resistance",
                             "trigger_reason": reason,
                             "setup": f"SELL (Short): Daily 50 EMA Touch + 15m Rejection ({session['name']})",
-                            "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                            "entry": entry, "entry2_sweep": 0.0, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
                             "candle_ts": int(c15["timestamp"]),
                         })
-                        out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
+                        out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                         return self._stamp(out)
 
         # ------------------------------------------------------------------
@@ -686,20 +683,19 @@ class BoxTheorySweep(Strategy):
                 stop = eng.round_asset_price(plan["stop"], rl)
                 tp1 = eng.round_asset_price(plan["tp1"], rl)
                 tp2 = eng.round_asset_price(plan["tp2"], rl)
-                entry2 = eng.round_asset_price(plan["entry2_sweep"], rl)
                 lvl_tag = f"SL (${sl:,.2f})" if rejected_sl_15m else f"RL (${rl:,.2f})"
                 reason = (
                     f"{bias_label} | Swept {lvl_tag} + 15m rejection "
-                    f"(Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
+                    f"(100% Maker Limit @ ${entry:,.2f} | SL ${stop:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                 )
                 out.update({
                     "signal": "LONG", "signal_kind": "REVERSAL", "trigger_zone": "Buy Zone RL-SL",
                     "trigger_reason": reason,
                     "setup": f"BUY (Long): {lvl_tag} Sweep + 15m Rejection ({session['name']})",
-                    "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                    "entry": entry, "entry2_sweep": 0.0, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
                     "candle_ts": int(c15["timestamp"]),
                 })
-                out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
+                out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                 return self._stamp(out)
 
         if trend_bias == "BULLISH":
@@ -728,20 +724,19 @@ class BoxTheorySweep(Strategy):
                     stop = eng.round_asset_price(plan["stop"], rl)
                     tp1 = eng.round_asset_price(plan["tp1"], rl)
                     tp2 = eng.round_asset_price(plan["tp2"], rl)
-                    entry2 = eng.round_asset_price(plan["entry2_sweep"], rl)
                     if stop < entry < tp1:
                         reason = (
                             f"{bias_label} | Touched Daily 50 EMA (${daily_ema50:,.2f}) + 15m "
-                            f"bullish rejection (Entry1 ${entry:,.2f} + Entry2 @ Sweep ${entry2:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
+                            f"bullish rejection (100% Maker Limit @ ${entry:,.2f} | SL ${stop:,.2f} | {plan['tp1_label']} & {plan['tp2_label']})"
                         )
                         out.update({
                             "signal": "LONG", "signal_kind": "EMA50_REJECTION", "trigger_zone": "Daily 50 EMA Support",
                             "trigger_reason": reason,
                             "setup": f"BUY (Long): Daily 50 EMA Touch + 15m Rejection ({session['name']})",
-                            "entry": entry, "entry2_sweep": entry2, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
+                            "entry": entry, "entry2_sweep": 0.0, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
                             "candle_ts": int(c15["timestamp"]),
                         })
-                        out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=entry2))
+                        out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                         return self._stamp(out)
 
         out["setup"] = (
@@ -763,9 +758,9 @@ class BoxTheorySweep(Strategy):
         b = eng.calculate_trade_setup_details("BUY", levels, live_price, margin_inr, leverage, usd_inr, pair=pair)
         s = eng.calculate_trade_setup_details("SELL", levels, live_price, margin_inr, leverage, usd_inr, pair=pair)
         if b:
-            b["trigger_reason"] = f"Planned ({trend_bias}): Entry1 @ RL/SL + Entry2 @ SL (${levels.get('SL', 0):,.2f}) | TP1 Nearer of MID/15m EMA50 -> Runner"
+            b["trigger_reason"] = f"Planned ({trend_bias}): 100% Maker Limit @ RL/SL | SL beyond SL (${levels.get('SL', 0):,.2f}) | TP1 Nearer of MID/15m EMA50 -> TP2 Runner"
         if s:
-            s["trigger_reason"] = f"Planned ({trend_bias}): Entry1 @ RH/SH + Entry2 @ SH (${levels.get('SH', 0):,.2f}) | TP1 Nearer of MID/15m EMA50 -> Runner"
+            s["trigger_reason"] = f"Planned ({trend_bias}): 100% Maker Limit @ RH/SH | SL beyond SH (${levels.get('SH', 0):,.2f}) | TP1 Nearer of MID/15m EMA50 -> TP2 Runner"
 
         if sig and sig.get("signal") == "LONG":
             return {"BUY": self._stamp({**sig, "direction": "BUY"}), "SELL": self._stamp(s),
@@ -790,11 +785,11 @@ class BoxTheorySweep(Strategy):
         if not levels:
             return []
         lines = [
-            {"label": "SH (Swing High / Short Entry 2)", "price": levels["SH"], "color": "#ef4444", "dash": "dash"},
-            {"label": "RH / PDH (Short Entry 1)", "price": levels["RH"], "color": "#ea580c", "dash": "solid"},
+            {"label": "SH (Swing High / Short SL Anchor)", "price": levels["SH"], "color": "#ef4444", "dash": "dash"},
+            {"label": "RH / PDH (Short Entry Zone)", "price": levels["RH"], "color": "#ea580c", "dash": "solid"},
             {"label": "MID (50% / TP1 Zone)", "price": levels["MID"], "color": "#0284c7", "dash": "dot"},
-            {"label": "RL / PDL (Long Entry 1)", "price": levels["RL"], "color": "#16a34a", "dash": "solid"},
-            {"label": "SL (Swing Low / Long Entry 2)", "price": levels["SL"], "color": "#10b981", "dash": "dash"},
+            {"label": "RL / PDL (Long Entry Zone)", "price": levels["RL"], "color": "#16a34a", "dash": "solid"},
+            {"label": "SL (Swing Low / Long SL Anchor)", "price": levels["SL"], "color": "#10b981", "dash": "dash"},
         ]
         if "EMA50" in levels:
             lines.append({"label": "Daily 50 EMA", "price": levels["EMA50"], "color": "#8b5cf6", "dash": "dash"})

@@ -200,10 +200,10 @@ def test_4_strategy_and_two_entry_levels():
         f"Expected 4-decimal manual Execute levels preserved without rounding off, got: {manual_4d}"
     )
 
-    # Verify build_two_entry_runner_plan places Entry 2 at SH ($7.43) and Catastrophe SL beyond SH (> $7.43), never inside RH-SH
+    # Verify build_two_entry_runner_plan uses 100% Single Entry (entry2_sweep == 0.0) while anchoring Catastrophe SL beyond SH (> $7.43)
     inj_plan = strat.build_two_entry_runner_plan("SHORT", entry=7.30, sweep_level=7.43, struct_tp1=7.10, struct_tp2=6.89, leverage=10)
     assert inj_plan is not None
-    assert abs(inj_plan["entry2_sweep"] - 7.43) < 1e-6, f"Expected Entry 2 at SH $7.43, got {inj_plan['entry2_sweep']}"
+    assert inj_plan["entry2_sweep"] == 0.0, f"Expected Entry 2 removed (0.0), got {inj_plan['entry2_sweep']}"
     assert inj_plan["stop"] > 7.43, f"Expected Catastrophe SL strictly above SH $7.43, got {inj_plan['stop']}"
 
     # Verify _nearest_box_tp1 picks nearer of MID or 15m 50 EMA, and Strategy 2 single-entry + 5% wallet loss stop
@@ -1027,10 +1027,19 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
                     leverage=10,
                 )
             assert ok_lim, f"Expected Live Maker Limit AutoTrade success, got: {ok_lim} {msg_lim}"
-            assert len(placed_orders) == 2, f"Expected Entry 1 Limit + Entry 2 Limit placed, got: {placed_orders}"
-            assert all(o["order_type"] == "limit_order" for o in placed_orders), f"Expected strictly limit_order, got: {placed_orders}"
+            assert len(placed_orders) == 1, f"Expected strictly 1 Single-Slot Maker Limit Entry 1 order (Entry 2 removed), got: {placed_orders}"
+            assert placed_orders[0]["order_type"] == "limit_order", f"Expected strictly limit_order, got: {placed_orders}"
             assert placed_orders[0]["price"] >= 7.301, f"Expected Maker SELL price >= 7.301, got {placed_orders[0]}"
+            assert placed_orders[0]["quantity"] >= 25.0, f"Expected 100% slot margin sizing (~32 INJ at 10x), got {placed_orders[0]['quantity']}"
+            assert meta_lim["lock"]["entry2_sweep"] == 0.0 and meta_lim["lock"]["qty2"] == 0.0
             assert meta_lim["lock"]["entry1_pending"] is True and meta_lim["lock"]["entry1_order_id"] == "oid_1"
+
+            # Verify Strategy 1 runner does NOT prematurely exit on 5m 9 EMA cross after TP1
+            should_ex_box, _, _ = eng._evaluate_smart_hybrid_runner_step(
+                pair="B-INJ_USDT", is_long=False, entry_p=7.301, tp1_p=7.150, cur_sl=7.225,
+                opened_ts=time.time() - 900.0, strategy_id="box_theory",
+            )
+            assert should_ex_box is False, "Expected 5m 9 EMA cross runner exit disabled for Strategy 1 (box_theory)"
 
             # Verify UI fast-path (manage_exchange=False) does NOT clear pending Entry 1 limit lock after 90s
             lk_now = eng.get_autotrade_config()["active_trade_lock"]
