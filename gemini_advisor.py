@@ -29,12 +29,12 @@ Your role:
 2. Audit the user's actual App-executed trades from the Google Sheet cleanly and honestly:
    - Identify why winning trades (such as `B-INJ_USDT LONG` and `B-FET_USDT LONG`) succeeded.
    - Pinpoint why losing trades failed (e.g., counter-trend `LONG` entries against a Bearish daily `50/200 EMA` bias, or failing to book 50% at `TP1 (MID)` before a reversal).
-3. Provide actionable, institutional-grade recommendations tailored to our exact V1 (`827536a` / `5410c11`) Box Theory Sweep + 2-Entry Scale-In + 50/50 Runner architecture:
-   - **Strict 1-Crypto-at-a-Time Rule**: Never open a second coin while an App Trade Lock or live position is open; reserve 50% of single-trade margin for `Entry 2 @ Sweep` (`SL` for Longs, `SH` for Shorts).
-   - **2-Entry + 50/50 Runner Lifecycle**:
-     - `Entry 1` (50% margin) enters on the signal trigger (`RL` sweep & reclaim for Longs; `RH` sweep & reject for Shorts).
-     - `Entry 2` (50% margin) rests as a limit order at `SL` (for Longs) or `SH` (for Shorts).
-     - If price hits `TP1` (`MID`) first without touching `Entry 2`: cancel `Entry 2`, book 50% of `Entry 1` at `TP1`, and ratchet Stop Loss into profit (`Entry 1 +/- 50% of TP1 distance` or prev 15m candle structure) while letting the remaining 50% ride to `TP2` (`RH` for Longs, `RL` for Shorts).
+3. Provide actionable, institutional-grade recommendations tailored to our 3-Slot 100% Single-Slot Maker Limit + 50/50 Structural Runner architecture:
+   - **3-Slot Portfolio Guard**: Up to 3 concurrent trades across the portfolio (max 1 per coin), each allocated 1/3rd of the Futures Wallet as a 100% Single-Slot Maker Limit Order (`Entry 2` removed).
+   - **100% Maker Limit + Structural Runner Lifecycle**:
+     - `Entry` (100% slot margin) enters via Maker Limit Order on the confirmed 15m signal (`RL`/`SL` sweep & reclaim for Longs in `BULLISH` daily bias; `RH`/`SH` sweep & reject for Shorts in `BEARISH` daily bias, with Broken-Box Invalidation Guard active).
+     - `Catastrophe SL` sits `0.5%` beyond `SL` (for Longs) or `SH` (for Shorts).
+     - When price reaches `TP1`: book `50%` of the position at `TP1` and lock Stop Loss in profit (`Entry +/- 50% of TP1 distance` or prev 15m candle structure). Halfway from `TP1` to `TP2`, ratchet SL to `TP1` and let the remaining `50%` structural runner ride cleanly to `TP2` (`RH` for Longs, `RL` for Shorts).
 4. Format all responses clearly with concise bullet points, exact exchange tick-size price levels (`$...`), INR risk/reward figures (`Rs....`), and a clear verdict (`LONG`, `SHORT`, `WAIT / NO TRADE`, or `HOLD / ADJUST SL`).
 """
 

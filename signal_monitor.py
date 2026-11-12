@@ -257,7 +257,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if portfolio_occupied and active_Slot_pair and _canon_pair(active_Slot_pair) != pair_base:
                     results.append({
                         **row,
-                        "message": f"1-crypto-at-a-time guard: {active_Slot_pair} is currently active (50% reserved for Entry 2)"
+                        "message": f"3-slot portfolio guard: {active_Slot_pair} is currently occupying max slots"
                     })
                     continue
 

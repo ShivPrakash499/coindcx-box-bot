@@ -442,7 +442,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 26
+_REQUIRED_DAEMON_VERSION = 27
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 
 
@@ -3783,7 +3783,7 @@ def sync_full_2entry_runner_to_position(
         leverage=pos_lev,
         qty1=pos_qty,
         qty2=qty2,
-        mode="App/API Live Execution (Smart Hybrid Synced)",
+        mode="App/API Live Execution (TP1/TP2/SL Synced)",
         is_live_exchange=True,
         entry2_order_id=e2_order_id,
         tp1_order_id=tp1_order_id or "DAEMON_50PCT_REDUCE_AT_TP1",
@@ -5353,6 +5353,7 @@ def _isolate_latest_iphone_notification(raw_text: str) -> str:
         "FUTURES WALLET",
         "SINGLE-TRADE MARGIN",
         "SMART HYBRID EXECUTION TICKET",
+        "TRADE EXECUTION TICKET",
         "ORDER SETUP",
         "SELECT TICKET",
         "CATASTROPHE SL",

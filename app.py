@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 26
+_DAEMON_VERSION = 27
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -705,11 +705,11 @@ margin_inr = st.sidebar.number_input(
     format="%.2f",
     key="sidebar_single_trade_margin_input",
     on_change=_on_sidebar_margin_change,
-    help="Automatically set to 1/3rd of Futures Wallet (3-Slot Mode: 50% Entry 1 + 50% Entry 2 @ Sweep)."
+    help="Automatically set to 1/3rd of Futures Wallet (3-Slot Mode: 100% Single-Slot Maker Limit)."
 )
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
-st.sidebar.caption(f"Split: **₹{margin_inr*0.5:,.2f}** Entry 1 + **₹{margin_inr*0.5:,.2f}** Entry 2 @ {leverage}x")
+st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (100% Single-Slot Maker Limit) @ {leverage}x")
 try:
     _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(float(margin_inr), int(leverage), wallet_data)
     if _eff_note:
@@ -728,7 +728,7 @@ if _is_staging_env:
     if _auto_cfg.get("enabled"):
         _auto_cfg = coindcx_engine.save_autotrade_config({"enabled": False, "paper_autotrade_enabled": True})
     st.sidebar.toggle(
-        "Enable AutoTrade (10x 2-Entry) [LIVE]",
+        "Enable AutoTrade (10x Maker Limit) [LIVE]",
         value=False,
         disabled=True,
         key="sidebar_live_autotrade_disabled_staging",
@@ -764,7 +764,7 @@ else:
         get_cached_positions.clear()
 
     autotrade_on = st.sidebar.toggle(
-        "Enable AutoTrade (10x 2-Entry)",
+        "Enable AutoTrade (10x Maker Limit)",
         value=_disk_auto_enabled,
         key="sidebar_autotrade_toggle",
         on_change=_on_sidebar_autotrade_toggle_change,
@@ -1631,7 +1631,7 @@ if active_section == "⚡ Signals":
         ):
             st.caption(
                 "Captures CoinDCX mobile push notifications from your **iPhone Air Shortcut** (`?coindcx_alert=...`) "
-                "or pasted text below, converts them into our **Smart Hybrid 2-Entry + Runner + Daily Box** setup, "
+                "or pasted text below, converts them into our **100% Maker Limit + Structural Runner + Daily Box** setup, "
                 "and syncs them to the `CoinDCX_Notifications` tab in Google Sheets so you can view & execute from iPhone or Desktop."
             )
             _p_col1, _p_col2 = st.columns([3.2, 1.0])
@@ -2010,10 +2010,9 @@ elif active_section == "🎯 Execute":
 
             adj_col1, adj_col2 = st.columns(2)
             with adj_col1:
-                _e1_label = "Entry 1 (50%) ($)" if _strat_has_e2 else "Entry 1 (100% Single Entry) ($)"
-                custom_entry = st.number_input(_e1_label, value=float(st.session_state.get(entry_key, _init_norm["entry"])), step=step_val, format=fmt_str, key=entry_key)
-                custom_e2 = st.number_input("Entry 2 @ Sweep (50%) ($)", value=float(st.session_state.get(e2_key, _init_norm["entry2_sweep"])), step=step_val, format=fmt_str, key=e2_key, disabled=not _strat_has_e2)
+                custom_entry = st.number_input("Entry (100% Maker Limit) ($)", value=float(st.session_state.get(entry_key, _init_norm["entry"])), step=step_val, format=fmt_str, key=entry_key)
                 custom_sl = st.number_input("Catastrophe SL ($)", value=float(st.session_state.get(sl_key, _init_norm["stop_loss"])), step=step_val, format=fmt_str, key=sl_key)
+                custom_e2 = 0.0
             with adj_col2:
                 _tp1_label = "TP1 (SL -> Ratchet, 100% Runner) ($)" if active_strategy.id == "ema9_retest" else "TP1 (50% Book -> SL Ratchet) ($)"
                 _tp2_label = "TP2 (100% Full Runner) ($)" if active_strategy.id == "ema9_retest" else "TP2 (50% Runner) ($)"
@@ -2074,7 +2073,7 @@ elif active_section == "🎯 Execute":
 
     with exec_right:
         if active_trade:
-            st.markdown("#### 🎫 Smart Hybrid Execution Ticket")
+            st.markdown("#### 🎫 Trade Execution Ticket")
             _e2_lvl = 0.0
             _has_e2 = False
             _is_full_runner = (active_strategy.id == "ema9_retest")
@@ -2121,7 +2120,6 @@ elif active_section == "🎯 Execute":
             _blended_roe = round(_disp_trade["roe_tp2"], 2) if _is_full_runner else round(0.5 * _disp_trade["roe_tp1"] + 0.5 * _disp_trade["roe_tp2"], 2)
             _fee_inr = cost_details["total_cost_inr"] if cost_details else 0.0
             _be_px = cost_details["breakeven_price"] if cost_details else _disp_trade["entry"]
-            _e2_display = f"{fmt_px(_e2_lvl)} ({_e2_q} {cur_asset} • Avg: {fmt_px(_avg_2x)})" if _has_e2 else "Disabled (100% Single Entry)"
             _tp1_display = f"{fmt_px(_disp_trade['tp1'])} (SL Ratchet Only • 100% Runner)" if _is_full_runner else f"{fmt_px(_disp_trade['tp1'])} ({_tp1_half_q} {cur_asset} • +{_disp_trade['roe_tp1']}% ROE)"
 
             st.html(f"""
@@ -2131,11 +2129,8 @@ elif active_section == "🎯 Execute":
                     <span style="font-weight:700; color:{text_color}; font-size:0.95rem;">Live: {fmt_px(cur_price)}</span>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr auto; row-gap:6px; font-size:0.86rem; color:{text_color};">
-                    <span style="color:{subtext_color};">Entry 1 ({'50% Zone' if _has_e2 else '100% Single Entry'}):</span>
+                    <span style="color:{subtext_color};">Entry (100% Single-Slot):</span>
                     <span style="text-align:right; font-weight:700;">{fmt_px(_disp_trade['entry'])} (₹{_tranche_m:,.0f} / {_tranche_q} {cur_asset})</span>
-
-                    <span style="color:{subtext_color};">Entry 2 / Trade 2 (50% Sweep Limit):</span>
-                    <span style="text-align:right; color:#8b5cf6; font-weight:700;">{_e2_display}</span>
 
                     <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else '50% Limit Order -> SL Ratchet'}):</span>
                     <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
@@ -2203,7 +2198,7 @@ elif active_section == "🎯 Execute":
                     key=f"btn_sync_existing_{selected_pair}",
                     use_container_width=True,
                 ):
-                    with st.spinner(f"Attaching Smart Hybrid TP1, TP2, SL & Entry 2 to open {cur_asset} position on CoinDCX..."):
+                    with st.spinner(f"Attaching TP1, TP2 & SL to open {cur_asset} position on CoinDCX..."):
                         s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                             pair=selected_pair,
                             direction=matching_active_pos["direction"],
@@ -2276,7 +2271,7 @@ elif active_section == "🎯 Execute":
                         _e2_order_id = ""
                         _tp1_order_id = "FULL_RUNNER_SL_RATCHET_AT_TP1" if _is_full_runner else "DAEMON_50PCT_REDUCE_AT_TP1"
                         _synced_live_lock = False
-                        with st.spinner("Submitting Smart Hybrid order + Position TP2/SL + TP1 Limit + Entry 2 to CoinDCX..."):
+                        with st.spinner("Submitting order + Position TP2/SL + TP1 Limit to CoinDCX..."):
                             ok, api_msg, api_extra = place_coindcx_futures_order(
                                 pair=selected_pair, side=trade_dir, quantity=_e1_qty,
                                 leverage=trade_leverage,
@@ -2347,7 +2342,7 @@ elif active_section == "🎯 Execute":
                             stop_loss=rec_sl, tp1=rec_tp1, tp2=rec_tp2,
                             entry2_sweep=rec_e2,
                             margin_inr=trade_margin_inr, leverage=trade_leverage, qty1=_e1_qty if is_live else active_trade["crypto_qty"],
-                            mode="App/API Live Execution (Smart Hybrid)" if is_live else "App/API Paper Execution",
+                            mode="App/API Live Execution" if is_live else "App/API Paper Execution",
                             is_live_exchange=is_live,
                             entry2_order_id=_e2_order_id if is_live else "",
                             tp1_order_id=_tp1_order_id if is_live else ("FULL_RUNNER_SL_RATCHET_AT_TP1" if _is_full_runner else "DAEMON_50PCT_REDUCE_AT_TP1"),
@@ -2566,12 +2561,11 @@ elif active_section == "📊 Positions":
                 f"</div>",
                 unsafe_allow_html=True
             )
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Entry 1 (Mark)", fmt_px(entry_p), f"Mark {mark_p:g}")
-            m2.metric("Entry 2 (Sweep)", fmt_px(e2_target))
-            m3.metric("Current SL", fmt_px(float(cur_sl)) if cur_sl else fmt_px(sl_target))
-            m4.metric("TP1 (50% Limit)", fmt_px(tp1))
-            m5.metric("TP2 (Position TP)", fmt_px(tp2))
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Entry (Mark)", fmt_px(entry_p), f"Mark {mark_p:g}")
+            m2.metric("Current SL", fmt_px(float(cur_sl)) if cur_sl else fmt_px(sl_target))
+            m3.metric("TP1 (50% Limit)", fmt_px(tp1))
+            m4.metric("TP2 (Position TP)", fmt_px(tp2))
             st.caption(f"{ratchet} • Liq: {fmt_px(float(p.get('liquidation_price', 0) or 0))} • Margin: ₹{float(p.get('locked_margin_inr', 0) or 0):,.0f}")
 
             b1, b2, b3, b4 = st.columns(4)
@@ -2582,13 +2576,13 @@ elif active_section == "📊 Positions":
                 on_click=_switch_pair_and_nav,
                 args=(pr, "📈 Chart & Levels", None),
             )
-            if b2.button(f"🛡️ Sync TP1+TP2+SL+E2", key=f"lt_sync_all_{pid}", use_container_width=True):
-                with st.spinner(f"Syncing TP1, TP2, SL & Entry 2 on CoinDCX for {sym_p}..."):
+            if b2.button(f"🛡️ Sync TP1+TP2+SL", key=f"lt_sync_all_{pid}", use_container_width=True):
+                with st.spinner(f"Syncing TP1, TP2 & SL on CoinDCX for {sym_p}..."):
                     s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                         pair=pr,
                         direction=p["direction"],
                         entry1_px=entry_p,
-                        entry2_px=e2_target,
+                        entry2_px=0.0,
                         tp1_px=tp1,
                         tp2_px=tp2,
                         sl_px=sl_target,
@@ -2621,20 +2615,19 @@ elif active_section == "📊 Positions":
                 else:
                     st.error(m)
 
-            with st.expander(f"⚙️ Edit TP1 / TP2 / SL / Entry 2 — {sym_p}"):
+            with st.expander(f"⚙️ Edit TP1 / TP2 / SL — {sym_p}"):
                 step = 0.01 if mark_p > 1.0 else 0.0001
                 fmt_s = "%.3f" if mark_p > 1.0 else "%.4f"
-                e1, e2, e3, e4 = st.columns(4)
+                e1, e2, e3 = st.columns(3)
                 new_tp1 = e1.number_input("TP1 50% Limit ($)", value=float(tp1), step=step, format=fmt_s, key=f"lt_tp1_{pid}")
                 new_tp2 = e2.number_input("TP2 Runner ($)", value=float(cur_tp or tp2), step=step, format=fmt_s, key=f"lt_tp_{pid}")
                 new_sl = e3.number_input("Stop Loss ($)", value=float(cur_sl or sl_target), step=step, format=fmt_s, key=f"lt_sl_{pid}")
-                new_e2 = e4.number_input("Entry 2 Sweep ($)", value=float(e2_target), step=step, format=fmt_s, key=f"lt_e2_{pid}")
-                if st.button("💾 Save & Sync All 4 Legs to CoinDCX", key=f"lt_save_{pid}", type="primary", use_container_width=True):
+                if st.button("💾 Save & Sync TP1 / TP2 / SL to CoinDCX", key=f"lt_save_{pid}", type="primary", use_container_width=True):
                     s_ok, s_msg, _ = coindcx_engine.sync_full_2entry_runner_to_position(
                         pair=pr,
                         direction=p["direction"],
                         entry1_px=entry_p,
-                        entry2_px=new_e2,
+                        entry2_px=0.0,
                         tp1_px=new_tp1,
                         tp2_px=new_tp2,
                         sl_px=new_sl,
@@ -2651,7 +2644,7 @@ elif active_section == "📊 Positions":
                         st.error(s_msg)
 
     if live_open_orders:
-        st.markdown("#### 📋 Live CoinDCX Open Orders (Entry 2 Sweep, TP1 50% Book & TP/SL Brackets)")
+        st.markdown("#### 📋 Live CoinDCX Open Orders (Entry / TP1 50% Book & TP/SL Brackets)")
         for o in live_open_orders:
             o_id = o.get("id", "")
             o_pair = o.get("pair", "")
@@ -2660,7 +2653,7 @@ elif active_section == "📊 Positions":
             o_qty = o.get("total_quantity", 0)
             o_px = o.get("price") or o.get("stop_price") or 0
             o_stage = o.get("stage", "")
-            role_tag = "🎯 Position TP/SL" if o_stage == "tpsl_exit" else ("🟣 Entry 2 / Limit" if "LIMIT" in o_type else o_type)
+            role_tag = "🎯 Position TP/SL" if o_stage == "tpsl_exit" else ("📌 Limit Order" if "LIMIT" in o_type else o_type)
             with st.container(border=True):
                 oc1, oc2 = st.columns([3.5, 1])
                 oc1.markdown(f"**{o_side} {clean_sym(o_pair)}** ({role_tag}) • Qty `{o_qty}` @ `{fmt_px(float(o_px))}`")
@@ -2823,7 +2816,7 @@ elif active_section == "🧪 Backtest":
 
     if st.button("🏆 Run 3-Slot Portfolio Backtest (All 12 High-Vol Movers — Up to 3 Concurrent Trades)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
-        with st.spinner(f"Simulating 1-Crypto-at-a-Time across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
+        with st.spinner(f"Simulating 3-Slot Portfolio across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
                 pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
                 duration_days=days_p,
@@ -2849,7 +2842,7 @@ elif active_section == "🧪 Backtest":
 
         pk1, pk2, pk3, pk4 = st.columns(4)
         pk1.metric("Net Portfolio Profit", f"₹{_tot_net:,.2f}", f"{_tot_roi:+.2f}% ROI")
-        pk2.metric("Total Trades (1 Slot)", _tot_tr)
+        pk2.metric("Total Trades (3 Slots)", _tot_tr)
         pk3.metric("Win Rate", f"{_tot_wr}%", f"{_tot_w}W / {_tot_l}L")
         pk4.metric("Profit Factor", f"{_tot_pf}")
 
@@ -3155,17 +3148,17 @@ elif active_section == "🤖 AI Advisor":
             quick_prompt = (
                 f"Analyze `{selected_pair}` right now using its live price, Daily Box Levels (`SH`, `RH`, `MID`, `RL`, `SL`), "
                 f"active signal status, and our historical Google Sheet trades. Should I enter `LONG`, `SHORT`, or `WAIT`? "
-                f"Give exact Entry 1, Entry 2 @ Sweep, TP1 (50% book), TP2 (50% runner), and Stop Loss levels."
+                f"Give exact Maker Limit Entry (100% slot), TP1 (50% book), TP2 (50% structural runner), and Catastrophe Stop Loss levels."
             )
         if qa_c3.button("🛡️ Review Open Position Risk", use_container_width=True):
             quick_prompt = (
-                "Check my currently open CoinDCX Futures positions and 1-Crypto-at-a-Time App Trade Lock. "
+                "Check my currently open CoinDCX Futures positions and 3-Slot Portfolio Trade Locks. "
                 "Evaluate my current unrealized PnL, distance to TP1/TP2/SL, and recommend whether I should hold, "
                 "ratchet my Stop Loss, or close the trade based on lessons from our Google Sheet journal."
             )
         if qa_c4.button("🏆 Top Coins to Trade Today", use_container_width=True):
             quick_prompt = (
-                "Based on our Google Sheet trade history (`Crypto_Trades_Journal`) and our 10x Box Theory Sweep + 2-Entry Runner strategy, "
+                "Based on our Google Sheet trade history (`Crypto_Trades_Journal`) and our 10x Box Theory Sweep (100% Single-Slot Maker Limit + Structural Runner) strategy, "
                 "which coins have performed best for us, which coins/conditions caused drawdowns, and what is the optimal single-trade margin "
                 "and execution gameplan for today's sessions?"
             )

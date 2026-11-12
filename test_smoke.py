@@ -502,7 +502,12 @@ def test_7_ui_render_and_navigation_tabs_integrity():
     assert '_cold_wallet_synced_once' in after_nav
     assert 'if isinstance(cur_bal, dict) and cur_bal.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):' in after_nav
 
-    # 6. Parse AST of app.py to ensure clean top-level structure
+    # 6. Verify legacy "Smart Hybrid" / "2-Entry" UI labels are completely removed from app.py
+    for stale_ui_label in ("Smart Hybrid", "10x 2-Entry", "Entry 2 @ Sweep", "Entry 2 / Trade 2"):
+        assert stale_ui_label not in app_src, f"Stale UI label '{stale_ui_label}' found in app.py!"
+    assert "#### 🎫 Trade Execution Ticket" in app_src
+
+    # 7. Parse AST of app.py to ensure clean top-level structure
     tree = ast.parse(app_src, filename="app.py")
     assert len(tree.body) > 20
     print(f"  -> PASS: All 6 UI tabs ({', '.join(expected_tabs)}) & fragment non-loop invariants verified.")
