@@ -74,7 +74,7 @@ def _save(state: dict) -> None:
 
 
 def enabled_strategy_ids() -> list:
-    """Defaults to Strategy 1 (`box_theory`: Box Theory Sweep + SH/SL Breakout Continuation) for AutoTrade & Backtest alignment, optionally overridden by ENABLED_STRATEGIES."""
+    """Defaults to Strategy 1 (`box_theory`: Box Theory Sweep) for AutoTrade & Backtest alignment, optionally overridden by ENABLED_STRATEGIES."""
     env = os.getenv("ENABLED_STRATEGIES", "").strip()
     all_ids = [s.id for s in strat_registry.list_strategies()]
     if env:

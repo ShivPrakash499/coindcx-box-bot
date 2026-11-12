@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 23
+_DAEMON_VERSION = 24
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -2816,8 +2816,8 @@ elif active_section == "📈 Chart & Levels":
 elif active_section == "🧪 Backtest":
     st.markdown("#### 🧪 3-Slot Portfolio High-Volatility Backtest (Up to 3 Concurrent Trades @ 10x Leverage)")
     st.caption(
-        "🎯 **Strategy 1 Only (`Box Theory Sweep` + `SH`/`SL` Breakout-Retest Continuation)** — identical to 24/7 AutoTrade execution "
-        "(includes `RH`/`SH`/`RL`/`SL` Sweep Reversals, Broken-Box Guard, Daily 50 EMA Rejection, and `SH`/`SL` Breakout-Retest Continuation)."
+        "🎯 **Strategy 1 Only (`Box Theory Sweep`)** — identical to 24/7 AutoTrade execution "
+        "(includes `RH`/`SH`/`RL`/`SL` Sweep Reversals, Broken-Box Invalidation Guard, and Daily 50 EMA Rejection; Setup 0 Breakout-Top Continuation removed)."
     )
     bc1, bc2, bc3 = st.columns(3)
     bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days"], index=0, key="bt_multi_dur")

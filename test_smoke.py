@@ -411,6 +411,7 @@ def test_6_deployment_regression_guards():
         "margin_inr": 15000.0, "leverage": 10, "trigger_zone": "SELL ZONE", "trigger_reason": "Test"
     }
     with patch.object(sm, "scan_pair", return_value=fake_sig), \
+         patch.object(eng, "get_autotrade_config", return_value={"email_alerts_enabled": True, "single_trade_margin_inr": 15000.0}), \
          patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{"pair": "I-INJ_INR", "direction": "SHORT"}]), \
          patch.object(sm.email_notifier, "send_trade_email") as mock_email:
@@ -885,13 +886,13 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
             pair="B-AVAX_USDT",
             sig={
                 "signal": "SHORT",
-                "strategy_id": "ema9_retest",
+                "strategy_id": "box_theory",
                 "entry": 9.01,
-                "entry2_sweep": 0.0,
+                "entry2_sweep": 9.20,
                 "tp1": 8.91,
                 "tp2": 8.75,
-                "stop_loss": 9.12,
-                "levels": {"trend_bias": "BEARISH", "RH": 9.20, "RL": 8.60, "MID": 8.90},
+                "stop_loss": 9.25,
+                "levels": {"trend_bias": "BEARISH", "RH": 9.10, "RL": 8.60, "MID": 8.85, "SH": 9.20, "SL": 8.50},
             },
             single_trade_margin_inr=19500.0,
             leverage=10,
@@ -899,9 +900,28 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         assert ok_stg and meta_stg.get("paper_mode") is True, f"Expected Staging Paper AutoTrade success, got: {ok_stg} {msg_stg}"
         assert not mock_live_order.called, "place_coindcx_futures_order MUST NEVER be called when is_staging_environment() is True!"
         assert meta_stg["lock"]["is_live_exchange"] is False
-        assert meta_stg["lock"]["strategy_id"] == "ema9_retest"
+        assert meta_stg["lock"]["strategy_id"] == "box_theory"
 
-    # Box Theory Sweep: Broken-Box Invalidation Guard & Box Breakout-Retest Continuation (RENDER 2026-11-09 scenario)
+        # Counter-trend LONG in BEARISH bias MUST ALWAYS be blocked (even if legacy BREAKOUT_CONTINUATION tag is passed)
+        ok_ct, msg_ct, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-FET_USDT",
+            sig={
+                "signal": "LONG",
+                "signal_kind": "BREAKOUT_CONTINUATION",
+                "strategy_id": "box_theory",
+                "entry": 0.1525,
+                "entry2_sweep": 0.1473,
+                "tp1": 0.1543,
+                "tp2": 0.1772,
+                "stop_loss": 0.1466,
+                "levels": {"trend_bias": "BEARISH", "RH": 0.1473, "RL": 0.1399, "MID": 0.1436, "SH": 0.1515, "SL": 0.1371},
+            },
+            single_trade_margin_inr=23267.74,
+            leverage=10,
+        )
+        assert not ok_ct and "Daily Bias Guard" in msg_ct, f"Expected Daily Bias Guard to block counter-trend LONG, got: {ok_ct} {msg_ct}"
+
+    # Box Theory Sweep: Broken-Box Invalidation Guard & Setup 0 Removal (RENDER 2026-11-09 & FET 2026-11-12 scenarios)
     render_recs = [
         {"open": 1.574, "high": 1.589, "low": 1.563, "close": 1.584, "EMA9": 1.556, "EMA50": 1.555},
         {"open": 1.584, "high": 1.626, "low": 1.581, "close": 1.613, "EMA9": 1.567, "EMA50": 1.557},
@@ -913,7 +933,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         {"open": 1.605, "high": 1.607, "low": 1.591, "close": 1.594, "EMA9": 1.594, "EMA50": 1.568},
         {"open": 1.593, "high": 1.601, "low": 1.591, "close": 1.597, "EMA9": 1.595, "EMA50": 1.569},
         {"open": 1.597, "high": 1.599, "low": 1.584, "close": 1.589, "EMA9": 1.594, "EMA50": 1.570},  # idx 9: 16:30 IST top-down pullback (must NOT short!)
-        {"open": 1.589, "high": 1.604, "low": 1.589, "close": 1.597, "EMA9": 1.595, "EMA50": 1.574},  # idx 10: 17:30 IST bullish support flip bounce (LONG continuation!)
+        {"open": 1.589, "high": 1.604, "low": 1.589, "close": 1.597, "EMA9": 1.595, "EMA50": 1.574},  # idx 10: 17:30 IST broken-box top bounce (must NOT buy Setup 0!)
     ]
     for r_c in render_recs:
         r_c["date_str"] = "2026-11-09"
@@ -931,12 +951,33 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
     sig_1630 = s1_box.backtest_entry(9, render_recs[9], render_ctx, render_recs)
     assert sig_1630 is None, f"Expected broken-box guard to block top-down SHORT at 16:30 IST, got: {sig_1630}"
 
-    # 17:30 IST (idx 10): holding RH ($1.580) support flip and bouncing to $1.597 triggers LONG Breakout Continuation
+    # 17:30 IST (idx 10): with Setup 0 removed, broken upper box in BEARISH bias must stay flat (NO LONG at top!)
     sig_1730 = s1_box.backtest_entry(10, render_recs[10], render_ctx, render_recs)
-    assert sig_1730 is not None and sig_1730["direction"] == "LONG", f"Expected LONG Box Breakout Continuation at 17:30 IST, got: {sig_1730}"
-    assert abs(sig_1730["entry"] - 1.597) < 1e-4 and abs(sig_1730["entry2_sweep"] - 1.580) < 1e-4
+    assert sig_1730 is None, f"Expected Setup 0 removal to block LONG at broken-box top, got: {sig_1730}"
 
-    print("  -> PASS: Strategy 3 (4 improvements), Box Broken-Level Guard, Box Breakout Continuation, and Staging Paper AutoTrade verified.")
+    # B-FET_USDT 2026-11-12 00:00 IST regression guard: spike to $0.1543 above SH ($0.1515) in BEARISH bias must NOT trigger LONG at $0.1520-$0.1525
+    fet_recs = [
+        {"open": 0.1513, "high": 0.1528, "low": 0.1511, "close": 0.1525, "EMA9": 0.1506, "EMA50": 0.1482, "date_str": "2026-11-11"},
+        {"open": 0.1524, "high": 0.1543, "low": 0.1522, "close": 0.1535, "EMA9": 0.1512, "EMA50": 0.1484, "date_str": "2026-11-11"},
+        {"open": 0.1536, "high": 0.1540, "low": 0.1526, "close": 0.1526, "EMA9": 0.1514, "EMA50": 0.1486, "date_str": "2026-11-11"},
+        {"open": 0.1526, "high": 0.1537, "low": 0.1517, "close": 0.1533, "EMA9": 0.1518, "EMA50": 0.1488, "date_str": "2026-11-11"},
+        {"open": 0.1534, "high": 0.1539, "low": 0.1525, "close": 0.1526, "EMA9": 0.1520, "EMA50": 0.1489, "date_str": "2026-11-11"},
+        {"open": 0.1526, "high": 0.1528, "low": 0.1518, "close": 0.1518, "EMA9": 0.1519, "EMA50": 0.1490, "date_str": "2026-11-11"},
+        {"open": 0.1519, "high": 0.1529, "low": 0.1518, "close": 0.1520, "EMA9": 0.1520, "EMA50": 0.1491, "date_str": "2026-11-11"},
+    ]
+    fet_box = {
+        "RH": 0.1473, "RL": 0.1399, "MID": 0.1436, "SH": 0.1515, "SL": 0.1371,
+        "EMA50": 0.1772, "EMA200": 0.2013, "ATR": 0.0130, "bias": "BEARISH", "trend_bias": "BEARISH",
+    }
+    fet_ctx = {
+        "boxes": {"2026-11-11": fet_box},
+        "ema50_15m": [x["EMA50"] for x in fet_recs],
+        "ema9_15m": [x["EMA9"] for x in fet_recs],
+    }
+    sig_fet_0000 = s1_box.backtest_entry(6, fet_recs[6], fet_ctx, fet_recs)
+    assert sig_fet_0000 is None, f"Expected FET 00:00 IST broken-box top bounce to stay flat, got: {sig_fet_0000}"
+
+    print("  -> PASS: Strategy 3 (4 improvements), Box Broken-Level Guard, Setup 0 Removal (FET/RENDER top-buy blocked), and Staging Paper AutoTrade verified.")
 
 
 if __name__ == "__main__":
