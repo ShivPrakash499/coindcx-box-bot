@@ -977,7 +977,96 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
     sig_fet_0000 = s1_box.backtest_entry(6, fet_recs[6], fet_ctx, fet_recs)
     assert sig_fet_0000 is None, f"Expected FET 00:00 IST broken-box top bounce to stay flat, got: {sig_fet_0000}"
 
-    print("  -> PASS: Strategy 3 (4 improvements), Box Broken-Level Guard, Setup 0 Removal (FET/RENDER top-buy blocked), and Staging Paper AutoTrade verified.")
+    # AutoTrade Maker Limit Order Conversion & Pending Entry 1 Lifecycle Verification
+    m_buy = eng.compute_maker_limit_entry_price(
+        "B-FET_USDT", "LONG", desired_entry_px=0.1468,
+        live_ticker={"last_price": 0.1468, "bid": 0.1468, "ask": 0.1469},
+        sl_px=0.1410, entry2_px=0.1425, tp1_px=0.1510,
+    )
+    assert abs(m_buy - 0.1467) < 1e-6, f"Expected Maker BUY 1 tick below 0.1468 -> 0.1467, got {m_buy}"
+    m_sell = eng.compute_maker_limit_entry_price(
+        "B-INJ_USDT", "SHORT", desired_entry_px=7.300,
+        live_ticker={"last_price": 7.304, "bid": 7.303, "ask": 7.305},
+        sl_px=7.490, entry2_px=7.430, tp1_px=7.150,
+    )
+    assert abs(m_sell - 7.305) < 1e-6, f"Expected Maker SELL at ask 7.305 (> 7.300 & > 7.304), got {m_sell}"
+
+    placed_orders = []
+    def _fake_place_limit(**kwargs):
+        placed_orders.append(kwargs)
+        return True, "OK_LIMIT", {"order_id": f"oid_{len(placed_orders)}"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "is_staging_environment", return_value=False), \
+             patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+             patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
+             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 60000.0, "available_inr": 60000.0}), \
+             patch.object(eng, "_get_coindcx_credentials", return_value=("k1", "s1")), \
+             patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.300, "bid": 7.299, "ask": 7.301}), \
+             patch.object(eng, "place_coindcx_futures_order", side_effect=_fake_place_limit), \
+             patch.object(eng.time, "sleep", return_value=None), \
+             patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}):
+                ok_lim, msg_lim, meta_lim = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={
+                        "signal": "SHORT",
+                        "strategy_id": "box_theory",
+                        "entry": 7.300,
+                        "entry2_sweep": 7.430,
+                        "tp1": 7.150,
+                        "tp2": 6.890,
+                        "stop_loss": 7.490,
+                        "levels": {"trend_bias": "BEARISH", "RH": 7.31, "RL": 6.89, "MID": 7.10, "SH": 7.43, "SL": 6.86},
+                    },
+                    single_trade_margin_inr=20000.0,
+                    leverage=10,
+                )
+            assert ok_lim, f"Expected Live Maker Limit AutoTrade success, got: {ok_lim} {msg_lim}"
+            assert len(placed_orders) == 2, f"Expected Entry 1 Limit + Entry 2 Limit placed, got: {placed_orders}"
+            assert all(o["order_type"] == "limit_order" for o in placed_orders), f"Expected strictly limit_order, got: {placed_orders}"
+            assert placed_orders[0]["price"] >= 7.301, f"Expected Maker SELL price >= 7.301, got {placed_orders[0]}"
+            assert meta_lim["lock"]["entry1_pending"] is True and meta_lim["lock"]["entry1_order_id"] == "oid_1"
+
+            # Verify UI fast-path (manage_exchange=False) does NOT clear pending Entry 1 limit lock after 90s
+            lk_now = eng.get_autotrade_config()["active_trade_lock"]
+            lk_now["opened_ts"] = time.time() - 300.0
+            eng.save_autotrade_config({"active_trade_lock": lk_now})
+            eng._PERSIST["session_verified"] = True
+            eng._ACTIVE_POSITIONS_CACHE["data"] = []
+            eng._ACTIVE_POSITIONS_CACHE["last_ok_ts"] = time.time()
+            st_fast = eng.get_active_portfolio_trade_status(manage_exchange=False)
+            assert st_fast["has_active_trade"] is True and st_fast["entry1_pending"] is True, f"Expected pending Entry 1 kept alive, got {st_fast}"
+
+            # Verify once Entry 1 fills into a live position, daemon auto-attaches TP2/SL + TP1 Limit & clears entry1_pending
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{
+                "id": "pos_inj_1", "pair": "B-INJ_USDT", "direction": "SHORT", "quantity": 15.0,
+                "entry_price": 7.301, "mark_price": 7.295, "leverage": 10, "stop_loss": None, "take_profit": None,
+            }]), \
+                 patch.object(eng, "fetch_coindcx_active_positions", return_value=[{
+                     "id": "pos_inj_1", "pair": "B-INJ_USDT", "direction": "SHORT", "quantity": 15.0,
+                     "entry_price": 7.301, "mark_price": 7.295, "leverage": 10, "stop_loss": None, "take_profit": None,
+                 }]), \
+                 patch.object(eng, "fetch_coindcx_open_orders", return_value=[{"id": "oid_2", "pair": "B-INJ_USDT", "side": "sell", "order_type": "limit_order", "total_quantity": 15.0, "price": 7.430}]), \
+                 patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK")):
+                st_filled = eng.get_active_portfolio_trade_status(manage_exchange=True)
+                lk_after = eng.get_autotrade_config()["active_trade_lock"]
+                assert lk_after["entry1_pending"] is False, f"Expected entry1_pending cleared upon fill, got {lk_after}"
+
+            # Verify unfilled Entry 1 auto-cancels cleanly if price runs to TP1 before filling
+            lk_run = dict(meta_lim["lock"], opened_ts=time.time() - 180.0, entry1_pending=True)
+            eng.save_autotrade_config({"active_trade_lock": lk_run})
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.140}), \
+                 patch.object(eng, "cancel_coindcx_open_entry_orders", return_value=(1, "Cancelled")) as mock_canc:
+                st_canc = eng.get_active_portfolio_trade_status(manage_exchange=True)
+                assert st_canc["is_occupied"] is False and mock_canc.called, f"Expected unfilled Entry 1 cancelled at TP1, got {st_canc}"
+
+    print("  -> PASS: Strategy 3 (4 improvements), Box Broken-Level Guard, Setup 0 Removal, Staging Paper AutoTrade, and Maker Limit Order Lifecycle verified.")
 
 
 if __name__ == "__main__":

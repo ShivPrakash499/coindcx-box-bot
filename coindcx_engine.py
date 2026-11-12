@@ -209,12 +209,16 @@ def fetch_live_ticker(pair="B-ETH_USDT"):
             if raw_p > 0:
                 high_p = float(item.get("high", raw_p) or raw_p)
                 low_p = float(item.get("low", raw_p) or raw_p)
+                bid_p = float(item.get("bid", 0) or 0)
+                ask_p = float(item.get("ask", 0) or 0)
                 chg = float(item.get("change_24_hour", 0) or 0)
                 vol = float(item.get("volume", 0) or 0)
                 return {
                     "pair": pair,
                     "symbol": clean_pair,
                     "last_price": round_asset_price(raw_p),
+                    "bid": round_asset_price(bid_p, raw_p) if bid_p > 0 else 0.0,
+                    "ask": round_asset_price(ask_p, raw_p) if ask_p > 0 else 0.0,
                     "high_24h": round_asset_price(high_p, raw_p),
                     "low_24h": round_asset_price(low_p, raw_p),
                     "change_24h": round(chg, 2),
@@ -438,7 +442,73 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 24
+_REQUIRED_DAEMON_VERSION = 25
+ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
+
+
+def compute_maker_limit_entry_price(
+    pair: str,
+    direction: str,
+    desired_entry_px: float,
+    live_ticker: dict = None,
+    nudge_ticks: int = 0,
+    sl_px: float = None,
+    entry2_px: float = None,
+    tp1_px: float = None,
+) -> float:
+    """
+    Computes a strict Maker-side Limit Order price for AutoTrade Entry 1 so CoinDCX:
+      1. Charges Maker fee (0.0236% incl. GST) instead of Taker Market fee (0.059% incl. GST — 60% lower fee!).
+      2. Never rejects the limit order for immediately crossing the book (BUY < last_price/ask, SELL > last_price/bid).
+    """
+    spec = get_pair_lot_spec(pair)
+    tick = float(spec.get("tick_size", 0.0001) or 0.0001)
+    is_long = str(direction or "LONG").upper() in ("LONG", "BUY")
+    base_e = float(desired_entry_px or 0.0)
+    if base_e <= 0:
+        return 0.0
+
+    tk = live_ticker if isinstance(live_ticker, dict) else fetch_live_ticker(pair)
+    last_p = float((tk or {}).get("last_price", 0.0) or 0.0)
+    bid_p = float((tk or {}).get("bid", 0.0) or 0.0)
+    ask_p = float((tk or {}).get("ask", 0.0) or 0.0)
+
+    # Only anchor to live ticker when live_p is from the same live market regime (within 3% of signal entry)
+    if last_p <= 0 or abs(last_p - base_e) / base_e > 0.03:
+        return format_order_price(pair, base_e)
+
+    extra_step = max(0, int(nudge_ticks)) * tick
+    if is_long:
+        if bid_p > 0 and bid_p < last_p:
+            maker_ceil = bid_p - extra_step
+        else:
+            maker_ceil = last_p - max(1, int(nudge_ticks) + 1) * tick
+        cand = min(base_e, maker_ceil)
+        # Keep strictly above Entry 2 / Stop Loss so level ordering stays valid
+        lower_guard = max(float(entry2_px or 0.0), float(sl_px or 0.0))
+        if lower_guard > 0 and cand <= lower_guard:
+            cand = base_e
+        fmt_px = format_order_price(pair, cand)
+        fmt_last = format_order_price(pair, last_p)
+        if fmt_last > tick and fmt_px >= fmt_last and (lower_guard <= 0 or (fmt_last - tick) > lower_guard):
+            fmt_px = format_order_price(pair, fmt_last - max(1, int(nudge_ticks) + 1) * tick)
+        return fmt_px
+    else:
+        if ask_p > 0 and ask_p > last_p:
+            maker_floor = ask_p + extra_step
+        else:
+            maker_floor = last_p + max(1, int(nudge_ticks) + 1) * tick
+        cand = max(base_e, maker_floor)
+        # Keep strictly below Entry 2 / Stop Loss so level ordering stays valid
+        upper_guards = [g for g in (float(entry2_px or 0.0), float(sl_px or 0.0)) if g > 0]
+        upper_guard = min(upper_guards) if upper_guards else 0.0
+        if upper_guard > 0 and cand >= upper_guard:
+            cand = base_e
+        fmt_px = format_order_price(pair, cand)
+        fmt_last = format_order_price(pair, last_p)
+        if fmt_last > 0 and fmt_px <= fmt_last and (upper_guard <= 0 or (fmt_last + tick) < upper_guard):
+            fmt_px = format_order_price(pair, fmt_last + max(1, int(nudge_ticks) + 1) * tick)
+        return fmt_px
 _sys.__dict__["_active_daemon_version"] = _REQUIRED_DAEMON_VERSION
 _NAT_PIN_LOCK = _PERSIST.setdefault("nat_pin_lock", _threading.Lock())
 
@@ -3697,9 +3767,17 @@ def sync_full_2entry_runner_to_position(
     e2_order_id = ""
     tranche_m_inr = max(float(total_margin_inr or 20000.0) * 0.5, float(matched_pos.get("locked_margin_inr", 10000.0) or 10000.0))
     qty2 = format_order_quantity(pair, ((tranche_m_inr * pos_lev) / u_inr) / e2_val) if (has_second_entry and e2_val > 0) else 0.0
+    already_full_2entry_sized = bool(
+        has_second_entry
+        and total_margin_inr
+        and float(total_margin_inr) > 0
+        and (pos_qty * pos_entry * u_inr) >= (float(total_margin_inr) * pos_lev * 0.80)
+    )
 
     if not has_second_entry:
         status_parts.append("Single Entry (100% Margin on Entry 1)")
+    elif already_full_2entry_sized:
+        status_parts.append("Entry 2 Sweep Limit: Already Filled in Position")
     elif existing_same_side_limit:
         e2_order_id = str(existing_same_side_limit.get("id", ""))
         status_parts.append(f"Entry 2 Limit ({existing_same_side_limit.get('total_quantity')} @ ${existing_same_side_limit.get('price')}): Already Open")
@@ -3739,6 +3817,8 @@ def sync_full_2entry_runner_to_position(
         entry2_order_id=e2_order_id,
         tp1_order_id=tp1_order_id or "DAEMON_50PCT_REDUCE_AT_TP1",
         strategy_id=strat_id,
+        entry1_pending=False,
+        entry2_filled=already_full_2entry_sized,
     )
     details["lock"] = lock_info
     _ACTIVE_POSITIONS_CACHE["data"] = None
@@ -3762,6 +3842,9 @@ def register_app_trade_lock(
     entry2_order_id: str = "",
     tp1_order_id: str = "",
     strategy_id: str = "box_theory",
+    entry1_order_id: str = "",
+    entry1_pending: bool = False,
+    entry2_filled: bool = False,
 ) -> dict:
     """
     Registers an active 1-Crypto-at-a-Time lock strictly for trades executed via our App/API.
@@ -3773,8 +3856,10 @@ def register_app_trade_lock(
         "direction": str(direction).upper(),
         "strategy_id": str(strategy_id or "box_theory"),
         "entry": float(entry or 0.0),
+        "entry1_order_id": str(entry1_order_id or ""),
+        "entry1_pending": bool(entry1_pending),
         "entry2_sweep": float(entry2_sweep or 0.0),
-        "entry2_filled": False,
+        "entry2_filled": bool(entry2_filled),
         "entry2_cancelled": False,
         "entry2_order_id": str(entry2_order_id or ""),
         "tp1_order_id": str(tp1_order_id or ""),
@@ -4236,10 +4321,18 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
         l_ts = float(lock.get("opened_ts", 0.0) or 0.0)
         is_live_ex = bool(lock.get("is_live_exchange", False))
         tp1_already_hit = bool(lock.get("tp1_hit", False))
+        e1_pending = bool(lock.get("entry1_pending", False))
+        e1_oid = str(lock.get("entry1_order_id", "") or "")
 
         # Fast-path for UI rendering: return lock status immediately in <1ms without blocking on exchange API calls
         if not manage_exchange:
-            if is_live_ex and l_ts > 0 and (time.time() - l_ts) >= 90 and _PERSIST.get("session_verified"):
+            if (
+                is_live_ex
+                and not e1_pending
+                and l_ts > 0
+                and (time.time() - l_ts) >= 90
+                and _PERSIST.get("session_verified")
+            ):
                 _cached_p = _ACTIVE_POSITIONS_CACHE.get("data")
                 _last_ok_p = float(_ACTIVE_POSITIONS_CACHE.get("last_ok_ts", 0.0))
                 if isinstance(_cached_p, list) and (time.time() - _last_ok_p) < 120.0:
@@ -4256,6 +4349,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 "active_pairs": _act_pairs,
                 "active_direction": l_dir,
                 "entry_price": l_entry,
+                "entry1_pending": e1_pending,
                 "entry2_sweep": l_entry2,
                 "tp1": l_tp1,
                 "tp2": l_tp2,
@@ -4270,7 +4364,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
         try:
             if l_ts > 0 and (time.time() - l_ts) > 8 * 3600:
                 if is_live_ex:
-                    cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
+                    cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
                 clear_autotrade_active_lock()
                 return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
 
@@ -4283,6 +4377,30 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 if live_positions is not None:
                     matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
                     if matched_live_pos and matched_live_pos.get("id"):
+                        if e1_pending:
+                            # Resting Entry 1 Maker Limit Order has now filled -> immediately attach Bracket TP2/SL + TP1 Limit + Entry 2 Limit!
+                            _sync_ok_p, _, _sync_det_p = sync_full_2entry_runner_to_position(
+                                pair=l_pair,
+                                direction=l_dir,
+                                entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
+                                entry2_px=l_entry2,
+                                tp1_px=l_tp1,
+                                tp2_px=l_tp2,
+                                sl_px=l_sl,
+                                total_margin_inr=float(lock.get("margin_inr", 20000.0) or 20000.0),
+                                leverage=int(lock.get("leverage", 10) or 10),
+                                strategy_id=str(lock.get("strategy_id", "box_theory") or "box_theory"),
+                            )
+                            if _sync_ok_p and isinstance((_sync_det_p or {}).get("lock"), dict):
+                                lock = _sync_det_p["lock"]
+                            else:
+                                lock["entry1_pending"] = False
+                                save_autotrade_config({"active_trade_lock": lock})
+                            e1_pending = False
+                            l_entry = float(lock.get("entry", l_entry) or l_entry)
+                            l_tp1 = float(lock.get("tp1", l_tp1) or l_tp1)
+                            l_tp2 = float(lock.get("tp2", l_tp2) or l_tp2)
+                            l_sl = float(lock.get("stop_loss", l_sl) or l_sl)
                         if lock.get("missing_count", 0) > 0:
                             lock["missing_count"] = 0
                             save_autotrade_config({"active_trade_lock": lock})
@@ -4351,6 +4469,61 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             heal_ok, _ = update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_sl, pair=l_pair)
                             lock["tpsl_healed"] = bool(heal_ok)
                             save_autotrade_config({"active_trade_lock": lock})
+                    elif e1_pending:
+                        # Entry 1 Maker Limit Order has not filled into an active position yet:
+                        # 1. Cancel cleanly if price already ran to TP1 without us, broke SL, or expired (>45m).
+                        _pend_px = float(fetch_live_ticker(l_pair).get("last_price", 0.0) or 0.0)
+                        _is_long_p = l_dir in ("LONG", "BUY")
+                        _ran_to_tp1 = (_pend_px >= l_tp1) if (_is_long_p and _pend_px > 0 and l_tp1 > 0) else ((_pend_px <= l_tp1) if (not _is_long_p and _pend_px > 0 and l_tp1 > 0) else False)
+                        _broke_sl = (_pend_px <= l_sl) if (_is_long_p and _pend_px > 0 and l_sl > 0) else ((_pend_px >= l_sl) if (not _is_long_p and _pend_px > 0 and l_sl > 0) else False)
+                        _expired_e1 = (l_ts > 0 and (time.time() - l_ts) >= ENTRY1_LIMIT_EXPIRY_SEC)
+                        if _ran_to_tp1 or _broke_sl or _expired_e1:
+                            cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
+                            clear_autotrade_active_lock()
+                            _why_c = "TP1 Reached Before Fill" if _ran_to_tp1 else ("SL Breached" if _broke_sl else "45m Limit Expired")
+                            return {"is_occupied": False, "active_pair": None, "source": f"Slot Free (Unfilled Entry 1 Limit Cancelled: {_why_c})"}
+
+                        # 2. Verify resting Entry 1 limit order is still open on CoinDCX (handles manual cancel on app)
+                        if l_ts > 0 and (time.time() - l_ts) >= 90 and fetch_coindcx_futures_balance().get("is_live_api"):
+                            _open_ords = fetch_coindcx_open_orders() or []
+                            _want_side = "BUY" if _is_long_p else "SELL"
+                            _still_open = any(
+                                o.get("pair") == l_pair
+                                and str(o.get("side", "")).upper() == _want_side
+                                and (not e1_oid or str(o.get("id", "")) == e1_oid)
+                                for o in _open_ords
+                            )
+                            if _still_open:
+                                if lock.get("missing_count", 0) > 0:
+                                    lock["missing_count"] = 0
+                                    save_autotrade_config({"active_trade_lock": lock})
+                            else:
+                                miss_cnt = int(lock.get("missing_count", 0)) + 1
+                                if miss_cnt >= 2:
+                                    cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
+                                    clear_autotrade_active_lock()
+                                    return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Entry 1 Limit Cancelled on Exchange)"}
+                                lock["missing_count"] = miss_cnt
+                                save_autotrade_config({"active_trade_lock": lock})
+
+                        _act_pairs_p = list(dict.fromkeys([p.get("pair") for p in live_positions if p.get("pair")] + [l_pair]))
+                        return {
+                            "is_occupied": len(_act_pairs_p) >= MAX_CONCURRENT_TRADES,
+                            "has_active_trade": True,
+                            "active_pair": l_pair,
+                            "active_pairs": _act_pairs_p,
+                            "active_direction": l_dir,
+                            "entry_price": l_entry,
+                            "entry1_pending": True,
+                            "entry2_sweep": l_entry2,
+                            "tp1": l_tp1,
+                            "tp2": l_tp2,
+                            "tp1_hit": False,
+                            "stop_loss": l_sl,
+                            "source": lock.get("mode", "App/API Live AutoTrade (Entry 1 Limit Resting)"),
+                            "count": len(_act_pairs_p),
+                            "max_slots": MAX_CONCURRENT_TRADES,
+                        }
                     elif len(live_positions) > 0:
                         # Another position is open on CoinDCX: keep the portfolio slot occupied!
                         other_p = live_positions[0]
@@ -4799,7 +4972,8 @@ def execute_autotrade_two_entry_signal(
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
-    live_tk_px = float(fetch_live_ticker(pair).get("last_price", 0.0) or 0.0)
+    live_tk_obj = fetch_live_ticker(pair)
+    live_tk_px = float((live_tk_obj or {}).get("last_price", 0.0) or 0.0)
     norm = normalize_two_entry_runner_levels(
         pair=pair,
         direction=direction,
@@ -4821,12 +4995,27 @@ def execute_autotrade_two_entry_signal(
     # Strategy 2 (ATR Reversal) & Strategy 3 (9 EMA Retest) use Single Entry (100% of single-trade margin on Entry 1)
     raw_e2 = float(sig.get("entry2_sweep") or 0.0)
     has_second_entry = (raw_e2 > 0.0) and (sig_strat_id == "box_theory")
+    if not has_second_entry:
+        entry2_px = 0.0
+
+    # Price Entry 1 strictly as a non-crossing Maker Limit Order (0.0236% Maker fee vs 0.059% Market Taker fee)
+    maker_e1_px = compute_maker_limit_entry_price(
+        pair=pair,
+        direction=norm_dir,
+        desired_entry_px=entry1_px,
+        live_ticker=live_tk_obj,
+        nudge_ticks=0,
+        sl_px=sl_px,
+        entry2_px=entry2_px,
+        tp1_px=tp1_px,
+    )
+    if maker_e1_px > 0:
+        entry1_px = maker_e1_px
+
     tranche_margin_inr = (margin_inr * 0.5) if has_second_entry else margin_inr
     tranche_notional_usd = (tranche_margin_inr * lev) / u_inr
     qty1 = format_order_quantity(pair, tranche_notional_usd / entry1_px) if entry1_px > 0 else 0.0
     qty2 = format_order_quantity(pair, tranche_notional_usd / entry2_px) if (has_second_entry and entry2_px > 0) else 0.0
-    if not has_second_entry:
-        entry2_px = 0.0
 
     # If 50% tranche is below CoinDCX Rs.2,448 minimum notional, use full margin on Entry 1 or bump notional
     if (qty1 * entry1_px * u_inr) < 2448.0 and (margin_inr * lev) >= 2448.0:
@@ -4847,7 +5036,7 @@ def execute_autotrade_two_entry_signal(
         )
         return True, (
             f"Staging Paper AutoTrade Executed: {norm_dir} {pair} ({sig_strat_id}) | "
-            f"Entry 1: ${entry1_px} ({qty1}) | TP1: ${tp1_px} | TP2: ${tp2_px} | SL: ${sl_px} @ {lev}x"
+            f"Entry 1 Limit: ${entry1_px} ({qty1}) | TP1: ${tp1_px} | TP2: ${tp2_px} | SL: ${sl_px} @ {lev}x"
         ), {"lock": lock_info, "paper_mode": True}
 
     wallet = fetch_coindcx_futures_balance()
@@ -4855,20 +5044,53 @@ def execute_autotrade_two_entry_signal(
     has_live_creds = bool(api_key_now and api_secret_now)
 
     if wallet.get("is_live_api") or has_live_creds:
-        # Leg 1: Entry 1 (50% Margin = qty1); TP2 & SL are attached once cleanly via sync_full_2entry_runner_to_position below
+        # Leg 1: Entry 1 (50% Margin = qty1) strictly as a Maker Limit Order (NEVER market_order!)
         ok1, msg1, extra1 = place_coindcx_futures_order(
             pair=pair,
             side=side,
             quantity=qty1,
             leverage=lev,
-            order_type="market_order",
+            order_type="limit_order",
+            price=entry1_px,
             margin_currency="INR",
             tp_price=None,
             sl_price=None,
             post_only=False,
         )
+        # If price moved 1-2 ticks during HTTP transit, refresh live ticker and retry strictly as a Maker Limit Order
+        if not ok1:
+            _TICKER_MAP_CACHE["ts"] = 0.0
+            fresh_tk = fetch_live_ticker(pair)
+            retry_e1_px = compute_maker_limit_entry_price(
+                pair=pair,
+                direction=norm_dir,
+                desired_entry_px=entry1_px,
+                live_ticker=fresh_tk,
+                nudge_ticks=3,
+                sl_px=sl_px,
+                entry2_px=entry2_px,
+                tp1_px=tp1_px,
+            )
+            if retry_e1_px > 0 and retry_e1_px != entry1_px:
+                entry1_px = retry_e1_px
+                qty1 = format_order_quantity(pair, tranche_notional_usd / entry1_px)
+                if (qty1 * entry1_px * u_inr) < 2448.0 and (margin_inr * lev) >= 2448.0:
+                    qty1 = format_order_quantity(pair, ((margin_inr * lev) / u_inr) / entry1_px)
+                ok1, msg1, extra1 = place_coindcx_futures_order(
+                    pair=pair,
+                    side=side,
+                    quantity=qty1,
+                    leverage=lev,
+                    order_type="limit_order",
+                    price=entry1_px,
+                    margin_currency="INR",
+                    tp_price=None,
+                    sl_price=None,
+                    post_only=False,
+                )
         if ok1:
-            # Synchronize Position TP2/SL + TP1 Limit Order + Entry 2 Sweep Limit Order onto the live position
+            e1_order_id = str((extra1 or {}).get("order_id") or (extra1 or {}).get("id") or "")
+            # Check if Entry 1 Limit Order already filled into an active position
             sync_ok, sync_msg, sync_details = sync_full_2entry_runner_to_position(
                 pair=pair,
                 direction=direction,
@@ -4883,7 +5105,7 @@ def execute_autotrade_two_entry_signal(
                 strategy_id=sig_strat_id,
             )
             if not sync_ok:
-                time.sleep(0.8)
+                time.sleep(0.6)
                 sync_ok, sync_msg, sync_details = sync_full_2entry_runner_to_position(
                     pair=pair,
                     direction=direction,
@@ -4899,6 +5121,25 @@ def execute_autotrade_two_entry_signal(
                 )
             lock_obj = (sync_details or {}).get("lock")
             if not lock_obj:
+                # Entry 1 Limit Order is resting on the order book waiting for a Maker fill:
+                # Also place Entry 2 Sweep Limit Order upfront so fast liquidity wicks fill both Maker legs,
+                # and mark entry1_pending=True so the 24/7 daemon attaches TP2/SL + TP1 Limit the instant Entry 1 fills!
+                e2_oid_pending = ""
+                e2_note = ""
+                if has_second_entry and qty2 > 0 and (qty2 * entry2_px * u_inr) >= 2448.0:
+                    ok2_p, _, extra2_p = place_coindcx_futures_order(
+                        pair=pair,
+                        side=side,
+                        quantity=qty2,
+                        leverage=lev,
+                        order_type="limit_order",
+                        price=entry2_px,
+                        margin_currency="INR",
+                        post_only=False,
+                    )
+                    if ok2_p:
+                        e2_oid_pending = str((extra2_p or {}).get("order_id") or (extra2_p or {}).get("id") or "")
+                        e2_note = f" + Entry 2 Limit ({qty2} @ ${entry2_px}) Resting"
                 lock_obj = register_app_trade_lock(
                     pair=pair,
                     direction=direction,
@@ -4911,12 +5152,16 @@ def execute_autotrade_two_entry_signal(
                     leverage=lev,
                     qty1=qty1,
                     qty2=qty2,
-                    mode="App/API Live AutoTrade (Entry 1 Placed)",
+                    mode="App/API Live AutoTrade (Entry 1 Limit Resting)",
                     is_live_exchange=True,
+                    entry2_order_id=e2_oid_pending,
                     strategy_id=sig_strat_id,
+                    entry1_order_id=e1_order_id,
+                    entry1_pending=True,
                 )
+                sync_msg = f"Entry 1 Maker Limit Resting{e2_note} -> Auto-Attaches TP1/TP2/SL on Fill"
             return True, (
-                f"Live 2-Entry + Runner Placed on {pair}! Entry 1 ({qty1} @ ${entry1_px}) | {sync_msg}"
+                f"Live Maker Limit AutoTrade Placed on {pair}! Entry 1 Limit ({qty1} @ ${entry1_px}) | {sync_msg}"
                 + (f" | {_cap_note}" if _cap_note else "")
             ), {
                 "entry1_order": extra1,
@@ -5480,6 +5725,8 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "get_coindcx_live_usdt_inr_rate": get_coindcx_live_usdt_inr_rate,
             "_send_coindcx_signed_request": _send_coindcx_signed_request,
             "place_coindcx_futures_order": place_coindcx_futures_order,
+            "compute_maker_limit_entry_price": compute_maker_limit_entry_price,
+            "sync_full_2entry_runner_to_position": sync_full_2entry_runner_to_position,
             "execute_autotrade_two_entry_signal": execute_autotrade_two_entry_signal,
             "get_active_portfolio_trade_status": get_active_portfolio_trade_status,
             "compute_tp1_profit_lock_sl": compute_tp1_profit_lock_sl,

@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 24
+_DAEMON_VERSION = 25
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -2178,7 +2178,7 @@ elif active_section == "🎯 Execute":
                 e1_fill_mode = st.radio(
                     "Entry 1 Type",
                     ["⚡ Market (Instant)", "📌 Limit"],
-                    index=0,
+                    index=1,
                     horizontal=True,
                     key=f"e1_fill_mode_{selected_pair}",
                     label_visibility="collapsed"
