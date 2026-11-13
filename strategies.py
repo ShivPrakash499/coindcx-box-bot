@@ -146,8 +146,6 @@ MIN_TP_ROE_PCT = 3.0                # Skip trade if TP1 distance is < 0.6% price
 MAX_SL_ROE_PCT = 5.0                # Legacy constant (not enforced): Box catastrophe SL = 0.5% beyond Entry 2 (SH/SL),
                                     # i.e. typically 1.3%-5% from Entry 1 depending on how far the sweep level is
 DAILY_WALLET_LOSS_STOP_PCT = 5.0    # STOP trading for the day if 5% of total futures wallet is lost including fees
-MAX_CONCURRENT_PORTFOLIO_RISK_PCT = 10.0  # Block 2nd/3rd concurrent trade if (open SL risk + today's loss) > 10% of wallet
-MIN_EMA50_200_RR = 0.60             # Minimum full-target R:R (|TP2 - Entry| / |Entry - SL|) required for 15m 50/200 EMA setups
 MAX_TRADES_PER_DAY = 999            # Legacy trade-count cap removed per discipline update
 DAILY_WIN_ROE_LOCK_PCT = 9999.0     # Legacy daily win-lock removed per discipline update
 
@@ -1911,10 +1909,7 @@ def _detect_ema50_200_setup(
                     stop_px = max(e200, reach_high) * 1.0025
                     if ((stop_px - c_close) / c_close) * 100.0 < 0.30:
                         stop_px = c_close * 1.004
-                    risk_dist = stop_px - c_close
                     rew_dist = c_close - rl
-                    if risk_dist <= 0 or (rew_dist / risk_dist) < MIN_EMA50_200_RR:
-                        return None
                     tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                     if tp1_dist >= c_close * 0.006:
                         tp1_px = c_close - tp1_dist
@@ -1952,10 +1947,7 @@ def _detect_ema50_200_setup(
                     stop_px = min(e200, reach_low) * 0.9975
                     if ((c_close - stop_px) / c_close) * 100.0 < 0.30:
                         stop_px = c_close * 0.996
-                    risk_dist = c_close - stop_px
                     rew_dist = rh - c_close
-                    if risk_dist <= 0 or (rew_dist / risk_dist) < MIN_EMA50_200_RR:
-                        return None
                     tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                     if tp1_dist >= c_close * 0.006:
                         tp1_px = c_close + tp1_dist

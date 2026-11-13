@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 29
+_DAEMON_VERSION = 28
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -820,7 +820,6 @@ if _slot_status.get("is_occupied"):
         st.rerun()
 elif _slot_cnt > 0:
     st.sidebar.info(f"🟢 **Active ({_slot_cnt}/{_slot_max} Slots):** `{_slot_pairs_str}` • **{_slot_max - _slot_cnt} Free**")
-    st.sidebar.caption("🛡️ **2nd/3rd Slot Guard:** Opens only if total open SL risk + today's loss ≤ **10%** of wallet")
     if st.sidebar.button("🔓 Clear Saved Lock", key="btn_clear_autotrade_lock", use_container_width=True):
         coindcx_engine.clear_autotrade_active_lock()
         st.rerun()
@@ -2622,7 +2621,7 @@ elif active_section == "📊 Positions":
             )
             m1, m2, m3, m4 = st.columns(4)
             m1.metric("Entry (Mark)", fmt_px(entry_p), f"Mark {mark_p:g}")
-            m2.metric("Current SL", fmt_px(float(cur_sl)) if cur_sl else f"None (Ref {fmt_px(sl_target)})")
+            m2.metric("Current SL", fmt_px(float(cur_sl)) if cur_sl else fmt_px(sl_target))
             m3.metric("TP1 (50% Limit)", fmt_px(tp1))
             m4.metric("TP2 (Position TP)", fmt_px(tp2))
             st.caption(f"{ratchet} • Liq: {fmt_px(float(p.get('liquidation_price', 0) or 0))} • Margin: ₹{float(p.get('locked_margin_inr', 0) or 0):,.0f}")
@@ -2660,7 +2659,7 @@ elif active_section == "📊 Positions":
             if target_sl is not None:
                 better = (cur_sl is None) or ((target_sl > float(cur_sl)) if is_long else (target_sl < float(cur_sl)))
                 if better and b3.button("🔒 Ratchet SL", key=f"lt_ratchet_{pid}", use_container_width=True):
-                    ok, m = update_coindcx_position_tpsl(pid, None, target_sl, pair=pr)
+                    ok, m = update_coindcx_position_tpsl(pid, cur_tp or tp2, target_sl, pair=pr)
                     get_cached_positions.clear()
                     (st.success if ok else st.error)(m)
             if b4.button(f"❌ Close {sym_p}", key=f"lt_close_{pid}", use_container_width=True):
