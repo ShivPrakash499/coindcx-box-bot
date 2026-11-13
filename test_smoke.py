@@ -1185,6 +1185,170 @@ def test_11_ema50_200_pullback_and_combo_modes():
     print("  -> PASS: 15m 50/200 EMA Pullback, Bear/Both Combo Modes & Tight 200 EMA SL preservation verified.")
 
 
+def test_12_no_autoheal_ema_rr_floor_and_concurrent_risk_guard():
+    print("[12/12] Verifying Auto-Heal Removal (TP1 Ratchet Kept), EMA R:R>=0.60 Floor, 10% Concurrent Risk Guard & Sheet Label...")
+    import tempfile
+    import coindcx_engine as eng
+    import strategies as strat
+
+    # 1. A2: Today's APT-style inverted 15m 50/200 EMA setup (R:R = 0.58 < 0.60) is blocked; valid R:R >= 0.60 passes
+    apt_box_bad = {"trend_bias": "BEARISH", "RH": 0.5800, "RL": 0.5333, "MID": 0.5566, "SH": 0.5850, "SL": 0.5290}
+    apt_recs = [
+        {"open": 0.5400, "high": 0.5415, "low": 0.5380, "close": 0.5395},
+        {"open": 0.5395, "high": 0.5410, "low": 0.5385, "close": 0.5402},
+        {"open": 0.5402, "high": 0.5420, "low": 0.5390, "close": 0.5410},
+        {"open": 0.5410, "high": 0.5430, "low": 0.5400, "close": 0.5418},
+        {"open": 0.5418, "high": 0.5440, "low": 0.5405, "close": 0.5425},
+        {"open": 0.5425, "high": 0.5540, "low": 0.5415, "close": 0.5460},
+        {"open": 0.5460, "high": 0.5555, "low": 0.5410, "close": 0.5421},  # Entry=0.5421, SL=0.5555*1.0025=0.5569 (+2.73%), RL=0.5333 (-1.62%) -> R:R=0.59 < 0.60
+    ]
+    assert strat._detect_ema50_200_setup(
+        apt_recs, 6, apt_box_bad, ema50_val=0.5450, ema200_val=0.5550,
+        prior_e50=[0.5450] * 6, prior_e200=[0.5550] * 6, allow_bear=True, allow_bull=True,
+    ) is None, "Expected inverted R:R=0.59 APT EMA setup to be blocked by MIN_EMA50_200_RR=0.60"
+
+    apt_box_good = {**apt_box_bad, "RL": 0.5250}  # Reward=0.0171 vs Risk=0.0148 -> R:R=1.15 >= 0.60
+    sig_apt_ok = strat._detect_ema50_200_setup(
+        apt_recs, 6, apt_box_good, ema50_val=0.5450, ema200_val=0.5550,
+        prior_e50=[0.5450] * 6, prior_e200=[0.5550] * 6, allow_bear=True, allow_bull=True,
+    )
+    assert sig_apt_ok is not None and sig_apt_ok["direction"] == "SHORT", "Expected R:R=1.15 EMA setup to pass"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        logged_sheet_payloads = []
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch("sheets_logger.log_trade_to_google_sheet", side_effect=lambda d: logged_sheet_payloads.append(d) or True):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+
+            # 2. Google Sheets Strategy Label for ema50_200
+            lk = eng.register_app_trade_lock(
+                pair="B-APT_USDT", direction="SHORT", entry=0.5421, stop_loss=0.5569,
+                tp1=0.5335, tp2=0.5250, margin_inr=24000.0, leverage=10, qty1=400.0,
+                mode="24/7 Live AutoTrade", is_live_exchange=True, strategy_id="ema50_200",
+                entry1_pending=False,
+            )
+            time.sleep(0.15)
+            assert logged_sheet_payloads and "Strategy 4: 15m 50/200 EMA Pullback" in logged_sheet_payloads[-1]["strategy_name"], (
+                f"Expected Strategy 4 sheet label, got {logged_sheet_payloads}"
+            )
+
+            # 3. A1: Manual trade with NO SL/TP -> _auto_protect_live_position_tp1_sl NEVER calls update_coindcx_position_tpsl
+            with patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK")) as mock_tpsl:
+                eng._auto_protect_live_position_tp1_sl({
+                    "id": "pos_manual_1", "pair": "B-BTC_USDT", "direction": "LONG",
+                    "entry_price": 90000.0, "mark_price": 89500.0, "quantity": 0.05,
+                    "stop_loss": None, "take_profit": None,
+                })
+                assert not mock_tpsl.called, "Manual trade must NEVER have catastrophe SL auto-attached"
+
+            # 4. A1: App/AutoTrade open position pre-TP1 with manually cleared/edited SL or TP -> ZERO Auto-Heal!
+            lk_open = dict(
+                lk, pair="B-INJ_USDT", direction="SHORT", entry=7.6115, stop_loss=7.8630,
+                tp1=7.4451, tp2=7.2730, qty1=32.5, opened_ts=time.time() - 300.0,
+                entry1_pending=False, tp1_hit=False, is_live_exchange=True,
+            )
+            eng.save_autotrade_config({"active_trade_lock": lk_open, "history": [lk_open]})
+            pos_inj_manual_sl = {
+                "id": "pos_inj_live", "pair": "B-INJ_USDT", "direction": "SHORT", "quantity": 32.5,
+                "entry_price": 7.6115, "mark_price": 7.7200, "leverage": 10,
+                "stop_loss": None, "take_profit": None,  # User cleared SL/TP on CoinDCX while adjusting!
+            }
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[pos_inj_manual_sl]), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.7200}), \
+                 patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)), \
+                 patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK")) as mock_tpsl2, \
+                 patch.object(eng, "place_coindcx_futures_order", return_value=(True, "OK", {})) as mock_ord2:
+                eng.get_active_portfolio_trade_status(manage_exchange=True)
+                eng._auto_protect_live_position_tp1_sl(pos_inj_manual_sl)
+                assert not mock_tpsl2.called, "Daemon must NEVER auto-heal or overwrite pre-TP1 SL/TP"
+                assert not mock_ord2.called, "Daemon must NEVER re-attach TP1 limit order post-fill"
+
+            # Once price reaches TP1 (7.4400 <= 7.4451), upward profit-lock SL ratchet DOES fire (with tp_price=None!)
+            pos_inj_at_tp1 = dict(pos_inj_manual_sl, mark_price=7.4400, quantity=16.2)
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[pos_inj_at_tp1]), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.4400}), \
+                 patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(True, 7.5500, 7.4350)), \
+                 patch.object(eng, "cancel_coindcx_open_entry_orders", return_value=(0, "OK")), \
+                 patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK")) as mock_tpsl_ratchet:
+                eng.get_active_portfolio_trade_status(manage_exchange=True)
+                assert mock_tpsl_ratchet.called, "Expected upward TP1 profit-lock SL ratchet to fire once TP1 is hit"
+                _, kwargs_r = mock_tpsl_ratchet.call_args
+                assert kwargs_r.get("tp_price") is None, f"Expected tp_price=None on SL ratchet so Position TP is untouched, got {kwargs_r}"
+                assert kwargs_r.get("sl_price") < 7.6115, f"Expected profit-locked SL < entry 7.6115, got {kwargs_r}"
+
+            # 5. A3: 10% Concurrent Portfolio Risk Guard (1st slot allowed; 2nd slot blocked if >10% wallet risk; allowed once Slot 1 locks profit)
+            today_str = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+            eng.save_autotrade_config({
+                "autotrade_strategy_mode": "box_plus_ema50_200_bear",
+                "daily_start_wallet": {"date": today_str, "inr": 72120.0},
+                "active_trade_lock": None,
+            })
+            bear_lvls = {"trend_bias": "BEARISH", "RH": 7.65, "RL": 7.27, "MID": 7.46, "SH": 7.824, "SL": 7.20}
+            wallet_ok = {"is_live_api": True, "total_inr": 72120.0, "available_inr": 48000.0}
+
+            # 5a. 1st trade (0 open positions) with 3.3% SL (₹7,933 = 11% SL risk > 10%) -> ALLOWED because open_count == 0!
+            blk_1st, _, info_1st = eng.check_concurrent_open_sl_risk_guard(
+                pair="B-INJ_USDT", norm_dir="SHORT", entry_px=7.6115, sl_px=7.8630,
+                margin_inr=24040.0, leverage=10, usd_inr=101.6, wallet=wallet_ok,
+                live_positions=[], slot_status={"is_occupied": False}, active_lock=None,
+            )
+            assert not blk_1st and info_1st["open_count"] == 0, f"1st slot must always be allowed, got {blk_1st} {info_1st}"
+
+            # 5b. 2nd concurrent trade while APT SHORT is open with ₹26,088 margin & 2.73% SL (₹7,338 open SL risk incl. fees > ₹7,212) -> BLOCKED!
+            apt_open_losing_sl = [{
+                "id": "pos_apt", "pair": "B-APT_USDT", "direction": "SHORT",
+                "entry_price": 0.5421, "stop_loss": 0.5569, "locked_margin_inr": 26088.16, "leverage": 10,
+            }]
+            with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value=wallet_ok), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "has_active_trade": True, "active_pair": "B-APT_USDT", "count": 1}), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=apt_open_losing_sl), \
+                 patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.6100}):
+                ok_2nd_blk, msg_2nd_blk, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.6115, "tp1": 7.4451, "tp2": 7.2730, "stop_loss": 7.8630, "levels": bear_lvls},
+                    single_trade_margin_inr=24040.0, leverage=10, usd_inr=101.6,
+                )
+                assert not ok_2nd_blk and "10% Concurrent Risk Guard" in msg_2nd_blk, (
+                    f"Expected 2nd concurrent trade blocked when open SL risk > 10% wallet, got: {ok_2nd_blk} {msg_2nd_blk}"
+                )
+
+            # 5c. Once APT SL ratchets into profit ($0.5390 <= $0.5421 -> ₹0 open risk), even a wide 3.3% structural Box SH stop on INJ IS ALLOWED!
+            apt_open_profit_locked = [{
+                "id": "pos_apt", "pair": "B-APT_USDT", "direction": "SHORT",
+                "entry_price": 0.5421, "stop_loss": 0.5390, "locked_margin_inr": 26088.16, "leverage": 10,
+            }]
+            blk_2nd_ok, msg_2nd_ok, info_2nd_ok = eng.check_concurrent_open_sl_risk_guard(
+                pair="B-INJ_USDT", norm_dir="SHORT", entry_px=7.6115, sl_px=7.8630,
+                margin_inr=24040.0, leverage=10, usd_inr=101.6, wallet=wallet_ok,
+                live_positions=apt_open_profit_locked,
+                slot_status={"is_occupied": False, "has_active_trade": True, "active_pair": "B-APT_USDT", "count": 1},
+            )
+            assert not blk_2nd_ok and info_2nd_ok["existing_open_sl_risk_inr"] == 0.0, (
+                f"Expected 2nd slot (including wide Box SH stop) allowed once Slot 1 locks profit, got {blk_2nd_ok} {msg_2nd_ok} {info_2nd_ok}"
+            )
+
+            # 5d. Open SL risk (1.9% SL = ₹4,766 incl. fee) + today's realized loss (₹3,000) = ₹7,766 > ₹7,212 (10%) -> BLOCKED!
+            apt_mod_sl = [{
+                "id": "pos_apt", "pair": "B-APT_USDT", "direction": "SHORT",
+                "entry_price": 0.5421, "stop_loss": 0.5524, "locked_margin_inr": 24040.0, "leverage": 10,
+            }]
+            wallet_down_3000 = {"is_live_api": True, "total_inr": 69120.0, "available_inr": 45080.0}
+            blk_loss, msg_loss, _ = eng.check_concurrent_open_sl_risk_guard(
+                pair="B-INJ_USDT", norm_dir="SHORT", entry_px=7.6115, sl_px=7.8630,
+                margin_inr=24040.0, leverage=10, usd_inr=101.6, wallet=wallet_down_3000,
+                live_positions=apt_mod_sl,
+                slot_status={"is_occupied": False, "has_active_trade": True, "active_pair": "B-APT_USDT", "count": 1},
+            )
+            assert blk_loss and "10% Concurrent Risk Guard" in msg_loss, (
+                f"Expected open SL risk + today's loss > 10% to block 2nd slot, got {blk_loss} {msg_loss}"
+            )
+
+    print("  -> PASS: Auto-Heal Removal, Upward TP1 Ratchet, EMA R:R>=0.60 Floor, 10% Concurrent Risk Guard & Sheet Label verified.")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1197,6 +1361,7 @@ if __name__ == "__main__":
     test_9_ai_advisor_and_tick_precision()
     test_10_strategy3_four_improvements_and_staging_paper_autotrade()
     test_11_ema50_200_pullback_and_combo_modes()
+    test_12_no_autoheal_ema_rr_floor_and_concurrent_risk_guard()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
