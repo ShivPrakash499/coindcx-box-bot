@@ -74,7 +74,7 @@ def _save(state: dict) -> None:
 
 
 def enabled_strategy_ids() -> list:
-    """Defaults to Strategy 1 (`box_theory`: Box Theory Sweep) for AutoTrade & Backtest alignment, optionally overridden by ENABLED_STRATEGIES."""
+    """Returns strategy IDs for the active AutoTrade / Scanner mode, optionally overridden by ENABLED_STRATEGIES."""
     env = os.getenv("ENABLED_STRATEGIES", "").strip()
     all_ids = [s.id for s in strat_registry.list_strategies()]
     if env:
@@ -82,7 +82,24 @@ def enabled_strategy_ids() -> list:
         matched = [i for i in all_ids if i in wanted]
         if matched:
             return matched
-    return [strat_registry.DEFAULT_STRATEGY_ID]
+    auto_cfg = eng.get_autotrade_config()
+    auto_mode = strat_registry.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
+    return strat_registry.autotrade_mode_strategy_ids(auto_mode)
+
+
+def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str) -> bool:
+    """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
+    m = strat_registry.resolve_autotrade_mode(auto_mode)
+    d = str(direction or "").upper()
+    if m == "box_theory":
+        return strategy_id == "box_theory"
+    if m == "ema50_200":
+        return strategy_id == "ema50_200"
+    if m == "box_plus_ema50_200_bear":
+        return (strategy_id == "box_theory") or (strategy_id == "ema50_200" and d == "SHORT")
+    if m == "box_plus_ema50_200_both":
+        return strategy_id in ("box_theory", "ema50_200")
+    return strategy_id == strat_registry.DEFAULT_STRATEGY_ID
 
 
 def scan_pair(pair: str, margin_inr: float, leverage: int, usd_inr: float, strategy_id: str = "box_theory"):
@@ -129,6 +146,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
     if hasattr(eng, "_check_and_kill_obsolete_daemon"):
         eng._check_and_kill_obsolete_daemon()
     auto_cfg = eng.get_autotrade_config()
+    auto_mode = strat_registry.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
     if margin_inr is None or margin_inr <= 0:
         margin_inr = float(auto_cfg.get("single_trade_margin_inr", 100000.0))
     if leverage is None or leverage <= 0:
@@ -222,8 +240,8 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
             pair_primary_triggered = False
             for sid in strategy_ids:
-                if sid == "ema9_retest" and pair_primary_triggered:
-                    continue  # Strategy 3 only runs when Strategies 1 & 2 yield no setup
+                if sid in ("ema9_retest", "ema50_200") and pair_primary_triggered:
+                    continue  # Fallback / continuation strategies only run when Box / primary yielded no setup on this pair
                 s = strat_registry.get_strategy(sid)
                 row = {
                     "pair": pair, "strategy_id": s.id, "strategy_name": s.name,
@@ -354,7 +372,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     msg = f"{msg} | 🛑 {daily_stop_msg}"
                 elif (
                     autotrade
-                    and s.id == strat_registry.DEFAULT_STRATEGY_ID
+                    and _autotrade_signal_eligible(str(sig.get("strategy_id") or s.id), sig.get("signal"), auto_mode)
                     and not portfolio_occupied
                     and not already_autotraded_candle
                     and not already_autotraded_setup

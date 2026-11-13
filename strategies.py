@@ -95,7 +95,8 @@ def backtest_session_name(c_time) -> str:
 
 
 def _closed_15m(pair: str, limit: int) -> pd.DataFrame:
-    df = eng.fetch_coindcx_candles(pair=pair, interval="15m", limit=limit + 5, sync_live_price=False)
+    fetch_limit = max(int(limit) + 5, 650)
+    df = eng.fetch_coindcx_candles(pair=pair, interval="15m", limit=fetch_limit, sync_live_price=False)
     if df.empty:
         return df
     now_ms = int(time.time() * 1000)
@@ -1832,12 +1833,463 @@ class CombinedPriorityStrategy(Strategy):
 
 
 # ----------------------------------------------------------------------------------------------
+# Strategy 4: 15m 50/200 EMA Pullback Strategy (Trending Continuation -> RL / RH Target)
+# ----------------------------------------------------------------------------------------------
+def _compute_warmed_15m_emas(df_sub: pd.DataFrame) -> tuple[list[float], list[float]]:
+    """Computes 15m EMA50 and EMA200 using extended pre-window history if attached in df_sub.attrs['df_full_15m']."""
+    df_full = df_sub.attrs.get("df_full_15m") if hasattr(df_sub, "attrs") else None
+    if df_full is not None and not df_full.empty and len(df_full) >= len(df_sub):
+        e50 = df_full["close"].ewm(span=50, adjust=False).mean()
+        e200 = df_full["close"].ewm(span=200, adjust=False).mean()
+        tail_n = len(df_sub)
+        return e50.iloc[-tail_n:].tolist(), e200.iloc[-tail_n:].tolist()
+    return (
+        df_sub["close"].ewm(span=50, adjust=False).mean().tolist(),
+        df_sub["close"].ewm(span=200, adjust=False).mean().tolist(),
+    )
+
+
+def _detect_ema50_200_setup(
+    recs15: list[dict],
+    idx: int,
+    box: dict,
+    ema50_val: float,
+    ema200_val: float,
+    prior_e50: list[float],
+    prior_e200: list[float],
+    allow_bear: bool = True,
+    allow_bull: bool = True,
+) -> dict | None:
+    """
+    Shared 15m 50/200 EMA Pullback detection (100% live <-> backtest parity):
+      - Bearish Daily Bias -> SHORT when 15m EMA50 < EMA200, price pulls up from below into [50, 200] EMA,
+        and 15m candle rejects back below EMA50. SL placed above max(15m EMA200, reach_high); TP2 = RL.
+      - Bullish Daily Bias -> LONG (Mirror Replica) when 15m EMA50 > EMA200, price pulls down from above
+        into [200, 50] EMA, and 15m candle rejects back above EMA50. SL placed below min(15m EMA200, reach_low); TP2 = RH.
+    """
+    if idx < 6 or not box or len(prior_e50) < 4 or len(prior_e200) < 4:
+        return None
+    bias = str(box.get("trend_bias") or box.get("bias") or "").upper()
+    if bias not in ("BEARISH", "BULLISH"):
+        return None
+
+    rh = float(box.get("RH", 0.0) or 0.0)
+    rl = float(box.get("RL", 0.0) or 0.0)
+    e50 = float(ema50_val or 0.0)
+    e200 = float(ema200_val or 0.0)
+    if rh <= 0 or rl <= 0 or e50 <= 0 or e200 <= 0:
+        return None
+
+    candle = recs15[idx]
+    prev = recs15[idx - 1]
+    prior = recs15[idx - len(prior_e50):idx]
+
+    c_open = float(candle.get("open", candle["close"]))
+    c_high = float(candle["high"])
+    c_low = float(candle["low"])
+    c_close = float(candle["close"])
+    c_rng = c_high - c_low
+    p_high = float(prev["high"])
+    p_low = float(prev["low"])
+    p_close = float(prev["close"])
+
+    if allow_bear and bias == "BEARISH" and e50 < e200:
+        below_cnt = sum(1 for r, em in zip(prior, prior_e50) if float(r["close"]) < float(em))
+        above_e200_cnt = sum(1 for r, em2 in zip(prior, prior_e200) if float(r["close"]) > float(em2))
+        if below_cnt >= 3 and above_e200_cnt <= 1:
+            reach_high = max(c_high, p_high)
+            if reach_high >= e50 * 0.9995 and reach_high <= e200 * 1.004:
+                u_wick = c_high - max(c_open, c_close)
+                bear_rej = (
+                    c_close < e50
+                    and c_close < c_open
+                    and ((c_close < p_close) or (c_rng > 0 and (u_wick / c_rng) >= 0.35))
+                )
+                if bear_rej and rl < c_close * 0.992:
+                    stop_px = max(e200, reach_high) * 1.0025
+                    if ((stop_px - c_close) / c_close) * 100.0 < 0.30:
+                        stop_px = c_close * 1.004
+                    rew_dist = c_close - rl
+                    tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
+                    if tp1_dist >= c_close * 0.006:
+                        tp1_px = c_close - tp1_dist
+                        tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                        tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                        return {
+                            "direction": "SHORT",
+                            "entry": c_close,
+                            "entry2_sweep": 0.0,
+                            "stop": stop_px,
+                            "tp1": tp1_px,
+                            "tp2": rl,
+                            "tp1_label": f"50% Book Mid(Entry,RL) ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
+                            "tp2_label": f"50% Runner @ RL (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
+                            "reason": "Bear 15m 50<200 EMA Pullback Rejection -> RL",
+                            "trigger_zone": "15m 50/200 EMA CEILING",
+                            "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
+                            "ema50_15m": e50,
+                            "ema200_15m": e200,
+                        }
+
+    if allow_bull and bias == "BULLISH" and e50 > e200:
+        above_cnt = sum(1 for r, em in zip(prior, prior_e50) if float(r["close"]) > float(em))
+        below_e200_cnt = sum(1 for r, em2 in zip(prior, prior_e200) if float(r["close"]) < float(em2))
+        if above_cnt >= 3 and below_e200_cnt <= 1:
+            reach_low = min(c_low, p_low)
+            if reach_low <= e50 * 1.0005 and reach_low >= e200 * 0.996:
+                l_wick = min(c_open, c_close) - c_low
+                bull_rej = (
+                    c_close > e50
+                    and c_close > c_open
+                    and ((c_close > p_close) or (c_rng > 0 and (l_wick / c_rng) >= 0.35))
+                )
+                if bull_rej and rh > c_close * 1.008:
+                    stop_px = min(e200, reach_low) * 0.9975
+                    if ((c_close - stop_px) / c_close) * 100.0 < 0.30:
+                        stop_px = c_close * 0.996
+                    rew_dist = rh - c_close
+                    tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
+                    if tp1_dist >= c_close * 0.006:
+                        tp1_px = c_close + tp1_dist
+                        tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                        tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                        return {
+                            "direction": "LONG",
+                            "entry": c_close,
+                            "entry2_sweep": 0.0,
+                            "stop": stop_px,
+                            "tp1": tp1_px,
+                            "tp2": rh,
+                            "tp1_label": f"50% Book Mid(Entry,RH) ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
+                            "tp2_label": f"50% Runner @ RH (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
+                            "reason": "Bull 15m 50>200 EMA Pullback Bounce -> RH",
+                            "trigger_zone": "15m 50/200 EMA FLOOR",
+                            "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
+                            "ema50_15m": e50,
+                            "ema200_15m": e200,
+                        }
+
+    return None
+
+
+class Ema50200PullbackStrategy(Strategy):
+    id = "ema50_200"
+    name = "15m 50/200 EMA Pullback"
+    short = "15m 50/200 EMA"
+    timeframe = "15m 50/200 EMA Pullback Rejection -> RL/RH (Single Entry)"
+    description = (
+        "Trending-market pullback continuation strategy: in Bearish Daily Bias (15m 50 < 200 EMA), shorts a "
+        "pullback up into the 50/200 EMA ceiling that rejects back below 50 EMA with SL above 15m 200 EMA and "
+        "TP2 at Range Low (RL). Mirror Long replica in Bullish Daily Bias (15m 50 > 200 EMA) targeting RH."
+    )
+    daily_warmup_days = 1000
+    tp1_name, tp2_name = "TP1 (50% Book Mid)", "TP2 (50% Runner @ RL/RH)"
+    uses_live_price = True
+
+    def __init__(self, allow_bear: bool = True, allow_bull: bool = True):
+        self.allow_bear = allow_bear
+        self.allow_bull = allow_bull
+
+    def compute_levels(self, pair):
+        lv = eng.calculate_daily_box_levels(pair)
+        if not lv:
+            return None
+        df15 = _closed_15m(pair, 30)
+        if df15 is not None and not df15.empty:
+            e50 = float(df15["EMA50"].iloc[-1])
+            e200 = float(df15["EMA200"].iloc[-1])
+            ref_px = float(lv.get("RH") or lv.get("daily_close") or e50)
+            lv["EMA50_15m"] = eng.round_asset_price(e50, ref_px)
+            lv["EMA200_15m"] = eng.round_asset_price(e200, ref_px)
+            lv["ema_15m_trend"] = "BEAR (50 < 200)" if e50 < e200 else ("BULL (50 > 200)" if e50 > e200 else "FLAT")
+        return lv
+
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+        levels = levels or self.compute_levels(pair)
+        if not levels:
+            return None
+        df15 = _closed_15m(pair, 40)
+        if df15.empty or len(df15) < 8:
+            return None
+
+        recs15 = df15.to_dict("records")
+        idx = len(recs15) - 1
+        cur = recs15[idx]
+        e50 = float(cur["EMA50"])
+        e200 = float(cur["EMA200"])
+        ref_px = float(cur["close"])
+        levels["EMA50_15m"] = eng.round_asset_price(e50, ref_px)
+        levels["EMA200_15m"] = eng.round_asset_price(e200, ref_px)
+        levels["ema_15m_trend"] = "BEAR (50 < 200)" if e50 < e200 else ("BULL (50 > 200)" if e50 > e200 else "FLAT")
+
+        session = eng.get_current_session_info(datetime.now(IST))
+        candle_time = datetime.fromtimestamp(cur["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
+        out = {
+            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+            "candle_evaluated": f"15m ({candle_time}) [{session['emoji']} {session['name']}]",
+            "session": session, "session_name": f"{session['emoji']} {session['name']}",
+            "is_prime_session": session["is_prime"], "is_us_open_candle": session["session_id"] == "NEW_YORK",
+            "pair": pair, "levels": levels, "candle_ts": int(cur["timestamp"]),
+            "signal": "NEUTRAL", "signal_kind": None, "trigger_zone": None, "trigger_reason": "",
+            "setup": (
+                f"WAIT / NO TRADE (Bias: {levels.get('trend_bias', 'RANGE')} • "
+                f"15m 50/200 EMA: {eng.round_asset_price(e50, ref_px)} / {eng.round_asset_price(e200, ref_px)})"
+            ),
+            "entry": ref_px, "entry2_sweep": 0.0, "stop_loss": 0.0, "tp1": 0.0, "tp2": 0.0,
+        }
+        out.update(position_metrics(pair, out["entry"], 0.0, out["entry"], out["entry"], margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+
+        prior = recs15[idx - 6:idx]
+        prior_e50 = [float(r["EMA50"]) for r in prior]
+        prior_e200 = [float(r["EMA200"]) for r in prior]
+        sig = _detect_ema50_200_setup(
+            recs15, idx, levels, e50, e200, prior_e50, prior_e200,
+            allow_bear=self.allow_bear, allow_bull=self.allow_bull,
+        )
+        if sig:
+            e_px = eng.round_asset_price(sig["entry"], ref_px)
+            sl_px = eng.round_asset_price(sig["stop"], ref_px)
+            tp1_px = eng.round_asset_price(sig["tp1"], ref_px)
+            tp2_px = eng.round_asset_price(sig["tp2"], ref_px)
+            out.update({
+                "signal": sig["direction"],
+                "signal_kind": "EMA50_200",
+                "trigger_zone": sig["trigger_zone"],
+                "trigger_reason": sig["reason"],
+                "setup": f"{sig['direction']} 15m 50/200 EMA -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}",
+                "entry": e_px,
+                "entry2_sweep": 0.0,
+                "stop_loss": sl_px,
+                "tp1": tp1_px,
+                "tp2": tp2_px,
+                "tp1_label": sig["tp1_label"],
+                "tp2_label": sig["tp2_label"],
+            })
+            out.update(position_metrics(pair, e_px, sl_px, tp1_px, tp2_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+        return self._stamp(out)
+
+    def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
+        if not levels:
+            return {"BUY": None, "SELL": None, "note": ""}
+        e50 = float(levels.get("EMA50_15m") or 0.0)
+        e200 = float(levels.get("EMA200_15m") or 0.0)
+        if e50 <= 0 or e200 <= 0:
+            df15 = _closed_15m(pair, 10)
+            if not df15.empty:
+                e50 = float(df15["EMA50"].iloc[-1])
+                e200 = float(df15["EMA200"].iloc[-1])
+        px = float(live_price or e50 or levels["MID"])
+        if e50 <= 0:
+            e50 = px
+        if e200 <= 0:
+            e200 = e50 * (1.012 if e50 < px else 0.988)
+
+        rh, rl = float(levels["RH"]), float(levels["RL"])
+
+        # SELL Limit Plan: entry near min(e50, live) / e50 ceiling, SL > e200, TP2 = RL
+        s_ent = eng.round_asset_price(e50, px)
+        s_sl = eng.round_asset_price(max(e200 * 1.0025, s_ent * 1.004), px)
+        s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
+        s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
+        s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
+        sell_setup = {
+            "direction": "SELL", "setup": "SHORT at 15m 50 EMA -> RL",
+            "entry": s_ent, "entry2_sweep": 0.0, "stop_loss": s_sl, "tp1": s_tp1, "tp2": s_tp2,
+            **position_metrics(pair, s_ent, s_sl, s_tp1, s_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
+        }
+
+        # BUY Limit Plan: entry near 15m 50 EMA floor, SL < 15m 200 EMA, TP2 = RH
+        b_ent = eng.round_asset_price(e50, px)
+        b_sl = eng.round_asset_price(min(e200 * 0.9975, b_ent * 0.996), px)
+        b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
+        b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
+        b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
+        buy_setup = {
+            "direction": "BUY", "setup": "LONG at 15m 50 EMA -> RH",
+            "entry": b_ent, "entry2_sweep": 0.0, "stop_loss": b_sl, "tp1": b_tp1, "tp2": b_tp2,
+            **position_metrics(pair, b_ent, b_sl, b_tp1, b_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
+        }
+
+        note = (
+            f"15m 50/200 EMA: ${eng.round_asset_price(e50, px)} / ${eng.round_asset_price(e200, px)} "
+            f"({levels.get('ema_15m_trend', '')}) | RL=${eng.round_asset_price(rl, px)}, RH=${eng.round_asset_price(rh, px)}"
+        )
+        return {"BUY": self._stamp(buy_setup), "SELL": self._stamp(sell_setup), "note": note}
+
+    def chart_lines(self, levels, plan=None):
+        lines = list(BoxTheorySweep().chart_lines(levels, plan)) if levels else []
+        if levels and levels.get("EMA50_15m"):
+            lines.append({"label": "15m 50 EMA (Pullback Zone)", "price": levels["EMA50_15m"], "color": "#a855f7", "dash": "solid"})
+        if levels and levels.get("EMA200_15m"):
+            lines.append({"label": "15m 200 EMA (SL Anchor)", "price": levels["EMA200_15m"], "color": "#eab308", "dash": "dot"})
+        return lines
+
+    def metric_badges(self, levels):
+        if not levels:
+            return []
+        badges = []
+        if levels.get("EMA50_15m"):
+            badges.append({"label": "15m 50 EMA", "value": levels["EMA50_15m"]})
+        if levels.get("EMA200_15m"):
+            badges.append({"label": "15m 200 EMA", "value": levels["EMA200_15m"]})
+        if levels.get("RL"):
+            badges.append({"label": "RL Target (Short)", "value": levels["RL"]})
+        if levels.get("RH"):
+            badges.append({"label": "RH Target (Long)", "value": levels["RH"]})
+        return badges
+
+    def level_rows(self, levels, live_price):
+        if not levels:
+            return []
+        rows = []
+        for k, lbl in (("EMA200_15m", "15m 200 EMA (SL Wall)"), ("EMA50_15m", "15m 50 EMA (Pullback)"), ("RH", "Range High (Long TP2)"), ("RL", "Range Low (Short TP2)")):
+            val = float(levels.get(k, 0.0) or 0.0)
+            if val > 0:
+                rows.append({"Level": lbl, "Price": val, "Distance %": round(((val - live_price) / live_price) * 100.0, 2) if live_price > 0 else 0.0})
+        return rows
+
+    def prepare_backtest(self, df, df_daily):
+        box_ctx = BoxTheorySweep().prepare_backtest(df, df_daily)
+        e50, e200 = _compute_warmed_15m_emas(df)
+        return {"boxes": box_ctx["boxes"], "ema50_15m": e50, "ema200_15m": e200}
+
+    def backtest_has_context(self, candle, ctx):
+        return bool(ctx["boxes"].get(candle["date_str"]))
+
+    def backtest_entry(self, idx, candle, ctx, records):
+        if idx < 6:
+            return None
+        box = ctx["boxes"].get(candle["date_str"])
+        if not box:
+            return None
+        e50 = float(ctx["ema50_15m"][idx])
+        e200 = float(ctx["ema200_15m"][idx])
+        prior_e50 = ctx["ema50_15m"][idx - 6:idx]
+        prior_e200 = ctx["ema200_15m"][idx - 6:idx]
+        return _detect_ema50_200_setup(
+            records, idx, box, e50, e200, prior_e50, prior_e200,
+            allow_bear=self.allow_bear, allow_bull=self.allow_bull,
+        )
+
+
+# ----------------------------------------------------------------------------------------------
+# Combo Strategy (Priority 1: Box Theory Sweep -> Priority 2: 15m 50/200 EMA Pullback)
+# ----------------------------------------------------------------------------------------------
+class BoxPlusEma50200Strategy(Strategy):
+    daily_warmup_days = 1000
+    tp1_name, tp2_name = "TP1 (50% Book)", "TP2 (50% Structural Runner)"
+    uses_live_price = True
+
+    def __init__(self, sid: str, name: str, short_lbl: str, allow_bull_ema: bool = False):
+        self.id = sid
+        self.name = name
+        self.short = short_lbl
+        self.allow_bull_ema = allow_bull_ema
+        self.timeframe = (
+            "15m Box Sweep (Long & Short) + Bear 15m 50/200 EMA Pullback"
+            if not allow_bull_ema
+            else "15m Box Sweep (Long & Short) + Bull & Bear 15m 50/200 EMA Pullback"
+        )
+        self.description = (
+            "Priority 1 runs Strategy 1 (15m Box Theory Sweep Long & Short). When price trends away from Box "
+            f"edges, Priority 2 runs 15m 50/200 EMA Pullback ({'Bear Short only' if not allow_bull_ema else 'Bull & Bear'})."
+        )
+        self.s1 = BoxTheorySweep()
+        self.s4 = Ema50200PullbackStrategy(allow_bear=True, allow_bull=allow_bull_ema)
+
+    def compute_levels(self, pair):
+        return self.s4.compute_levels(pair)
+
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+        levels = levels or self.compute_levels(pair)
+        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
+            return sig1
+        sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+        if sig4 and sig4.get("signal") in ("LONG", "SHORT"):
+            return sig4
+        return sig1
+
+    def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
+        return self.s1.plan_setups(pair, levels, live_price, margin_inr, leverage, usd_inr)
+
+    def chart_lines(self, levels, plan=None):
+        return self.s4.chart_lines(levels, plan)
+
+    def metric_badges(self, levels):
+        return self.s1.metric_badges(levels) + self.s4.metric_badges(levels)
+
+    def level_rows(self, levels, live_price):
+        return self.s1.level_rows(levels, live_price)
+
+    def prepare_backtest(self, df, df_daily):
+        ctx1 = self.s1.prepare_backtest(df, df_daily)
+        return {
+            "ctx1": ctx1,
+            "ctx4": self.s4.prepare_backtest(df, df_daily),
+            "boxes": ctx1["boxes"],
+        }
+
+    def backtest_has_context(self, candle, ctx):
+        return self.s1.backtest_has_context(candle, ctx["ctx1"])
+
+    def backtest_entry(self, idx, candle, ctx, records):
+        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+        if e1:
+            return e1
+        return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
+
+
+AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
+    ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA (Recommended)"),
+    ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
+    ("box_theory", "Box Theory Sweep Only (v27)"),
+    ("ema50_200", "15m 50/200 EMA Pullback Only"),
+]
+DEFAULT_AUTOTRADE_MODE = "box_plus_ema50_200_bear"
+
+
+def resolve_autotrade_mode(mode: str | None) -> str:
+    valid = {k for k, _ in AUTOTRADE_MODE_CHOICES}
+    m = str(mode or "").strip()
+    return m if m in valid else DEFAULT_AUTOTRADE_MODE
+
+
+def autotrade_mode_label(mode: str | None) -> str:
+    m = resolve_autotrade_mode(mode)
+    return dict(AUTOTRADE_MODE_CHOICES).get(m, m)
+
+
+def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
+    """Ordered component strategies for live scanning under a given AutoTrade/Backtest mode."""
+    m = resolve_autotrade_mode(mode)
+    if m == "box_theory":
+        return ["box_theory"]
+    if m == "ema50_200":
+        return ["ema50_200"]
+    return ["box_theory", "ema50_200"]
+
+
+# ----------------------------------------------------------------------------------------------
 # Registry
 # ----------------------------------------------------------------------------------------------
 STRATEGY_REGISTRY: dict[str, Strategy] = {
     BoxTheorySweep.id: BoxTheorySweep(),
     AtrReversal.id: AtrReversal(),
     Ema9RetestStrategy.id: Ema9RetestStrategy(),
+    Ema50200PullbackStrategy.id: Ema50200PullbackStrategy(allow_bear=True, allow_bull=True),
+    "box_plus_ema50_200_bear": BoxPlusEma50200Strategy(
+        sid="box_plus_ema50_200_bear",
+        name="Combo: Box (L+S) + Bear 15m 50/200 EMA",
+        short_lbl="Combo (Box + Bear EMA)",
+        allow_bull_ema=False,
+    ),
+    "box_plus_ema50_200_both": BoxPlusEma50200Strategy(
+        sid="box_plus_ema50_200_both",
+        name="Combo: Box + Bull & Bear 15m 50/200 EMA",
+        short_lbl="Combo (Box + Bull&Bear EMA)",
+        allow_bull_ema=True,
+    ),
     CombinedPriorityStrategy.id: CombinedPriorityStrategy(include_strategy3_entry=True),
 }
 DEFAULT_STRATEGY_ID = BoxTheorySweep.id
@@ -1850,6 +2302,7 @@ def get_strategy(strategy_id: str | None) -> Strategy:
 def list_strategies() -> list[Strategy]:
     return [
         STRATEGY_REGISTRY[BoxTheorySweep.id],
+        STRATEGY_REGISTRY[Ema50200PullbackStrategy.id],
         STRATEGY_REGISTRY[AtrReversal.id],
         STRATEGY_REGISTRY[Ema9RetestStrategy.id],
     ]

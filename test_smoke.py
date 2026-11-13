@@ -1083,6 +1083,108 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
     print("  -> PASS: Strategy 3 (4 improvements), Box Broken-Level Guard, Setup 0 Removal, Staging Paper AutoTrade, and Maker Limit Order Lifecycle verified.")
 
 
+def test_11_ema50_200_pullback_and_combo_modes():
+    print("[11/11] Verifying 15m 50/200 EMA Pullback Strategy, Combo Modes & Guardrails across all layers...")
+    import tempfile
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+
+    # 1. Registry & mode resolver checks
+    assert "ema50_200" in strat.STRATEGY_REGISTRY
+    assert "box_plus_ema50_200_bear" in strat.STRATEGY_REGISTRY
+    assert "box_plus_ema50_200_both" in strat.STRATEGY_REGISTRY
+    assert any(s.id == "ema50_200" for s in strat.list_strategies())
+    assert strat.resolve_autotrade_mode(None) == "box_plus_ema50_200_bear"
+    assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_bear") == ["box_theory", "ema50_200"]
+
+    # 2. Bearish Daily Bias -> SHORT @ 15m 50/200 EMA Pullback with SL > 15m 200 EMA -> TP2 = RL
+    bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
+    recs_bear = [
+        {"open": 7.04, "high": 7.06, "low": 7.01, "close": 7.03},
+        {"open": 7.03, "high": 7.05, "low": 7.02, "close": 7.04},
+        {"open": 7.04, "high": 7.07, "low": 7.03, "close": 7.05},
+        {"open": 7.05, "high": 7.08, "low": 7.04, "close": 7.06},
+        {"open": 7.06, "high": 7.10, "low": 7.05, "close": 7.08},
+        {"open": 7.08, "high": 7.16, "low": 7.07, "close": 7.13},  # touches near 50/200 ceiling
+        {"open": 7.13, "high": 7.17, "low": 7.07, "close": 7.09},  # bearish rejection close < 50 EMA (7.12)
+    ]
+    prior_e50 = [7.12] * 6
+    prior_e200 = [7.18] * 6
+    sig_bear = strat._detect_ema50_200_setup(
+        recs_bear, 6, bear_box, ema50_val=7.12, ema200_val=7.18, prior_e50=prior_e50, prior_e200=prior_e200,
+        allow_bear=True, allow_bull=False,
+    )
+    assert sig_bear is not None and sig_bear["direction"] == "SHORT"
+    assert sig_bear["stop"] > 7.18, f"Expected SL strictly above 15m 200 EMA ($7.18), got {sig_bear['stop']}"
+    assert abs(sig_bear["tp2"] - 6.80) < 1e-6, f"Expected TP2 == RL ($6.80), got {sig_bear['tp2']}"
+
+    # 3. Bullish Daily Bias -> LONG replica with SL < 15m 200 EMA -> TP2 = RH (respects allow_bull)
+    bull_box = {"trend_bias": "BULLISH", "RH": 7.60, "RL": 6.90, "MID": 7.25, "SH": 7.68, "SL": 6.82}
+    recs_bull = [
+        {"open": 7.28, "high": 7.30, "low": 7.25, "close": 7.29},
+        {"open": 7.29, "high": 7.31, "low": 7.26, "close": 7.28},
+        {"open": 7.28, "high": 7.30, "low": 7.24, "close": 7.26},
+        {"open": 7.26, "high": 7.28, "low": 7.23, "close": 7.25},
+        {"open": 7.25, "high": 7.26, "low": 7.21, "close": 7.24},
+        {"open": 7.24, "high": 7.25, "low": 7.16, "close": 7.19},  # touches floor
+        {"open": 7.19, "high": 7.26, "low": 7.15, "close": 7.24},  # bullish rejection close > 50 EMA (7.20)
+    ]
+    assert strat._detect_ema50_200_setup(
+        recs_bull, 6, bull_box, ema50_val=7.20, ema200_val=7.14, prior_e50=[7.20] * 6, prior_e200=[7.14] * 6,
+        allow_bear=True, allow_bull=False,
+    ) is None, "Expected Bear-Only EMA mode to skip Bullish EMA Longs"
+    sig_bull = strat._detect_ema50_200_setup(
+        recs_bull, 6, bull_box, ema50_val=7.20, ema200_val=7.14, prior_e50=[7.20] * 6, prior_e200=[7.14] * 6,
+        allow_bear=True, allow_bull=True,
+    )
+    assert sig_bull is not None and sig_bull["direction"] == "LONG"
+    assert sig_bull["stop"] < 7.14, f"Expected SL strictly below 15m 200 EMA ($7.14), got {sig_bull['stop']}"
+    assert abs(sig_bull["tp2"] - 7.60) < 1e-6, f"Expected TP2 == RH ($7.60), got {sig_bull['tp2']}"
+
+    # 4. Tight 15m 200 EMA SL is preserved when levels=None (not inflated by Box SH/SL anchor)
+    tight_norm = eng.normalize_two_entry_runner_levels(
+        pair="B-INJ_USDT", direction="SHORT", entry1_px=7.090, entry2_px=None,
+        tp1_px=6.950, tp2_px=6.800, sl_px=7.129, live_px=7.090, levels=None,
+    )
+    assert abs(tight_norm["stop_loss"] - 7.129) < 1e-4, f"Expected tight 15m 200 EMA SL preserved, got {tight_norm}"
+
+    # 5. signal_monitor & execute_autotrade_two_entry_signal mode guards
+    assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_bear") is True
+    assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_bear") is True
+    assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_bear") is False
+    assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_both") is True
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "is_staging_environment", return_value=True), \
+             patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
+             patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+             patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.090}), \
+             patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng.save_autotrade_config({"autotrade_strategy_mode": "box_plus_ema50_200_bear"})
+            with patch.object(eng, "compute_market_bias", return_value={"bias": "BULLISH"}):
+                ok_blk, msg_blk, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "LONG", "strategy_id": "ema50_200", "entry": 7.24, "tp1": 7.38, "tp2": 7.60, "stop_loss": 7.12, "levels": bull_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert not ok_blk and "Bear-Only 15m 50/200 EMA" in msg_blk, f"Expected Bear-Only mode block on EMA LONG, got: {ok_blk} {msg_blk}"
+            with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
+                ok_ema_s, msg_ema_s, meta_ema_s = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "ema50_200", "entry": 7.090, "tp1": 6.950, "tp2": 6.800, "stop_loss": 7.185, "levels": bear_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert ok_ema_s, f"Expected Bearish EMA50/200 SHORT allowed in Combo Bear mode, got: {ok_ema_s} {msg_ema_s}"
+                assert abs(meta_ema_s["lock"]["stop_loss"] - 7.185) < 1e-4, f"Expected EMA SL preserved in lock: {meta_ema_s['lock']}"
+
+    print("  -> PASS: 15m 50/200 EMA Pullback, Bear/Both Combo Modes & Tight 200 EMA SL preservation verified.")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1094,6 +1196,7 @@ if __name__ == "__main__":
     test_8_stale_cache_expiry_and_nat_pinner()
     test_9_ai_advisor_and_tick_precision()
     test_10_strategy3_four_improvements_and_staging_paper_autotrade()
+    test_11_ema50_200_pullback_and_combo_modes()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

@@ -32,8 +32,10 @@ Your role:
 3. Provide actionable, institutional-grade recommendations tailored to our 3-Slot 100% Single-Slot Maker Limit + 50/50 Structural Runner architecture:
    - **3-Slot Portfolio Guard**: Up to 3 concurrent trades across the portfolio (max 1 per coin), each allocated 1/3rd of the Futures Wallet as a 100% Single-Slot Maker Limit Order (`Entry 2` removed).
    - **100% Maker Limit + Structural Runner Lifecycle**:
-     - `Entry` (100% slot margin) enters via Maker Limit Order on the confirmed 15m signal (`RL`/`SL` sweep & reclaim for Longs in `BULLISH` daily bias; `RH`/`SH` sweep & reject for Shorts in `BEARISH` daily bias, with Broken-Box Invalidation Guard active).
-     - `Catastrophe SL` sits `0.5%` beyond `SL` (for Longs) or `SH` (for Shorts).
+     - **Priority 1 — Box Theory Sweep (`box_theory`)**: `Entry` (100% slot margin) enters via Maker Limit Order on the confirmed 15m signal (`RL`/`SL` sweep & reclaim for Longs in `BULLISH` daily bias; `RH`/`SH` sweep & reject for Shorts in `BEARISH` daily bias, with Broken-Box Invalidation Guard active). `Catastrophe SL` sits `0.5%` beyond `SL` (Longs) or `SH` (Shorts).
+     - **Priority 2 — 15m 50/200 EMA Pullback (`ema50_200`)**: In strong trends when price does not pull all the way back to outer Box zones:
+       * **Bearish Daily Bias (`15m 50 EMA < 200 EMA`) -> `SHORT`**: Short pullback rejections at `15m 50/200 EMA` ceiling, `SL` above `15m 200 EMA`, `TP1 = 50% Mid(Entry, RL)` (capped 2%), `TP2 = RL`.
+       * **Bullish Daily Bias (`15m 50 EMA > 200 EMA`) -> `LONG`**: Long pullback bounces off `15m 50/200 EMA` floor (enabled in `Combo: Box + Bull & Bear 15m 50/200 EMA` or `15m 50/200 EMA Only`), `SL` below `15m 200 EMA`, `TP2 = RH`.
      - When price reaches `TP1`: book `50%` of the position at `TP1` and lock Stop Loss in profit (`Entry +/- 50% of TP1 distance` or prev 15m candle structure). Halfway from `TP1` to `TP2`, ratchet SL to `TP1` and let the remaining `50%` structural runner ride cleanly to `TP2` (`RH` for Longs, `RL` for Shorts).
 4. Format all responses clearly with concise bullet points, exact exchange tick-size price levels (`$...`), INR risk/reward figures (`Rs....`), and a clear verdict (`LONG`, `SHORT`, `WAIT / NO TRADE`, or `HOLD / ADJUST SL`).
 """
@@ -185,14 +187,19 @@ def _compute_exact_pair_structure(pair: str) -> dict:
                 "today_low": float(cur_d["low"]),
             })
 
-        df_15 = eng.fetch_coindcx_candles(pair, "15m", limit=60)
+        df_15 = eng.fetch_coindcx_candles(pair, "15m", limit=650, sync_live_price=False)
         if not df_15.empty and len(df_15) >= 20:
-            out["ema20_15m"] = float(df_15["close"].ewm(span=20, adjust=False).mean().iloc[-1])
-            out["ema50_15m"] = float(df_15["close"].ewm(span=50, adjust=False).mean().iloc[-1])
-            out["prev15_high"] = float(df_15["high"].iloc[-2])
-            out["prev15_low"] = float(df_15["low"].iloc[-2])
-            out["prev15_close"] = float(df_15["close"].iloc[-2])
-            delta = df_15["close"].diff()
+            now_ms_15 = int(datetime.now(IST).timestamp() * 1000)
+            c15 = df_15[df_15["timestamp"] + 900000 <= now_ms_15]
+            if c15.empty or len(c15) < 20:
+                c15 = df_15
+            out["ema20_15m"] = float(c15["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+            out["ema50_15m"] = float(c15["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+            out["ema200_15m"] = float(c15["close"].ewm(span=200, adjust=False).mean().iloc[-1])
+            out["prev15_high"] = float(c15["high"].iloc[-2])
+            out["prev15_low"] = float(c15["low"].iloc[-2])
+            out["prev15_close"] = float(c15["close"].iloc[-2])
+            delta = c15["close"].diff()
             gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
             loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
             rs = gain / loss.replace(0, 1e-9)
@@ -210,9 +217,14 @@ def build_live_market_context(selected_pair: str = "B-SOL_USDT") -> str:
     ]
     try:
         import coindcx_engine
+        import strategies as strat_reg
 
+        auto_cfg = coindcx_engine.get_autotrade_config()
+        auto_mode_id = strat_reg.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
+        auto_mode_lbl = strat_reg.autotrade_mode_label(auto_mode_id)
         bal = coindcx_engine.fetch_coindcx_futures_balance()
         slot = coindcx_engine.get_active_portfolio_trade_status()
+        lines.append(f"- **Active AutoTrade / Strategy Mode**: `{auto_mode_lbl}` (`{auto_mode_id}`)")
         lines.append(
             f"- **Wallet Balance**: `Rs.{float(bal.get('total_inr', 0.0)):,.2f}` "
             f"(Available: `Rs.{float(bal.get('available_inr', 0.0)):,.2f}`, Live API: `{bal.get('is_live_api')}`)"
@@ -245,7 +257,8 @@ def build_live_market_context(selected_pair: str = "B-SOL_USDT") -> str:
                 f"  * Daily `50/200 EMA` Trend Bias: **`{st_data['daily_bias']}`** (`EMA50={_fmt_tick(selected_pair, st_data['ema50_d'])}`, `EMA200={_fmt_tick(selected_pair, st_data['ema200_d'])}`)\n"
                 f"  * Sweep High (`SH`): `{_fmt_tick(selected_pair, st_data['SH'])}` | Range High (`RH`): `{_fmt_tick(selected_pair, st_data['RH'])}`\n"
                 f"  * Box Midpoint (`MID` / TP1): `{_fmt_tick(selected_pair, st_data['MID'])}`\n"
-                f"  * Range Low (`RL`): `{_fmt_tick(selected_pair, st_data['RL'])}` | Sweep Low (`SL`): `{_fmt_tick(selected_pair, st_data['SL'])}`"
+                f"  * Range Low (`RL`): `{_fmt_tick(selected_pair, st_data['RL'])}` | Sweep Low (`SL`): `{_fmt_tick(selected_pair, st_data['SL'])}`\n"
+                f"  * `15m 50/200 EMA` Dynamic Zone: `EMA50={_fmt_tick(selected_pair, st_data.get('ema50_15m', st_data['live_price']))}` | `EMA200={_fmt_tick(selected_pair, st_data.get('ema200_15m', st_data['live_price']))}`"
             )
     except Exception as e:
         lines.append(f"- [Market Context Notice]: {e}")
@@ -290,12 +303,16 @@ def _generate_live_quant_advisor_response(user_prompt: str, selected_pair: str =
     sl = st_info.get("SL", px * 0.90)
     ema20_15 = st_info.get("ema20_15m", px)
     ema50_15 = st_info.get("ema50_15m", px)
+    ema200_15 = st_info.get("ema200_15m", ema50_15)
     prev15_h = st_info.get("prev15_high", px)
     prev15_l = st_info.get("prev15_low", px)
     rsi_15 = st_info.get("rsi_15m", 50.0)
     today_h = st_info.get("today_high", st_info.get("high_24h", px))
     today_o = st_info.get("today_open", rh)
     bias = st_info.get("daily_bias", "BULLISH")
+    import strategies as strat_reg
+    auto_mode_id = strat_reg.resolve_autotrade_mode(eng.get_autotrade_config().get("autotrade_strategy_mode"))
+    auto_mode_lbl = strat_reg.autotrade_mode_label(auto_mode_id)
 
     # Match active position for target_pair if any
     active_pos = None
@@ -349,7 +366,7 @@ def _generate_live_quant_advisor_response(user_prompt: str, selected_pair: str =
             f"  * **Sweep High (`SH`)**: **`{_fmt_tick(target_pair, sh)}`** | **Range High (`RH` — Yesterday's High)**: **`{_fmt_tick(target_pair, rh)}`**\n"
             f"  * **Equilibrium Midpoint (`MID` / Box TP1)**: **`{_fmt_tick(target_pair, mid)}`**\n"
             f"  * **Range Low (`RL`)**: `{_fmt_tick(target_pair, rl)}` | **Sweep Low (`SL`)**: `{_fmt_tick(target_pair, sl)}`\n"
-            f"  * **15m Dynamic Levels**: `15m 20-EMA = {_fmt_tick(target_pair, ema20_15)}` | `15m 50-EMA = {_fmt_tick(target_pair, ema50_15)}` | "
+            f"  * **15m Dynamic Levels**: `15m 20-EMA = {_fmt_tick(target_pair, ema20_15)}` | `15m 50-EMA = {_fmt_tick(target_pair, ema50_15)}` | `15m 200-EMA = {_fmt_tick(target_pair, ema200_15)}` | "
             f"`Prev 15m H/L = {_fmt_tick(target_pair, prev15_h)} / {_fmt_tick(target_pair, prev15_l)}` | `15m RSI = {rsi_15:.1f}`\n"
             f"  * **Daily `50/200 EMA` Bias**: **`{bias}`** (`EMA50 = {_fmt_tick(target_pair, st_info.get('ema50_d', 0.0))}`, `EMA200 = {_fmt_tick(target_pair, st_info.get('ema200_d', 0.0))}`)"
         )
@@ -385,22 +402,28 @@ def _generate_live_quant_advisor_response(user_prompt: str, selected_pair: str =
             )
     else:
         # No active position — provide setup recommendation for target_pair
+        ema_regime_15m = "50 < 200 EMA (Bearish Pullback Resistance)" if ema50_15 < ema200_15 else "50 > 200 EMA (Bullish Pullback Support)"
+        ema_bear_sl = max(ema200_15, ema50_15) * 1.0025
+        ema_bull_sl = min(ema200_15, ema50_15) * 0.9975
         sections.append(
             f"### 🎯 Live Setup Analysis for `{target_pair}` (`{_fmt_tick(target_pair, px)}`)\n"
+            f"- **Active AutoTrade Mode**: `{auto_mode_lbl}`\n"
             f"- **Daily `50/200 EMA` Bias**: **`{bias}`** (`EMA50 = {_fmt_tick(target_pair, st_info.get('ema50_d', 0.0))}`, `EMA200 = {_fmt_tick(target_pair, st_info.get('ema200_d', 0.0))}`)\n"
             f"- **Exact Daily Box Levels**:\n"
             f"  * `SH`: **`{_fmt_tick(target_pair, sh)}`** | `RH`: **`{_fmt_tick(target_pair, rh)}`**\n"
             f"  * `MID (TP1)`: **`{_fmt_tick(target_pair, mid)}`**\n"
             f"  * `RL`: **`{_fmt_tick(target_pair, rl)}`** | `SL`: **`{_fmt_tick(target_pair, sl)}`**\n"
-            f"- **15m Indicators**: `20-EMA = {_fmt_tick(target_pair, ema20_15)}` | `50-EMA = {_fmt_tick(target_pair, ema50_15)}` | `RSI(14) = {rsi_15:.1f}`\n"
+            f"- **15m 50/200 EMA Trend Levels**: `20-EMA = {_fmt_tick(target_pair, ema20_15)}` | `50-EMA = {_fmt_tick(target_pair, ema50_15)}` | `200-EMA = {_fmt_tick(target_pair, ema200_15)}` (`{ema_regime_15m}`) | `RSI(14) = {rsi_15:.1f}`\n"
             f"- **Recommended Action**:\n"
             + (
-                f"  * Bias is **`BULLISH`** — only take **LONG** setups inside the `RL–SL` Buy Zone (`{_fmt_tick(target_pair, rl)}` – `{_fmt_tick(target_pair, sl)}`) with `TP1 = {_fmt_tick(target_pair, mid)}` (book 50% & lock SL at `0.5R`) and `TP2 = {_fmt_tick(target_pair, rh)}`."
+                f"  * **Priority 1 (`Box Sweep LONG`)**: Wait for a confirmed 15m sweep/reclaim in the `RL–SL` Buy Zone (`{_fmt_tick(target_pair, rl)}` – `{_fmt_tick(target_pair, sl)}`) with `TP1 = {_fmt_tick(target_pair, mid)}` and `TP2 = {_fmt_tick(target_pair, rh)}`.\n"
+                f"  * **Priority 2 (`15m 50/200 EMA Pullback`)**: `15m 50 > 200 EMA` support bounce at `{_fmt_tick(target_pair, ema50_15)}` (`SL < 15m 200 EMA` `{_fmt_tick(target_pair, ema_bull_sl)}`, `TP2 = {_fmt_tick(target_pair, rh)}`) — active when mode is `Combo: Box + Bull & Bear 15m 50/200 EMA` or `15m 50/200 EMA Pullback Only`."
                 if bias == "BULLISH"
                 else (
-                    f"  * Bias is **`BEARISH`** — only take **SHORT** setups inside the `RH–SH` Sell Zone (`{_fmt_tick(target_pair, rh)}` – `{_fmt_tick(target_pair, sh)}`) with `TP1 = {_fmt_tick(target_pair, mid)}` (book 50% & lock SL at `0.5R`) and `TP2 = {_fmt_tick(target_pair, rl)}`."
+                    f"  * **Priority 1 (`Box Sweep SHORT`)**: Wait for a confirmed 15m sweep/rejection in the `RH–SH` Sell Zone (`{_fmt_tick(target_pair, rh)}` – `{_fmt_tick(target_pair, sh)}`) with `TP1 = {_fmt_tick(target_pair, mid)}` and `TP2 = {_fmt_tick(target_pair, rl)}`.\n"
+                    f"  * **Priority 2 (`15m 50/200 EMA Pullback SHORT` — Active in Bearish Trend)**: If price pulls up into `15m 50 EMA` (`{_fmt_tick(target_pair, ema50_15)}`) below `200 EMA` (`{_fmt_tick(target_pair, ema200_15)}`) and rejects below `50 EMA`, enter **SHORT** with `SL` above `15m 200 EMA` (**`{_fmt_tick(target_pair, ema_bear_sl)}`**) and `TP2` at **`{_fmt_tick(target_pair, rl)}` (`RL`)**."
                     if bias == "BEARISH"
-                    else f"  * Bias is **`RANGE`** — trade confirmed 15m reversals at `RH–SH` (`{_fmt_tick(target_pair, rh)}` – `{_fmt_tick(target_pair, sh)}`) or `RL–SL` (`{_fmt_tick(target_pair, rl)}` – `{_fmt_tick(target_pair, sl)}`) targeting `MID = {_fmt_tick(target_pair, mid)}`."
+                    else f"  * Bias is **`RANGE`** — trade Priority 1 confirmed 15m reversals at `RH–SH` (`{_fmt_tick(target_pair, rh)}` – `{_fmt_tick(target_pair, sh)}`) or `RL–SL` (`{_fmt_tick(target_pair, rl)}` – `{_fmt_tick(target_pair, sl)}`) targeting `MID = {_fmt_tick(target_pair, mid)}` (15m 50/200 EMA pullbacks stand aside in `RANGE`)."
                 )
             )
         )

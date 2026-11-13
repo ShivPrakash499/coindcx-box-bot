@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 27
+_DAEMON_VERSION = 28
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -229,13 +229,14 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
                         else bool(auto_cfg.get("enabled", False))
                     )
                     _send_flag = bool(auto_cfg.get("email_alerts_enabled", False if _is_stg_worker else True))
+                    _auto_mode_w = strategy_registry.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
                     _safe_scan_and_alert(
                         pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
                         usd_inr=u_inr,
                         send=_send_flag,
-                        strategy_ids=[strategy_registry.DEFAULT_STRATEGY_ID],
+                        strategy_ids=strategy_registry.autotrade_mode_strategy_ids(_auto_mode_w),
                         autotrade=_auto_flag,
                     )
             except Exception as e:
@@ -769,6 +770,32 @@ else:
         key="sidebar_autotrade_toggle",
         on_change=_on_sidebar_autotrade_toggle_change,
     )
+
+_auto_mode_keys = [k for k, _ in strategy_registry.AUTOTRADE_MODE_CHOICES]
+_auto_mode_labels = dict(strategy_registry.AUTOTRADE_MODE_CHOICES)
+_saved_auto_mode = strategy_registry.resolve_autotrade_mode(_auto_cfg.get("autotrade_strategy_mode"))
+if st.session_state.get("sidebar_autotrade_strategy_mode") not in _auto_mode_keys:
+    st.session_state["sidebar_autotrade_strategy_mode"] = _saved_auto_mode
+
+def _on_sidebar_autotrade_strategy_change():
+    new_m = strategy_registry.resolve_autotrade_mode(st.session_state.get("sidebar_autotrade_strategy_mode"))
+    coindcx_engine.save_autotrade_config({"autotrade_strategy_mode": new_m})
+    new_ids = strategy_registry.autotrade_mode_strategy_ids(new_m)
+    st.session_state["monitor_strategies"] = [strategy_registry.get_strategy(sid).name for sid in new_ids]
+    get_cached_signals_scan.clear()
+    get_cached_positions.clear()
+
+selected_autotrade_mode = st.sidebar.selectbox(
+    "AutoTrade Strategy",
+    options=_auto_mode_keys,
+    format_func=lambda k: _auto_mode_labels.get(k, k),
+    key="sidebar_autotrade_strategy_mode",
+    on_change=_on_sidebar_autotrade_strategy_change,
+    help="Select what 24/7 AutoTrade & the default Scanner run: Combo (Box Sweep Priority 1 + Bear 15m 50/200 EMA Priority 2), Box + Bull & Bear EMA, Box Sweep Only, or 15m 50/200 EMA Only.",
+)
+_active_mode_strats = strategy_registry.autotrade_mode_strategy_ids(selected_autotrade_mode)
+st.sidebar.caption(f"🎯 **Mode:** `{_auto_mode_labels.get(selected_autotrade_mode, selected_autotrade_mode)}`")
+
 if (
     round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
@@ -840,8 +867,10 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
         help="Persisted across logins & restarts. Defaults to OFF on Staging so Staging never sends duplicate emails alongside Main.",
     )
     _strategy_names = [s.name for s in strategy_registry.list_strategies()]
-    _default_strat_names = [strategy_registry.get_strategy(strategy_registry.DEFAULT_STRATEGY_ID).name]
-    monitor_strategy_names = st.multiselect("Active Strategies (AutoTrade = Strategy 1 Only)", _strategy_names, default=_default_strat_names, key="monitor_strategies")
+    _default_strat_names = [strategy_registry.get_strategy(sid).name for sid in _active_mode_strats if strategy_registry.get_strategy(sid).name in _strategy_names]
+    if not _default_strat_names:
+        _default_strat_names = [strategy_registry.get_strategy(strategy_registry.DEFAULT_STRATEGY_ID).name]
+    monitor_strategy_names = st.multiselect("Scanner Strategies (Signals Tab)", _strategy_names, default=_default_strat_names, key="monitor_strategies")
     monitor_strategy_ids = [s.id for s in strategy_registry.list_strategies() if s.name in monitor_strategy_names]
     _default_watch = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
     monitor_pairs = st.multiselect(
@@ -1591,7 +1620,15 @@ if active_section == "⚡ Signals":
                 _elig_signals = [
                     r for r in active_signals
                     if r.get("pair") not in _open_set
-                    and r.get("strategy_id", strategy_registry.DEFAULT_STRATEGY_ID) == strategy_registry.DEFAULT_STRATEGY_ID
+                    and (
+                        signal_monitor._autotrade_signal_eligible(
+                            str((r.get("signal") or {}).get("strategy_id") or r.get("strategy_id") or strategy_registry.DEFAULT_STRATEGY_ID),
+                            (r.get("signal") or {}).get("signal"),
+                            selected_autotrade_mode,
+                        )
+                        if signal_monitor and hasattr(signal_monitor, "_autotrade_signal_eligible")
+                        else r.get("strategy_id", strategy_registry.DEFAULT_STRATEGY_ID) == strategy_registry.DEFAULT_STRATEGY_ID
+                    )
                 ]
                 if not _elig_signals:
                     _top_r = None
@@ -1724,10 +1761,11 @@ if active_section == "⚡ Signals":
                         unsafe_allow_html=True
                     )
                     m1, m2, m3, m4 = st.columns(4)
+                    _is_ema_sig = (str(sig.get("strategy_id") or r.get("strategy_id")) == "ema50_200")
                     m1.metric("Entry (100% Limit)", fmt_px(sig["entry"]))
                     m2.metric("TP1 (50% -> Lock SL)", fmt_px(sig["tp1"]), f"+{sig['roe_tp1']}% ROE")
-                    m3.metric("TP2 (50% Runner)", fmt_px(sig["tp2"]), f"+{sig['roe_tp2']}% ROE")
-                    m4.metric("Catastrophe SL", fmt_px(sig["stop_loss"]), f"-{sig['roe_sl']}% ROE")
+                    m3.metric("TP2 (RL/RH Runner)" if _is_ema_sig else "TP2 (50% Runner)", fmt_px(sig["tp2"]), f"+{sig['roe_tp2']}% ROE")
+                    m4.metric("SL (15m 200 EMA)" if _is_ema_sig else "Catastrophe SL", fmt_px(sig["stop_loss"]), f"-{sig['roe_sl']}% ROE")
 
                     b1, b2 = st.columns(2)
                     b1.button(
@@ -1744,7 +1782,7 @@ if active_section == "⚡ Signals":
                         use_container_width=True,
                     ):
                         ok_a, msg_a, _ = coindcx_engine.execute_autotrade_two_entry_signal(
-                            pair=pair_r, sig=sig, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
+                            pair=pair_r, sig={**sig, "manual_override": True}, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
                         )
                         if ok_a:
                             st.session_state["last_autotrade_banner"] = f"🚀 **Auto-Executed ({name_r}):** {msg_a}"
@@ -1778,11 +1816,18 @@ if active_section == "⚡ Signals":
                 zone, bias_lbl = "—", "—"
                 sh_s = rh_s = mid_s = rl_s = sl_s = "—"
 
-            sig_status = f"🔥 {active_r['signal']['signal']}" if active_r else "⏳ Watching"
+            sig_lv = next(
+                (pr_r.get("signal", {}).get("levels", {}) for pr_r in pair_res if isinstance(pr_r.get("signal"), dict) and isinstance(pr_r["signal"].get("levels"), dict) and pr_r["signal"]["levels"].get("ema_15m_trend")),
+                {},
+            )
+            _raw_15m = str(sig_lv.get("ema_15m_trend") or "")
+            ema15_lbl = "🔴 50<200" if "BEAR" in _raw_15m else ("🟢 50>200" if "BULL" in _raw_15m else "—")
+            sig_status = f"🔥 {active_r['signal']['signal']} ({active_r.get('strategy_name', '')[:12]})" if active_r else "⏳ Watching"
             matrix_rows.append({
                 "Asset": sym_w,
                 "Price": fmt_px(px),
                 "Bias": bias_lbl,
+                "15m EMA": ema15_lbl,
                 "Zone": zone,
                 "Status": sig_status,
                 "SH": sh_s,
@@ -1801,6 +1846,7 @@ if active_section == "⚡ Signals":
                     f"<td style='font-weight:800;'>{_mr['Asset']}</td>"
                     f"<td>{_mr['Price']}</td>"
                     f"<td>{_mr['Bias']}</td>"
+                    f"<td>{_mr['15m EMA']}</td>"
                     f"<td>{_mr['Zone']}</td>"
                     f"<td style='color:{_st_col};font-weight:700;'>{_mr['Status']}</td>"
                     f"<td style='color:#ef4444;'>{_mr['SH']}</td>"
@@ -1812,7 +1858,7 @@ if active_section == "⚡ Signals":
                 )
             st.html(
                 f"<div class='pro-table-wrap'><table class='pro-table'>"
-                f"<thead><tr><th>Asset</th><th>Price</th><th>Bias</th><th>Zone</th><th>Status</th>"
+                f"<thead><tr><th>Asset</th><th>Price</th><th>Bias</th><th>15m EMA</th><th>Zone</th><th>Status</th>"
                 f"<th>SH</th><th>RH</th><th>MID</th><th>RL</th><th>SL</th></tr></thead>"
                 f"<tbody>{''.join(_m_trs)}</tbody></table></div>"
             )
@@ -1875,15 +1921,18 @@ elif active_section == "🎯 Execute":
         trade_usd_inr = float(usd_inr)
 
         _all_label = "All Strategies (Auto-Detect)"
-        _mode_opts = [_all_label] + [f"{s.name} Only" for s in strategy_registry.list_strategies()]
+        _combo_bear_lbl = "Combo: Box + Bear 15m 50/200 EMA"
+        _combo_both_lbl = "Combo: Box + Bull & Bear 15m 50/200 EMA"
+        _mode_opts = [_all_label, _combo_bear_lbl, _combo_both_lbl] + [f"{s.name} Only" for s in strategy_registry.list_strategies()]
         if st.session_state.get("exec_strategy_mode") not in _mode_opts:
             st.session_state["exec_strategy_mode"] = _mode_opts[0]
         exec_strategy_mode = st.selectbox("Strategy", _mode_opts, key="exec_strategy_mode", label_visibility="collapsed")
-        armed_strats = (
-            strategy_registry.list_strategies()
-            if exec_strategy_mode == _all_label
-            else [s for s in strategy_registry.list_strategies() if f"{s.name} Only" == exec_strategy_mode]
-        )
+        if exec_strategy_mode == _all_label:
+            armed_strats = strategy_registry.list_strategies()
+        elif exec_strategy_mode in (_combo_bear_lbl, _combo_both_lbl):
+            armed_strats = [strategy_registry.get_strategy("box_theory"), strategy_registry.get_strategy("ema50_200")]
+        else:
+            armed_strats = [s for s in strategy_registry.list_strategies() if f"{s.name} Only" == exec_strategy_mode]
 
         choices = []
         _pref = st.session_state.get("url_prefill")
@@ -1918,16 +1967,18 @@ elif active_section == "🎯 Execute":
                     strategy_registry.setup_tag(_s.id, "SIGNAL"),
                     _s
                 ))
-            if exec_strategy_mode == _all_label and _s.id != "box_theory":
+            if exec_strategy_mode in (_all_label, _combo_bear_lbl, _combo_both_lbl) and _s.id not in ("box_theory", "ema50_200"):
                 continue
             _plan = get_cached_strategy_plan(_s.id, selected_pair, float(cur_price), trade_margin_inr, trade_leverage, trade_usd_inr)
+            _multi_plan_mode = exec_strategy_mode in (_all_label, _combo_bear_lbl, _combo_both_lbl)
+            _plan_sfx = (" [Box]" if _s.id == "box_theory" else " [50/200 EMA]") if _multi_plan_mode else ""
             for _d, _ico in (("BUY", "🟢"), ("SELL", "🔴")):
                 _st = _plan.get(_d)
                 if not _st or _st.get("signal_kind"):
                     continue
                 choices.append((
-                    f"{_ico} {_d} Plan ({fmt_px(_st['entry'])})",
-                    _st,
+                    f"{_ico} {_d} Plan{_plan_sfx} ({fmt_px(_st['entry'])})",
+                    {**_st, "strategy_id": _st.get("strategy_id") or _s.id},
                     strategy_registry.setup_tag(_s.id, _d),
                     _s
                 ))
@@ -1953,7 +2004,8 @@ elif active_section == "🎯 Execute":
             tp1_tracker_key = f"last_formula_tp1_{selected_pair}_{setup_tag}"
             custom_e1_tracker_key = f"last_custom_entry_{selected_pair}_{setup_tag}"
 
-            _is_box_strat = (active_strategy.id == "box_theory")
+            _sig_sid = str(active_trade.get("strategy_id") or active_strategy.id)
+            _is_box_strat = (_sig_sid == "box_theory")
             _strat_has_e2 = False  # Entry 2 removed: 100% Single-Slot Maker Limit sizing across all strategies
             _raw_e2_default = 0.0
             _init_norm = coindcx_engine.normalize_two_entry_runner_levels(
@@ -2011,7 +2063,8 @@ elif active_section == "🎯 Execute":
             adj_col1, adj_col2 = st.columns(2)
             with adj_col1:
                 custom_entry = st.number_input("Entry (100% Maker Limit) ($)", value=float(st.session_state.get(entry_key, _init_norm["entry"])), step=step_val, format=fmt_str, key=entry_key)
-                custom_sl = st.number_input("Catastrophe SL ($)", value=float(st.session_state.get(sl_key, _init_norm["stop_loss"])), step=step_val, format=fmt_str, key=sl_key)
+                _sl_input_lbl = "SL (15m 200 EMA) ($)" if _sig_sid == "ema50_200" else "Catastrophe SL ($)"
+                custom_sl = st.number_input(_sl_input_lbl, value=float(st.session_state.get(sl_key, _init_norm["stop_loss"])), step=step_val, format=fmt_str, key=sl_key)
                 custom_e2 = 0.0
             with adj_col2:
                 _tp1_label = "TP1 (SL -> Ratchet, 100% Runner) ($)" if active_strategy.id == "ema9_retest" else "TP1 (50% Book -> SL Ratchet) ($)"
@@ -2076,7 +2129,8 @@ elif active_section == "🎯 Execute":
             st.markdown("#### 🎫 Trade Execution Ticket")
             _e2_lvl = 0.0
             _has_e2 = False
-            _is_full_runner = (active_strategy.id == "ema9_retest")
+            _is_full_runner = (_sig_sid == "ema9_retest")
+            _exec_strat_name = "15m 50/200 EMA Pullback" if _sig_sid == "ema50_200" else strategy_registry.get_strategy(_sig_sid).name
             _cur_fill_mode = str(st.session_state.get(f"e1_fill_mode_{selected_pair}", "📌 Limit"))
             _user_custom_e1 = abs(float(active_trade["entry"]) - float(_init_norm["entry"])) > 1e-6
             _user_custom_tp1 = abs(float(active_trade["tp1"]) - float(_formula_norm_for_e1["tp1"])) > 1e-6
@@ -2091,7 +2145,7 @@ elif active_section == "🎯 Execute":
                     tp2_px=float(active_trade["tp2"]),
                     sl_px=float(active_trade["stop_loss"]),
                     live_px=float(cur_price),
-                    levels=levels if (active_strategy.id == "box_theory") else None,
+                    levels=levels if _is_box_strat else None,
                 )
                 _m_e1 = float(_mkt_norm["entry"])
                 _m_tp1 = float(_mkt_norm["tp1"])
@@ -2125,7 +2179,7 @@ elif active_section == "🎯 Execute":
             st.html(f"""
             <div class="pro-card" style="padding:14px;">
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:6px;">
-                    <span class="{color_class}">{trade_dir} {cur_asset}/USDT ({trade_leverage}x)</span>
+                    <span><span class="{color_class}">{trade_dir} {cur_asset}/USDT ({trade_leverage}x)</span> <span style="font-size:0.78rem; color:{subtext_color}; margin-left:6px;">[{_exec_strat_name}]</span></span>
                     <span style="font-weight:700; color:{text_color}; font-size:0.95rem;">Live: {fmt_px(cur_price)}</span>
                 </div>
                 <div style="display:grid; grid-template-columns:1fr auto; row-gap:6px; font-size:0.86rem; color:{text_color};">
@@ -2135,10 +2189,10 @@ elif active_section == "🎯 Execute":
                     <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else '50% Limit Order -> SL Ratchet'}):</span>
                     <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
 
-                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else '50% Position TP Runner'}):</span>
+                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else ('RL / RH Structural Target' if _sig_sid == 'ema50_200' else '50% Position TP Runner')}):</span>
                     <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(_disp_trade['tp2'])} (+{_disp_trade['roe_tp2']}% ROE)</span>
 
-                    <span style="color:{subtext_color};">Catastrophe Stop Loss (Position SL):</span>
+                    <span style="color:{subtext_color};">{'Stop Loss (15m 200 EMA)' if _sig_sid == 'ema50_200' else 'Catastrophe Stop Loss (Position SL)'}:</span>
                     <span style="text-align:right; color:#ef4444; font-weight:700;">{fmt_px(_disp_trade['stop_loss'])} (-{_disp_trade['roe_sl']}%)</span>
 
                     <span style="color:{subtext_color};">Est. Fee (incl. GST) / Breakeven:</span>
@@ -2210,7 +2264,7 @@ elif active_section == "🎯 Execute":
                             total_margin_inr=trade_margin_inr,
                             leverage=trade_leverage,
                             usd_inr=trade_usd_inr,
-                            strategy_id=active_strategy.id,
+                            strategy_id=_sig_sid,
                         )
                         get_cached_positions.clear()
                         get_cached_open_orders.clear()
@@ -2252,11 +2306,11 @@ elif active_section == "🎯 Execute":
                             direction=trade_dir,
                             entry1_px=_ref_e1_px,
                             entry2_px=None,
-                            tp1_px=None if (not _user_edited_tp1 and active_strategy.id == "box_theory") else float(active_trade["tp1"]),
+                            tp1_px=None if (not _user_edited_tp1 and _is_box_strat) else float(active_trade["tp1"]),
                             tp2_px=float(active_trade["tp2"]),
                             sl_px=float(active_trade["stop_loss"]),
                             live_px=(shield_live_px if (_use_market_e1 and shield_live_px > 0) else _ref_e1_px),
-                            levels=levels if (active_strategy.id == "box_theory") else None,
+                            levels=levels if _is_box_strat else None,
                         )
                         _is_buy_e = (trade_dir == "BUY")
                         _maker_px = float(_ref_e1_px) if not _use_market_e1 else _exec_norm["entry"]
@@ -2294,7 +2348,7 @@ elif active_section == "🎯 Execute":
                                     total_margin_inr=trade_margin_inr,
                                     leverage=trade_leverage,
                                     usd_inr=trade_usd_inr,
-                                    strategy_id=active_strategy.id,
+                                    strategy_id=_sig_sid,
                                 )
                                 if s_ok:
                                     _synced_live_lock = True
@@ -2346,9 +2400,10 @@ elif active_section == "🎯 Execute":
                             is_live_exchange=is_live,
                             entry2_order_id=_e2_order_id if is_live else "",
                             tp1_order_id=_tp1_order_id if is_live else ("FULL_RUNNER_SL_RATCHET_AT_TP1" if _is_full_runner else "DAEMON_50PCT_REDUCE_AT_TP1"),
-                            strategy_id=active_strategy.id,
+                            strategy_id=_sig_sid,
                         )
 
+                    _sig_strat_obj = strategy_registry.get_strategy(_sig_sid)
                     order_record = {
                         "timestamp": exec_time, "pair": selected_pair, "signal": trade_dir, "direction": trade_dir,
                         "setup": active_trade.get("setup", "Box Setup"), "entry": limit_entry_px,
@@ -2356,8 +2411,8 @@ elif active_section == "🎯 Execute":
                         "crypto_qty": active_trade["crypto_qty"], "margin_inr": trade_margin_inr,
                         "leverage": trade_leverage, "usd_inr": trade_usd_inr,
                         "profit_tp1_inr": active_trade["profit_tp1_inr"], "loss_sl_inr": active_trade["loss_sl_inr"],
-                        "status": order_status, "strategy_id": active_strategy.id,
-                        "strategy_name": active_strategy.name, "trigger_reason": active_trade.get("trigger_reason", "")
+                        "status": order_status, "strategy_id": _sig_sid,
+                        "strategy_name": _sig_strat_obj.name, "trigger_reason": active_trade.get("trigger_reason", "")
                     }
 
                     if is_live or already_reached:
@@ -2369,7 +2424,7 @@ elif active_section == "🎯 Execute":
                             tp1=active_trade["tp1"], tp2=active_trade["tp2"], margin_inr=trade_margin_inr,
                             leverage=trade_leverage, kind="EXECUTED",
                             note="Live order submitted." if is_live else "Paper order filled.",
-                            strategy_name=active_strategy.name, strategy_id=active_strategy.id,
+                            strategy_name=_sig_strat_obj.name, strategy_id=_sig_sid,
                             trigger_reason=active_trade.get("trigger_reason", "")
                         )
                         msg_out = f"✅ {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt_px(limit_entry_px)} ({live_api_msg or 'Filled'})"
@@ -2379,7 +2434,7 @@ elif active_section == "🎯 Execute":
 
                     st.session_state.setdefault("trade_plans", {})[selected_pair] = {
                         "direction": "LONG" if trade_dir == "BUY" else "SHORT", "entry": limit_entry_px,
-                        "entry2_sweep": float(_e2_lvl),
+                        "entry2_sweep": float(_e2_lvl), "strategy_id": _sig_sid,
                         "sl": active_trade["stop_loss"], "tp1": active_trade["tp1"], "tp2": active_trade["tp2"],
                         "applied": True, "margin_inr": trade_margin_inr, "leverage": trade_leverage
                     }
@@ -2510,6 +2565,7 @@ elif active_section == "📊 Positions":
         if not plan and auto_lock_cfg.get("pair") == pr:
             plan = {
                 "direction": p["direction"],
+                "strategy_id": str(auto_lock_cfg.get("strategy_id") or "box_theory"),
                 "entry": float(auto_lock_cfg.get("entry") or entry_p),
                 "entry2_sweep": float(auto_lock_cfg.get("entry2_sweep") or 0.0),
                 "sl": float(auto_lock_cfg.get("stop_loss") or 0.0),
@@ -2518,9 +2574,11 @@ elif active_section == "📊 Positions":
                 "margin_inr": float(auto_lock_cfg.get("margin_inr") or margin_inr),
                 "leverage": int(p.get("leverage") or leverage),
             }
+        _pos_strat_id = str(plan.get("strategy_id") or (auto_lock_cfg.get("strategy_id") if auto_lock_cfg.get("pair") == pr else "box_theory") or "box_theory")
+        _pos_strat_lbl = "15m 50/200 EMA" if _pos_strat_id == "ema50_200" else strategy_registry.get_strategy(_pos_strat_id).short
         cur_sl, cur_tp = p.get("stop_loss"), p.get("take_profit")
 
-        # Compute normalized 2-Entry + Runner levels for this active position
+        # Compute normalized Maker Limit + Structural Runner levels (preserve EMA SL without Box override for ema50_200)
         pos_box_levels = get_cached_box_levels(pr)
         pos_norm = coindcx_engine.normalize_two_entry_runner_levels(
             pair=pr,
@@ -2531,7 +2589,7 @@ elif active_section == "📊 Positions":
             tp2_px=float(plan.get("tp2") or cur_tp or 0.0),
             sl_px=float(plan.get("sl") or cur_sl or 0.0),
             live_px=mark_p,
-            levels=pos_box_levels,
+            levels=pos_box_levels if _pos_strat_id == "box_theory" else None,
         )
         tp1 = float(pos_norm["tp1"])
         tp2 = float(pos_norm["tp2"])
@@ -2556,7 +2614,7 @@ elif active_section == "📊 Positions":
             badge = "badge-buy" if is_long else "badge-sell"
             st.markdown(
                 f"<div style='display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;'>"
-                f"<div><span class='{badge}'>{p['direction']} {sym_p}/USDT</span> &nbsp; <b>{p['quantity']}</b> @ {fmt_px(entry_p)} ({p['leverage']}x)</div>"
+                f"<div><span class='{badge}'>{p['direction']} {sym_p}/USDT</span> &nbsp; <b>{p['quantity']}</b> @ {fmt_px(entry_p)} ({p['leverage']}x) &nbsp; <span style='font-size:0.78rem;opacity:0.8;'>[{_pos_strat_lbl}]</span></div>"
                 f"<div style='font-size:1.15rem;font-weight:800;color:{col};'>{'+' if pnl_inr >= 0 else ''}₹{pnl_inr:,.2f} ({roe:+.2f}% ROE)</div>"
                 f"</div>",
                 unsafe_allow_html=True
@@ -2589,6 +2647,7 @@ elif active_section == "📊 Positions":
                         total_margin_inr=float(plan.get("margin_inr") or margin_inr),
                         leverage=int(round(float(p.get("leverage") or leverage))),
                         usd_inr=float(usd_inr),
+                        strategy_id=_pos_strat_id,
                     )
                     get_cached_positions.clear()
                     get_cached_open_orders.clear()
@@ -2634,6 +2693,7 @@ elif active_section == "📊 Positions":
                         total_margin_inr=float(plan.get("margin_inr") or margin_inr),
                         leverage=int(round(float(p.get("leverage") or leverage))),
                         usd_inr=float(usd_inr),
+                        strategy_id=_pos_strat_id,
                     )
                     get_cached_positions.clear()
                     get_cached_open_orders.clear()
@@ -2735,9 +2795,14 @@ elif active_section == "📈 Chart & Levels":
                 st.rerun()
 
         active_tf = st.session_state.chart_timeframe
-        df_chart = fetch_coindcx_candles(selected_pair, interval=active_tf, limit=candle_count, sync_live_price=True)
+        _fetch_bars = max(int(candle_count), 600) if active_tf in ("5m", "15m", "1h") else int(candle_count)
+        df_chart_raw = fetch_coindcx_candles(selected_pair, interval=active_tf, limit=_fetch_bars, sync_live_price=True)
 
-        if not df_chart.empty:
+        if not df_chart_raw.empty:
+            df_chart_raw = df_chart_raw.copy()
+            df_chart_raw["EMA50_CALC"] = df_chart_raw["close"].ewm(span=50, adjust=False).mean()
+            df_chart_raw["EMA200_CALC"] = df_chart_raw["close"].ewm(span=200, adjust=False).mean()
+            df_chart = df_chart_raw.iloc[-int(candle_count):].reset_index(drop=True)
             ts_series = pd.to_datetime(df_chart["timestamp"], unit="ms")
             fig = go.Figure()
 
@@ -2751,8 +2816,8 @@ elif active_section == "📈 Chart & Levels":
                 decreasing_line_color=candle_down, decreasing_fillcolor=candle_down
             ))
 
-            ema50_curve = df_chart["close"].ewm(span=50, adjust=False).mean()
-            ema200_curve = df_chart["close"].ewm(span=200, adjust=False).mean()
+            ema50_curve = df_chart["EMA50_CALC"]
+            ema200_curve = df_chart["EMA200_CALC"]
             fig.add_trace(go.Scatter(x=ts_series, y=ema50_curve, mode="lines", name="50 EMA", line=dict(color="#8b5cf6", width=1.8)))
             fig.add_trace(go.Scatter(x=ts_series, y=ema200_curve, mode="lines", name="200 EMA", line=dict(color="#f59e0b", width=1.8, dash="dot")))
 
@@ -2805,25 +2870,37 @@ elif active_section == "📈 Chart & Levels":
 # ==============================================================================
 elif active_section == "🧪 Backtest":
     st.markdown("#### 🧪 3-Slot Portfolio High-Volatility Backtest (Up to 3 Concurrent Trades @ 10x Leverage)")
-    st.caption(
-        "🎯 **Strategy 1 Only (`Box Theory Sweep`)** — identical to 24/7 AutoTrade execution "
-        "(includes `RH`/`SH`/`RL`/`SL` Sweep Reversals, Broken-Box Invalidation Guard, and Daily 50 EMA Rejection; Setup 0 Breakout-Top Continuation removed)."
+    _bt_mode_keys = [k for k, _ in strategy_registry.AUTOTRADE_MODE_CHOICES]
+    _bt_mode_labels = dict(strategy_registry.AUTOTRADE_MODE_CHOICES)
+    if st.session_state.get("bt_multi_strat_mode") not in _bt_mode_keys:
+        st.session_state["bt_multi_strat_mode"] = selected_autotrade_mode
+
+    bc0, bc1, bc2, bc3 = st.columns([1.8, 1.0, 1.1, 1.0])
+    bt_strat_mode = bc0.selectbox(
+        "Strategy Mode",
+        options=_bt_mode_keys,
+        format_func=lambda k: _bt_mode_labels.get(k, k),
+        key="bt_multi_strat_mode",
     )
-    bc1, bc2, bc3 = st.columns(3)
+    st.caption(
+        f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` — matches 24/7 AutoTrade execution "
+        "(`Box Theory Sweep` Priority 1 at outer `RH`/`SH`/`RL`/`SL` zones + Daily `50 EMA`; `15m 50/200 EMA Pullback` Priority 2 "
+        "with `SL` beyond `15m 200 EMA` and `TP2` at `RL` / `RH`). *Backtest results use historical CoinDCX data and are hypothetical.*"
+    )
     bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days"], index=0, key="bt_multi_dur")
     bt_capital = bc2.number_input("Single-Trade Margin (₹)", min_value=5000, value=int(margin_inr), step=5000, key="bt_multi_cap")
     bt_lev = bc3.slider("Leverage (x)", 1, 20, 10, key="bt_multi_lev")
 
     if st.button("🏆 Run 3-Slot Portfolio Backtest (All 12 High-Vol Movers — Up to 3 Concurrent Trades)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
-        with st.spinner(f"Simulating 3-Slot Portfolio across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
+        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
                 pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
                 duration_days=days_p,
                 margin_inr=float(bt_capital),
                 leverage=bt_lev,
                 usd_inr=usd_inr,
-                strategy_id=strategy_registry.DEFAULT_STRATEGY_ID,
+                strategy_id=bt_strat_mode,
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 
@@ -2845,6 +2922,17 @@ elif active_section == "🧪 Backtest":
         pk2.metric("Total Trades (3 Slots)", _tot_tr)
         pk3.metric("Win Rate", f"{_tot_wr}%", f"{_tot_w}W / {_tot_l}L")
         pk4.metric("Profit Factor", f"{_tot_pf}")
+
+        _sb = port_out.get("strategy_breakdown") or {}
+        if _sb:
+            _sb_cols = st.columns(len(_sb))
+            for _sbi, (_s_name, _s_stats) in enumerate(_sb.items()):
+                _sn = float(_s_stats.get("net_pnl_inr", 0.0))
+                _sb_cols[_sbi].metric(
+                    f"📌 {_s_name}",
+                    f"{'+' if _sn >= 0 else ''}₹{_sn:,.2f}",
+                    f"{_s_stats.get('trades', 0)}T • {_s_stats.get('wins', 0)}W/{_s_stats.get('losses', 0)}L ({_s_stats.get('win_rate_pct', 0)}% WR)",
+                )
 
         if abs(_used_m - 100000.0) > 1.0:
             st.caption(
@@ -2958,6 +3046,7 @@ elif active_section == "🧪 Backtest":
                         f"<td>{tr_row.get('entry_time', '')}</td>"
                         f"<td>{tr_row.get('exit_time', '')}</td>"
                         f"<td style='font-weight:800;'>{_tp}</td>"
+                        f"<td>{tr_row.get('strategy', '')}</td>"
                         f"<td><span class='{_d_badge}'>{_td}</span></td>"
                         f"<td>{fmt_px(float(tr_row.get('entry_price', 0.0)))}</td>"
                         f"<td>{fmt_px(float(tr_row.get('exit_price', 0.0)))}</td>"
@@ -2968,7 +3057,7 @@ elif active_section == "🧪 Backtest":
                     )
                 st.html(
                     f"<div class='pro-table-wrap'><table class='pro-table'>"
-                    f"<thead><tr><th>#</th><th>Entry Time</th><th>Exit Time</th><th>Pair</th><th>Side</th>"
+                    f"<thead><tr><th>#</th><th>Entry Time</th><th>Exit Time</th><th>Pair</th><th>Strategy</th><th>Side</th>"
                     f"<th>Entry</th><th>Exit</th><th>ROE %</th><th>Net PnL (₹)</th><th>Exit Reason</th></tr></thead>"
                     f"<tbody>{''.join(_tr_rows)}</tbody></table></div>"
                 )
@@ -2980,8 +3069,8 @@ elif active_section == "🤖 AI Advisor":
     st.markdown("### 🤖 Gemini AI Trade Recommendation Bot & Google Sheet Reader")
     st.caption(
         "Reads all App-executed trades directly from your **`Crypto_Trades_Journal` Google Sheet** (`Live_Trades` & `Closed_Trades`) "
-        "plus live CoinDCX Futures positions, Daily Box Levels (`SH`, `RH`, `MID`, `RL`, `SL`), and `50/200 EMA` trend bias to deliver "
-        "personalized trade audits and real-time setup recommendations."
+        "plus live CoinDCX Futures positions, Daily Box Levels (`SH`, `RH`, `MID`, `RL`, `SL`), `15m 50/200 EMA` trend structure, and "
+        "Daily `50/200 EMA` bias to deliver personalized audits and real-time setup recommendations."
     )
 
     # 1. Fetch Google Sheet Trades
@@ -3147,8 +3236,8 @@ elif active_section == "🤖 AI Advisor":
         if qa_c2.button(f"🎯 Best Setup on {asset_name} Now", use_container_width=True):
             quick_prompt = (
                 f"Analyze `{selected_pair}` right now using its live price, Daily Box Levels (`SH`, `RH`, `MID`, `RL`, `SL`), "
-                f"active signal status, and our historical Google Sheet trades. Should I enter `LONG`, `SHORT`, or `WAIT`? "
-                f"Give exact Maker Limit Entry (100% slot), TP1 (50% book), TP2 (50% structural runner), and Catastrophe Stop Loss levels."
+                f"`15m 50/200 EMA` pullback levels, active signal status, and our historical Google Sheet trades. Should I enter `LONG`, `SHORT`, or `WAIT`? "
+                f"Give exact Maker Limit Entry (100% slot), TP1 (50% book), TP2 (50% structural runner / RL / RH), and Stop Loss (Box SH/SL or 15m 200 EMA) levels."
             )
         if qa_c3.button("🛡️ Review Open Position Risk", use_container_width=True):
             quick_prompt = (
@@ -3158,7 +3247,7 @@ elif active_section == "🤖 AI Advisor":
             )
         if qa_c4.button("🏆 Top Coins to Trade Today", use_container_width=True):
             quick_prompt = (
-                "Based on our Google Sheet trade history (`Crypto_Trades_Journal`) and our 10x Box Theory Sweep (100% Single-Slot Maker Limit + Structural Runner) strategy, "
+                "Based on our Google Sheet trade history (`Crypto_Trades_Journal`) and our Combo 10x Strategy (`Box Theory Sweep` + `15m 50/200 EMA Pullback`), "
                 "which coins have performed best for us, which coins/conditions caused drawdowns, and what is the optimal single-trade margin "
                 "and execution gameplan for today's sessions?"
             )

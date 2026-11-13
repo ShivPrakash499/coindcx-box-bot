@@ -442,7 +442,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 27
+_REQUIRED_DAEMON_VERSION = 28
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 
 
@@ -2639,15 +2639,23 @@ def run_strategy_backtest(
     eff_wallet_inr = float(wallet_inr) if (wallet_inr and wallet_inr > 0) else (margin_inr / TRADE_ALLOCATION_FRACTION)
     max_daily_loss_inr = eff_wallet_inr * (_strategies.DAILY_WALLET_LOSS_STOP_PCT / 100.0)
 
-    # 1. Fetch execution candles using multi-batch pagination
-    df = fetch_historical_candles_paginated(
+    # 1. Fetch execution candles using multi-batch pagination (with 5d pre-window buffer on 15m for 200 EMA warmup)
+    fetch_days_exec = (duration_days + 5) if interval == "15m" else duration_days
+    df_exec_raw = fetch_historical_candles_paginated(
         pair=pair,
         interval=interval,
-        duration_days=duration_days,
+        duration_days=fetch_days_exec,
         progress_callback=progress_callback
     )
-    if df.empty or len(df) < 20:
+    if df_exec_raw.empty or len(df_exec_raw) < 20:
         return {"error": f"Insufficient historical candle data available for {pair} on {interval}."}
+    if interval == "15m":
+        cutoff_ms = int(df_exec_raw["timestamp"].iloc[-1]) - int(duration_days * 86400 * 1000)
+        df_sub = df_exec_raw[df_exec_raw["timestamp"] >= cutoff_ms].copy().reset_index(drop=True)
+        df = df_sub if len(df_sub) >= 20 else df_exec_raw.copy().reset_index(drop=True)
+        df.attrs["df_full_15m"] = df_exec_raw.copy().reset_index(drop=True)
+    else:
+        df = df_exec_raw
 
     # 2. Fetch daily candles for daily box & ATR establishment
     df_daily = fetch_historical_candles_paginated(
@@ -3309,7 +3317,7 @@ _AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 
 
 
 # Keys that must survive a Streamlit Cloud restart (persisted per deployment to the Google Sheet)
-_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "email_alerts_enabled", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
+_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "email_alerts_enabled", "autotrade_strategy_mode", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
 
 
 def get_git_branch_name() -> str:
@@ -3412,6 +3420,7 @@ def get_autotrade_config() -> dict:
         "paper_autotrade_enabled": True if _is_stg else False,
         "email_alerts_enabled": False if _is_stg else True,
         "paper_only": _is_stg,
+        "autotrade_strategy_mode": "box_plus_ema50_200_bear",
         "wallet_balance_inr": 47287.18,
         "single_trade_margin_inr": 15762.39,
         "leverage": 10,
@@ -3552,15 +3561,17 @@ def normalize_two_entry_runner_levels(
         high_ref = max(e1, cur_p) if cur_p > 0 else e1
         low_ref = min(e1, cur_p) if cur_p > 0 else e1
 
+        has_box_ctx = isinstance(levels, dict) and bool(levels.get("SL") or levels.get("MID"))
+        use_sweep_anchor = has_explicit_e2 or has_box_ctx
         sl_sweep_ref = float(entry2_px if has_explicit_e2 else ((levels.get("SL") if levels else 0.0) or 0.0))
-        if sl_sweep_ref <= 0 or sl_sweep_ref >= low_ref * 0.9992:
+        if use_sweep_anchor and (sl_sweep_ref <= 0 or sl_sweep_ref >= low_ref * 0.9992):
             sl_sweep_ref = low_ref * 0.992
         cand_e2 = sl_sweep_ref if has_explicit_e2 else 0.0
 
         cand_sl = float(sl_px or 0.0)
-        min_long_anchor = min(low_ref, sl_sweep_ref)
+        min_long_anchor = min(low_ref, sl_sweep_ref) if (use_sweep_anchor and sl_sweep_ref > 0) else low_ref
         if cand_sl <= 0 or cand_sl >= min_long_anchor * 0.999:
-            cand_sl = min_long_anchor * 0.995
+            cand_sl = (min_long_anchor if use_sweep_anchor else low_ref * 0.992) * 0.995
 
         cand_tp2 = float(tp2_px or (levels.get("RH") if levels else 0.0) or 0.0)
         cand_tp1 = float(tp1_px or 0.0)
@@ -3580,15 +3591,17 @@ def normalize_two_entry_runner_levels(
         low_ref = min(e1, cur_p) if cur_p > 0 else e1
         high_ref = max(e1, cur_p) if cur_p > 0 else e1
 
+        has_box_ctx = isinstance(levels, dict) and bool(levels.get("SH") or levels.get("MID"))
+        use_sweep_anchor = has_explicit_e2 or has_box_ctx
         sh_sweep_ref = float(entry2_px if has_explicit_e2 else ((levels.get("SH") if levels else 0.0) or 0.0))
-        if sh_sweep_ref <= 0 or sh_sweep_ref <= high_ref * 1.0008:
+        if use_sweep_anchor and (sh_sweep_ref <= 0 or sh_sweep_ref <= high_ref * 1.0008):
             sh_sweep_ref = high_ref * 1.008
         cand_e2 = sh_sweep_ref if has_explicit_e2 else 0.0
 
         cand_sl = float(sl_px or 0.0)
-        max_short_anchor = max(high_ref, sh_sweep_ref)
+        max_short_anchor = max(high_ref, sh_sweep_ref) if (use_sweep_anchor and sh_sweep_ref > 0) else high_ref
         if cand_sl <= 0 or cand_sl <= max_short_anchor * 1.001:
-            cand_sl = max_short_anchor * 1.005
+            cand_sl = (max_short_anchor if use_sweep_anchor else high_ref * 1.008) * 1.005
 
         cand_tp2 = float(tp2_px or (levels.get("RL") if levels else 0.0) or 0.0)
         cand_tp1 = float(tp1_px or 0.0)
@@ -3657,10 +3670,11 @@ def sync_full_2entry_runner_to_position(
     use_full_s3_runner = (strat_id == "ema9_retest")
 
     levels = None
-    try:
-        levels = calculate_daily_box_levels(pair)
-    except Exception:
-        pass
+    if strat_id == "box_theory":
+        try:
+            levels = calculate_daily_box_levels(pair)
+        except Exception:
+            pass
 
     norm = normalize_two_entry_runner_levels(
         pair=pair,
@@ -4931,17 +4945,32 @@ def execute_autotrade_two_entry_signal(
     else:
         daily_bias = "NEUTRAL"
 
-    # AutoTrade Strategy 1 Enforcement: AutoTrade strictly executes Strategy 1 (`box_theory`:
-    # RH/SH/RL/SL Sweep Reversals + Daily 50 EMA Rejection; Setup 0 Breakout Continuation removed)
+    # AutoTrade Strategy Enforcement: supports `box_theory` (Strategy 1) and `ema50_200` (Strategy 4)
+    # per the configured `autotrade_strategy_mode` (default: `box_plus_ema50_200_bear`)
+    import strategies as _strat_mod
+    auto_mode = _strat_mod.resolve_autotrade_mode(cfg.get("autotrade_strategy_mode"))
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
-    if sig_strat_id != "box_theory":
+    allow_mode_override = bool(sig.get("manual_override", False))
+    if sig_strat_id not in ("box_theory", "ema50_200"):
         return False, (
-            f"AutoTrade Strategy Guard: AutoTrade is restricted to Strategy 1 (Box Theory Sweep); "
+            f"AutoTrade Strategy Guard: AutoTrade only executes Box Theory Sweep or 15m 50/200 EMA Pullback; "
             f"skipping {sig_strat_id} on {pair}."
         ), {"strategy_id": sig_strat_id}
-    if sig_strat_id in ("box_theory", "ema9_retest") and (
-        (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG")
-    ):
+    if not allow_mode_override:
+        if auto_mode == "box_theory" and sig_strat_id != "box_theory":
+            return False, (
+                f"AutoTrade Mode Guard: Sidebar AutoTrade Strategy is Box Sweep Only; skipping {sig_strat_id} on {pair}."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode}
+        if auto_mode == "ema50_200" and sig_strat_id != "ema50_200":
+            return False, (
+                f"AutoTrade Mode Guard: Sidebar AutoTrade Strategy is 15m 50/200 EMA Only; skipping {sig_strat_id} on {pair}."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode}
+        if auto_mode == "box_plus_ema50_200_bear" and sig_strat_id == "ema50_200" and norm_dir != "SHORT":
+            return False, (
+                f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
+                f"(switch to Combo: Box + Bull & Bear 15m 50/200 EMA to enable Bullish EMA Longs)."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
+    if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
         return False, (
             f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
         ), {"daily_bias": daily_bias, "direction": norm_dir}
@@ -4961,7 +4990,7 @@ def execute_autotrade_two_entry_signal(
         tp2_px=float(sig["tp2"]),
         sl_px=float(sig["stop_loss"]),
         live_px=live_tk_px if live_tk_px > 0 else float(sig["entry"]),
-        levels=sig.get("levels"),
+        levels=sig.get("levels") if sig_strat_id == "box_theory" else None,
     )
     entry1_px = norm["entry"]
     entry2_px = 0.0
@@ -5220,6 +5249,7 @@ def run_portfolio_single_slot_backtest(
             "net_profit_inr": 0.0, "total_roi_pct": 0.0, "profit_factor": 0.0,
             "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(),
             "coin_summary_df": pd.DataFrame(), "standalone_summary_df": standalone_df,
+            "strategy_id": strategy_id, "strategy_breakdown": {},
         }
 
     df_all = pd.DataFrame(all_candidates).sort_values(by=["entry_time", "vol_rank"]).reset_index(drop=True)
@@ -5309,6 +5339,19 @@ def run_portfolio_single_slot_backtest(
     coin_grp = coin_grp.sort_values(by=["Net_Profit_INR", "Trades"], ascending=[False, False]).reset_index(drop=True)
     coin_grp = coin_grp[["pair", "Trades", "Wins", "Losses", "Win_Rate_%", "Net_Profit_INR", "ROI_Pct", "Avg_ROE_Pct"]]
 
+    strategy_breakdown = {}
+    if not pdf.empty and "strategy" in pdf.columns:
+        for s_lbl, grp in pdf.groupby("strategy"):
+            s_tr = int(len(grp))
+            s_w = int((grp["is_win"] == True).sum())
+            s_l = s_tr - s_w
+            s_net = round(float(grp["net_pnl_inr"].sum()), 2)
+            s_wr = round((s_w / s_tr) * 100.0, 1) if s_tr > 0 else 0.0
+            strategy_breakdown[str(s_lbl)] = {
+                "trades": s_tr, "wins": s_w, "losses": s_l,
+                "win_rate_pct": s_wr, "net_pnl_inr": s_net,
+            }
+
     return {
         "total_trades": tot,
         "win_count": int(len(wins)),
@@ -5323,6 +5366,8 @@ def run_portfolio_single_slot_backtest(
         "trades_df": pdf,
         "coin_summary_df": coin_grp,
         "standalone_summary_df": standalone_df,
+        "strategy_id": strategy_id,
+        "strategy_breakdown": strategy_breakdown,
         "margin_inr": margin_inr,
         "leverage": leverage,
         "duration_days": duration_days,
