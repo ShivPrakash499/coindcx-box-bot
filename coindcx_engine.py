@@ -442,7 +442,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 30
+_REQUIRED_DAEMON_VERSION = 31
 _WALLET_ACTIVITY_CACHE = _PERSIST.setdefault("wallet_activity_cache", {"ts": 0.0, "date": "", "data": None})
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 
@@ -1007,7 +1007,7 @@ def fetch_today_futures_wallet_activity(usd_inr: float = None, force_refresh: bo
 
     res_tx, _ = _send_coindcx_signed_request(
         "GET",
-        "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets/transactions?page=1&size=200",
+        "https://api.coindcx.com/exchange/v1/derivatives/futures/wallets/transactions?page=1&size=1000",
     )
     if was_verified and (res_tx is None or res_tx.status_code != 401):
         _PERSIST["session_verified"] = True
@@ -1017,12 +1017,18 @@ def fetch_today_futures_wallet_activity(usd_inr: float = None, force_refresh: bo
     if res_tx is None or res_tx.status_code != 200:
         if isinstance(cached, dict) and _WALLET_ACTIVITY_CACHE.get("date") == today_str:
             return dict(cached)
-        return {"ok": False, "date": today_str, "transfers": [], "net_transfers_inr": 0.0, "trading_tx_count": 0}
+        return {
+            "ok": False, "date": today_str, "transfers": [],
+            "net_transfers_inr": 0.0, "trading_tx_count": 0, "net_trading_tx_inr": 0.0,
+        }
 
     try:
         payload = res_tx.json()
     except Exception:
-        return {"ok": False, "date": today_str, "transfers": [], "net_transfers_inr": 0.0, "trading_tx_count": 0}
+        return {
+            "ok": False, "date": today_str, "transfers": [],
+            "net_transfers_inr": 0.0, "trading_tx_count": 0, "net_trading_tx_inr": 0.0,
+        }
 
     tx_list = (
         payload if isinstance(payload, list)
@@ -1032,6 +1038,7 @@ def fetch_today_futures_wallet_activity(usd_inr: float = None, force_refresh: bo
 
     transfers = []
     net_transfers_inr = 0.0
+    net_trading_tx_inr = 0.0
     trading_tx_count = 0
     saw_valid_tx_schema = (len(tx_list) == 0)
 
@@ -1079,9 +1086,13 @@ def fetch_today_futures_wallet_activity(usd_inr: float = None, force_refresh: bo
             net_transfers_inr += signed_inr
         else:
             trading_tx_count += 1
+            net_trading_tx_inr += signed_inr
 
     if not saw_valid_tx_schema:
-        return {"ok": False, "date": today_str, "transfers": [], "net_transfers_inr": 0.0, "trading_tx_count": 0}
+        return {
+            "ok": False, "date": today_str, "transfers": [],
+            "net_transfers_inr": 0.0, "trading_tx_count": 0, "net_trading_tx_inr": 0.0,
+        }
 
     transfers.sort(key=lambda x: x["ts"])
     act_res = {
@@ -1090,6 +1101,7 @@ def fetch_today_futures_wallet_activity(usd_inr: float = None, force_refresh: bo
         "transfers": transfers,
         "net_transfers_inr": round(net_transfers_inr, 2),
         "trading_tx_count": trading_tx_count,
+        "net_trading_tx_inr": round(net_trading_tx_inr, 2),
     }
     _WALLET_ACTIVITY_CACHE["data"] = act_res
     _WALLET_ACTIVITY_CACHE["date"] = today_str
@@ -1245,6 +1257,11 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
             synced_wallet["_key_prefix"] = api_key[:8]
             synced_wallet["is_live_api"] = True
             synced_wallet["source"] = f"CoinDCX Live Futures API (Synced via {bridge_ip})"
+            b_act = synced_wallet.get("today_wallet_activity")
+            if isinstance(b_act, dict) and b_act.get("ok"):
+                _WALLET_ACTIVITY_CACHE["data"] = dict(b_act)
+                _WALLET_ACTIVITY_CACHE["date"] = str(b_act.get("date") or "")
+                _WALLET_ACTIVITY_CACHE["ts"] = now_ts
             _WALLET_BALANCE_CACHE["data"] = synced_wallet
             _WALLET_BALANCE_CACHE["ts"] = now_ts
             _WALLET_BALANCE_CACHE["last_good_live"] = synced_wallet
@@ -4973,6 +4990,7 @@ def reset_daily_loss_stop_baseline(wallet: dict | None = None) -> dict:
         "ts": now_ts,
         "applied_tx_ids": tx_ids,
         "net_transfers_inr": net_tf,
+        "manual_reset": True,
     }
     save_autotrade_config({"daily_start_wallet": ds, "daily_loss_stop_hit": ""})
     return ds
@@ -4981,13 +4999,10 @@ def reset_daily_loss_stop_baseline(wallet: dict | None = None) -> dict:
 def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, dict]:
     """
     Live 5% Daily Loss Stop (IST day, Wallet-Transfer-Aware):
-      - Day-start baseline = first verified live futures wallet balance seen after 00:00 IST (persisted).
-      - Automatically excludes internal wallet transfers (`by_universal_wallet`: Futures <-> Spot/INR deposits
-        and withdrawals) using CoinDCX's `/derivatives/futures/wallets/transactions` ledger so transferring funds
-        out of Futures Wallet to INR Wallet is NEVER mistaken for a trading loss (and depositing funds never masks
-        actual trading losses).
-      - If transfer-adjusted `(baseline - current) >= DAILY_WALLET_LOSS_STOP_PCT%` of baseline -> block new trades
-        until 00:00 IST.
+      - Reconstructs exact 00:00 IST start-of-day wallet & transfer-adjusted trading baseline directly from CoinDCX's
+        `/derivatives/futures/wallets/transactions` ledger (`by_universal_wallet` vs `by_futures_order`/`by_futures_funding`)
+        whenever available, so mid-day container starts between multiple transfers never double-count earlier transfers!
+      - Excludes all internal wallet transfers (`Futures <-> Spot/INR` withdrawals & deposits) from daily loss calculation.
     Fails open (does not block) only when the live wallet cannot be verified (orders would fail anyway).
     """
     import strategies as _strategies
@@ -5001,6 +5016,9 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
     if cur <= 0:
         return False, "Daily loss stop: wallet balance unavailable", {}
 
+    locked_inr_now = float(w.get("locked_inr", 0.0) or 0.0) + float(w.get("locked_margin_usd", 0.0) or 0.0) * 100.0
+    is_flat_wallet = (locked_inr_now <= 0.05)
+
     act = w.get("today_wallet_activity")
     if not (isinstance(act, dict) and act.get("ok") and act.get("date") == today):
         cached_act = _WALLET_ACTIVITY_CACHE.get("data")
@@ -5011,18 +5029,37 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
         else:
             act = {}
 
-    transfers_today = [t for t in (act.get("transfers") or []) if isinstance(t, dict)] if act.get("ok") else []
-    net_transfers_today = round(float(act.get("net_transfers_inr", 0.0) or 0.0), 2) if act.get("ok") else 0.0
-    trading_tx_count = int(act.get("trading_tx_count", 0) or 0) if act.get("ok") else -1
+    has_ledger = bool(act.get("ok") and act.get("date") == today)
+    transfers_today = [t for t in (act.get("transfers") or []) if isinstance(t, dict)] if has_ledger else []
+    net_transfers_today = round(float(act.get("net_transfers_inr", 0.0) or 0.0), 2) if has_ledger else 0.0
+    has_net_trading_field = has_ledger and ("net_trading_tx_inr" in act)
+    net_trading_tx_inr = round(float(act.get("net_trading_tx_inr", 0.0) or 0.0), 2) if has_net_trading_field else 0.0
+    trading_tx_count = int(act.get("trading_tx_count", 0) or 0) if has_ledger else -1
 
     cfg = get_autotrade_config()
     ds = cfg.get("daily_start_wallet")
     cfg_updates = {}
 
+    # Exact ledger reconstruction when flat (zero locked margin) & ledger has transfers or full trading breakdown:
+    # W_midnight = W_cur - net_transfers_today - net_trading_tx_inr; W_effective_start = W_cur - net_trading_tx_inr
+    can_reconstruct_exact = bool(
+        has_ledger
+        and transfers_today
+        and is_flat_wallet
+        and (trading_tx_count == 0 or has_net_trading_field)
+    )
+
     if not (isinstance(ds, dict) and ds.get("date") == today and float(ds.get("inr", 0) or 0) > 0):
+        if can_reconstruct_exact:
+            eff_start = round(max(0.01, cur - net_trading_tx_inr), 2)
+            midnight_est = round(max(0.01, eff_start - net_transfers_today), 2)
+        else:
+            eff_start = round(cur, 2)
+            midnight_est = round(cur - net_transfers_today, 2) if transfers_today else round(cur, 2)
         ds = {
             "date": today,
-            "inr": round(cur, 2),
+            "inr": eff_start,
+            "midnight_inr": midnight_est,
             "ts": now_ts,
             "applied_tx_ids": [str(t["id"]) for t in transfers_today if t.get("id")],
             "net_transfers_inr": net_transfers_today,
@@ -5033,10 +5070,21 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
     elif transfers_today:
         ds = dict(ds)
         old_start = float(ds["inr"])
-        if "applied_tx_ids" not in ds:
-            # One-time migration for pre-v30 daily_start_wallet saved earlier today before transfer tracking:
-            # - If 0 trading/funding transactions occurred today, 100% of any wallet delta is pure wallet transfers.
-            # - Otherwise shift baseline by today's net universal-wallet transfers.
+        is_manual_rst = bool(ds.get("manual_reset", False))
+
+        if not is_manual_rst and can_reconstruct_exact and "midnight_inr" not in ds:
+            # Exact ledger anchor (eliminates double-counting when container booted between multiple transfers!)
+            eff_start = round(max(0.01, cur - net_trading_tx_inr), 2)
+            midnight_est = round(max(0.01, eff_start - net_transfers_today), 2)
+            if abs(eff_start - old_start) >= 0.05 or ds.get("net_transfers_inr") != net_transfers_today:
+                ds["raw_pre_transfer_inr"] = round(float(ds.get("raw_pre_transfer_inr", old_start) or old_start), 2)
+                ds["inr"] = eff_start
+                ds["midnight_inr"] = midnight_est
+                ds["ts"] = now_ts
+                ds["applied_tx_ids"] = [str(t["id"]) for t in transfers_today if t.get("id")]
+                ds["net_transfers_inr"] = net_transfers_today
+                cfg_updates["daily_start_wallet"] = ds
+        elif "applied_tx_ids" not in ds:
             if trading_tx_count == 0:
                 new_start = round(cur, 2)
             else:
@@ -5065,19 +5113,24 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
                     if "raw_pre_transfer_inr" not in ds:
                         ds["raw_pre_transfer_inr"] = round(old_start, 2)
                     ds["inr"] = round(max(0.01, old_start + delta_unapplied), 2)
+                    if "midnight_inr" not in ds:
+                        ds["midnight_inr"] = round(max(0.01, ds["inr"] - net_transfers_today), 2)
                 ds["applied_tx_ids"] = list(applied_set)
                 ds["net_transfers_inr"] = net_transfers_today
                 cfg_updates["daily_start_wallet"] = ds
 
     start = float(ds["inr"])
-    loss = start - cur
+    today_pnl_inr = round(cur - start, 2)
+    loss = max(0.0, start - cur)
     limit = start * pct / 100.0
     net_tf_recorded = float(ds.get("net_transfers_inr", net_transfers_today) or 0.0)
     info = {
         "date": today,
         "day_start_inr": round(start, 2),
+        "midnight_inr": round(float(ds.get("midnight_inr", start - net_tf_recorded) or start), 2),
         "raw_day_start_inr": round(float(ds.get("raw_pre_transfer_inr", start) or start), 2),
         "current_inr": round(cur, 2),
+        "today_pnl_inr": today_pnl_inr,
         "loss_inr": round(loss, 2),
         "limit_inr": round(limit, 2),
         "net_transfers_inr": round(net_tf_recorded, 2),
@@ -5100,7 +5153,7 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
         save_autotrade_config(cfg_updates)
 
     tf_tag = f" (excl. ₹{abs(net_tf_recorded):,.0f} transfer)" if abs(net_tf_recorded) >= 1.0 else ""
-    return False, f"Daily loss ₹{max(loss, 0):,.2f} / limit ₹{limit:,.2f}{tf_tag}", info
+    return False, f"Daily loss ₹{loss:,.2f} / limit ₹{limit:,.2f}{tf_tag}", info
 
 
 def compute_wallet_capped_margin(margin_inr: float, leverage: int, wallet: dict | None = None,
@@ -6047,6 +6100,8 @@ def _upgrade_all_in_memory_functions_and_disarm():
         _COINDCX_SIGN_LOCK = _PERSIST["lock"]
         _NAT_PIN_LOCK = _PERSIST["nat_pin_lock"]
         _WALLET_BALANCE_CACHE["refreshing"] = False
+        _WALLET_BALANCE_CACHE["ts"] = 0.0
+        _WALLET_ACTIVITY_CACHE["ts"] = 0.0
         _ACTIVE_POSITIONS_CACHE["refreshing"] = False
         _PERSIST["last_nat_probe_ts"] = 0.0
         if not _PERSIST.get("session_verified"):

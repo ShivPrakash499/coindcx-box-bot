@@ -1278,7 +1278,42 @@ def test_12_wallet_transfer_aware_daily_loss_stop():
             })
             assert hit_3 and "5% Daily Loss Stop" in msg_3, f"Expected real Rs.4,000 trading loss to trigger stop even after deposit: {msg_3}"
 
-            # 4. Manual 1-Click Baseline Sync (`reset_daily_loss_stop_baseline`) clears stop & re-anchors cleanly
+            # 4. Mid-day two-transfer Staging scenario (09:47 IST -Rs.10k + 18:01 IST -Rs.4k = -Rs.14k, +Rs.4,910.89 trading PnL):
+            #    Even if container had previously saved 49794.53 without midnight_inr, exact flat-wallet ledger reconstruction
+            #    must recover midnight_inr = 69,788.04, day_start_inr = 55,788.04, today_pnl_inr = +4,910.89, loss_inr = 0.0!
+            eng.save_autotrade_config({
+                "daily_start_wallet": {
+                    "date": today_s,
+                    "inr": 49794.53,
+                    "applied_tx_ids": ["t1", "t2"],
+                    "net_transfers_inr": -14000.0,
+                },
+                "daily_loss_stop_hit": "",
+            })
+            act_stg = {
+                "ok": True,
+                "date": today_s,
+                "transfers": [
+                    {"id": "t1", "ts": (now_ms - 30000000) / 1000.0, "signed_inr": -10000.0, "reason": "by_universal_wallet"},
+                    {"id": "t2", "ts": (now_ms - 60000) / 1000.0, "signed_inr": -4000.0, "reason": "by_universal_wallet"},
+                ],
+                "net_transfers_inr": -14000.0,
+                "trading_tx_count": 11,
+                "net_trading_tx_inr": 4910.89,
+            }
+            hit_stg, _, info_stg = eng.check_live_daily_loss_stop({
+                "is_live_api": True,
+                "total_inr": 60698.93,
+                "available_inr": 60698.93,
+                "locked_inr": 0.0,
+                "today_wallet_activity": act_stg,
+            })
+            assert not hit_stg
+            assert abs(info_stg["midnight_inr"] - 69788.04) < 0.05, info_stg
+            assert abs(info_stg["day_start_inr"] - 55788.04) < 0.05, info_stg
+            assert abs(info_stg["today_pnl_inr"] - 4910.89) < 0.05 and info_stg["loss_inr"] == 0.0, info_stg
+
+            # 5. Manual 1-Click Baseline Sync (`reset_daily_loss_stop_baseline`) clears stop & re-anchors cleanly
             reset_ds = eng.reset_daily_loss_stop_baseline({"is_live_api": True, "total_inr": 66698.93, "today_wallet_activity": act_3})
             assert abs(reset_ds["inr"] - 66698.93) < 0.05
             assert eng.get_autotrade_config().get("daily_loss_stop_hit") == ""
