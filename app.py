@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 28
+_DAEMON_VERSION = 30
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -828,6 +828,19 @@ else:
 
 if wallet_data.get("is_live_api") and coindcx_engine._PERSIST.get("session_verified"):
     st.sidebar.caption("✅ **CoinDCX Live API:** Connected & Ready")
+    _dl_hit_sb, _dl_msg_sb, _dl_info_sb = coindcx_engine.check_live_daily_loss_stop(wallet_data)
+    if _dl_hit_sb:
+        st.sidebar.warning(f"🛑 {_dl_msg_sb}")
+        if st.sidebar.button("🔄 Sync Baseline (After Transfer)", key="btn_sb_sync_wallet_base", use_container_width=True):
+            coindcx_engine.reset_daily_loss_stop_baseline(wallet_data)
+            get_cached_signals_scan.clear()
+            st.rerun()
+    elif _dl_info_sb:
+        _tf_sb_note = f" • Excl. ₹{abs(_dl_info_sb['net_transfers_inr']):,.0f} Transfer" if _dl_info_sb.get("transfer_adjusted") else ""
+        st.sidebar.caption(
+            f"🛡️ **5% Loss Guard:** ₹{max(0.0, float(_dl_info_sb.get('loss_inr', 0.0))):,.0f} / "
+            f"₹{float(_dl_info_sb.get('limit_inr', 0.0)):,.0f} (Base ₹{float(_dl_info_sb.get('day_start_inr', 0.0)):,.0f}{_tf_sb_note})"
+        )
 else:
     _api_err = wallet_data.get("api_error", "") or coindcx_engine._PERSIST.get("last_auth_error", "")
     if _api_err:
@@ -1656,9 +1669,20 @@ if active_section == "⚡ Signals":
         if st.session_state.get("last_autotrade_banner"):
             st.success(st.session_state.pop("last_autotrade_banner"))
 
+        _shown_dl_sync_btn = False
         for _err_r in active_signals:
             if _err_r.get("autotrade_error"):
                 st.warning(f"⚠️ **AutoTrade Notice ({clean_sym(_err_r['pair'])}):** {_err_r['autotrade_error']}")
+                if "Daily Loss Stop" in str(_err_r["autotrade_error"]) and not _shown_dl_sync_btn:
+                    _shown_dl_sync_btn = True
+                    if st.button(
+                        "🔄 Sync Wallet Baseline to Current Futures Balance (Transferred Funds — Not a Trading Loss)",
+                        key="btn_sig_reset_daily_baseline",
+                        use_container_width=True,
+                    ):
+                        coindcx_engine.reset_daily_loss_stop_baseline(wallet_data)
+                        get_cached_signals_scan.clear()
+                        st.rerun()
 
         # 📲 iPhone Air CoinDCX Push Notification Reader & Synced Feed
         _recent_push_list = coindcx_engine.get_recent_coindcx_notifications(limit=5)

@@ -1185,6 +1185,113 @@ def test_11_ema50_200_pullback_and_combo_modes():
     print("  -> PASS: 15m 50/200 EMA Pullback, Bear/Both Combo Modes & Tight 200 EMA SL preservation verified.")
 
 
+def test_12_wallet_transfer_aware_daily_loss_stop():
+    print("[12/12] Verifying Wallet-Transfer-Aware 5% Daily Loss Stop & 1-Click Baseline Sync...")
+    import tempfile
+    import coindcx_engine as eng
+
+    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    now_ms = int(time.time() * 1000)
+
+    # 1. Exact live scenario from 2026-11-16:
+    #    Main started day at Rs.69,788.04 (legacy pre-v30 ds without applied_tx_ids), user transferred Rs.9,089.11
+    #    from Futures Wallet -> INR Wallet (reason="by_universal_wallet", transaction_type="debit"), leaving Rs.60,698.93
+    #    with 0 trading losses. Must NOT trigger 5% Daily Loss Stop and must auto-clear stale daily_loss_stop_hit!
+    def _mock_tx_api_withdrawal(method, url, payload=None, timeout=3.5):
+        if "wallets/transactions" in url:
+            return _MockResponse(200, [
+                {
+                    "id": "tx_transfer_out_1",
+                    "transaction_type": "debit",
+                    "amount": "9089.11",
+                    "currency_short_name": "INR",
+                    "reason": "by_universal_wallet",
+                    "created_at": now_ms - 60000,
+                }
+            ]), None
+        return _MockResponse(200, []), None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "_send_coindcx_signed_request", side_effect=_mock_tx_api_withdrawal):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng._WALLET_ACTIVITY_CACHE["data"] = None
+            eng._WALLET_ACTIVITY_CACHE["ts"] = 0.0
+            eng.save_autotrade_config({
+                "enabled": True,
+                "daily_start_wallet": {"date": today_s, "inr": 69788.04},
+                "daily_loss_stop_hit": today_s,
+            })
+            act = eng.fetch_today_futures_wallet_activity(usd_inr=104.2, force_refresh=True)
+            assert act["ok"] is True and abs(act["net_transfers_inr"] - (-9089.11)) < 0.02, f"Unexpected activity: {act}"
+
+            w_after_transfer = {
+                "is_live_api": True,
+                "total_inr": 60698.93,
+                "available_inr": 60698.93,
+                "today_wallet_activity": act,
+            }
+            hit_tf, msg_tf, info_tf = eng.check_live_daily_loss_stop(w_after_transfer)
+            assert not hit_tf, f"Wallet transfer out must NOT trigger 5% Daily Loss Stop! Got: {msg_tf} / {info_tf}"
+            assert abs(info_tf["day_start_inr"] - 60698.93) < 0.05, f"Expected baseline adjusted to 60698.93, got {info_tf}"
+            assert abs(info_tf["loss_inr"]) < 0.05, f"Expected 0 trading loss, got {info_tf}"
+            assert eng.get_autotrade_config().get("daily_loss_stop_hit") == "", "Expected stale daily_loss_stop_hit cleared"
+
+            # 2. Subsequent mid-day transfer out on an already-migrated ds (with ts & applied_tx_ids):
+            #    User has -Rs.1,000 real trading loss (60,698.93 -> 59,698.93) AND transfers another Rs.10,000 out (-> 49,698.93).
+            #    Adjusted baseline = 50,698.93 -> real loss = Rs.1,000 (< 5% limit Rs.2,534.95 -> NOT blocked!)
+            act_2 = {
+                "ok": True,
+                "date": today_s,
+                "transfers": [
+                    {"id": "tx_transfer_out_1", "ts": (now_ms - 60000) / 1000.0, "signed_inr": -9089.11, "reason": "by_universal_wallet"},
+                    {"id": "tx_transfer_out_2", "ts": time.time() + 1.0, "signed_inr": -10000.0, "reason": "by_universal_wallet"},
+                ],
+                "net_transfers_inr": -19089.11,
+                "trading_tx_count": 2,
+            }
+            hit_2, msg_2, info_2 = eng.check_live_daily_loss_stop({
+                "is_live_api": True,
+                "total_inr": 49698.93,
+                "available_inr": 49698.93,
+                "today_wallet_activity": act_2,
+            })
+            assert not hit_2, f"Expected Rs.1,000 trading loss + Rs.10,000 transfer NOT blocked: {msg_2}"
+            assert abs(info_2["day_start_inr"] - 50698.93) < 0.05 and abs(info_2["loss_inr"] - 1000.0) < 0.05, info_2
+
+            # 3. Deposit into Futures Wallet (+Rs.20,000) must NOT mask a real 5% trading loss (-Rs.4,000 on Rs.70,698.93 -> Rs.66,698.93)
+            act_3 = {
+                "ok": True,
+                "date": today_s,
+                "transfers": act_2["transfers"] + [
+                    {"id": "tx_deposit_in_3", "ts": time.time() + 2.0, "signed_inr": 20000.0, "reason": "by_universal_wallet"},
+                ],
+                "net_transfers_inr": 910.89,
+                "trading_tx_count": 4,
+            }
+            hit_3, msg_3, info_3 = eng.check_live_daily_loss_stop({
+                "is_live_api": True,
+                "total_inr": 66698.93,
+                "available_inr": 66698.93,
+                "today_wallet_activity": act_3,
+            })
+            assert hit_3 and "5% Daily Loss Stop" in msg_3, f"Expected real Rs.4,000 trading loss to trigger stop even after deposit: {msg_3}"
+
+            # 4. Manual 1-Click Baseline Sync (`reset_daily_loss_stop_baseline`) clears stop & re-anchors cleanly
+            reset_ds = eng.reset_daily_loss_stop_baseline({"is_live_api": True, "total_inr": 66698.93, "today_wallet_activity": act_3})
+            assert abs(reset_ds["inr"] - 66698.93) < 0.05
+            assert eng.get_autotrade_config().get("daily_loss_stop_hit") == ""
+            hit_after_rst, _, _ = eng.check_live_daily_loss_stop({"is_live_api": True, "total_inr": 66698.93, "today_wallet_activity": act_3})
+            assert not hit_after_rst
+
+            # Clear module activity cache so subsequent tests run isolated
+            eng._WALLET_ACTIVITY_CACHE["data"] = None
+            eng._WALLET_ACTIVITY_CACHE["ts"] = 0.0
+
+    print("  -> PASS: Wallet-Transfer-Aware 5% Daily Loss Stop (Withdrawals, Deposits, Legacy Migration & 1-Click Sync) verified.")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1197,6 +1304,7 @@ if __name__ == "__main__":
     test_9_ai_advisor_and_tick_precision()
     test_10_strategy3_four_improvements_and_staging_paper_autotrade()
     test_11_ema50_200_pullback_and_combo_modes()
+    test_12_wallet_transfer_aware_daily_loss_stop()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
