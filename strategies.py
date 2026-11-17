@@ -1906,30 +1906,40 @@ def _detect_ema50_200_setup(
                     and ((c_close < p_close) or (c_rng > 0 and (u_wick / c_rng) >= 0.35))
                 )
                 if bear_rej and rl < c_close * 0.992:
-                    stop_px = max(e200, reach_high) * 1.0025
-                    if ((stop_px - c_close) / c_close) * 100.0 < 0.30:
-                        stop_px = c_close * 1.004
-                    rew_dist = c_close - rl
-                    tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
-                    if tp1_dist >= c_close * 0.006:
-                        tp1_px = c_close - tp1_dist
-                        tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                        tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                        return {
-                            "direction": "SHORT",
-                            "entry": c_close,
-                            "entry2_sweep": 0.0,
-                            "stop": stop_px,
-                            "tp1": tp1_px,
-                            "tp2": rl,
-                            "tp1_label": f"50% Book Mid(Entry,RL) ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
-                            "tp2_label": f"50% Runner @ RL (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
-                            "reason": "Bear 15m 50<200 EMA Pullback Rejection -> RL",
-                            "trigger_zone": "15m 50/200 EMA CEILING",
-                            "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
-                            "ema50_15m": e50,
-                            "ema200_15m": e200,
-                        }
+                    lb = min(idx, 12)
+                    loc_low_3h = min(float(recs15[k]["low"]) for k in range(idx - lb, idx))
+                    room_3h = c_close - loc_low_3h
+                    # 3h Structure Guard: skip shorting directly into a 3h local double-bottom (<0.45% room)
+                    if room_3h >= c_close * 0.0045:
+                        stop_px = max(e200, reach_high) * 1.0025
+                        if ((stop_px - c_close) / c_close) * 100.0 < 0.30:
+                            stop_px = c_close * 1.004
+                        rew_dist = c_close - rl
+                        tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
+                        tp1_src_lbl = "Mid(Entry,RL)"
+                        # 3h Structure-Capped TP1: book 50% right above 3h local swing low before support bounces
+                        if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
+                            tp1_dist = max(c_close * 0.008, room_3h * 0.94)
+                            tp1_src_lbl = "3h-SwingLow"
+                        if tp1_dist >= c_close * 0.006:
+                            tp1_px = c_close - tp1_dist
+                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            return {
+                                "direction": "SHORT",
+                                "entry": c_close,
+                                "entry2_sweep": 0.0,
+                                "stop": stop_px,
+                                "tp1": tp1_px,
+                                "tp2": rl,
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
+                                "tp2_label": f"50% Runner @ RL (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
+                                "reason": f"Bear 15m 50<200 EMA Pullback Rejection -> RL (TP1: {tp1_src_lbl})",
+                                "trigger_zone": "15m 50/200 EMA CEILING",
+                                "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
+                                "ema50_15m": e50,
+                                "ema200_15m": e200,
+                            }
 
     if allow_bull and bias == "BULLISH" and e50 > e200:
         above_cnt = sum(1 for r, em in zip(prior, prior_e50) if float(r["close"]) > float(em))
@@ -1944,30 +1954,40 @@ def _detect_ema50_200_setup(
                     and ((c_close > p_close) or (c_rng > 0 and (l_wick / c_rng) >= 0.35))
                 )
                 if bull_rej and rh > c_close * 1.008:
-                    stop_px = min(e200, reach_low) * 0.9975
-                    if ((c_close - stop_px) / c_close) * 100.0 < 0.30:
-                        stop_px = c_close * 0.996
-                    rew_dist = rh - c_close
-                    tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
-                    if tp1_dist >= c_close * 0.006:
-                        tp1_px = c_close + tp1_dist
-                        tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                        tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                        return {
-                            "direction": "LONG",
-                            "entry": c_close,
-                            "entry2_sweep": 0.0,
-                            "stop": stop_px,
-                            "tp1": tp1_px,
-                            "tp2": rh,
-                            "tp1_label": f"50% Book Mid(Entry,RH) ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
-                            "tp2_label": f"50% Runner @ RH (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
-                            "reason": "Bull 15m 50>200 EMA Pullback Bounce -> RH",
-                            "trigger_zone": "15m 50/200 EMA FLOOR",
-                            "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
-                            "ema50_15m": e50,
-                            "ema200_15m": e200,
-                        }
+                    lb = min(idx, 12)
+                    loc_high_3h = max(float(recs15[k]["high"]) for k in range(idx - lb, idx))
+                    room_3h = loc_high_3h - c_close
+                    # 3h Structure Guard: skip longing directly into a 3h local double-top (<0.45% room)
+                    if room_3h >= c_close * 0.0045:
+                        stop_px = min(e200, reach_low) * 0.9975
+                        if ((c_close - stop_px) / c_close) * 100.0 < 0.30:
+                            stop_px = c_close * 0.996
+                        rew_dist = rh - c_close
+                        tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
+                        tp1_src_lbl = "Mid(Entry,RH)"
+                        # 3h Structure-Capped TP1: book 50% right below 3h local swing high before resistance stalls
+                        if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
+                            tp1_dist = max(c_close * 0.008, room_3h * 0.94)
+                            tp1_src_lbl = "3h-SwingHigh"
+                        if tp1_dist >= c_close * 0.006:
+                            tp1_px = c_close + tp1_dist
+                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            return {
+                                "direction": "LONG",
+                                "entry": c_close,
+                                "entry2_sweep": 0.0,
+                                "stop": stop_px,
+                                "tp1": tp1_px,
+                                "tp2": rh,
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
+                                "tp2_label": f"50% Runner @ RH (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
+                                "reason": f"Bull 15m 50>200 EMA Pullback Bounce -> RH (TP1: {tp1_src_lbl})",
+                                "trigger_zone": "15m 50/200 EMA FLOOR",
+                                "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
+                                "ema50_15m": e50,
+                                "ema200_15m": e200,
+                            }
 
     return None
 
@@ -2180,22 +2200,31 @@ class BoxPlusEma50200Strategy(Strategy):
     tp1_name, tp2_name = "TP1 (50% Book)", "TP2 (50% Structural Runner)"
     uses_live_price = True
 
-    def __init__(self, sid: str, name: str, short_lbl: str, allow_bull_ema: bool = False):
+    def __init__(self, sid: str, name: str, short_lbl: str, allow_bull_ema: bool = False, regime_adaptive: bool = False):
         self.id = sid
         self.name = name
         self.short = short_lbl
         self.allow_bull_ema = allow_bull_ema
-        self.timeframe = (
-            "15m Box Sweep (Long & Short) + Bear 15m 50/200 EMA Pullback"
-            if not allow_bull_ema
-            else "15m Box Sweep (Long & Short) + Bull & Bear 15m 50/200 EMA Pullback"
-        )
-        self.description = (
-            "Priority 1 runs Strategy 1 (15m Box Theory Sweep Long & Short). When price trends away from Box "
-            f"edges, Priority 2 runs 15m 50/200 EMA Pullback ({'Bear Short only' if not allow_bull_ema else 'Bull & Bear'})."
-        )
+        self.regime_adaptive = regime_adaptive
+        if regime_adaptive:
+            self.timeframe = "Regime-Adaptive: Box Sweep (All Regimes) + Auto Bull/Bear 15m 50/200 EMA in Strong Trends"
+            self.description = (
+                "2-Year Verified Regime-Adaptive Routing: always runs Strategy 1 (15m Box Theory Sweep L+S); "
+                "automatically activates Bull 15m 50/200 EMA Longs in STRONG UPTREND, Bear 15m 50/200 EMA Shorts "
+                "in STRONG DOWNTREND, and pauses EMA trend entries during RANGING / CHOP markets."
+            )
+        else:
+            self.timeframe = (
+                "15m Box Sweep (Long & Short) + Bear 15m 50/200 EMA Pullback"
+                if not allow_bull_ema
+                else "15m Box Sweep (Long & Short) + Bull & Bear 15m 50/200 EMA Pullback"
+            )
+            self.description = (
+                "Priority 1 runs Strategy 1 (15m Box Theory Sweep Long & Short). When price trends away from Box "
+                f"edges, Priority 2 runs 15m 50/200 EMA Pullback ({'Bear Short only' if not allow_bull_ema else 'Bull & Bear'})."
+            )
         self.s1 = BoxTheorySweep()
-        self.s4 = Ema50200PullbackStrategy(allow_bear=True, allow_bull=allow_bull_ema)
+        self.s4 = Ema50200PullbackStrategy(allow_bear=True, allow_bull=(allow_bull_ema or regime_adaptive))
 
     def compute_levels(self, pair):
         return self.s4.compute_levels(pair)
@@ -2204,6 +2233,17 @@ class BoxPlusEma50200Strategy(Strategy):
         levels = levels or self.compute_levels(pair)
         sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
         if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
+            return sig1
+        if self.regime_adaptive:
+            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
+            if reg == "RANGING_CHOP":
+                return sig1
+            sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+            if sig4 and (
+                (reg == "STRONG_DOWNTREND" and sig4.get("signal") == "SHORT")
+                or (reg == "STRONG_UPTREND" and sig4.get("signal") == "LONG")
+            ):
+                return sig4
             return sig1
         sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
         if sig4 and sig4.get("signal") in ("LONG", "SHORT"):
@@ -2224,10 +2264,31 @@ class BoxPlusEma50200Strategy(Strategy):
 
     def prepare_backtest(self, df, df_daily):
         ctx1 = self.s1.prepare_backtest(df, df_daily)
+        reg_map = {}
+        if self.regime_adaptive:
+            reg_map = dict(eng._PERSIST.get("backtest_regime_map") or {})
+            if not reg_map and df_daily is not None and len(df_daily) >= 18:
+                d = df_daily.copy().reset_index(drop=True)
+                if "date_str" not in d.columns:
+                    d["dt_ist"] = pd.to_datetime(d["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(IST)
+                    d["date_str"] = d["dt_ist"].dt.strftime("%Y-%m-%d")
+                e50_s = d["close"].ewm(span=50, adjust=False).mean().tolist()
+                e200_s = d["close"].ewm(span=200, adjust=False).mean().tolist()
+                closes = d["close"].tolist()
+                dates = d["date_str"].tolist()
+                for i in range(16, len(closes)):
+                    pc, pe50, pe200 = float(closes[i - 1]), float(e50_s[i - 1]), float(e200_s[i - 1])
+                    bf = 1.0 if (pc > pe50 and pc > pe200) else 0.0
+                    brf = 1.0 if (pc < pe50 and pc < pe200) else 0.0
+                    r14 = (pc / float(closes[i - 15]) - 1.0) * 100.0
+                    r5 = (pc / float(closes[i - 6]) - 1.0) * 100.0
+                    r2 = (pc / float(closes[i - 3]) - 1.0) * 100.0
+                    reg_map[dates[i]] = eng.classify_universe_regime_from_stats(bf, brf, r14, r5, r2)
         return {
             "ctx1": ctx1,
             "ctx4": self.s4.prepare_backtest(df, df_daily),
             "boxes": ctx1["boxes"],
+            "regime_map": reg_map,
         }
 
     def backtest_has_context(self, candle, ctx):
@@ -2237,16 +2298,28 @@ class BoxPlusEma50200Strategy(Strategy):
         e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
         if e1:
             return e1
+        if self.regime_adaptive:
+            day_reg = (ctx.get("regime_map") or {}).get(candle["date_str"], "RANGING_CHOP")
+            if day_reg == "RANGING_CHOP":
+                return None
+            e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
+            if e4 and (
+                (day_reg == "STRONG_DOWNTREND" and e4.get("direction") == "SHORT")
+                or (day_reg == "STRONG_UPTREND" and e4.get("direction") == "LONG")
+            ):
+                return e4
+            return None
         return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
 
 
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
-    ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA (Recommended)"),
+    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Box + Auto Trend EMA] (Recommended)"),
+    ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA"),
     ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
     ("box_theory", "Box Theory Sweep Only (v27)"),
     ("ema50_200", "15m 50/200 EMA Pullback Only"),
 ]
-DEFAULT_AUTOTRADE_MODE = "box_plus_ema50_200_bear"
+DEFAULT_AUTOTRADE_MODE = "box_plus_ema50_200_regime"
 
 
 def resolve_autotrade_mode(mode: str | None) -> str:
@@ -2267,6 +2340,13 @@ def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
         return ["box_theory"]
     if m == "ema50_200":
         return ["ema50_200"]
+    if m == "box_plus_ema50_200_regime":
+        try:
+            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
+            if reg == "RANGING_CHOP":
+                return ["box_theory"]
+        except Exception:
+            pass
     return ["box_theory", "ema50_200"]
 
 
@@ -2278,6 +2358,13 @@ STRATEGY_REGISTRY: dict[str, Strategy] = {
     AtrReversal.id: AtrReversal(),
     Ema9RetestStrategy.id: Ema9RetestStrategy(),
     Ema50200PullbackStrategy.id: Ema50200PullbackStrategy(allow_bear=True, allow_bull=True),
+    "box_plus_ema50_200_regime": BoxPlusEma50200Strategy(
+        sid="box_plus_ema50_200_regime",
+        name="Combo: Regime-Adaptive [Box + Auto Trend EMA]",
+        short_lbl="Combo (Regime-Adaptive)",
+        allow_bull_ema=True,
+        regime_adaptive=True,
+    ),
     "box_plus_ema50_200_bear": BoxPlusEma50200Strategy(
         sid="box_plus_ema50_200_bear",
         name="Combo: Box (L+S) + Bear 15m 50/200 EMA",

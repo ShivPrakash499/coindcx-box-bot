@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 32
+_DAEMON_VERSION = 33
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -369,6 +369,10 @@ def get_cached_open_orders():
 @st.cache_data(ttl=300)
 def get_cached_bias(pair):
     return compute_market_bias(pair)
+
+@st.cache_data(ttl=180)
+def get_cached_market_regime():
+    return coindcx_engine.compute_market_regime()
 
 @st.cache_data(ttl=300)
 def get_cached_strategy_levels(strategy_id, pair):
@@ -773,6 +777,13 @@ else:
 
 _auto_mode_keys = [k for k, _ in strategy_registry.AUTOTRADE_MODE_CHOICES]
 _auto_mode_labels = dict(strategy_registry.AUTOTRADE_MODE_CHOICES)
+if not _auto_cfg.get("regime_mode_migrated_v33"):
+    _mig_updates = {"regime_mode_migrated_v33": True}
+    if _auto_cfg.get("autotrade_strategy_mode") in (None, "", "box_plus_ema50_200_bear"):
+        _mig_updates["autotrade_strategy_mode"] = "box_plus_ema50_200_regime"
+        st.session_state.pop("sidebar_autotrade_strategy_mode", None)
+        st.session_state.pop("monitor_strategies", None)
+    _auto_cfg = coindcx_engine.save_autotrade_config(_mig_updates)
 _saved_auto_mode = strategy_registry.resolve_autotrade_mode(_auto_cfg.get("autotrade_strategy_mode"))
 if st.session_state.get("sidebar_autotrade_strategy_mode") not in _auto_mode_keys:
     st.session_state["sidebar_autotrade_strategy_mode"] = _saved_auto_mode
@@ -791,10 +802,15 @@ selected_autotrade_mode = st.sidebar.selectbox(
     format_func=lambda k: _auto_mode_labels.get(k, k),
     key="sidebar_autotrade_strategy_mode",
     on_change=_on_sidebar_autotrade_strategy_change,
-    help="Select what 24/7 AutoTrade & the default Scanner run: Combo (Box Sweep Priority 1 + Bear 15m 50/200 EMA Priority 2), Box + Bull & Bear EMA, Box Sweep Only, or 15m 50/200 EMA Only.",
+    help="Select what 24/7 AutoTrade & the default Scanner run: Regime-Adaptive (Box Sweep in all markets + Auto Bull/Bear 15m 50/200 EMA in Strong Trends, paused in Chop), Bear EMA, Bull & Bear EMA, Box Only, or EMA Only.",
 )
+_live_regime_info = get_cached_market_regime()
 _active_mode_strats = strategy_registry.autotrade_mode_strategy_ids(selected_autotrade_mode)
 st.sidebar.caption(f"🎯 **Mode:** `{_auto_mode_labels.get(selected_autotrade_mode, selected_autotrade_mode)}`")
+st.sidebar.caption(
+    f"🧭 **Market Trend:** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
+    f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`)"
+)
 
 if (
     round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
@@ -1597,9 +1613,12 @@ if active_section == "⚡ Signals":
                         signal_monitor._LAST_SCAN_CACHE["ts"] = 0.0
                 except Exception:
                     pass
+                get_cached_market_regime.clear()
                 get_cached_top_movers.clear()
                 get_cached_signals_scan.clear()
                 st.rerun()
+
+        st.caption(f"🧭 **Detected Market Trend:** {_live_regime_info.get('summary', '')}")
 
         # Top 6 High-Volatility Movers Grid
         top_movers = get_cached_top_movers(tuple(monitor_pairs), top_n=min(6, len(monitor_pairs)))
@@ -2906,9 +2925,9 @@ elif active_section == "🧪 Backtest":
     st.caption(
         f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` — matches 24/7 AutoTrade execution "
         "(`Box Theory Sweep` Priority 1 at outer `RH`/`SH`/`RL`/`SL` zones + Daily `50 EMA`; `15m 50/200 EMA Pullback` Priority 2 "
-        "with `SL` beyond `15m 200 EMA` and `TP2` at `RL` / `RH`). *Backtest results use historical CoinDCX data and are hypothetical.*"
+        "with 3h Structure-Aware `TP1`, `SL` beyond `15m 200 EMA`, `TP2` at `RL` / `RH`, and Max 2 Concurrent EMA Slots). *Backtest results use historical CoinDCX data and are hypothetical.*"
     )
-    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days"], index=0, key="bt_multi_dur")
+    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days"], index=0, key="bt_multi_dur")
     bt_capital = bc2.number_input("Single-Trade Margin (₹)", min_value=5000, value=int(margin_inr), step=5000, key="bt_multi_cap")
     bt_lev = bc3.slider("Leverage (x)", 1, 20, 10, key="bt_multi_lev")
 

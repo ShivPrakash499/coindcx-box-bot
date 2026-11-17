@@ -99,6 +99,13 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str)
         return (strategy_id == "box_theory") or (strategy_id == "ema50_200" and d == "SHORT")
     if m == "box_plus_ema50_200_both":
         return strategy_id in ("box_theory", "ema50_200")
+    if m == "box_plus_ema50_200_regime":
+        if strategy_id == "box_theory":
+            return True
+        if strategy_id == "ema50_200":
+            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
+            return (reg == "STRONG_DOWNTREND" and d == "SHORT") or (reg == "STRONG_UPTREND" and d == "LONG")
+        return False
     return strategy_id == strat_registry.DEFAULT_STRATEGY_ID
 
 
@@ -258,6 +265,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     continue
                 if sid in ("box_theory", "atr_reversal"):
                     pair_primary_triggered = True
+
+                if auto_mode == "box_plus_ema50_200_regime" and s.id == "ema50_200":
+                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode):
+                        reg_lbl = eng.compute_market_regime().get("label", "RANGING / CHOP")
+                        results.append({**row, "signal": None, "message": f"paused by Regime-Adaptive mode ({reg_lbl})"})
+                        continue
 
                 if float(sig.get("roe_tp1", 0.0)) < 3.0:
                     results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})

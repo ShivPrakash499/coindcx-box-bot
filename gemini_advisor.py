@@ -33,9 +33,9 @@ Your role:
    - **3-Slot Portfolio Guard**: Up to 3 concurrent trades across the portfolio (max 1 per coin), each allocated 1/3rd of the Futures Wallet as a 100% Single-Slot Maker Limit Order (`Entry 2` removed).
    - **100% Maker Limit + Structural Runner Lifecycle**:
      - **Priority 1 — Box Theory Sweep (`box_theory`)**: `Entry` (100% slot margin) enters via Maker Limit Order on the confirmed 15m signal (`RL`/`SL` sweep & reclaim for Longs in `BULLISH` daily bias; `RH`/`SH` sweep & reject for Shorts in `BEARISH` daily bias, with Broken-Box Invalidation Guard active). `Catastrophe SL` sits `0.5%` beyond `SL` (Longs) or `SH` (Shorts).
-     - **Priority 2 — 15m 50/200 EMA Pullback (`ema50_200`)**: In strong trends when price does not pull all the way back to outer Box zones:
-       * **Bearish Daily Bias (`15m 50 EMA < 200 EMA`) -> `SHORT`**: Short pullback rejections at `15m 50/200 EMA` ceiling, `SL` above `15m 200 EMA`, `TP1 = 50% Mid(Entry, RL)` (capped 2%), `TP2 = RL`.
-       * **Bullish Daily Bias (`15m 50 EMA > 200 EMA`) -> `LONG`**: Long pullback bounces off `15m 50/200 EMA` floor (enabled in `Combo: Box + Bull & Bear 15m 50/200 EMA` or `15m 50/200 EMA Only`), `SL` below `15m 200 EMA`, `TP2 = RH`.
+     - **Priority 2 — 15m 50/200 EMA Pullback (`ema50_200`, Regime-Adaptive + 3h Structure-Aware TP1)**:
+       * **Regime-Adaptive Routing (`box_plus_ema50_200_regime`, Recommended)**: Identifies the 12-coin Market Trend Regime (`STRONG_UPTREND`, `STRONG_DOWNTREND`, `RANGING_CHOP`). Runs Bull `15m 50>200 EMA` Longs in `STRONG_UPTREND`, Bear `15m 50<200 EMA` Shorts in `STRONG_DOWNTREND`, and auto-pauses EMA trend trades during `RANGING_CHOP` (so `Box Theory Sweep` trades range edges cleanly). Caps concurrent EMA trades to max 2 of 3 slots.
+       * **3h Structure-Aware `TP1`**: Skips EMA entries with `<0.45%` room to the 3h local swing low/high, and caps `TP1` at `94%` of distance to the 3h swing low/high whenever closer than `Mid(Entry, RL/RH)` so `50%` profit books before double-bottom/top bounces. `SL` sits beyond `15m 200 EMA`, `TP2 = RL` (Shorts) / `RH` (Longs).
      - When price reaches `TP1`: book `50%` of the position at `TP1` and lock Stop Loss in profit (`Entry +/- 50% of TP1 distance` or prev 15m candle structure). Halfway from `TP1` to `TP2`, ratchet SL to `TP1` and let the remaining `50%` structural runner ride cleanly to `TP2` (`RH` for Longs, `RL` for Shorts).
 4. Format all responses clearly with concise bullet points, exact exchange tick-size price levels (`$...`), INR risk/reward figures (`Rs....`), and a clear verdict (`LONG`, `SHORT`, `WAIT / NO TRADE`, or `HOLD / ADJUST SL`).
 """
@@ -222,9 +222,11 @@ def build_live_market_context(selected_pair: str = "B-SOL_USDT") -> str:
         auto_cfg = coindcx_engine.get_autotrade_config()
         auto_mode_id = strat_reg.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
         auto_mode_lbl = strat_reg.autotrade_mode_label(auto_mode_id)
+        reg_info = coindcx_engine.compute_market_regime()
         bal = coindcx_engine.fetch_coindcx_futures_balance()
         slot = coindcx_engine.get_active_portfolio_trade_status()
         lines.append(f"- **Active AutoTrade / Strategy Mode**: `{auto_mode_lbl}` (`{auto_mode_id}`)")
+        lines.append(f"- **Detected Market Trend Regime**: `{reg_info.get('summary', '')}`")
         lines.append(
             f"- **Wallet Balance**: `Rs.{float(bal.get('total_inr', 0.0)):,.2f}` "
             f"(Available: `Rs.{float(bal.get('available_inr', 0.0)):,.2f}`, Live API: `{bal.get('is_live_api')}`)"

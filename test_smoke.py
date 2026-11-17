@@ -1092,10 +1092,11 @@ def test_11_ema50_200_pullback_and_combo_modes():
 
     # 1. Registry & mode resolver checks
     assert "ema50_200" in strat.STRATEGY_REGISTRY
+    assert "box_plus_ema50_200_regime" in strat.STRATEGY_REGISTRY
     assert "box_plus_ema50_200_bear" in strat.STRATEGY_REGISTRY
     assert "box_plus_ema50_200_both" in strat.STRATEGY_REGISTRY
     assert any(s.id == "ema50_200" for s in strat.list_strategies())
-    assert strat.resolve_autotrade_mode(None) == "box_plus_ema50_200_bear"
+    assert strat.resolve_autotrade_mode(None) == "box_plus_ema50_200_regime"
     assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_bear") == ["box_theory", "ema50_200"]
 
     # 2. Bearish Daily Bias -> SHORT @ 15m 50/200 EMA Pullback with SL > 15m 200 EMA -> TP2 = RL
@@ -1217,6 +1218,106 @@ def test_12_sidebar_unlock_autotrade():
     print("  -> PASS: Sidebar 'Unlock AutoTrade' cleanly unlocks 5% Daily Loss Stop & syncs wallet baseline.")
 
 
+def test_13_regime_adaptive_routing_and_structure_tp1():
+    print("[13/13] Verifying Market-Regime Classifier, Regime-Adaptive Routing, 3h Structure-Aware TP1 & Max 2 EMA Slots...")
+    import tempfile
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+
+    # 1. Market Trend Regime Classifier across all 3 market conditions
+    assert eng.classify_universe_regime_from_stats(0.67, 0.08, 12.4, 4.2, 1.8) == "STRONG_UPTREND"
+    assert eng.classify_universe_regime_from_stats(0.0, 0.83, -18.7, -11.7, -7.3) == "STRONG_DOWNTREND"
+    # Post-crash inside-bar / relief consolidation (like Nov 17: bear=83%, r14=-17.9%, r5=-12.1%, r2=+2.27%) -> RANGING_CHOP!
+    assert eng.classify_universe_regime_from_stats(0.0, 0.83, -17.9, -12.1, 2.27) == "RANGING_CHOP"
+    assert eng.classify_universe_regime_from_stats(0.25, 0.33, -1.2, 0.4, 0.2) == "RANGING_CHOP"
+
+    # 2. 3h Structure-Aware TP1: skips <0.45% double-bottom floor & caps TP1 above 3h swing low
+    bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
+    recs_floor_blocked = [
+        {"open": 7.08, "high": 7.10, "low": 7.07, "close": 7.08},
+        {"open": 7.08, "high": 7.10, "low": 7.07, "close": 7.08},
+        {"open": 7.08, "high": 7.10, "low": 7.07, "close": 7.08},
+        {"open": 7.08, "high": 7.10, "low": 7.07, "close": 7.08},
+        {"open": 7.08, "high": 7.10, "low": 7.07, "close": 7.08},
+        {"open": 7.08, "high": 7.16, "low": 7.07, "close": 7.13},
+        {"open": 7.13, "high": 7.17, "low": 7.07, "close": 7.09},  # room to 7.07 is only 0.28% (<0.45% floor!)
+    ]
+    assert strat._detect_ema50_200_setup(
+        recs_floor_blocked, 6, bear_box, ema50_val=7.12, ema200_val=7.18,
+        prior_e50=[7.12] * 6, prior_e200=[7.18] * 6, allow_bear=True, allow_bull=False,
+    ) is None, "Expected 3h <0.45% double-bottom floor guard to skip entry"
+
+    recs_capped = [dict(r) for r in recs_floor_blocked]
+    recs_capped[0]["low"] = 7.01  # 3h swing low = $7.01 (1.13% room < 2.0% raw TP1 -> TP1 must cap above $7.01!)
+    sig_cap = strat._detect_ema50_200_setup(
+        recs_capped, 6, bear_box, ema50_val=7.12, ema200_val=7.18,
+        prior_e50=[7.12] * 6, prior_e200=[7.18] * 6, allow_bear=True, allow_bull=False,
+    )
+    assert sig_cap is not None and sig_cap["tp1"] > 7.01 and "3h-SwingLow" in sig_cap["tp1_label"], (
+        f"Expected TP1 capped above 3h swing low $7.01, got {sig_cap}"
+    )
+
+    # 3. Regime-Adaptive Routing across RANGING_CHOP, STRONG_DOWNTREND, STRONG_UPTREND + Max 2 EMA Slots
+    with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}):
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory"]
+        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
+
+    with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "label": "STRONG UPTREND", "median_2d_pct": 1.8}):
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory", "ema50_200"]
+        assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        now_t = time.time()
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "is_staging_environment", return_value=True), \
+             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
+             patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+             patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.090}), \
+             patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng.save_autotrade_config({
+                "autotrade_strategy_mode": "box_plus_ema50_200_regime",
+                "history": [
+                    {"pair": "B-SUI_USDT", "strategy_id": "ema50_200", "opened_ts": now_t - 600},
+                    {"pair": "B-AVAX_USDT", "strategy_id": "ema50_200", "opened_ts": now_t - 300},
+                ],
+            })
+            # In RANGING_CHOP -> EMA SHORT is auto-paused!
+            with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]):
+                ok_ch, msg_ch, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "ema50_200", "entry": 7.09, "tp1": 7.015, "tp2": 6.80, "stop_loss": 7.185, "levels": bear_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert not ok_ch and "Market Regime Guard" in msg_ch, f"Expected RANGING_CHOP guard block, got {ok_ch} {msg_ch}"
+
+            # In STRONG_DOWNTREND with 2 EMA trades already open -> 3rd EMA trade is capped (reserving 3rd slot for Box)!
+            two_open = [{"pair": "B-SUI_USDT"}, {"pair": "B-AVAX_USDT"}]
+            with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.5}), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=two_open):
+                ok_cap, msg_cap, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "ema50_200", "entry": 7.09, "tp1": 7.015, "tp2": 6.80, "stop_loss": 7.185, "levels": bear_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert not ok_cap and "EMA Slot Cap (2/2" in msg_cap, f"Expected Max 2 EMA Slot Cap, got {ok_cap} {msg_cap}"
+                # Meanwhile Box Theory Sweep CAN still take the 3rd slot!
+                ok_box3, msg_box3, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.51, "tp1": 7.36, "tp2": 6.80, "stop_loss": 7.64, "levels": bear_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert ok_box3, f"Expected 3rd slot reserved & open for Box Theory Sweep, got {ok_box3} {msg_box3}"
+
+    print("  -> PASS: Market-Regime Classifier, Regime-Adaptive Routing, 3h Structure-Aware TP1 & Max 2 EMA Slots verified.")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1230,6 +1331,7 @@ if __name__ == "__main__":
     test_10_strategy3_four_improvements_and_staging_paper_autotrade()
     test_11_ema50_200_pullback_and_combo_modes()
     test_12_sidebar_unlock_autotrade()
+    test_13_regime_adaptive_routing_and_structure_tp1()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

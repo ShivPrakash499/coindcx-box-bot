@@ -442,8 +442,9 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 32
+_REQUIRED_DAEMON_VERSION = 33
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
+MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 
 
 def compute_maker_limit_entry_price(
@@ -3313,11 +3314,209 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
     return ordered
 
 
+_MARKET_REGIME_CACHE = _PERSIST.setdefault("market_regime_cache", {"ts": 0.0, "data": None})
+
+
+def classify_universe_regime_from_stats(
+    bull_frac: float,
+    bear_frac: float,
+    r14: float,
+    r5: float,
+    r2: float,
+) -> str:
+    """
+    Zero-lookahead 2-Year Verified Market Trend Classifier across the 12-coin High-Volatility Universe:
+      - STRONG_UPTREND   : >=50% Bullish Daily Bias AND 14d median >= +2.5% AND 5d >= -1.0% AND 2d >= -1.5%
+      - STRONG_DOWNTREND : >=50% Bearish Daily Bias AND 14d median <= -3.5% AND 5d <= +0.5% AND 2d <= +1.0%
+      - RANGING_CHOP     : Mixed breadth, flat 14d momentum, or multi-day post-crash/rally consolidation
+                           (e.g. 2d median bounce > +1.0% in Bear or pullback < -1.5% in Bull).
+    """
+    if bull_frac >= 0.50 and r14 >= 2.5 and r5 >= -1.0 and r2 >= -1.5:
+        return "STRONG_UPTREND"
+    if bear_frac >= 0.50 and r14 <= -3.5 and r5 <= 0.5 and r2 <= 1.0:
+        return "STRONG_DOWNTREND"
+    return "RANGING_CHOP"
+
+
+def _format_regime_metadata(regime: str, bull_frac: float, bear_frac: float, r14: float, r5: float, r2: float) -> dict:
+    b_pct = round(bull_frac * 100.0, 0)
+    br_pct = round(bear_frac * 100.0, 0)
+    if regime == "STRONG_UPTREND":
+        emoji, label = "🟢", "STRONG UPTREND"
+        routing = "Box Sweep (L+S) + Bull 15m 50/200 EMA (LONG)"
+    elif regime == "STRONG_DOWNTREND":
+        emoji, label = "🔴", "STRONG DOWNTREND"
+        routing = "Box Sweep (L+S) + Bear 15m 50/200 EMA (SHORT)"
+    else:
+        emoji, label = "🟡", "RANGING / CHOP"
+        routing = "Box Theory Sweep ONLY (15m 50/200 EMA Auto-Paused in Chop)"
+    summary = (
+        f"{emoji} {label} — Breadth: {b_pct:.0f}% Bull / {br_pct:.0f}% Bear | "
+        f"14d: {r14:+.1f}% • 5d: {r5:+.1f}% • 2d: {r2:+.1f}% -> {routing}"
+    )
+    return {
+        "regime": regime,
+        "emoji": emoji,
+        "label": label,
+        "active_routing": routing,
+        "bull_breadth_pct": round(bull_frac * 100.0, 1),
+        "bear_breadth_pct": round(bear_frac * 100.0, 1),
+        "median_14d_pct": round(r14, 2),
+        "median_5d_pct": round(r5, 2),
+        "median_2d_pct": round(r2, 2),
+        "summary": summary,
+    }
+
+
+def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) -> dict:
+    """
+    Computes the live zero-lookahead Market Trend Regime across HIGH_VOL_FUTURES_UNIVERSE
+    using completed daily candles (cached 5 minutes so UI & 24/7 scanner calls take 0ms when warm).
+    """
+    now = time.time()
+    cached = _MARKET_REGIME_CACHE.get("data")
+    if not force_refresh and isinstance(cached, dict) and (now - float(_MARKET_REGIME_CACHE.get("ts", 0.0))) < 300.0:
+        return dict(cached)
+
+    pool = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
+    now_ms = int(now * 1000)
+    bull_cnt, bear_cnt, valid_cnt = 0, 0, 0
+    r14_list, r5_list, r2_list = [], [], []
+
+    for p in pool:
+        try:
+            df_d = fetch_coindcx_candles(pair=p, interval="1d", limit=260, sync_live_price=False)
+            if df_d is None or df_d.empty or len(df_d) < 20:
+                continue
+            closed_d = df_d[df_d["timestamp"] + 86400000 <= now_ms].reset_index(drop=True)
+            if len(closed_d) < 16:
+                closed_d = df_d.iloc[:-1].reset_index(drop=True)
+            if len(closed_d) < 16:
+                continue
+            closes = closed_d["close"]
+            e50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+            e200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
+            c_last = float(closes.iloc[-1])
+            valid_cnt += 1
+            if c_last > e50 and c_last > e200:
+                bull_cnt += 1
+            elif c_last < e50 and c_last < e200:
+                bear_cnt += 1
+            r14_list.append((c_last / float(closes.iloc[-15]) - 1.0) * 100.0)
+            r5_list.append((c_last / float(closes.iloc[-6]) - 1.0) * 100.0)
+            r2_list.append((c_last / float(closes.iloc[-3]) - 1.0) * 100.0)
+        except Exception:
+            continue
+
+    if valid_cnt == 0:
+        fallback = _format_regime_metadata("RANGING_CHOP", 0.0, 0.0, 0.0, 0.0, 0.0)
+        return fallback
+
+    r14_med = float(pd.Series(r14_list).median()) if r14_list else 0.0
+    r5_med = float(pd.Series(r5_list).median()) if r5_list else 0.0
+    r2_med = float(pd.Series(r2_list).median()) if r2_list else 0.0
+    bull_f = bull_cnt / valid_cnt
+    bear_f = bear_cnt / valid_cnt
+    reg = classify_universe_regime_from_stats(bull_f, bear_f, r14_med, r5_med, r2_med)
+    out = _format_regime_metadata(reg, bull_f, bear_f, r14_med, r5_med, r2_med)
+    _MARKET_REGIME_CACHE["data"] = dict(out)
+    _MARKET_REGIME_CACHE["ts"] = now
+    return out
+
+
+def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30, warmup_days: int = 1000) -> dict[str, str]:
+    """
+    Builds a date_str -> ('STRONG_UPTREND' | 'STRONG_DOWNTREND' | 'RANGING_CHOP') lookup across the
+    12-coin universe for historical backtests (strictly using prior completed daily candles, zero lookahead).
+    """
+    pool = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
+    bias_by_d: dict[str, list[str]] = {}
+    r14_by_d: dict[str, list[float]] = {}
+    r5_by_d: dict[str, list[float]] = {}
+    r2_by_d: dict[str, list[float]] = {}
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+
+    for p in pool:
+        try:
+            df_d = fetch_historical_candles_paginated(pair=p, interval="1d", duration_days=duration_days + warmup_days)
+            if df_d is None or df_d.empty or len(df_d) < 20:
+                continue
+            df_d = df_d.copy().reset_index(drop=True)
+            df_d["dt_ist"] = pd.to_datetime(df_d["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(IST)
+            df_d["date_str"] = df_d["dt_ist"].dt.strftime("%Y-%m-%d")
+            if str(df_d["date_str"].iloc[-1]) < today_str:
+                nxt = df_d.iloc[[-1]].copy()
+                nxt["timestamp"] = int(df_d["timestamp"].iloc[-1]) + 86400000
+                nxt["date_str"] = today_str
+                df_d = pd.concat([df_d, nxt], ignore_index=True)
+
+            e50_s = df_d["close"].ewm(span=50, adjust=False).mean().tolist()
+            e200_s = df_d["close"].ewm(span=200, adjust=False).mean().tolist()
+            closes = df_d["close"].tolist()
+            dates = df_d["date_str"].tolist()
+            for i in range(16, len(closes)):
+                cur_d = dates[i]
+                pc, pe50, pe200 = float(closes[i - 1]), float(e50_s[i - 1]), float(e200_s[i - 1])
+                b = "BULLISH" if (pc > pe50 and pc > pe200) else ("BEARISH" if (pc < pe50 and pc < pe200) else "NEUTRAL")
+                bias_by_d.setdefault(cur_d, []).append(b)
+                r14_by_d.setdefault(cur_d, []).append((pc / float(closes[i - 15]) - 1.0) * 100.0)
+                r5_by_d.setdefault(cur_d, []).append((pc / float(closes[i - 6]) - 1.0) * 100.0)
+                r2_by_d.setdefault(cur_d, []).append((pc / float(closes[i - 3]) - 1.0) * 100.0)
+        except Exception:
+            continue
+
+    reg_map: dict[str, str] = {}
+    for d_k, b_list in bias_by_d.items():
+        nb = max(1, len(b_list))
+        bull_f = sum(1 for x in b_list if x == "BULLISH") / nb
+        bear_f = sum(1 for x in b_list if x == "BEARISH") / nb
+        r14_m = float(pd.Series(r14_by_d.get(d_k, [0.0])).median())
+        r5_m = float(pd.Series(r5_by_d.get(d_k, [0.0])).median())
+        r2_m = float(pd.Series(r2_by_d.get(d_k, [0.0])).median())
+        reg_map[d_k] = classify_universe_regime_from_stats(bull_f, bear_f, r14_m, r5_m, r2_m)
+    _PERSIST["backtest_regime_map"] = reg_map
+    return reg_map
+
+
+def count_open_ema50_200_slots(live_positions: list[dict] = None, cfg: dict = None) -> int:
+    """
+    Counts how many currently active portfolio trades were opened by Strategy 4 (`ema50_200`),
+    so AutoTrade caps correlated EMA trend positions at MAX_EMA_CONCURRENT_TRADES (2) and keeps >=1 slot for Box Sweep.
+    """
+    cfg = cfg if isinstance(cfg, dict) else get_autotrade_config()
+    records = []
+    lock = cfg.get("active_trade_lock")
+    if isinstance(lock, dict) and lock.get("pair"):
+        records.append(lock)
+    for h in (cfg.get("history") or []):
+        if isinstance(h, dict) and h.get("pair"):
+            records.append(h)
+
+    now_ts = time.time()
+    if live_positions:
+        ema_cnt = 0
+        for pos in live_positions:
+            p_name = pos.get("pair")
+            if not p_name:
+                continue
+            matched_rec = next(
+                (r for r in records if r.get("pair") == p_name and (now_ts - float(r.get("opened_ts", 0.0) or 0.0)) < 7 * 86400),
+                None,
+            )
+            if matched_rec and str(matched_rec.get("strategy_id", "")) == "ema50_200":
+                ema_cnt += 1
+        return ema_cnt
+
+    if isinstance(lock, dict) and lock.get("pair") and str(lock.get("strategy_id", "")) == "ema50_200":
+        return 1
+    return 0
+
+
 _AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 0.0, "data": None})
 
 
 # Keys that must survive a Streamlit Cloud restart (persisted per deployment to the Google Sheet)
-_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "email_alerts_enabled", "autotrade_strategy_mode", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
+_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "email_alerts_enabled", "autotrade_strategy_mode", "regime_mode_migrated_v33", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
 
 
 def get_git_branch_name() -> str:
@@ -3420,7 +3619,7 @@ def get_autotrade_config() -> dict:
         "paper_autotrade_enabled": True if _is_stg else False,
         "email_alerts_enabled": False if _is_stg else True,
         "paper_only": _is_stg,
-        "autotrade_strategy_mode": "box_plus_ema50_200_bear",
+        "autotrade_strategy_mode": "box_plus_ema50_200_regime",
         "wallet_balance_inr": 47287.18,
         "single_trade_margin_inr": 15762.39,
         "leverage": 10,
@@ -3882,6 +4081,7 @@ def register_app_trade_lock(
             "box_theory": "Strategy 1: Box Theory Sweep",
             "atr_reversal": "Strategy 2: 1-Candle 25% ATR Reversal",
             "ema9_retest": "Strategy 3: 9 EMA Touch & Confirm",
+            "ema50_200": "Strategy 4: 15m 50/200 EMA Pullback",
         }
         _base_strat = _strat_map.get(str(strategy_id or "box_theory"), "Box Theory Sweep")
         _tag_suffix = "Staging Paper AutoTrade" if not is_live_exchange else "App Live Order"
@@ -4987,8 +5187,32 @@ def execute_autotrade_two_entry_signal(
         if auto_mode == "box_plus_ema50_200_bear" and sig_strat_id == "ema50_200" and norm_dir != "SHORT":
             return False, (
                 f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
-                f"(switch to Combo: Box + Bull & Bear 15m 50/200 EMA to enable Bullish EMA Longs)."
+                f"(switch to Combo: Regime-Adaptive or Bull & Bear EMA to enable Bullish EMA Longs)."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
+        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "ema50_200":
+            reg_info = compute_market_regime()
+            cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
+            if cur_reg == "RANGING_CHOP":
+                return False, (
+                    f"Market Regime Guard ({reg_info.get('label', 'RANGING / CHOP')}): Market is ranging "
+                    f"(2d median {reg_info.get('median_2d_pct', 0.0):+.2f}%), auto-pausing 15m 50/200 EMA on {pair} "
+                    f"and trading Box Theory Sweep only."
+                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+            if cur_reg == "STRONG_DOWNTREND" and norm_dir != "SHORT":
+                return False, (
+                    f"Market Regime Guard (STRONG DOWNTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
+                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+            if cur_reg == "STRONG_UPTREND" and norm_dir != "LONG":
+                return False, (
+                    f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
+                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+        if sig_strat_id == "ema50_200":
+            open_ema_cnt = count_open_ema50_200_slots(live_positions=live_ex_pos, cfg=cfg)
+            if open_ema_cnt >= MAX_EMA_CONCURRENT_TRADES:
+                return False, (
+                    f"EMA Slot Cap ({open_ema_cnt}/{MAX_EMA_CONCURRENT_TRADES} EMA slots active): "
+                    f"Reserving final portfolio slot for Box Theory Sweep; skipping correlated EMA trade on {pair}."
+                ), {"strategy_id": sig_strat_id, "open_ema_slots": open_ema_cnt}
     if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
         return False, (
             f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
@@ -5226,6 +5450,8 @@ def run_portfolio_single_slot_backtest(
     max_daily_loss_inr = eff_wallet_inr * (_strategies.DAILY_WALLET_LOSS_STOP_PCT / 100.0)
 
     universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
+    if strategy_id == "box_plus_ema50_200_regime":
+        build_historical_regime_map(pairs=universe, duration_days=duration_days)
     all_candidates = []
     standalone_rows = []
     for rank, p in enumerate(universe):
@@ -5313,6 +5539,10 @@ def run_portfolio_single_slot_backtest(
             continue
         if len(active_open_trades) >= max_slots:
             continue
+        if "50/200 EMA" in str(tr.get("strategy", "")):
+            open_ema_bt = sum(1 for t in active_open_trades if "50/200 EMA" in str(t.get("strategy", "")))
+            if open_ema_bt >= MAX_EMA_CONCURRENT_TRADES:
+                continue
         tr_dict = tr.to_dict()
         accepted.append(tr_dict)
         active_open_trades.append(tr_dict)
@@ -5771,6 +6001,10 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "_auto_protect_live_position_tp1_sl": _auto_protect_live_position_tp1_sl,
             "check_live_daily_loss_stop": check_live_daily_loss_stop,
             "unlock_autotrade_daily_loss_stop": unlock_autotrade_daily_loss_stop,
+            "classify_universe_regime_from_stats": classify_universe_regime_from_stats,
+            "compute_market_regime": compute_market_regime,
+            "build_historical_regime_map": build_historical_regime_map,
+            "count_open_ema50_200_slots": count_open_ema50_200_slots,
         }
         cur_globals = globals()
         for obj in gc.get_objects():
