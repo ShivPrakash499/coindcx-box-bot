@@ -1909,8 +1909,13 @@ def _detect_ema50_200_setup(
                     lb = min(idx, 12)
                     loc_low_3h = min(float(recs15[k]["low"]) for k in range(idx - lb, idx))
                     room_3h = c_close - loc_low_3h
-                    # 3h Structure Guard: skip shorting directly into a 3h local double-bottom (<0.45% room)
-                    if room_3h >= c_close * 0.0045:
+                    box_w = max(1e-9, rh - rl)
+                    z_pos = (c_close - rl) / box_w
+                    # 1. Bottom-of-Box Floor Guard (v34): never short in the extreme bottom 15% of the Daily Box [RL, RH],
+                    #    and in the bottom 35% require >=0.55% 3h structural room (prevents APT $0.4304 bottom-of-box traps).
+                    # 2. 3h Structure Guard: skip shorting directly into a 3h local double-bottom (<0.45% room).
+                    bottom_box_blocked = (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
+                    if not bottom_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = max(e200, reach_high) * 1.0025
                         if ((stop_px - c_close) / c_close) * 100.0 < 0.30:
                             stop_px = c_close * 1.004
@@ -1957,8 +1962,13 @@ def _detect_ema50_200_setup(
                     lb = min(idx, 12)
                     loc_high_3h = max(float(recs15[k]["high"]) for k in range(idx - lb, idx))
                     room_3h = loc_high_3h - c_close
-                    # 3h Structure Guard: skip longing directly into a 3h local double-top (<0.45% room)
-                    if room_3h >= c_close * 0.0045:
+                    box_w = max(1e-9, rh - rl)
+                    z_top = (rh - c_close) / box_w
+                    # 1. Top-of-Box Ceiling Guard (v34): never buy in the extreme top 15% of the Daily Box [RL, RH],
+                    #    and in the top 35% require >=0.55% 3h structural room.
+                    # 2. 3h Structure Guard: skip longing directly into a 3h local double-top (<0.45% room).
+                    top_box_blocked = (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
+                    if not top_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = min(e200, reach_low) * 0.9975
                         if ((c_close - stop_px) / c_close) * 100.0 < 0.30:
                             stop_px = c_close * 0.996

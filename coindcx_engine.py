@@ -442,7 +442,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 33
+_REQUIRED_DAEMON_VERSION = 34
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 
@@ -1048,7 +1048,8 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
             try:
                 _cur_cfg = get_autotrade_config()
                 _upd = {"wallet_balance_inr": round(total_inr, 2)}
-                if not _cur_cfg.get("user_custom_margin"):
+                _cur_sm = float(_cur_cfg.get("single_trade_margin_inr", 0.0) or 0.0)
+                if not _cur_cfg.get("user_custom_margin") and _cur_sm in (0.0, 15762.39, 30000.0, 250000.0, 100000.0):
                     _upd["single_trade_margin_inr"] = round(total_inr * TRADE_ALLOCATION_FRACTION, 2)
                 save_autotrade_config(_upd)
             except Exception:
@@ -1108,7 +1109,8 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
                 if _b_tot > 0:
                     _cur_cfg_b = get_autotrade_config()
                     _upd_b = {"wallet_balance_inr": round(_b_tot, 2)}
-                    if not _cur_cfg_b.get("user_custom_margin"):
+                    _cur_sm_b = float(_cur_cfg_b.get("single_trade_margin_inr", 0.0) or 0.0)
+                    if not _cur_cfg_b.get("user_custom_margin") and _cur_sm_b in (0.0, 15762.39, 30000.0, 250000.0, 100000.0):
                         _upd_b["single_trade_margin_inr"] = round(_b_tot * TRADE_ALLOCATION_FRACTION, 2)
                     save_autotrade_config(_upd_b)
             except Exception:
@@ -1463,7 +1465,7 @@ def exit_coindcx_position(position_id: str, pair: str = None) -> tuple[bool, str
                 _ACTIVE_POSITIONS_CACHE["data"] = fresh_pos
                 try:
                     cancel_coindcx_open_entry_orders(pair, cancel_all_for_pair=True)
-                    clear_autotrade_active_lock()
+                    clear_autotrade_active_lock(pair)
                 except Exception:
                     pass
                 return True, f"Position for {pair} is already closed on CoinDCX."
@@ -1477,7 +1479,7 @@ def exit_coindcx_position(position_id: str, pair: str = None) -> tuple[bool, str
         try:
             if pair:
                 cancel_coindcx_open_entry_orders(pair, cancel_all_for_pair=True)
-            clear_autotrade_active_lock()
+            clear_autotrade_active_lock(pair)
         except Exception:
             pass
         return True, f"Successfully executed market exit for position {target_id or pair}"
@@ -3478,45 +3480,133 @@ def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30
     return reg_map
 
 
-def count_open_ema50_200_slots(live_positions: list[dict] = None, cfg: dict = None) -> int:
+def _get_active_locks_map(cfg: dict = None) -> dict[str, dict]:
+    """Returns a normalized {pair: lock_dict} map combining multi-pair `active_trade_locks` and legacy `active_trade_lock`."""
+    cfg = cfg if isinstance(cfg, dict) else get_autotrade_config()
+    out: dict[str, dict] = {}
+    raw_map = cfg.get("active_trade_locks")
+    if isinstance(raw_map, dict):
+        for _, lk in raw_map.items():
+            if isinstance(lk, dict) and lk.get("pair"):
+                out[str(lk["pair"])] = dict(lk)
+    legacy = cfg.get("active_trade_lock")
+    if isinstance(legacy, dict) and legacy.get("pair"):
+        lp = str(legacy["pair"])
+        if lp not in out:
+            out[lp] = dict(legacy)
+    return out
+
+
+def get_open_entry_limit_orders(
+    open_orders: list[dict] = None,
+    live_positions: list[dict] = None,
+    cfg: dict = None,
+) -> list[dict]:
     """
-    Counts how many currently active portfolio trades were opened by Strategy 4 (`ema50_200`),
-    so AutoTrade caps correlated EMA trend positions at MAX_EMA_CONCURRENT_TRADES (2) and keeps >=1 slot for Box Sweep.
+    Returns resting Entry Limit Orders on CoinDCX (excluding bracket `tpsl_exit` triggers and excluding
+    opposite-side `TP1` partial-take-profit reduce limit orders on already-open positions).
+    """
+    ords = open_orders if isinstance(open_orders, list) else (fetch_coindcx_open_orders() or [])
+    pos_dir_by_pair = {
+        str(p.get("pair")): str(p.get("direction", "LONG")).upper()
+        for p in (live_positions or [])
+        if isinstance(p, dict) and p.get("pair")
+    }
+    entry_ords = []
+    for o in ords:
+        if not isinstance(o, dict):
+            continue
+        o_pair = str(o.get("pair") or "").strip()
+        if not o_pair:
+            continue
+        if str(o.get("stage") or "").lower() == "tpsl_exit":
+            continue
+        o_type = str(o.get("order_type") or "").lower()
+        if "limit" not in o_type:
+            continue
+        o_status = str(o.get("status") or "open").lower()
+        if o_status not in ("open", "partially_filled", "init", "untriggered", ""):
+            continue
+        if o_pair in pos_dir_by_pair:
+            pos_long = pos_dir_by_pair[o_pair] in ("LONG", "BUY")
+            o_side = str(o.get("side") or "").upper()
+            # Opposite-side limit order on an open position is our 50% TP1 partial exit, not a new slot entry
+            if (pos_long and o_side == "SELL") or ((not pos_long) and o_side == "BUY"):
+                continue
+        entry_ords.append(o)
+    return entry_ords
+
+
+def count_open_ema50_200_slots(
+    live_positions: list[dict] = None,
+    cfg: dict = None,
+    open_orders: list[dict] = None,
+) -> int:
+    """
+    Counts how many currently active portfolio trades (both filled positions AND resting Entry 1 limit orders)
+    were opened by Strategy 4 (`ema50_200`), so AutoTrade caps correlated EMA trend positions at
+    MAX_EMA_CONCURRENT_TRADES (2) and keeps >=1 slot for Box Sweep.
     """
     cfg = cfg if isinstance(cfg, dict) else get_autotrade_config()
-    records = []
-    lock = cfg.get("active_trade_lock")
-    if isinstance(lock, dict) and lock.get("pair"):
-        records.append(lock)
+    locks_map = _get_active_locks_map(cfg)
+    records = list(locks_map.values())
     for h in (cfg.get("history") or []):
         if isinstance(h, dict) and h.get("pair"):
             records.append(h)
 
     now_ts = time.time()
-    if live_positions:
-        ema_cnt = 0
+    active_pairs: list[str] = []
+    if live_positions is not None:
         for pos in live_positions:
-            p_name = pos.get("pair")
-            if not p_name:
-                continue
+            p_name = pos.get("pair") if isinstance(pos, dict) else None
+            if p_name and p_name not in active_pairs:
+                active_pairs.append(str(p_name))
+        if isinstance(open_orders, list):
+            for eo in get_open_entry_limit_orders(open_orders=open_orders, live_positions=live_positions, cfg=cfg):
+                ep = eo.get("pair")
+                if ep and ep not in active_pairs:
+                    active_pairs.append(str(ep))
+        for lp, lk in locks_map.items():
+            if bool(lk.get("entry1_pending")) and (now_ts - float(lk.get("opened_ts", 0.0) or 0.0)) < ENTRY1_LIMIT_EXPIRY_SEC:
+                if lp not in active_pairs:
+                    active_pairs.append(lp)
+
+        ema_cnt = 0
+        for p_name in active_pairs:
             matched_rec = next(
-                (r for r in records if r.get("pair") == p_name and (now_ts - float(r.get("opened_ts", 0.0) or 0.0)) < 7 * 86400),
+                (
+                    r for r in records
+                    if r.get("pair") == p_name
+                    and not r.get("closed")
+                    and (now_ts - float(r.get("opened_ts", 0.0) or 0.0)) < 7 * 86400
+                ),
                 None,
             )
             if matched_rec and str(matched_rec.get("strategy_id", "")) == "ema50_200":
                 ema_cnt += 1
         return ema_cnt
 
-    if isinstance(lock, dict) and lock.get("pair") and str(lock.get("strategy_id", "")) == "ema50_200":
-        return 1
-    return 0
+    return sum(1 for lk in locks_map.values() if str(lk.get("strategy_id", "")) == "ema50_200")
 
 
 _AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 0.0, "data": None})
 
 
 # Keys that must survive a Streamlit Cloud restart (persisted per deployment to the Google Sheet)
-_DURABLE_AUTOTRADE_KEYS = ("enabled", "paper_autotrade_enabled", "email_alerts_enabled", "autotrade_strategy_mode", "regime_mode_migrated_v33", "single_trade_margin_inr", "leverage", "daily_start_wallet", "daily_loss_stop_hit", "active_trade_lock")
+_DURABLE_AUTOTRADE_KEYS = (
+    "enabled",
+    "paper_autotrade_enabled",
+    "email_alerts_enabled",
+    "autotrade_strategy_mode",
+    "regime_mode_migrated_v33",
+    "single_trade_margin_inr",
+    "user_custom_margin",
+    "leverage",
+    "daily_start_wallet",
+    "daily_loss_stop_hit",
+    "active_trade_lock",
+    "active_trade_locks",
+)
 
 
 def get_git_branch_name() -> str:
@@ -3622,10 +3712,12 @@ def get_autotrade_config() -> dict:
         "autotrade_strategy_mode": "box_plus_ema50_200_regime",
         "wallet_balance_inr": 47287.18,
         "single_trade_margin_inr": 15762.39,
+        "user_custom_margin": False,
         "leverage": 10,
         "one_crypto_at_a_time": True,
         "high_vol_scan_enabled": True,
         "active_trade_lock": None,
+        "active_trade_locks": {},
         "history": [],
         "updated_at": "",
     }
@@ -3636,6 +3728,7 @@ def get_autotrade_config() -> dict:
             if isinstance(cached_data, dict) and _AUTOTRADE_CFG_MEM_CACHE.get("mtime") == mtime:
                 res = dict(default_cfg)
                 res.update(cached_data)
+                res["paper_only"] = _is_stg
                 wb_c = float(res.get("wallet_balance_inr", 47287.18) or 47287.18)
                 sm_c = float(res.get("single_trade_margin_inr", 0) or 0)
                 if sm_c <= 0 or sm_c in (15762.39, 30000.0, 250000.0, 100000.0) or not res.get("user_custom_margin"):
@@ -3647,6 +3740,7 @@ def get_autotrade_config() -> dict:
                     _AUTOTRADE_CFG_MEM_CACHE["data"] = dict(saved)
                     _AUTOTRADE_CFG_MEM_CACHE["mtime"] = mtime
                     default_cfg.update(saved)
+                    default_cfg["paper_only"] = _is_stg
                     wb = float(default_cfg.get("wallet_balance_inr", 47287.18) or 47287.18)
                     sm_val = float(default_cfg.get("single_trade_margin_inr", 0) or 0)
                     if sm_val <= 0 or sm_val in (15762.39, 30000.0, 250000.0, 100000.0) or not default_cfg.get("user_custom_margin"):
@@ -3659,6 +3753,15 @@ def get_autotrade_config() -> dict:
 def save_autotrade_config(updates: dict) -> dict:
     """Saves updated AutoTrade settings to .cache/autotrade_config.json without triggering any API calls."""
     cfg = get_autotrade_config()
+    updates = dict(updates or {})
+    if "active_trade_lock" in updates and "active_trade_locks" not in updates:
+        lk_upd = updates.get("active_trade_lock")
+        if lk_upd is None:
+            updates["active_trade_locks"] = {}
+        elif isinstance(lk_upd, dict) and lk_upd.get("pair"):
+            cur_map = dict(_get_active_locks_map(cfg))
+            cur_map[str(lk_upd["pair"])] = dict(lk_upd)
+            updates["active_trade_locks"] = cur_map
     durable_changed = any(k in updates and updates.get(k) != cfg.get(k) for k in _DURABLE_AUTOTRADE_KEYS)
     cfg.update(updates)
     if durable_changed:
@@ -3675,29 +3778,43 @@ def save_autotrade_config(updates: dict) -> dict:
     return cfg
 
 
-def clear_autotrade_active_lock() -> dict:
-    """Clears any local paper/autotrade active trade slot lock so the next coin can trade."""
+def clear_autotrade_active_lock(pair: str = None) -> dict:
+    """Clears `pair` from `active_trade_locks` (or clears ALL active locks when `pair` is None)."""
     try:
         cfg = get_autotrade_config()
-        prev_lock = cfg.get("active_trade_lock")
+        locks_map = _get_active_locks_map(cfg)
         hist = list(cfg.get("history") or [])
-        if isinstance(prev_lock, dict) and prev_lock.get("pair"):
-            p_pair = prev_lock.get("pair")
-            p_ts = float(prev_lock.get("opened_ts", 0.0) or 0.0)
+        target_pairs = [str(pair)] if pair else list(locks_map.keys())
+        for p_pair in target_pairs:
+            prev_lock = locks_map.pop(p_pair, None)
+            p_ts = float((prev_lock or {}).get("opened_ts", 0.0) or 0.0)
             for h in hist:
                 if isinstance(h, dict) and h.get("pair") == p_pair:
                     if p_ts <= 0 or abs(float(h.get("opened_ts", 0.0) or 0.0) - p_ts) < 5.0:
                         h["closed"] = True
-            return save_autotrade_config({"active_trade_lock": None, "history": hist[:30]})
+        next_primary = (
+            max(locks_map.values(), key=lambda x: float(x.get("opened_ts", 0.0) or 0.0))
+            if locks_map else None
+        )
+        return save_autotrade_config({
+            "active_trade_lock": next_primary,
+            "active_trade_locks": locks_map,
+            "history": hist[:30],
+        })
     except Exception:
         pass
-    return save_autotrade_config({"active_trade_lock": None})
+    return save_autotrade_config({"active_trade_lock": None, "active_trade_locks": {}})
 
 
-def cancel_coindcx_open_entry_orders(pair: str, order_id: str = None, side: str = None) -> int:
+def cancel_coindcx_open_entry_orders(
+    pair: str,
+    order_id: str = None,
+    side: str = None,
+    cancel_all_for_pair: bool = False,
+) -> int:
     """
-    Cancels any unfilled resting limit orders (such as an unfilled Entry 2 @ Sweep order)
-    for `pair` once TP1 is reached or the trade closes.
+    Cancels any unfilled resting limit orders (and optionally all open orders when `cancel_all_for_pair=True`)
+    for `pair` once TP1 is reached, Entry 1 expires, or the trade closes.
     If `side` ('buy' or 'sell') is provided, only cancels limit orders on that side.
     """
     cancelled = 0
@@ -3718,7 +3835,7 @@ def cancel_coindcx_open_entry_orders(pair: str, order_id: str = None, side: str 
             o_stage = o.get("stage", "")
             o_side = str(o.get("side", "")).lower().strip()
             o_type = str(o.get("order_type", "")).lower()
-            if o_id and o_pair == pair and o_stage != "tpsl_exit" and "limit" in o_type:
+            if o_id and o_pair == pair and (cancel_all_for_pair or (o_stage != "tpsl_exit" and "limit" in o_type)):
                 if side_filter and o_side and o_side != side_filter:
                     continue
                 res, _ = _send_coindcx_signed_request(
@@ -4053,6 +4170,7 @@ def register_app_trade_lock(
         "runner_halfway_ratcheted": False,
         "stop_loss": float(stop_loss or 0.0),
         "qty1": float(qty1 or 0.0),
+        "target_qty1": float(qty1 or 0.0),
         "qty2": float(qty2 or 0.0),
         "margin_inr": float(margin_inr or 0.0),
         "leverage": int(leverage or 10),
@@ -4062,7 +4180,10 @@ def register_app_trade_lock(
         "is_live_exchange": bool(is_live_exchange),
     }
     cfg = get_autotrade_config()
-    prev_lock = cfg.get("active_trade_lock") or {}
+    locks_map = _get_active_locks_map(cfg)
+    prev_lock = locks_map.get(pair) or cfg.get("active_trade_lock") or {}
+    if pair in locks_map and float(locks_map[pair].get("target_qty1", 0.0) or 0.0) > float(lock_info["target_qty1"]):
+        lock_info["target_qty1"] = float(locks_map[pair]["target_qty1"])
     is_paper_autotrade = ("Paper AutoTrade" in str(mode)) or (not is_live_exchange and is_staging_environment())
     should_log_sheet = bool(
         (is_live_exchange or is_paper_autotrade)
@@ -4072,9 +4193,10 @@ def register_app_trade_lock(
             or (time.time() - float(prev_lock.get("opened_ts", 0.0) or 0.0)) > 600
         )
     )
+    locks_map[pair] = lock_info
     hist = cfg.get("history", [])
     hist.insert(0, {**lock_info, "status": "APP_API_LOCK_SET"})
-    save_autotrade_config({"active_trade_lock": lock_info, "history": hist[:30]})
+    save_autotrade_config({"active_trade_lock": lock_info, "active_trade_locks": locks_map, "history": hist[:30]})
 
     if should_log_sheet:
         _strat_map = {
@@ -4317,7 +4439,8 @@ def _find_matching_app_trade_record(pos: dict) -> dict | None:
     now_ts = time.time()
 
     cfg = get_autotrade_config()
-    lock = cfg.get("active_trade_lock")
+    locks_map = _get_active_locks_map(cfg)
+    lock = locks_map.get(pair)
     if isinstance(lock, dict) and lock.get("pair") == pair:
         l_dir = str(lock.get("direction", "LONG")).upper()
         if (l_dir in ("LONG", "BUY")) == is_long:
@@ -4498,7 +4621,26 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
           Cancels any remaining resting orders and releases the 1-Crypto-at-a-Time App Lock.
     """
     cfg = get_autotrade_config()
-    lock = cfg.get("active_trade_lock")
+    locks_map = _get_active_locks_map(cfg)
+    if not manage_exchange and locks_map and _PERSIST.get("session_verified"):
+        _cached_p = _ACTIVE_POSITIONS_CACHE.get("data")
+        _last_ok_p = float(_ACTIVE_POSITIONS_CACHE.get("last_ok_ts", 0.0))
+        if isinstance(_cached_p, list) and (time.time() - _last_ok_p) < 120.0:
+            for _lp_k, _lk_v in list(locks_map.items()):
+                _lk_ts = float(_lk_v.get("opened_ts", 0.0) or 0.0)
+                if (
+                    bool(_lk_v.get("is_live_exchange", False))
+                    and not bool(_lk_v.get("entry1_pending", False))
+                    and _lk_ts > 0
+                    and (time.time() - _lk_ts) >= 90
+                    and not any(p.get("pair") == _lp_k for p in _cached_p)
+                ):
+                    clear_autotrade_active_lock(_lp_k)
+                    locks_map.pop(_lp_k, None)
+            if not locks_map and len(_cached_p) == 0:
+                return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
+
+    lock = max(locks_map.values(), key=lambda x: float(x.get("opened_ts", 0.0) or 0.0)) if locks_map else None
     if isinstance(lock, dict) and lock.get("pair"):
         l_pair = lock["pair"]
         l_dir = str(lock.get("direction", "LONG")).upper()
@@ -4515,21 +4657,11 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
 
         # Fast-path for UI rendering: return lock status immediately in <1ms without blocking on exchange API calls
         if not manage_exchange:
-            if (
-                is_live_ex
-                and not e1_pending
-                and l_ts > 0
-                and (time.time() - l_ts) >= 90
-                and _PERSIST.get("session_verified")
-            ):
-                _cached_p = _ACTIVE_POSITIONS_CACHE.get("data")
-                _last_ok_p = float(_ACTIVE_POSITIONS_CACHE.get("last_ok_ts", 0.0))
-                if isinstance(_cached_p, list) and (time.time() - _last_ok_p) < 120.0:
-                    if not any(p.get("pair") == l_pair for p in _cached_p):
-                        clear_autotrade_active_lock()
-                        return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
             _c_pos = _ACTIVE_POSITIONS_CACHE.get("data") or []
-            _act_pairs = list(dict.fromkeys([p.get("pair") for p in _c_pos if isinstance(p, dict) and p.get("pair")] + ([l_pair] if l_pair else [])))
+            _act_pairs = list(dict.fromkeys(
+                [p.get("pair") for p in _c_pos if isinstance(p, dict) and p.get("pair")]
+                + list(locks_map.keys())
+            ))
             _cnt = max(1, len(_act_pairs))
             return {
                 "is_occupied": _cnt >= MAX_CONCURRENT_TRADES,
@@ -4554,42 +4686,100 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             if l_ts > 0 and (time.time() - l_ts) > 8 * 3600:
                 if is_live_ex:
                     cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
-                clear_autotrade_active_lock()
+                clear_autotrade_active_lock(l_pair)
                 return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
 
             matched_live_pos = None
-            if is_live_ex:
+            live_positions = None
+            if is_live_ex or any(bool(v.get("is_live_exchange")) for v in locks_map.values()):
                 # CRITICAL: Always use synchronous live fetch (_fetch_coindcx_active_positions_sync) here,
                 # NEVER the UI's non-blocking cold-cache fetch_coindcx_active_positions(force_refresh=False),
                 # which returns [] when cold and previously caused active_trade_lock to be falsely cleared!
                 live_positions = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
                 if live_positions is not None:
+                    # Sync any other pending Maker Limit locks in `locks_map` (multi-slot concurrency support)
+                    for _o_lp, _o_lk in list(locks_map.items()):
+                        if _o_lp == l_pair or not bool(_o_lk.get("is_live_exchange")):
+                            continue
+                        _o_ts = float(_o_lk.get("opened_ts", 0.0) or 0.0)
+                        _o_pos = next((p for p in live_positions if p.get("pair") == _o_lp), None)
+                        if _o_pos and _o_pos.get("id") and bool(_o_lk.get("entry1_pending")):
+                            _o_q = float(_o_pos.get("quantity", 0.0) or 0.0)
+                            _o_tgt = float(_o_lk.get("target_qty1") or _o_lk.get("qty1") or 0.0)
+                            if _o_tgt <= 0 or _o_q >= (_o_tgt * 0.50) or (_o_ts > 0 and (time.time() - _o_ts) >= 180.0):
+                                sync_full_2entry_runner_to_position(
+                                    pair=_o_lp,
+                                    direction=str(_o_lk.get("direction", "LONG")),
+                                    entry1_px=float(_o_pos.get("entry_price") or _o_lk.get("entry", 0.0)),
+                                    entry2_px=float(_o_lk.get("entry2_sweep", 0.0) or 0.0),
+                                    tp1_px=float(_o_lk.get("tp1", 0.0) or 0.0),
+                                    tp2_px=float(_o_lk.get("tp2", 0.0) or 0.0),
+                                    sl_px=float(_o_lk.get("stop_loss", 0.0) or 0.0),
+                                    total_margin_inr=float(_o_lk.get("margin_inr", 20000.0) or 20000.0),
+                                    leverage=int(_o_lk.get("leverage", 10) or 10),
+                                    strategy_id=str(_o_lk.get("strategy_id", "box_theory") or "box_theory"),
+                                )
+                        elif not _o_pos and bool(_o_lk.get("entry1_pending")) and _o_ts > 0 and (time.time() - _o_ts) >= ENTRY1_LIMIT_EXPIRY_SEC:
+                            cancel_coindcx_open_entry_orders(_o_lp)
+                            clear_autotrade_active_lock(_o_lp)
+                            locks_map.pop(_o_lp, None)
+
+                if is_live_ex and live_positions is not None:
                     matched_live_pos = next((p for p in live_positions if p.get("pair") == l_pair), None)
                     if matched_live_pos and matched_live_pos.get("id"):
                         if e1_pending:
-                            # Resting Entry 1 Maker Limit Order has now filled -> immediately attach Bracket TP2/SL + TP1 Limit + Entry 2 Limit!
-                            _sync_ok_p, _, _sync_det_p = sync_full_2entry_runner_to_position(
-                                pair=l_pair,
-                                direction=l_dir,
-                                entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
-                                entry2_px=l_entry2,
-                                tp1_px=l_tp1,
-                                tp2_px=l_tp2,
-                                sl_px=l_sl,
-                                total_margin_inr=float(lock.get("margin_inr", 20000.0) or 20000.0),
-                                leverage=int(lock.get("leverage", 10) or 10),
-                                strategy_id=str(lock.get("strategy_id", "box_theory") or "box_theory"),
-                            )
-                            if _sync_ok_p and isinstance((_sync_det_p or {}).get("lock"), dict):
-                                lock = _sync_det_p["lock"]
+                            _pos_qty_now = float(matched_live_pos.get("quantity", 0.0) or 0.0)
+                            _tgt_qty1 = float(lock.get("target_qty1") or lock.get("qty1") or 0.0)
+                            _age_e1 = (time.time() - l_ts) if l_ts > 0 else 999.0
+                            if _tgt_qty1 > 0 and _pos_qty_now < (_tgt_qty1 * 0.50) and _age_e1 < 180.0:
+                                # Dust partial fill (e.g. 6.5 of 9,899.1 APT): attach catastrophe SL/TP2 for safety,
+                                # but KEEP entry1_pending=True & target_qty1 intact until >=50% fills (or 180s elapses)!
+                                if matched_live_pos.get("stop_loss") is None or matched_live_pos.get("take_profit") is None:
+                                    update_coindcx_position_tpsl(matched_live_pos["id"], tp_price=l_tp2, sl_price=l_sl, pair=l_pair)
                             else:
-                                lock["entry1_pending"] = False
+                                # Resting Entry 1 Maker Limit Order has meaningfully filled -> attach Bracket TP2/SL + TP1 Limit!
+                                _sync_ok_p, _, _sync_det_p = sync_full_2entry_runner_to_position(
+                                    pair=l_pair,
+                                    direction=l_dir,
+                                    entry1_px=float(matched_live_pos.get("entry_price") or l_entry),
+                                    entry2_px=l_entry2,
+                                    tp1_px=l_tp1,
+                                    tp2_px=l_tp2,
+                                    sl_px=l_sl,
+                                    total_margin_inr=float(lock.get("margin_inr", 20000.0) or 20000.0),
+                                    leverage=int(lock.get("leverage", 10) or 10),
+                                    strategy_id=str(lock.get("strategy_id", "box_theory") or "box_theory"),
+                                )
+                                if _sync_ok_p and isinstance((_sync_det_p or {}).get("lock"), dict):
+                                    lock = _sync_det_p["lock"]
+                                else:
+                                    lock["entry1_pending"] = False
+                                    save_autotrade_config({"active_trade_lock": lock})
+                                e1_pending = False
+                                l_entry = float(lock.get("entry", l_entry) or l_entry)
+                                l_tp1 = float(lock.get("tp1", l_tp1) or l_tp1)
+                                l_tp2 = float(lock.get("tp2", l_tp2) or l_tp2)
+                                l_sl = float(lock.get("stop_loss", l_sl) or l_sl)
+                        elif not tp1_already_hit:
+                            # If remaining Maker Limit quantity filled after initial sync, upsize the 50% TP1 limit order!
+                            _pos_qty_now2 = float(matched_live_pos.get("quantity", 0.0) or 0.0)
+                            _synced_q1 = float(lock.get("qty1", 0.0) or 0.0)
+                            if _synced_q1 > 0 and _pos_qty_now2 > (_synced_q1 * 1.35) and str(lock.get("strategy_id", "box_theory")) != "ema9_retest":
+                                _opp_r = "SELL" if l_dir in ("LONG", "BUY") else "BUY"
+                                _old_tp1_oid = str(lock.get("tp1_order_id", "") or "")
+                                if _old_tp1_oid and not _old_tp1_oid.startswith(("DAEMON_", "FULL_", "STRATEGY")):
+                                    cancel_coindcx_open_entry_orders(l_pair, _old_tp1_oid, side=_opp_r.lower())
+                                _new_tp1_q = format_order_quantity(l_pair, _pos_qty_now2 * 0.5)
+                                _r_lev = int(round(float(matched_live_pos.get("leverage") or lock.get("leverage", 10) or 10)))
+                                if _new_tp1_q > 0:
+                                    _ok_r1, _, _ext_r1 = place_coindcx_futures_order(
+                                        pair=l_pair, side=_opp_r, quantity=_new_tp1_q, leverage=_r_lev,
+                                        order_type="limit_order", price=l_tp1, margin_currency="INR", post_only=False,
+                                    )
+                                    if _ok_r1:
+                                        lock["tp1_order_id"] = str((_ext_r1 or {}).get("order_id", "DAEMON_50PCT_REDUCE_AT_TP1"))
+                                lock["qty1"] = _pos_qty_now2
                                 save_autotrade_config({"active_trade_lock": lock})
-                            e1_pending = False
-                            l_entry = float(lock.get("entry", l_entry) or l_entry)
-                            l_tp1 = float(lock.get("tp1", l_tp1) or l_tp1)
-                            l_tp2 = float(lock.get("tp2", l_tp2) or l_tp2)
-                            l_sl = float(lock.get("stop_loss", l_sl) or l_sl)
                         if lock.get("missing_count", 0) > 0:
                             lock["missing_count"] = 0
                             save_autotrade_config({"active_trade_lock": lock})
@@ -4667,12 +4857,24 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         _broke_sl = (_pend_px <= l_sl) if (_is_long_p and _pend_px > 0 and l_sl > 0) else ((_pend_px >= l_sl) if (not _is_long_p and _pend_px > 0 and l_sl > 0) else False)
                         _expired_e1 = (l_ts > 0 and (time.time() - l_ts) >= ENTRY1_LIMIT_EXPIRY_SEC)
                         if _ran_to_tp1 or _broke_sl or _expired_e1:
-                            cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
-                            clear_autotrade_active_lock()
+                            cancel_coindcx_open_entry_orders(l_pair)
+                            clear_autotrade_active_lock(l_pair)
                             _why_c = "TP1 Reached Before Fill" if _ran_to_tp1 else ("SL Breached" if _broke_sl else "45m Limit Expired")
+                            _rem_pairs = list(dict.fromkeys([p.get("pair") for p in (live_positions or []) if p.get("pair")] + list(_get_active_locks_map().keys())))
+                            if _rem_pairs:
+                                return {
+                                    "is_occupied": len(_rem_pairs) >= MAX_CONCURRENT_TRADES,
+                                    "has_active_trade": True,
+                                    "active_pair": _rem_pairs[0],
+                                    "active_pairs": _rem_pairs,
+                                    "count": len(_rem_pairs),
+                                    "max_slots": MAX_CONCURRENT_TRADES,
+                                    "source": f"Active ({len(_rem_pairs)}/{MAX_CONCURRENT_TRADES}); {l_pair} cancelled ({_why_c})",
+                                }
                             return {"is_occupied": False, "active_pair": None, "source": f"Slot Free (Unfilled Entry 1 Limit Cancelled: {_why_c})"}
 
                         # 2. Verify resting Entry 1 limit order is still open on CoinDCX (handles manual cancel on app)
+                        _open_ords = []
                         if l_ts > 0 and (time.time() - l_ts) >= 90 and fetch_coindcx_futures_balance().get("is_live_api"):
                             _open_ords = fetch_coindcx_open_orders() or []
                             _want_side = "BUY" if _is_long_p else "SELL"
@@ -4689,13 +4891,23 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             else:
                                 miss_cnt = int(lock.get("missing_count", 0)) + 1
                                 if miss_cnt >= 2:
-                                    cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
-                                    clear_autotrade_active_lock()
+                                    cancel_coindcx_open_entry_orders(l_pair)
+                                    clear_autotrade_active_lock(l_pair)
                                     return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Entry 1 Limit Cancelled on Exchange)"}
                                 lock["missing_count"] = miss_cnt
                                 save_autotrade_config({"active_trade_lock": lock})
 
-                        _act_pairs_p = list(dict.fromkeys([p.get("pair") for p in live_positions if p.get("pair")] + [l_pair]))
+                        _eo_pairs = [
+                            eo.get("pair")
+                            for eo in (get_open_entry_limit_orders(open_orders=_open_ords, live_positions=live_positions, cfg=cfg) if _open_ords else [])
+                            if eo.get("pair")
+                        ]
+                        _act_pairs_p = list(dict.fromkeys(
+                            [p.get("pair") for p in live_positions if p.get("pair")]
+                            + _eo_pairs
+                            + list(_get_active_locks_map().keys())
+                            + [l_pair]
+                        ))
                         return {
                             "is_occupied": len(_act_pairs_p) >= MAX_CONCURRENT_TRADES,
                             "has_active_trade": True,
@@ -4734,7 +4946,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         miss_cnt = int(lock.get("missing_count", 0)) + 1
                         if miss_cnt >= 2:
                             cancel_coindcx_open_entry_orders(l_pair, lock.get("entry2_order_id", ""))
-                            clear_autotrade_active_lock()
+                            clear_autotrade_active_lock(l_pair)
                             return {"is_occupied": False, "active_pair": None, "source": "Slot Free (App Trade Closed on Exchange)"}
                         else:
                             lock["missing_count"] = miss_cnt
@@ -4806,7 +5018,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         else:
                             _exit_r = "TP2 Target Hit" if hit_tp2 else ("Profit-Locked SL Hit" if tp1_already_hit else ("80% TP1 Breakeven SL Hit" if lock.get("tp1_80pct_be_ratcheted") else "Stop Loss Hit"))
                             _log_paper_close_async(px, _exit_r)
-                        clear_autotrade_active_lock()
+                        clear_autotrade_active_lock(l_pair)
                         return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Completed)"}
 
                     # Stage 1: Price reaches TP1 (or resting TP1 limit order already filled / 15m candle wicked through TP1)
@@ -4869,7 +5081,11 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                         lock["stop_loss"] = ratcheted_sl
                         lock["mode"] = f"{lock.get('mode', 'App Trade')} [TP1 50% Booked -> SL Profit-Locked @ ${ratcheted_sl}]"
                         l_sl = ratcheted_sl
-                        save_autotrade_config({"active_trade_lock": lock})
+                        _hist_tp1 = list(cfg.get("history") or [])
+                        for _hh in _hist_tp1:
+                            if isinstance(_hh, dict) and _hh.get("pair") == l_pair and abs(float(_hh.get("opened_ts", 0.0) or 0.0) - l_ts) < 5.0:
+                                _hh["tp1_hit"] = True
+                        save_autotrade_config({"active_trade_lock": lock, "history": _hist_tp1[:30]})
 
                         # Update SL on CoinDCX position while keeping single native TP at TP2 (strictly in profit & valid side of px)
                         min_prof_sl = round_asset_price(l_entry * (1.0018 if is_long else 0.9982), l_entry)
@@ -4894,7 +5110,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                 exit_coindcx_position(matched_live_pos["id"], pair=l_pair)
                             elif not is_live_ex:
                                 _log_paper_close_async(px, "Smart Hybrid Runner Exit (9 EMA / 20% ATR Pullback)")
-                            clear_autotrade_active_lock()
+                            clear_autotrade_active_lock(l_pair)
                             return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Smart Hybrid Runner Exited)"}
 
                         if l_tp2 > 0:
@@ -4945,7 +5161,11 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             pass
 
         _c_pos2 = _ACTIVE_POSITIONS_CACHE.get("data") or []
-        _act_pairs2 = list(dict.fromkeys([p.get("pair") for p in _c_pos2 if isinstance(p, dict) and p.get("pair")] + ([l_pair] if l_pair else [])))
+        _act_pairs2 = list(dict.fromkeys(
+            [p.get("pair") for p in _c_pos2 if isinstance(p, dict) and p.get("pair")]
+            + list(_get_active_locks_map().keys())
+            + ([l_pair] if l_pair else [])
+        ))
         _cnt2 = max(1, len(_act_pairs2))
         return {
             "is_occupied": _cnt2 >= MAX_CONCURRENT_TRADES,
@@ -4954,6 +5174,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             "active_pairs": _act_pairs2,
             "active_direction": l_dir,
             "entry_price": float(lock.get("entry", 0.0) or 0.0),
+            "entry1_pending": e1_pending,
             "entry2_sweep": float(lock.get("entry2_sweep", 0.0) or 0.0),
             "tp1": l_tp1,
             "tp2": l_tp2,
@@ -5052,12 +5273,19 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
     return False, f"Daily loss ₹{max(loss, 0):,.2f} / limit ₹{limit:,.2f}", info
 
 
-def compute_wallet_capped_margin(margin_inr: float, leverage: int, wallet: dict | None = None,
-                                 max_slots: int | None = None) -> tuple[float, str]:
+def compute_wallet_capped_margin(
+    margin_inr: float,
+    leverage: int,
+    wallet: dict | None = None,
+    max_slots: int | None = None,
+    honor_custom_margin: bool = False,
+) -> tuple[float, str]:
     """
     Caps the per-trade margin to what the live futures wallet can actually fund:
-      effective = min(Single-Trade Margin setting, wallet total / slots, free balance * 0.98).
-    Returns (effective_margin_inr, note). Unverified wallet -> returns the setting unchanged.
+      - Default (`honor_custom_margin=False`): `per_slot = total / slots`
+      - Custom Sidebar Margin (`honor_custom_margin=True`): honors the exact Sidebar `Single-Trade Margin (INR)`
+        up to `total * 0.98` (without dividing by 3 slots).
+    Returns `(effective_margin_inr, note)`. Unverified wallet -> returns the setting unchanged.
     """
     w = wallet if isinstance(wallet, dict) else fetch_coindcx_futures_balance()
     slots = max(1, int(max_slots or MAX_CONCURRENT_TRADES))
@@ -5065,14 +5293,23 @@ def compute_wallet_capped_margin(margin_inr: float, leverage: int, wallet: dict 
         return float(margin_inr), ""
     total = float(w.get("total_inr", 0.0) or 0.0)
     avail = float(w.get("available_inr", total) or 0.0)
-    per_slot = total / slots if total > 0 else float(margin_inr)
+    if total > 0:
+        per_slot = (total * 0.98) if honor_custom_margin else (total / slots)
+    else:
+        per_slot = float(margin_inr)
     eff = max(0.0, min(float(margin_inr), per_slot, avail * 0.98))
     note = ""
     if eff + 0.01 < float(margin_inr):
-        note = (
-            f"Margin capped to ₹{eff:,.2f} (setting ₹{float(margin_inr):,.2f}; wallet ₹{total:,.2f} / {slots} slots = "
-            f"₹{per_slot:,.2f}; free ₹{avail:,.2f})"
-        )
+        if honor_custom_margin:
+            note = (
+                f"Margin capped to ₹{eff:,.2f} (Sidebar ₹{float(margin_inr):,.2f}; wallet ₹{total:,.2f}; "
+                f"free ₹{avail:,.2f})"
+            )
+        else:
+            note = (
+                f"Margin capped to ₹{eff:,.2f} (setting ₹{float(margin_inr):,.2f}; wallet ₹{total:,.2f} / {slots} slots = "
+                f"₹{per_slot:,.2f}; free ₹{avail:,.2f})"
+            )
     return round(eff, 2), note
 
 
@@ -5084,16 +5321,15 @@ def execute_autotrade_two_entry_signal(
     usd_inr: float = None,
 ) -> tuple[bool, str, dict]:
     """
-    Executes the 2-Entry Sweep Scale-In + 50/50 Runner setup for a single crypto at 10x leverage:
-      1. Verifies no other App/API crypto position is currently active ('1 Crypto at a Time').
-      2. Allocates 50% of `single_trade_margin_inr` to Entry 1 (`qty1`) with Position TP = TP2 and SL = Catastrophe SL.
-      3. Places a 50% partial-take-profit limit order (`0.5 * qty1`, opposite side) at TP1 so if price moves straight to TP1
-         without touching Entry 2, 50% of Entry 1 books at TP1 while the remaining 50% rides risk-free to TP2!
-      4. Allocates the remaining 50% of `single_trade_margin_inr` to Entry 2 (`qty2` Limit Order at SL/SH Sweep), which is
-         automatically cancelled if TP1 is hit first.
+    Executes the 100% Single-Slot Maker Limit + 50/50 Structural Runner setup at 10x leverage:
+      1. Enforces strict 3-slot accounting across BOTH filled positions AND resting Entry 1 Limit Orders.
+      2. Honors the exact Sidebar Single-Trade Margin (`user_custom_margin`) and skips cleanly when free margin
+         is `< 90%` of the target slot margin (eliminating ₹666–₹1,002 leftover-cash dust trades).
+      3. Rejects Maker Limit placement if live price has drifted within `< 0.35%` of Stop Loss.
     """
     cfg = get_autotrade_config()
-    margin_inr = float(single_trade_margin_inr or cfg.get("single_trade_margin_inr", 30000.0))
+    raw_requested_margin = float(single_trade_margin_inr or cfg.get("single_trade_margin_inr", 30000.0))
+    honor_custom_margin = bool(cfg.get("user_custom_margin", False))
     lev = int(leverage or cfg.get("leverage", 10))
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
 
@@ -5105,7 +5341,24 @@ def execute_autotrade_two_entry_signal(
     _stop_hit, _stop_msg, _stop_info = check_live_daily_loss_stop(_wallet_now)
     if _stop_hit:
         return False, _stop_msg, {"daily_loss_stop": _stop_info}
-    margin_inr, _cap_note = compute_wallet_capped_margin(margin_inr, lev, _wallet_now, max_slots)
+
+    # Anti-Crumb Free-Margin Guard: never downsize a ₹20k–₹26.5k slot into a ₹666–₹1,002 leftover-cash dust trade!
+    if isinstance(_wallet_now, dict) and _wallet_now.get("is_live_api") and not staging_paper_only:
+        _tot_w = float(_wallet_now.get("total_inr", 0.0) or 0.0)
+        _avail_w = float(_wallet_now.get("available_inr", _tot_w) or 0.0)
+        _target_slot_m = (
+            min(raw_requested_margin, (_tot_w * 0.98 if honor_custom_margin else (_tot_w / max(1, max_slots))))
+            if _tot_w > 0 else raw_requested_margin
+        )
+        if _target_slot_m >= 2500.0 and (_avail_w * 0.98) < (_target_slot_m * 0.90):
+            return False, (
+                f"Insufficient Free Margin Guard: Free Futures margin ₹{_avail_w:,.2f} is below 90% of target slot margin "
+                f"₹{_target_slot_m:,.2f} (Sidebar ₹{raw_requested_margin:,.2f}). Skipping {pair} instead of placing an under-sized dust order."
+            ), {"wallet": _wallet_now, "target_slot_margin_inr": round(_target_slot_m, 2)}
+
+    margin_inr, _cap_note = compute_wallet_capped_margin(
+        raw_requested_margin, lev, _wallet_now, max_slots, honor_custom_margin=honor_custom_margin
+    )
     if (margin_inr * lev) < 2448.0:
         return False, (
             f"Insufficient Futures Wallet: usable margin ₹{margin_inr:,.2f} x {lev}x = ₹{margin_inr * lev:,.2f} notional "
@@ -5113,34 +5366,63 @@ def execute_autotrade_two_entry_signal(
         ), {"wallet": _wallet_now}
 
     slot = get_active_portfolio_trade_status()
+    slot_pairs = list(slot.get("active_pairs") or ([slot.get("active_pair")] if slot.get("active_pair") else []))
+    if pair in slot_pairs:
+        return False, (
+            f"Duplicate Pair Guard: Active trade or resting limit order already open on {pair} ({slot.get('source')}). "
+            f"Skipping duplicate {pair} order."
+        ), {"slot_status": slot}
     if slot.get("is_occupied"):
-        act_p = slot.get("active_pair")
-        slot_cnt = int(slot.get("count", 1) or 1)
+        act_p = slot.get("active_pair") or ", ".join(slot_pairs[:max_slots])
+        slot_cnt = int(slot.get("count", len(slot_pairs)) or 1)
         if act_p == pair or slot_cnt >= max_slots:
             return False, (
-                f"Portfolio Slot Guard ({slot_cnt}/{max_slots} active): Active trade already open on {act_p} ({slot.get('source')}). "
+                f"Portfolio Slot Guard ({slot_cnt}/{max_slots} active): Active trades/orders already open on {act_p} ({slot.get('source')}). "
                 f"Skipping {pair}."
             ), {"slot_status": slot}
 
-    # Mandatory synchronous live CoinDCX position check: block duplicate pair or when >= max_slots (3) positions are open
+    # Mandatory synchronous live CoinDCX position + resting open-order check:
+    # count BOTH filled positions AND resting Entry 1 Limit Orders toward `max_slots` (3)!
     live_ex_pos = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
     if live_ex_pos is None and os.getenv("COINDCX_API_KEY") and not staging_paper_only:
         return False, (
             f"Portfolio Safety Guard: Could not verify live CoinDCX positions right now; "
             f"blocking {pair} AutoTrade until exchange positions are verified."
         ), {"live_ex_pos": None}
-    if live_ex_pos:
-        same_pair_open = next((p for p in live_ex_pos if p.get("pair") == pair), None)
-        if same_pair_open:
-            return False, (
-                f"Duplicate Pair Guard: CoinDCX already has an open position on {pair}. Skipping duplicate {pair} order."
-            ), {"live_ex_pos": live_ex_pos}
-        if len(live_ex_pos) >= max_slots:
-            open_names = ", ".join(str(p.get("pair", "UNKNOWN")) for p in live_ex_pos[:max_slots])
-            return False, (
-                f"3-Slot Wallet Guard ({len(live_ex_pos)}/{max_slots} active): CoinDCX already has {len(live_ex_pos)} open trades ({open_names}). "
-                f"Skipping {pair} (₹60k wallet / ₹20k per trade = max {max_slots} concurrent trades)."
-            ), {"live_ex_pos": live_ex_pos}
+
+    open_entry_orders = None
+    occupied_pairs: list[str] = []
+    for _lp in (live_ex_pos or []):
+        _p_n = _lp.get("pair") if isinstance(_lp, dict) else None
+        if _p_n and _p_n not in occupied_pairs:
+            occupied_pairs.append(str(_p_n))
+    if not staging_paper_only and isinstance(_wallet_now, dict) and _wallet_now.get("is_live_api"):
+        try:
+            open_entry_orders = get_open_entry_limit_orders(live_positions=live_ex_pos, cfg=cfg)
+            for _eo in (open_entry_orders or []):
+                _ep = _eo.get("pair")
+                if _ep and _ep not in occupied_pairs:
+                    occupied_pairs.append(str(_ep))
+        except Exception:
+            open_entry_orders = None
+    _now_chk = time.time()
+    for _lkp, _lkv in _get_active_locks_map(cfg).items():
+        if bool(_lkv.get("is_live_exchange")) == (not staging_paper_only):
+            if (_now_chk - float(_lkv.get("opened_ts", 0.0) or 0.0)) < ENTRY1_LIMIT_EXPIRY_SEC:
+                if _lkp not in occupied_pairs:
+                    occupied_pairs.append(str(_lkp))
+
+    if pair in occupied_pairs:
+        return False, (
+            f"Duplicate Pair Guard: CoinDCX already has an open position or resting limit order on {pair}. Skipping duplicate {pair} order."
+        ), {"live_ex_pos": live_ex_pos, "occupied_pairs": occupied_pairs}
+    if len(occupied_pairs) >= max_slots:
+        open_names = ", ".join(occupied_pairs[:max_slots])
+        return False, (
+            f"3-Slot Wallet Guard ({len(occupied_pairs)}/{max_slots} active, incl. resting limit orders): "
+            f"CoinDCX already has {len(occupied_pairs)} active trades/orders ({open_names}). "
+            f"Skipping {pair} (max {max_slots} concurrent trades)."
+        ), {"live_ex_pos": live_ex_pos, "occupied_pairs": occupied_pairs}
 
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     norm_dir = "LONG" if direction in ("LONG", "BUY") else "SHORT"
@@ -5207,7 +5489,11 @@ def execute_autotrade_two_entry_signal(
                     f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
                 ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
         if sig_strat_id == "ema50_200":
-            open_ema_cnt = count_open_ema50_200_slots(live_positions=live_ex_pos, cfg=cfg)
+            open_ema_cnt = count_open_ema50_200_slots(
+                live_positions=live_ex_pos if live_ex_pos is not None else [],
+                cfg=cfg,
+                open_orders=open_entry_orders,
+            )
             if open_ema_cnt >= MAX_EMA_CONCURRENT_TRADES:
                 return False, (
                     f"EMA Slot Cap ({open_ema_cnt}/{MAX_EMA_CONCURRENT_TRADES} EMA slots active): "
@@ -5222,6 +5508,19 @@ def execute_autotrade_two_entry_signal(
     opp_side = "SELL" if side == "BUY" else "BUY"
     live_tk_obj = fetch_live_ticker(pair)
     live_tk_px = float((live_tk_obj or {}).get("last_price", 0.0) or 0.0)
+    raw_sig_sl = float(sig.get("stop_loss") or 0.0)
+    # Pre-Normalization SL Price-Drift Guard (< 0.35% buffer):
+    # Never let `normalize_two_entry_runner_levels` silently widen SL when live market price has already
+    # drifted into or past the signal's structural Stop Loss (e.g. RENDER $1.4079 vs $1.4085 SL)!
+    if raw_sig_sl > 0 and live_tk_px > 0:
+        _pre_bad_side = (live_tk_px <= raw_sig_sl) if norm_dir == "LONG" else (live_tk_px >= raw_sig_sl)
+        _pre_gap_pct = abs(raw_sig_sl - live_tk_px) / live_tk_px
+        if _pre_bad_side or _pre_gap_pct < 0.0035:
+            return False, (
+                f"Price Drift Guard: Live price ${live_tk_px} has drifted within {_pre_gap_pct * 100.0:.2f}% of "
+                f"(or beyond) Signal Stop Loss ${raw_sig_sl} (< 0.35% minimum buffer). Aborting {pair} to prevent instant stop-out."
+            ), {"live_px": live_tk_px, "signal_sl_px": raw_sig_sl}
+
     raw_e2 = float(sig.get("entry2_sweep") or 0.0)
     has_second_entry = False  # Entry 2 removed: 100% Single-Slot Maker Limit sizing on Entry 1
     norm = normalize_two_entry_runner_levels(
@@ -5254,6 +5553,16 @@ def execute_autotrade_two_entry_signal(
     )
     if maker_e1_px > 0:
         entry1_px = maker_e1_px
+
+    # Post-Nudge SL Price-Drift Guard (< 0.35% buffer): abort if live market drifted right up against Stop Loss
+    if sl_px > 0 and entry1_px > 0:
+        _sl_bad_side = (entry1_px <= sl_px) if norm_dir == "LONG" else (entry1_px >= sl_px)
+        _sl_gap_pct = abs(sl_px - entry1_px) / entry1_px
+        if _sl_bad_side or _sl_gap_pct < 0.0035:
+            return False, (
+                f"Price Drift Guard: Live Maker Limit ${entry1_px} is within {_sl_gap_pct * 100.0:.2f}% of Stop Loss ${sl_px} "
+                f"(< 0.35% minimum buffer). Aborting {pair} to prevent instant stop-out."
+            ), {"entry1_px": entry1_px, "sl_px": sl_px}
 
     tranche_margin_inr = (margin_inr * 0.5) if has_second_entry else margin_inr
     tranche_notional_usd = (tranche_margin_inr * lev) / u_inr
@@ -5315,6 +5624,14 @@ def execute_autotrade_two_entry_signal(
                 tp1_px=tp1_px,
             )
             if retry_e1_px > 0 and retry_e1_px != entry1_px:
+                if sl_px > 0 and (
+                    ((retry_e1_px <= sl_px) if norm_dir == "LONG" else (retry_e1_px >= sl_px))
+                    or (abs(sl_px - retry_e1_px) / retry_e1_px) < 0.0035
+                ):
+                    return False, (
+                        f"Price Drift Guard: Retry Maker Limit ${retry_e1_px} drifted within 0.35% of Stop Loss ${sl_px}. "
+                        f"Aborting {pair} to prevent instant stop-out."
+                    ), {"entry1_px": retry_e1_px, "sl_px": sl_px}
                 entry1_px = retry_e1_px
                 qty1 = format_order_quantity(pair, tranche_notional_usd / entry1_px)
                 if (qty1 * entry1_px * u_inr) < 2448.0 and (margin_inr * lev) >= 2448.0:
@@ -5527,6 +5844,7 @@ def run_portfolio_single_slot_backtest(
                 locked_days.add(t_ent_day)
         active_open_trades = still_open
 
+    last_ema_zone_by_pair: dict[str, tuple] = {}
     for _, tr in df_all.iterrows():
         ent_t = str(tr["entry_time"])
         ext_t = str(tr["exit_time"])
@@ -5539,11 +5857,31 @@ def run_portfolio_single_slot_backtest(
             continue
         if len(active_open_trades) >= max_slots:
             continue
-        if "50/200 EMA" in str(tr.get("strategy", "")):
+        is_ema_tr = "50/200 EMA" in str(tr.get("strategy", ""))
+        if is_ema_tr:
             open_ema_bt = sum(1 for t in active_open_trades if "50/200 EMA" in str(t.get("strategy", "")))
             if open_ema_bt >= MAX_EMA_CONCURRENT_TRADES:
                 continue
+            prev_z = last_ema_zone_by_pair.get(str(tr["pair"]))
+            cur_ep = float(tr.get("entry_price", 0.0) or 0.0)
+            cur_dt = pd.to_datetime(ent_t)
+            if prev_z and cur_ep > 0:
+                prev_dt, prev_dir, prev_ep, prev_win = prev_z
+                zone_lock_sec = 3600 if prev_win else (4 * 3600)
+                if (
+                    prev_dir == str(tr.get("direction", ""))
+                    and (cur_dt - prev_dt).total_seconds() < zone_lock_sec
+                    and abs(cur_ep - prev_ep) / cur_ep < 0.008
+                ):
+                    continue
         tr_dict = tr.to_dict()
+        if is_ema_tr:
+            last_ema_zone_by_pair[str(tr["pair"])] = (
+                pd.to_datetime(ent_t),
+                str(tr.get("direction", "")),
+                float(tr.get("entry_price", 0.0) or 0.0),
+                bool(tr.get("is_win", False)),
+            )
         accepted.append(tr_dict)
         active_open_trades.append(tr_dict)
         day_counts[day_str] = day_counts.get(day_str, 0) + 1
@@ -6005,6 +6343,12 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "compute_market_regime": compute_market_regime,
             "build_historical_regime_map": build_historical_regime_map,
             "count_open_ema50_200_slots": count_open_ema50_200_slots,
+            "_get_active_locks_map": _get_active_locks_map,
+            "get_open_entry_limit_orders": get_open_entry_limit_orders,
+            "compute_wallet_capped_margin": compute_wallet_capped_margin,
+            "save_autotrade_config": save_autotrade_config,
+            "clear_autotrade_active_lock": clear_autotrade_active_lock,
+            "register_app_trade_lock": register_app_trade_lock,
         }
         cur_globals = globals()
         for obj in gc.get_objects():

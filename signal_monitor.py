@@ -193,13 +193,18 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         autotrade_daily_key = f"AUTOTRADE_DAILY_COUNT|{today_ist}"
         autotrade_daily_count = int(state.get(autotrade_daily_key, 0))
 
-        # Collect all pairs currently in a Live CoinDCX position or active App Trade Lock
+        # Collect all pairs currently in a Live CoinDCX position, resting Entry Limit order, or active App Trade Lock
         # (normalized by base symbol via `_canon_pair` so `B-INJ_USDT` == `I-INJ_INR` == `INJUSDT`)
         open_live_pairs = set()
         open_live_bases = set()
-        if portfolio_occupied and active_Slot_pair:
-            open_live_pairs.add(active_Slot_pair)
-            open_live_bases.add(_canon_pair(active_Slot_pair))
+        for _ap in (slot_status.get("active_pairs") or ([active_Slot_pair] if active_Slot_pair else [])):
+            if _ap:
+                open_live_pairs.add(_ap)
+                open_live_bases.add(_canon_pair(_ap))
+        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
+            portfolio_occupied = True
+            if not active_Slot_pair:
+                active_Slot_pair = next(iter(open_live_pairs), None)
 
         live_pos_verified = False
         try:
@@ -225,6 +230,19 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                         portfolio_occupied = True
                         active_Slot_pair = p_raw
+
+            # Also count unfilled resting Entry Limit Orders on CoinDCX toward the 3-slot cap (prevents 4th concurrent trade race)
+            if (is_daemon_thread or autotrade) and hasattr(eng, "get_open_entry_limit_orders"):
+                _w_chk = eng.fetch_coindcx_futures_balance(force_refresh=False) or {}
+                if _w_chk.get("is_live_api"):
+                    for _eo in (eng.get_open_entry_limit_orders(live_positions=live_pos_list, cfg=auto_cfg) or []):
+                        _ep_pair = _eo.get("pair")
+                        if _ep_pair:
+                            open_live_pairs.add(_ep_pair)
+                            open_live_bases.add(_canon_pair(_ep_pair))
+                            if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
+                                portfolio_occupied = True
+                                active_Slot_pair = _ep_pair
         except Exception:
             pass
 
@@ -334,10 +352,18 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     last.get("candle_ts") == sig["candle_ts"] and bool(last.get("autotraded", False))
                 )
                 last_autotraded_at = float(last.get("autotraded_at", 0.0) or 0.0)
+                _prev_hist_tp1_won = any(
+                    isinstance(_h, dict)
+                    and _h.get("pair") == pair
+                    and bool(_h.get("tp1_hit", False))
+                    and float(_h.get("opened_ts", 0.0) or 0.0) >= (last_autotraded_at - 15.0)
+                    for _h in (auto_cfg.get("history") or [])[:15]
+                )
+                _zone_lock_sec = (COOLDOWN_MIN * 60) if _prev_hist_tp1_won else (SAME_SETUP_LOCK_MIN * 60)
                 already_autotraded_setup = (
                     bool(last.get("autotraded", False))
                     and same_price_zone
-                    and ((now_ts - last_autotraded_at) < COOLDOWN_MIN * 60)
+                    and ((now_ts - last_autotraded_at) < _zone_lock_sec)
                 )
 
                 if (

@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 33
+_DAEMON_VERSION = 34
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -692,11 +692,10 @@ if not _auto_cfg.get("user_custom_margin"):
 
 def _on_sidebar_margin_change():
     new_m = round(float(st.session_state.get("sidebar_single_trade_margin_input", _one_third_wallet)), 2)
-    is_cust = abs(new_m - _one_third_wallet) > 1.0
     coindcx_engine.save_autotrade_config({
         "single_trade_margin_inr": new_m,
         "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
-        "user_custom_margin": is_cust,
+        "user_custom_margin": True,
     })
     get_cached_signals_scan.clear()
 
@@ -710,13 +709,18 @@ margin_inr = st.sidebar.number_input(
     format="%.2f",
     key="sidebar_single_trade_margin_input",
     on_change=_on_sidebar_margin_change,
-    help="Automatically set to 1/3rd of Futures Wallet (3-Slot Mode: 100% Single-Slot Maker Limit)."
+    help="Exact per-trade margin used by AutoTrade & Execute (defaults to 1/3rd of Futures Wallet until customized; never downsized into dust trades)."
 )
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
 st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (100% Single-Slot Maker Limit) @ {leverage}x")
 try:
-    _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(float(margin_inr), int(leverage), wallet_data)
+    _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(
+        float(margin_inr),
+        int(leverage),
+        wallet_data,
+        honor_custom_margin=bool(_auto_cfg.get("user_custom_margin", False)),
+    )
     if _eff_note:
         st.sidebar.warning(f"⚠️ AutoTrade will use **₹{_eff_margin:,.2f}** per trade. {_eff_note}")
 except Exception:

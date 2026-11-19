@@ -1318,6 +1318,171 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
     print("  -> PASS: Market-Regime Classifier, Regime-Adaptive Routing, 3h Structure-Aware TP1 & Max 2 EMA Slots verified.")
 
 
+def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
+    print("[14/14] Verifying v34 Fixes: Resting-Order 3-Slot & Partial-Fill Guard, Exact Sidebar Margin (No Crumbs) & Bottom-of-Box/SL-Drift Guard...")
+    import tempfile
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+
+    bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+
+            # --- FIX #2A: Custom Sidebar Margin (Rs.26,500 on Rs.53,750 wallet) persists across balance sync & is honored ---
+            eng.save_autotrade_config({
+                "single_trade_margin_inr": 26500.0,
+                "user_custom_margin": True,
+                "wallet_balance_inr": 53750.0,
+                "autotrade_strategy_mode": "box_plus_ema50_200_regime",
+            })
+            assert "user_custom_margin" in eng._DURABLE_AUTOTRADE_KEYS
+            assert "active_trade_locks" in eng._DURABLE_AUTOTRADE_KEYS
+            w_53k = {"is_live_api": True, "total_inr": 53750.0, "available_inr": 53750.0}
+            eff_cust, _ = eng.compute_wallet_capped_margin(26500.0, 10, w_53k, 3, honor_custom_margin=True)
+            assert abs(eff_cust - 26500.0) < 0.01, f"Expected exact Rs.26,500 Sidebar margin honored, got {eff_cust}"
+
+            # Simulate 25s background balance sync -> must NOT overwrite Rs.26,500 back to 1/3 wallet (Rs.17,916.67)!
+            def _fake_wallet_200(method, url, payload=None, timeout=3.5):
+                return _MockResponse(200, [{"currency_short_name": "INR", "balance": "53750.0", "locked_balance": "0.0", "cross_user_margin": "0.0"}]), None
+
+            with patch.object(eng, "_send_coindcx_signed_request", side_effect=_fake_wallet_200):
+                eng._fetch_coindcx_futures_balance_sync()
+            assert abs(float(eng.get_autotrade_config()["single_trade_margin_inr"]) - 26500.0) < 0.01, (
+                f"Balance sync overwrote user's Rs.26,500 Sidebar margin: {eng.get_autotrade_config()}"
+            )
+
+            # --- FIX #2B: Anti-Crumb Guard blocks leftover-cash dust trades (Rs.893 free vs Rs.26,500 Sidebar margin) ---
+            w_crumb = {"is_live_api": True, "total_inr": 53750.0, "available_inr": 893.64}
+            with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value=w_crumb), \
+                 patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})):
+                ok_cr, msg_cr, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-NEAR_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 3.405, "tp1": 3.35, "tp2": 3.25, "stop_loss": 3.46, "levels": bear_box},
+                    single_trade_margin_inr=26500.0, leverage=10,
+                )
+                assert not ok_cr and "Insufficient Free Margin Guard" in msg_cr, f"Expected dust crumb trade blocked, got {ok_cr} {msg_cr}"
+
+            # --- FIX #1A: Multi-pair `active_trade_locks` + Resting Open Entry Limit Orders enforce 3-Slot & Max 2 EMA ---
+            eng.register_app_trade_lock(
+                pair="B-APT_USDT", direction="SHORT", entry=0.4319, stop_loss=0.4446, tp1=0.4257, tp2=0.4195,
+                margin_inr=17916.0, leverage=10, qty1=9899.1, is_live_exchange=True,
+                strategy_id="ema50_200", entry1_order_id="oid_apt", entry1_pending=True,
+            )
+            eng.register_app_trade_lock(
+                pair="B-FET_USDT", direction="SHORT", entry=0.1286, stop_loss=0.1310, tp1=0.1268, tp2=0.1245,
+                margin_inr=17916.0, leverage=10, qty1=13650.0, is_live_exchange=True,
+                strategy_id="ema50_200", entry1_order_id="oid_fet", entry1_pending=True,
+            )
+            locks_now = eng._get_active_locks_map()
+            assert "B-APT_USDT" in locks_now and "B-FET_USDT" in locks_now, f"Multi-pair locks overwritten: {locks_now}"
+
+            resting_ords = [
+                {"id": "oid_apt", "pair": "B-APT_USDT", "side": "sell", "order_type": "limit_order", "status": "open", "stage": "default"},
+                {"id": "oid_fet", "pair": "B-FET_USDT", "side": "sell", "order_type": "limit_order", "status": "open", "stage": "default"},
+                # Opposite-side TP1 reduce order on an already-open INJ SHORT position must NOT double-count as a new entry!
+                {"id": "oid_inj_tp1", "pair": "B-INJ_USDT", "side": "buy", "order_type": "limit_order", "status": "open", "stage": "default"},
+            ]
+            open_pos_1 = [{"id": "pos_inj", "pair": "B-INJ_USDT", "direction": "SHORT", "quantity": 25.0, "entry_price": 7.30}]
+            entry_only = eng.get_open_entry_limit_orders(open_orders=resting_ords, live_positions=open_pos_1)
+            assert [o["pair"] for o in entry_only] == ["B-APT_USDT", "B-FET_USDT"], f"Unexpected entry orders: {entry_only}"
+            assert eng.count_open_ema50_200_slots(live_positions=open_pos_1, open_orders=resting_ords) == 2
+
+            # With 1 filled position (INJ) + 2 resting entry limit orders (APT, FET) = 3 slots -> 4th trade (BTC) MUST be blocked!
+            w_full = {"is_live_api": True, "total_inr": 60000.0, "available_inr": 40000.0}
+            with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value=w_full), \
+                 patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=open_pos_1), \
+                 patch.object(eng, "fetch_coindcx_open_orders", return_value=resting_ords), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-INJ_USDT"]}):
+                eng.save_autotrade_config({"user_custom_margin": False, "single_trade_margin_inr": 20000.0})
+                ok_4r, msg_4r, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-BTC_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 64200.0, "tp1": 63500.0, "tp2": 62500.0, "stop_loss": 64900.0, "levels": bear_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert not ok_4r and "3-Slot Wallet Guard" in msg_4r, f"Expected 3-Slot guard with resting orders, got {ok_4r} {msg_4r}"
+
+            # --- FIX #1B: Dust partial fill (6.5 of 9,899.1 APT) keeps entry1_pending=True until >=50% filled ---
+            eng.clear_autotrade_active_lock("B-FET_USDT")
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{
+                "id": "pos_apt_dust", "pair": "B-APT_USDT", "direction": "SHORT", "quantity": 6.5,
+                "entry_price": 0.4319, "mark_price": 0.4318, "leverage": 10, "stop_loss": None, "take_profit": None,
+            }]), \
+                 patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK")), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 0.4318}):
+                eng.get_active_portfolio_trade_status(manage_exchange=True)
+                apt_lk = eng._get_active_locks_map()["B-APT_USDT"]
+                assert apt_lk["entry1_pending"] is True and abs(apt_lk["target_qty1"] - 9899.1) < 0.1, (
+                    f"Expected 6.5/9899.1 APT partial fill to keep entry1_pending=True, got {apt_lk}"
+                )
+
+            # --- FIX #3A: Bottom-of-Box APT 11:15 IST trap (z_pos=30.9% & room_3h=0.49%) & Extreme Bottom 15% blocked ---
+            apt_box = {"trend_bias": "BEARISH", "RH": 0.4548, "RL": 0.4195, "MID": 0.4371, "SH": 0.4623, "SL": 0.4132}
+            apt_recs = [{"open": 0.4312, "high": 0.4318, "low": 0.4283, "close": 0.4310} for _ in range(12)] + [
+                {"open": 0.4312, "high": 0.4323, "low": 0.4301, "close": 0.4311},
+                {"open": 0.4311, "high": 0.4322, "low": 0.4295, "close": 0.4304},  # z_pos = 30.9%, room_3h to 0.4283 = 0.488% < 0.55%!
+            ]
+            sig_apt_bot = strat._detect_ema50_200_setup(
+                apt_recs, 13, apt_box, ema50_val=0.4317, ema200_val=0.4409,
+                prior_e50=[0.4318] * 6, prior_e200=[0.4410] * 6, allow_bear=True, allow_bull=False,
+            )
+            assert sig_apt_bot is None, f"Expected APT bottom-of-box 0.49% dead-zone short blocked, got {sig_apt_bot}"
+
+            # --- FIX #3B: Post-Nudge < 0.35% SL Price-Drift Guard (RENDER $1.4080 vs $1.4085 SL) ---
+            eng.clear_autotrade_active_lock()
+            with patch.object(eng, "is_staging_environment", return_value=True), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+                 patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+                 patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.4079, "bid": 1.4078, "ask": 1.4080}):
+                ok_dr, msg_dr, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-RENDER_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "ema50_200", "entry": 1.3870, "tp1": 1.3720, "tp2": 1.3450, "stop_loss": 1.4085, "levels": bear_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert not ok_dr and "Price Drift Guard" in msg_dr, f"Expected <0.35% SL drift guard block on RENDER, got {ok_dr} {msg_dr}"
+
+            # --- FIX #3C: 4h (240m) Same-Price-Zone (0.8%) AutoTrade Re-Entry Lock in signal_monitor ---
+            temp_state = os.path.join(tmpdir, "alert_state.json")
+            key_apt = "ema50_200|B-APT_USDT|EMA50_200|SHORT"
+            fake_apt_sig = {
+                "signal": "SHORT", "signal_kind": "EMA50_200", "strategy_id": "ema50_200",
+                "entry": 0.4320, "entry2_sweep": 0.0, "tp1": 0.4260, "tp2": 0.4195, "stop_loss": 0.4430,
+                "roe_tp1": 13.8, "candle_ts": int(time.time() * 1000), "margin_inr": 20000.0, "leverage": 10,
+                "trigger_zone": "15m 50/200 EMA CEILING", "trigger_reason": "Test", "levels": apt_box,
+            }
+            with patch.object(sm, "STATE_FILE", temp_state), \
+                 patch.dict(sm._MEM_STATE, {
+                     key_apt: {
+                         "candle_ts": int(time.time() * 1000) - 8100000,
+                         "sent_at": time.time() - 8100.0,       # 2h 15m ago (< 4h!)
+                         "autotraded": True,
+                         "autotraded_at": time.time() - 8100.0, # 2h 15m ago (< 4h!)
+                         "direction": "SHORT",
+                         "entry": 0.4319,                       # within 0.8% of 0.4320!
+                     }
+                 }, clear=True), \
+                 patch.object(sm, "scan_pair", return_value=fake_apt_sig), \
+                 patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": []}), \
+                 patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
+                 patch.object(eng, "execute_autotrade_two_entry_signal") as mock_exec_auto:
+                sm._LAST_SCAN_CACHE["results"] = []
+                res_re = sm.scan_and_alert(pairs=["B-APT_USDT"], send=False, strategy_ids=["ema50_200"], autotrade=True)
+                assert not mock_exec_auto.called, f"Expected 4h same-zone lock to block 2h15m APT re-entry, got {res_re}"
+
+    print("  -> PASS: All 3 v34 Fixes (Strict 3-Slot/Partial-Fill, Exact Sidebar Margin/No Crumbs, Box-Floor/SL-Drift/4h Lock) verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1332,6 +1497,7 @@ if __name__ == "__main__":
     test_11_ema50_200_pullback_and_combo_modes()
     test_12_sidebar_unlock_autotrade()
     test_13_regime_adaptive_routing_and_structure_tp1()
+    test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
