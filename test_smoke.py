@@ -690,9 +690,44 @@ def test_9_ai_advisor_and_tick_precision():
         assert disc["ok"] is True and disc["top_model"] == "gemini-5.0-pro", disc
         assert disc["model_ids"] == ["gemini-5.0-pro", "gemini-4-argon", "gemini-3.8-flash"], disc["model_ids"]
         resp_auto = ga.ask_gemini_trade_advisor(
-            user_prompt="Top coins today?", preferred_model="auto", api_key="test_dynamic_discovery_key"
+            user_prompt="Top coins today?", preferred_model="auto", api_key="test_dynamic_discovery_key", prefer_vertex=False
         )
         assert resp_auto["ok"] and resp_auto["llm_used"] and "gemini-5.0-pro" in resp_auto["model_used"], resp_auto
+
+    # 2c. Regression guard: when BOTH VERTEX_ADC_JSON AND GEMINI_API_KEY are configured (Staging/Main Secrets),
+    #     Vertex AI Priority 1 MUST still run (never bypassed by api_key!), and 403-blocked models auto-fallback cleanly.
+    fake_v_client = _MM()
+    def _fake_v_gen(model, contents, config=None):
+        if model == "gemini-4-neon":
+            raise RuntimeError("403 PERMISSION_DENIED: eligible paid billing account required")
+        return _NS(text=f"Vertex live reply from {model}")
+    fake_v_client.models.generate_content.side_effect = _fake_v_gen
+    ga._VERTEX_WORKING_MODEL_CACHE.update({"ts": 0.0, "model": "", "project": ""})
+    ga._VERTEX_BLOCKED_MODELS.clear()
+    ga._VERTEX_SLOW_MODELS.clear()
+    with patch.object(ga, "_get_vertex_adc_client", return_value=(object(), "gen-lang-client-test")), \
+         patch.object(ga, "discover_available_gemini_models", return_value={
+             "ok": True, "model_ids": ["gemini-4-neon", "gemini-4-hydrogen"], "top_model": "gemini-4-neon"
+         }), \
+         patch.object(ga.genai, "Client", return_value=fake_v_client):
+        resp_v_coexist = ga.ask_gemini_trade_advisor(
+            user_prompt="Audit my trades",
+            preferred_model="gemini-4-neon",
+            api_key="AIzaFakeCoexistingKey1234567890123456",
+            prefer_vertex=True,
+        )
+        assert resp_v_coexist["ok"] and resp_v_coexist["llm_used"], resp_v_coexist
+        assert "gemini-4-hydrogen" in resp_v_coexist["model_used"] and "Vertex AI" in resp_v_coexist["model_used"], resp_v_coexist
+        assert "Auto-Fallback from gemini-4-neon" in resp_v_coexist["model_used"], resp_v_coexist
+        assert ("gen-lang-client-test", "gemini-4-neon") in ga._VERTEX_BLOCKED_MODELS
+    ga._VERTEX_WORKING_MODEL_CACHE.update({"ts": 0.0, "model": "", "project": ""})
+    ga._VERTEX_BLOCKED_MODELS.clear()
+
+    # 2d. Verify High-Tech AI Advisor avatar asset, Google profile avatar loader, and auto-scroll chat window wiring
+    ai_avatar_file = os.path.join(ROOT_DIR, "assets", "ai_advisor_avatar.png")
+    assert os.path.isfile(ai_avatar_file) and os.path.getsize(ai_avatar_file) > 1024, "Missing assets/ai_advisor_avatar.png"
+    assert "ai_advisor_chat_shell" in app_src and "_scroll_ai_chat_into_view" in app_src
+    assert "_load_user_google_avatar" in app_src and "_load_ai_advisor_avatar" in app_src and "prefer_vertex=True" in app_src
 
     # 3. Verify AI Advisor generates distinct, intent-routed, tick-exact responses (with real pnl_inr, NOT Rs.0.00!)
     mock_struct = {

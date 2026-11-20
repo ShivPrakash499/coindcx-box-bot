@@ -770,3 +770,46 @@ def fetch_coindcx_notifications_from_sheet(limit: int = 15) -> list[dict]:
         return list(reversed(rows[-limit:])) if rows else []
     except Exception:
         return []
+
+
+_OWNER_PHOTO_CACHE: dict = {"ts": 0.0, "url": ""}
+
+
+def fetch_sheet_owner_photo_url(force_refresh: bool = False) -> str:
+    """
+    Dynamically reads the Google Account profile picture (`photoLink`) of the owner of
+    `Crypto_Trades_Journal` via Google Drive API v3 (cached for 6 hours, zero hardcoded URLs).
+    """
+    import time as _t
+    import re as _re
+    import requests as _req
+
+    now = _t.time()
+    if (not force_refresh) and _OWNER_PHOTO_CACHE.get("url") and (now - float(_OWNER_PHOTO_CACHE.get("ts", 0.0))) < 21600.0:
+        return str(_OWNER_PHOTO_CACHE["url"])
+
+    try:
+        sa_dict = _load_service_account_dict()
+        if not sa_dict:
+            return str(_OWNER_PHOTO_CACHE.get("url") or "")
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(sa_dict, ["https://www.googleapis.com/auth/drive"])
+        tok = creds.get_access_token().access_token
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = gspread.authorize(creds).open(target_sheet)
+        resp = _req.get(
+            f"https://www.googleapis.com/drive/v3/files/{book.id}",
+            params={"fields": "owners(displayName,emailAddress,photoLink)"},
+            headers={"Authorization": f"Bearer {tok}"},
+            timeout=6,
+        )
+        if resp.status_code == 200:
+            owners = (resp.json() or {}).get("owners") or []
+            for ow in owners:
+                link = str((ow or {}).get("photoLink") or "").strip()
+                if link:
+                    link = _re.sub(r"=s\d+(-c)?$", "=s128", link)
+                    _OWNER_PHOTO_CACHE.update({"ts": now, "url": link})
+                    return link
+    except Exception:
+        pass
+    return str(_OWNER_PHOTO_CACHE.get("url") or "")

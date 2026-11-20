@@ -1402,6 +1402,35 @@ st.html(f"""
             font-size: 16px !important;
         }}
     }}
+    /* High-Tech AI Advisor Chat Window & Circular Avatars */
+    .st-key-ai_advisor_chat_shell {{
+        scroll-margin-top: 14px;
+    }}
+    div[data-testid="stChatMessageAvatarUser"] img,
+    div[data-testid="stChatMessageAvatarAssistant"] img,
+    div[data-testid="stChatMessageAvatarCustom"] img {{
+        border-radius: 50% !important;
+        object-fit: cover !important;
+        width: 36px !important;
+        height: 36px !important;
+    }}
+    div[data-testid="stChatMessageAvatarAssistant"] img {{
+        box-shadow: 0 0 10px rgba(0, 229, 255, 0.45), 0 0 2px rgba(99, 102, 241, 0.8) !important;
+        background: #0b1020 !important;
+    }}
+    div[data-testid="stChatMessageAvatarUser"] img {{
+        border: 1.5px solid rgba(148, 163, 184, 0.55) !important;
+    }}
+    /* Remove vertical whitespace gap from 0px auto-scroll helper iframes */
+    div[data-testid="stIFrame"][height="0"],
+    iframe[height="0"] {{
+        display: block !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
+        border: none !important;
+    }}
 </style>
 """)
 
@@ -3516,8 +3545,106 @@ elif active_section == "🤖 AI Advisor":
     if gemini_advisor is None:
         st.error("Gemini Advisor module (`gemini_advisor.py` / `google-genai`) could not be loaded.")
     else:
+        @st.cache_data(ttl=21600, show_spinner=False)
+        def _load_user_google_avatar():
+            """Dynamically loads the user's Google profile picture (circular 128x128 PNG bytes, cached 6h)."""
+            try:
+                import io as _io
+                import requests as _req
+                photo_url = sheets_logger.fetch_sheet_owner_photo_url()
+                if not photo_url:
+                    return "👤"
+                r = _req.get(photo_url, timeout=6)
+                if r.status_code == 200 and r.content and len(r.content) > 200:
+                    try:
+                        from PIL import Image, ImageDraw
+                        im = Image.open(_io.BytesIO(r.content)).convert("RGBA")
+                        side = min(im.size)
+                        left = (im.width - side) // 2
+                        top = (im.height - side) // 2
+                        im = im.crop((left, top, left + side, top + side)).resize((128, 128), Image.Resampling.LANCZOS)
+                        mask_big = Image.new("L", (512, 512), 0)
+                        ImageDraw.Draw(mask_big).ellipse((2, 2, 510, 510), fill=255)
+                        im.putalpha(mask_big.resize((128, 128), Image.Resampling.LANCZOS))
+                        buf = _io.BytesIO()
+                        im.save(buf, format="PNG", optimize=True)
+                        return buf.getvalue()
+                    except Exception:
+                        return r.content
+                return photo_url
+            except Exception:
+                return "👤"
+
+        @st.cache_data(ttl=86400, show_spinner=False)
+        def _load_ai_advisor_avatar():
+            """Loads the custom high-tech glowing cybernetic AI Advisor avatar PNG."""
+            p = os.path.join(CURRENT_DIR, "assets", "ai_advisor_avatar.png")
+            if os.path.isfile(p):
+                try:
+                    with open(p, "rb") as _f:
+                        return _f.read()
+                except Exception:
+                    return p
+            return "⚡"
+
+        def _scroll_ai_chat_into_view(mode: str = "latest_answer", nonce: int = 0) -> None:
+            """Smoothly moves the AI Advisor chat window UP into the viewport and focuses the newest turn."""
+            try:
+                import streamlit.components.v1 as _st_components
+                _st_components.html(
+                    f"""
+                    <script>
+                    (function() {{
+                        const mode = "{mode}";
+                        const nonce = {int(nonce)};
+                        function doScroll() {{
+                            try {{
+                                const doc = window.parent.document;
+                                const shell = doc.querySelector('.st-key-ai_advisor_chat_shell');
+                                const bottomAnchor = doc.getElementById('ai-chat-bottom-anchor');
+                                const latestAnswer = doc.getElementById('ai-chat-latest-answer');
+                                if (shell) {{
+                                    shell.scrollIntoView({{ behavior: 'smooth', block: 'start' }});
+                                }} else if (bottomAnchor) {{
+                                    bottomAnchor.scrollIntoView({{ behavior: 'smooth', block: 'end' }});
+                                }}
+                                const target = (mode === 'latest_answer' && latestAnswer) ? latestAnswer : bottomAnchor;
+                                if (target) {{
+                                    let scroller = target.parentElement;
+                                    while (scroller && scroller !== doc.body) {{
+                                        const cs = window.parent.getComputedStyle(scroller);
+                                        if ((cs.overflowY === 'auto' || cs.overflowY === 'scroll') && scroller.scrollHeight > scroller.clientHeight + 8) {{
+                                            if (mode === 'latest_answer' && latestAnswer) {{
+                                                const topRel = latestAnswer.getBoundingClientRect().top - scroller.getBoundingClientRect().top + scroller.scrollTop - 12;
+                                                scroller.scrollTo({{ top: Math.max(0, topRel), behavior: 'smooth' }});
+                                            }} else {{
+                                                scroller.scrollTo({{ top: scroller.scrollHeight, behavior: 'smooth' }});
+                                            }}
+                                            break;
+                                        }}
+                                        scroller = scroller.parentElement;
+                                    }}
+                                }}
+                            }} catch (e) {{}}
+                        }}
+                        setTimeout(doScroll, 60);
+                        setTimeout(doScroll, 280);
+                    }})();
+                    </script>
+                    """,
+                    height=0,
+                    width=0,
+                )
+            except Exception:
+                pass
+
+        user_avatar = _load_user_google_avatar()
+        ai_avatar = _load_ai_advisor_avatar()
+
         current_gem_key = gemini_advisor.get_gemini_api_key()
         entered_gem_key = ""
+        # Warm Vertex AI model probe in the background so the first prompt responds in ~4-6s
+        gemini_advisor.trigger_vertex_model_probe_bg(api_key=current_gem_key)
         selector_opts, disc_info = gemini_advisor.get_selector_model_options(api_key=current_gem_key)
         cfg_c1, cfg_c_ref, cfg_c2 = st.columns([2.2, 0.55, 2.0])
         with cfg_c1:
@@ -3534,14 +3661,15 @@ elif active_section == "🤖 AI Advisor":
             )
         with cfg_c_ref:
             st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-            if st.button("🔄 Models", key="btn_refresh_gemini_models", help="Re-discover latest models unlocked on your Gemini API key", use_container_width=True):
+            if st.button("🔄 Models", key="btn_refresh_gemini_models", help="Re-discover latest models unlocked on your Gemini subscription", use_container_width=True):
                 gemini_advisor.discover_available_gemini_models(api_key=current_gem_key, force_refresh=True)
+                gemini_advisor.trigger_vertex_model_probe_bg(api_key=current_gem_key, force=True)
                 st.rerun()
         with cfg_c2:
             st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
             _has_v_adc, _v_proj_ui = gemini_advisor.has_vertex_adc_credentials()
             if _has_v_adc:
-                _v_top_lbl = gemini_advisor._VERTEX_WORKING_MODEL_CACHE.get("model") or disc_info.get("top_model") or "gemini-4-argon"
+                _v_top_lbl = gemini_advisor._VERTEX_WORKING_MODEL_CACHE.get("model") or disc_info.get("top_model") or "gemini-4-hydrogen"
                 st.success(
                     f"🟢 **Vertex AI Live (Cloud / AI Ultra Credits)** — Connected via Streamlit Server Secrets "
                     f"(`{_v_proj_ui}`) • Auto-Latest: **`{_v_top_lbl}`**"
@@ -3560,7 +3688,7 @@ elif active_section == "🤖 AI Advisor":
                 st.info(
                     "🟡 **Connected via Streamlit Server Secrets (`gen-lang-client-0777980903`)** — "
                     "Intent-Routed **Live Quant + Sheet Engine** active "
-                    "*(add `VERTEX_ADC_JSON` or `GEMINI_API_KEY` to Streamlit Secrets to unlock live Gemini 4 Argon / Carbon)*"
+                    "*(add `VERTEX_ADC_JSON` or `GEMINI_API_KEY` to Streamlit Secrets to unlock live Gemini 4 Argon / Carbon / Hydrogen)*"
                 )
 
         # Initialize Chat History in Session State
@@ -3614,62 +3742,91 @@ elif active_section == "🤖 AI Advisor":
             st.session_state.gemini_last_interaction_id = None
             st.rerun()
 
-        # Render existing chat messages
-        for msg in st.session_state.gemini_chat_messages:
-            with st.chat_message(msg.get("role", "assistant")):
-                if msg.get("model") and msg.get("model") != "system":
-                    st.caption(f"🧠 Model: `{msg['model']}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed")
-                st.markdown(msg.get("content", ""))
+        # 4. Dedicated Scrollable Chat Window (moves UP into view automatically when AI responds!)
+        with st.container(key="ai_advisor_chat_shell"):
+            chat_box = st.container(height=540, border=True)
 
-        # Chat Input box
+        # Chat Input box pinned right underneath the chat window
         typed_prompt = st.chat_input(
             f"Ask Gemini about your Google Sheet trades, {asset_name}/USDT levels, or what trade to take next..."
         )
         active_prompt = quick_prompt or typed_prompt
 
+        with chat_box:
+            msgs_existing = st.session_state.gemini_chat_messages
+            last_asst_idx = max((i for i, m in enumerate(msgs_existing) if m.get("role") == "assistant"), default=-1)
+            for idx_m, msg in enumerate(msgs_existing):
+                _role = msg.get("role", "assistant")
+                _av = user_avatar if _role == "user" else ai_avatar
+                if (not active_prompt) and idx_m == last_asst_idx and idx_m > 0:
+                    st.markdown('<div id="ai-chat-latest-answer"></div>', unsafe_allow_html=True)
+                with st.chat_message(_role, avatar=_av):
+                    if msg.get("model") and msg.get("model") != "system":
+                        st.caption(f"🧠 Model: `{msg['model']}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed")
+                    st.markdown(msg.get("content", ""))
+
+            if active_prompt:
+                active_key = (entered_gem_key or current_gem_key or "").strip()
+                if active_key and active_key != current_gem_key:
+                    gemini_advisor.save_gemini_api_key(active_key)
+
+                st.session_state.gemini_chat_messages.append({"role": "user", "content": active_prompt})
+                with st.chat_message("user", avatar=user_avatar):
+                    st.markdown(active_prompt)
+
+                # Immediately bring the chat window UP into view while the AI is thinking
+                _scroll_nonce = int(st.session_state.get("_ai_scroll_nonce", 0)) + 1
+                st.session_state["_ai_scroll_nonce"] = _scroll_nonce
+                st.markdown('<div id="ai-chat-latest-answer"></div>', unsafe_allow_html=True)
+
+                with st.chat_message("assistant", avatar=ai_avatar):
+                    _scroll_ai_chat_into_view(mode="bottom", nonce=_scroll_nonce)
+                    try:
+                        with st.spinner(f"⚡ Consulting `{selected_gemini_model}` with live `Crypto_Trades_Journal` Sheet + `{selected_pair}` market data..."):
+                            live_mkt_ctx = gemini_advisor.build_live_market_context(selected_pair=selected_pair)
+                            resp = gemini_advisor.ask_gemini_trade_advisor(
+                                user_prompt=active_prompt,
+                                preferred_model=selected_gemini_model,
+                                previous_interaction_id=st.session_state.get("gemini_last_interaction_id"),
+                                sheet_markdown_context=sheet_data.get("markdown_summary", ""),
+                                market_context=live_mkt_ctx,
+                                api_key=active_key,
+                                selected_pair=selected_pair,
+                                prefer_vertex=True,
+                            )
+                    except Exception as _ai_exc:
+                        resp = {"ok": False, "error": f"AI Advisor runtime error: {str(_ai_exc)[:200]}"}
+
+                    if resp.get("ok"):
+                        used_m = resp.get("model_used") or selected_gemini_model
+                        fb_note = str(resp.get("fallback_reason") or "").strip()
+                        st.session_state.gemini_last_interaction_id = resp.get("interaction_id")
+                        cap_txt = f"🧠 Model: `{used_m}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed"
+                        if (_has_v_adc or active_key) and not resp.get("llm_used") and fb_note:
+                            cap_txt += f" • ⚠️ Gemini API fallback: `{fb_note[:140]}`"
+                        st.caption(cap_txt)
+                        st.markdown(resp.get("text", ""))
+                        st.session_state.gemini_chat_messages.append({
+                            "role": "assistant",
+                            "content": resp.get("text", ""),
+                            "model": used_m,
+                        })
+                    else:
+                        err_msg = f"⚠️ **{resp.get('error', 'Failed to generate recommendation.')}**"
+                        st.error(err_msg)
+                        st.session_state.gemini_chat_messages.append({
+                            "role": "assistant",
+                            "content": err_msg,
+                            "model": "error",
+                        })
+
+            st.markdown('<div id="ai-chat-bottom-anchor"></div>', unsafe_allow_html=True)
+
+        # Scroll chat window smoothly UP to the new AI answer once rendered
         if active_prompt:
-            active_key = (entered_gem_key or current_gem_key or "").strip()
-            if active_key and active_key != current_gem_key:
-                gemini_advisor.save_gemini_api_key(active_key)
-
-            st.session_state.gemini_chat_messages.append({"role": "user", "content": active_prompt})
-            with st.chat_message("user"):
-                st.markdown(active_prompt)
-
-            with st.chat_message("assistant"):
-                with st.spinner(f"🤖 Consulting `{selected_gemini_model}` with live `Crypto_Trades_Journal` Sheet + `{selected_pair}` market data..."):
-                    live_mkt_ctx = gemini_advisor.build_live_market_context(selected_pair=selected_pair)
-                    resp = gemini_advisor.ask_gemini_trade_advisor(
-                        user_prompt=active_prompt,
-                        preferred_model=selected_gemini_model,
-                        previous_interaction_id=st.session_state.get("gemini_last_interaction_id"),
-                        sheet_markdown_context=sheet_data.get("markdown_summary", ""),
-                        market_context=live_mkt_ctx,
-                        api_key=active_key,
-                        selected_pair=selected_pair,
-                    )
-                if resp.get("ok"):
-                    used_m = resp.get("model_used") or selected_gemini_model
-                    fb_note = str(resp.get("fallback_reason") or "").strip()
-                    st.session_state.gemini_last_interaction_id = resp.get("interaction_id")
-                    cap_txt = f"🧠 Model: `{used_m}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed"
-                    if active_key and not resp.get("llm_used") and fb_note:
-                        cap_txt += f" • ⚠️ Gemini API fallback: `{fb_note[:140]}`"
-                    st.caption(cap_txt)
-                    st.markdown(resp.get("text", ""))
-                    st.session_state.gemini_chat_messages.append({
-                        "role": "assistant",
-                        "content": resp.get("text", ""),
-                        "model": used_m,
-                    })
-                else:
-                    err_msg = f"⚠️ **{resp.get('error', 'Failed to generate recommendation.')}**"
-                    st.error(err_msg)
-                    st.session_state.gemini_chat_messages.append({
-                        "role": "assistant",
-                        "content": err_msg,
-                        "model": "error",
-                    })
+            _scroll_nonce_done = int(st.session_state.get("_ai_scroll_nonce", 0)) + 1
+            st.session_state["_ai_scroll_nonce"] = _scroll_nonce_done
+            _scroll_ai_chat_into_view(mode="latest_answer", nonce=_scroll_nonce_done)
 
 # Auto-refresh UI at most ONCE at the very end of the page ONLY when transitioning from cold/unverified to Live Synced
 if (not wallet_data.get("is_live_api") or not coindcx_engine._PERSIST.get("session_verified")) and not st.session_state.get("_cold_wallet_synced_once"):
