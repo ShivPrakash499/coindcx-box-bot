@@ -561,11 +561,29 @@ class BoxTheorySweep(Strategy):
         }
         out.update(position_metrics(pair, c15_close, 0.0, near_tp1, out["tp2"], margin_inr, leverage, usd_inr))
 
+        neutral_guard = "BOTH"
+        if trend_bias == "NEUTRAL":
+            try:
+                neutral_guard = str(eng.compute_market_regime().get("neutral_coin_guard") or "BOTH")
+            except Exception:
+                neutral_guard = "BOTH"
+
+        allow_short_box = (trend_bias == "BEARISH") or (trend_bias == "NEUTRAL" and neutral_guard != "LONG_ONLY")
+        allow_long_box = (trend_bias == "BULLISH") or (trend_bias == "NEUTRAL" and neutral_guard != "SHORT_ONLY")
+
         bias_label = (
             f"Daily Bearish (<50 EMA ${daily_ema50:,.2f} & <200 EMA ${daily_ema200:,.2f})" if trend_bias == "BEARISH"
             else (
                 f"Daily Bullish (>50 EMA ${daily_ema50:,.2f} & >200 EMA ${daily_ema200:,.2f})" if trend_bias == "BULLISH"
-                else f"Daily Range (Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f})"
+                else (
+                    f"Daily Range -> SHORT Only (Macro Bear >=70% + BTC Bear | Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f})"
+                    if neutral_guard == "SHORT_ONLY"
+                    else (
+                        f"Daily Range -> LONG Only (Macro Bull >=70% + BTC Bull | Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f})"
+                        if neutral_guard == "LONG_ONLY"
+                        else f"Daily Range (Between 50 EMA ${daily_ema50:,.2f} & 200 EMA ${daily_ema200:,.2f})"
+                    )
+                )
             )
         )
         out["daily_trend_summary"] = bias_label
@@ -576,7 +594,7 @@ class BoxTheorySweep(Strategy):
 
         # ------------------------------------------------------------------
         # 1. SHORT SETUPS (Strictly 15m Confirmation, only when Upper Box is NOT already broken):
-        #    A: Outer Box RH or SH Liquidity Sweep + 15m Close Below RH (in BEARISH & NEUTRAL)
+        #    A: Outer Box RH or SH Liquidity Sweep + 15m Close Below RH (in BEARISH, or NEUTRAL unless Macro Bull LONG_ONLY)
         #    B: Daily 50 EMA Touch + 15m Bearish Rejection (in BEARISH, no 65% box filter)
         # ------------------------------------------------------------------
         upper_wick_15m = c15_high - max(c15_open, c15_close)
@@ -586,8 +604,8 @@ class BoxTheorySweep(Strategy):
         swept_rh_15m = (not upper_box_broken) and (prev_c15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(prev_c15_high, c15_high) <= sh * 1.005)
         swept_sh_15m = (not upper_box_broken) and (prev_c15_high >= sh or c15_high >= sh) and (c15_close < sh) and (c15_close <= rh * 1.001) and (max(prev_c15_high, c15_high) <= sh * 1.012)
 
-        rejected_rh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_rh_15m and has_bear_confirm_15m
-        rejected_sh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_sh_15m and has_bear_confirm_15m
+        rejected_rh_15m = allow_short_box and swept_rh_15m and has_bear_confirm_15m
+        rejected_sh_15m = allow_short_box and swept_sh_15m and has_bear_confirm_15m
 
         if rejected_rh_15m or rejected_sh_15m:
             entry = eng.round_asset_price(c15_close, rh)
@@ -669,8 +687,8 @@ class BoxTheorySweep(Strategy):
         swept_rl_15m = (not lower_box_broken) and (prev_c15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(prev_c15_low, c15_low) >= sl * 0.995)
         swept_sl_15m = (not lower_box_broken) and (prev_c15_low <= sl or c15_low <= sl) and (c15_close > sl) and (c15_close >= rl * 0.999) and (min(prev_c15_low, c15_low) >= sl * 0.988)
 
-        rejected_rl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_rl_15m and has_bull_confirm_15m
-        rejected_sl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_sl_15m and has_bull_confirm_15m
+        rejected_rl_15m = allow_long_box and swept_rl_15m and has_bull_confirm_15m
+        rejected_sl_15m = allow_long_box and swept_sl_15m and has_bull_confirm_15m
 
         if rejected_rl_15m or rejected_sl_15m:
             entry = eng.round_asset_price(c15_close, rl)
@@ -775,7 +793,17 @@ class BoxTheorySweep(Strategy):
         elif trend_bias == "BULLISH":
             note_txt = f"🟢 Daily Trend Bias is BULLISH (> 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — Primary Long bias on 15m confirmation."
         else:
-            note_txt = f"🟡 Daily Range Mode: Price (${levels.get('daily_close', 0):,.2f}) is between 50 EMA (${levels.get('EMA50', 0):,.2f}) and 200 EMA (${levels.get('EMA200', 0):,.2f}) — Both Box Edges Active on 15m."
+            _ng_plan = "BOTH"
+            try:
+                _ng_plan = str(eng.compute_market_regime().get("neutral_coin_guard") or "BOTH")
+            except Exception:
+                _ng_plan = "BOTH"
+            if _ng_plan == "SHORT_ONLY":
+                note_txt = f"🟡 Daily Range Mode (Macro Bear Guard Active): Price (${levels.get('daily_close', 0):,.2f}) is between 50 EMA (${levels.get('EMA50', 0):,.2f}) & 200 EMA (${levels.get('EMA200', 0):,.2f}), while ≥70% Breadth & BTC are BEARISH — AutoTrade restricted to SHORT at RH/SH only."
+            elif _ng_plan == "LONG_ONLY":
+                note_txt = f"🟡 Daily Range Mode (Macro Bull Guard Active): Price (${levels.get('daily_close', 0):,.2f}) is between 50 EMA (${levels.get('EMA50', 0):,.2f}) & 200 EMA (${levels.get('EMA200', 0):,.2f}), while ≥70% Breadth & BTC are BULLISH — AutoTrade restricted to LONG at RL/SL only."
+            else:
+                note_txt = f"🟡 Daily Range Mode: Price (${levels.get('daily_close', 0):,.2f}) is between 50 EMA (${levels.get('EMA50', 0):,.2f}) and 200 EMA (${levels.get('EMA200', 0):,.2f}) — Both Box Edges Active on 15m."
         return {
             "BUY": self._stamp(b),
             "SELL": self._stamp(s),
@@ -858,6 +886,11 @@ class BoxTheorySweep(Strategy):
         p_low = float(prev["low"])
         p_close = float(prev["close"])
 
+        bt_ng_map = eng._PERSIST.get("backtest_neutral_guard_map")
+        neutral_guard_bt = (bt_ng_map.get(candle["date_str"], "BOTH") if isinstance(bt_ng_map, dict) else "BOTH") if bias == "NEUTRAL" else "BOTH"
+        allow_short_bt = (bias == "BEARISH") or (bias == "NEUTRAL" and neutral_guard_bt != "LONG_ONLY")
+        allow_long_bt = (bias == "BULLISH") or (bias == "NEUTRAL" and neutral_guard_bt != "SHORT_ONLY")
+
         tag = (
             "Daily <50/200 EMA" if bias == "BEARISH"
             else ("Daily >50/200 EMA" if bias == "BULLISH" else "Daily Range (Between 50/200 EMA)")
@@ -878,8 +911,8 @@ class BoxTheorySweep(Strategy):
         swept_rh_seq = (not upper_box_broken) and (p_high >= rh or c_high >= rh) and (c_close < rh) and (max(p_high, c_high) <= sh * 1.005)
         swept_sh_seq = (not upper_box_broken) and (p_high >= sh or c_high >= sh) and (c_close < sh) and (c_close <= rh * 1.001) and (max(p_high, c_high) <= sh * 1.012)
 
-        swept_rh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_rh_seq and has_bear_confirm
-        swept_sh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_sh_seq and has_bear_confirm
+        swept_rh_rej = allow_short_bt and swept_rh_seq and has_bear_confirm
+        swept_sh_rej = allow_short_bt and swept_sh_seq and has_bear_confirm
 
         if swept_rh_rej or swept_sh_rej:
             scale_in_lvl = max(sh, p_high, c_high)
@@ -931,8 +964,8 @@ class BoxTheorySweep(Strategy):
         swept_rl_seq = (not lower_box_broken) and (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
         swept_sl_seq = (not lower_box_broken) and (p_low <= sl or c_low <= sl) and (c_close > sl) and (c15_close >= rl * 0.999 if "c15_close" in locals() else c_close >= rl * 0.999) and (min(p_low, c_low) >= sl * 0.988)
 
-        swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
-        swept_sl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_sl_seq and has_bull_confirm
+        swept_rl_rej = allow_long_bt and swept_rl_seq and has_bull_confirm
+        swept_sl_rej = allow_long_bt and swept_sl_seq and has_bull_confirm
 
         if swept_rl_rej or swept_sl_rej:
             scale_in_lvl = min(sl, p_low, c_low)

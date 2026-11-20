@@ -442,7 +442,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 34
+_REQUIRED_DAEMON_VERSION = 35
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 
@@ -1440,6 +1440,594 @@ def fetch_coindcx_open_orders():
             pass
 
     return orders
+
+
+_FUTURES_FUNDS_CACHE = _PERSIST.setdefault(
+    "futures_funds_cache",
+    {"ts": 0.0, "transactions": [], "spot_balances": [], "ok": False, "error": "", "pages": 0},
+)
+
+
+def _parse_tx_timestamp_ms(val) -> int:
+    """Parses CoinDCX epoch seconds, epoch milliseconds, or ISO-8601 timestamp into integer ms."""
+    if val is None or val == "":
+        return 0
+    if isinstance(val, (int, float)):
+        v = float(val)
+        if v <= 0:
+            return 0
+        return int(v * 1000) if v < 1e11 else int(v)
+    s = str(val).strip()
+    if s.replace(".", "", 1).isdigit():
+        fv = float(s)
+        return int(fv * 1000) if fv < 1e11 else int(fv)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return 0
+
+
+def fetch_coindcx_spot_balances() -> list[dict]:
+    """
+    Fetches non-zero Spot / Main Wallet balances via POST /exchange/v1/users/balances.
+    Fails gracefully (returns []) if the API key is Futures-only or unverified.
+    """
+    out = []
+    try:
+        res, _ = _send_coindcx_signed_request(
+            "POST",
+            "https://api.coindcx.com/exchange/v1/users/balances",
+            {},
+            timeout=8.0,
+        )
+        if res is not None and res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    cur = str(item.get("currency") or item.get("currency_short_name") or "").upper().strip()
+                    bal = float(item.get("balance", 0.0) or 0.0)
+                    locked = float(item.get("locked_balance", 0.0) or 0.0)
+                    if cur and (bal > 0.0 or locked > 0.0):
+                        out.append({
+                            "currency": cur,
+                            "available": round(bal, 6),
+                            "locked": round(locked, 6),
+                            "total": round(bal + locked, 6),
+                        })
+                out.sort(key=lambda x: (0 if x["currency"] == "INR" else (1 if x["currency"] == "USDT" else 2), -x["total"]))
+    except Exception:
+        pass
+    return out
+
+
+def fetch_coindcx_futures_wallet_transactions(
+    force_refresh: bool = False,
+    max_pages: int = 60,
+) -> dict:
+    """
+    Paginates GET /exchange/v1/derivatives/futures/wallets/transactions from page 1 to the beginning
+    of the user's CoinDCX Futures Wallet history (covering INR & USDT Futures transfers, trade settlements,
+    and funding fees). Cached for 180s in `_FUTURES_FUNDS_CACHE` unless `force_refresh=True`.
+    """
+    now_ts = time.time()
+    if (
+        not force_refresh
+        and _FUTURES_FUNDS_CACHE.get("ok")
+        and (now_ts - float(_FUTURES_FUNDS_CACHE.get("ts", 0.0))) < 180.0
+    ):
+        return {
+            "ok": True,
+            "transactions": list(_FUTURES_FUNDS_CACHE.get("transactions") or []),
+            "spot_balances": list(_FUTURES_FUNDS_CACHE.get("spot_balances") or []),
+            "pages_fetched": int(_FUTURES_FUNDS_CACHE.get("pages", 0) or 0),
+            "fetched_at_ist": _FUTURES_FUNDS_CACHE.get("fetched_at_ist", ""),
+            "error": "",
+        }
+
+    api_key, api_secret = _get_coindcx_credentials()
+    if not api_key or not api_secret:
+        return {
+            "ok": False,
+            "transactions": [],
+            "spot_balances": [],
+            "pages_fetched": 0,
+            "fetched_at_ist": "",
+            "error": "CoinDCX API credentials are not configured.",
+        }
+
+    all_tx: list[dict] = []
+    seen_ids: set[str] = set()
+    prev_page_fp = None
+    pages_fetched = 0
+    last_err = ""
+    success = False
+
+    for page_size in (1000, 500, 100):
+        all_tx = []
+        seen_ids = set()
+        prev_page_fp = None
+        pages_fetched = 0
+        tried_ok = False
+        for page in range(1, max(1, int(max_pages)) + 1):
+            url = f"https://api.coindcx.com/exchange/v1/derivatives/futures/wallets/transactions?page={page}&size={page_size}"
+            res, err = _send_coindcx_signed_request("GET", url, {}, timeout=12.0)
+            if res is None:
+                last_err = err or "Connection error reaching CoinDCX Futures Transactions API"
+                break
+            if res.status_code != 200:
+                msg_txt = res.text[:240]
+                try:
+                    rj = res.json()
+                    if isinstance(rj, dict) and rj.get("message"):
+                        msg_txt = str(rj["message"])
+                except Exception:
+                    pass
+                last_err = f"CoinDCX API HTTP {res.status_code}: {msg_txt}"
+                # HTTP 401/403 is credential/IP rejection -> don't retry smaller page sizes
+                if res.status_code in (401, 403):
+                    return {
+                        "ok": False,
+                        "transactions": list(_FUTURES_FUNDS_CACHE.get("transactions") or []),
+                        "spot_balances": list(_FUTURES_FUNDS_CACHE.get("spot_balances") or []),
+                        "pages_fetched": int(_FUTURES_FUNDS_CACHE.get("pages", 0) or 0),
+                        "fetched_at_ist": _FUTURES_FUNDS_CACHE.get("fetched_at_ist", ""),
+                        "error": last_err,
+                    }
+                break
+
+            tried_ok = True
+            success = True
+            try:
+                raw_json = res.json()
+            except Exception as je:
+                last_err = f"Invalid JSON from CoinDCX transactions API: {je}"
+                break
+
+            batch = raw_json if isinstance(raw_json, list) else (
+                (raw_json.get("data") or raw_json.get("transactions") or []) if isinstance(raw_json, dict) else []
+            )
+            if not isinstance(batch, list) or len(batch) == 0:
+                break
+
+            # Detect duplicate page if exchange ignores pagination beyond final page
+            cur_fp = tuple(
+                (
+                    str(x.get("id", "")),
+                    str(x.get("created_at", "")),
+                    str(x.get("amount", "")),
+                    str(x.get("transaction_type", "")),
+                    str(x.get("reason", "")),
+                )
+                for x in batch[:10]
+            )
+            if prev_page_fp is not None and cur_fp == prev_page_fp:
+                break
+            prev_page_fp = cur_fp
+
+            pages_fetched += 1
+            added_this_page = 0
+            for item in batch:
+                if not isinstance(item, dict):
+                    continue
+                tx_id = str(item.get("id") or "").strip()
+                if tx_id:
+                    if tx_id in seen_ids:
+                        continue
+                    seen_ids.add(tx_id)
+                all_tx.append(item)
+                added_this_page += 1
+
+            if len(batch) < page_size or added_this_page == 0:
+                break
+            time.sleep(0.08)
+
+        if tried_ok:
+            break
+
+    spot_balances = fetch_coindcx_spot_balances() if success else []
+    fetched_ist = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    if success:
+        _FUTURES_FUNDS_CACHE.update({
+            "ts": now_ts,
+            "transactions": list(all_tx),
+            "spot_balances": list(spot_balances),
+            "ok": True,
+            "error": "",
+            "pages": pages_fetched,
+            "fetched_at_ist": fetched_ist,
+        })
+    return {
+        "ok": success,
+        "transactions": all_tx,
+        "spot_balances": spot_balances,
+        "pages_fetched": pages_fetched,
+        "fetched_at_ist": fetched_ist if success else _FUTURES_FUNDS_CACHE.get("fetched_at_ist", ""),
+        "error": "" if success else (last_err or "Failed to fetch CoinDCX Futures wallet transactions."),
+    }
+
+
+def compute_futures_funds_summary(
+    transactions: list[dict],
+    wallet: dict | None = None,
+    positions: list[dict] | None = None,
+    spot_balances: list[dict] | None = None,
+    usd_inr: float | None = None,
+) -> dict:
+    """
+    Aggregates CoinDCX Futures Wallet transaction history from the very beginning into:
+      - Total Capital Added / Deposited to Futures Wallet (INR & USDT)
+      - Total Withdrawn from Futures Wallet (INR & USDT)
+      - Net Capital Invested & Peak Net Capital Deployed
+      - Current Realized Futures Wallet Value, Open Unrealized PnL, & Total Equity
+      - Realized Growth (INR & %), Total Growth (INR & % vs Net Capital, Peak Capital, and Total Deposited)
+      - Breakdown by CoinDCX ledger `reason` (`by_universal_wallet`, `by_futures_order`, `by_futures_funding`, etc.)
+      - Chronological Transfers Table, Monthly Summary Table, and Equity vs Invested Capital Timeline
+    """
+    w = wallet if isinstance(wallet, dict) else {}
+    rate = float(usd_inr or w.get("live_usd_inr") or get_coindcx_live_usdt_inr_rate() or 102.0)
+
+    def _to_inr(amt_abs: float, cur: str) -> float:
+        c = cur.upper()
+        if c == "INR":
+            return amt_abs
+        if c in ("USDT", "USD", "USDC"):
+            return amt_abs * rate
+        return amt_abs
+
+    parsed_rows = []
+    for idx_t, tx in enumerate(transactions or []):
+        if not isinstance(tx, dict):
+            continue
+        ts_ms = _parse_tx_timestamp_ms(tx.get("created_at") or tx.get("timestamp") or tx.get("updated_at"))
+        dt_ist = datetime.fromtimestamp(ts_ms / 1000.0, tz=IST) if ts_ms > 0 else None
+        raw_amt = float(tx.get("amount", 0.0) or 0.0)
+        ttype = str(tx.get("transaction_type") or tx.get("type") or "").strip().lower()
+        if ttype in ("credit", "deposit", "in", "cr"):
+            is_credit = True
+            norm_type = "credit"
+        elif ttype in ("debit", "withdraw", "withdrawal", "out", "dr"):
+            is_credit = False
+            norm_type = "debit"
+        else:
+            is_credit = raw_amt >= 0.0
+            norm_type = "credit" if is_credit else "debit"
+        amt_abs = abs(raw_amt)
+        signed_amt = amt_abs if is_credit else -amt_abs
+        cur = str(tx.get("currency_short_name") or tx.get("currency") or "INR").upper().strip()
+        reason = str(tx.get("reason") or "other").strip()
+        reason_l = reason.lower()
+        is_transfer = any(k in reason_l for k in ("universal_wallet", "wallet", "transfer", "deposit", "withdraw"))
+        is_funding = "funding" in reason_l
+        is_order = (not is_transfer) and (not is_funding) and any(
+            k in reason_l for k in ("order", "trade", "position", "pnl", "fee", "liquidat", "settle", "margin")
+        )
+        cat = "transfer" if is_transfer else ("funding" if is_funding else ("order" if is_order else "other"))
+        inr_abs = _to_inr(amt_abs, cur)
+        signed_inr = inr_abs if is_credit else -inr_abs
+
+        parsed_rows.append({
+            "idx": idx_t,
+            "ts_ms": ts_ms,
+            "dt_str": dt_ist.strftime("%Y-%m-%d %H:%M:%S IST") if dt_ist else str(tx.get("created_at", "")),
+            "date_str": dt_ist.strftime("%Y-%m-%d") if dt_ist else "Unknown",
+            "ym": dt_ist.strftime("%Y-%m") if dt_ist else "Unknown",
+            "month_label": dt_ist.strftime("%b %Y") if dt_ist else "Unknown",
+            "transaction_type": norm_type,
+            "is_credit": is_credit,
+            "amount": round(amt_abs, 6),
+            "signed_amount": round(signed_amt, 6),
+            "currency": cur,
+            "amount_inr": round(inr_abs, 2),
+            "signed_inr": round(signed_inr, 2),
+            "reason": reason,
+            "category": cat,
+            "balance_after": tx.get("balance"),
+        })
+
+    # Sort oldest -> newest for exact running cumulative capital & wallet trajectory
+    parsed_rows.sort(key=lambda r: (r["ts_ms"], r["idx"]))
+
+    total_added_inr = 0.0
+    total_withdrawn_inr = 0.0
+    total_added_usdt = 0.0
+    total_withdrawn_usdt = 0.0
+    total_added_all_inr = 0.0
+    total_withdrawn_all_inr = 0.0
+    deposit_count = 0
+    withdrawal_count = 0
+
+    order_credits_inr = 0.0
+    order_debits_inr = 0.0
+    funding_credits_inr = 0.0
+    funding_debits_inr = 0.0
+    other_net_inr = 0.0
+
+    cum_net_cap_inr = 0.0
+    peak_net_cap_inr = 0.0
+    cum_ledger_inr = 0.0
+
+    transfers_rows = []
+    reason_agg: dict[tuple[str, str, str], dict] = {}
+    monthly_map: dict[str, dict] = {}
+    daily_timeline_map: dict[str, dict] = {}
+
+    for r in parsed_rows:
+        rk = (r["reason"], r["currency"], r["transaction_type"])
+        if rk not in reason_agg:
+            reason_agg[rk] = {
+                "Reason": r["reason"],
+                "Category": r["category"].title(),
+                "Currency": r["currency"],
+                "Type": r["transaction_type"].upper(),
+                "Count": 0,
+                "Total Amount": 0.0,
+                "INR Equivalent (₹)": 0.0,
+            }
+        reason_agg[rk]["Count"] += 1
+        reason_agg[rk]["Total Amount"] += r["amount"]
+        reason_agg[rk]["INR Equivalent (₹)"] += r["amount_inr"]
+
+        ym = r["ym"]
+        if ym not in monthly_map:
+            monthly_map[ym] = {
+                "ym": ym,
+                "Month": r["month_label"],
+                "Added (₹)": 0.0,
+                "Withdrawn (₹)": 0.0,
+                "Net Flow (₹)": 0.0,
+                "Trading & Funding Ledger (₹)": 0.0,
+                "Deposits": 0,
+                "Withdrawals": 0,
+                "End Net Capital (₹)": 0.0,
+                "Est. End Wallet (₹)": 0.0,
+            }
+        m_row = monthly_map[ym]
+
+        cum_ledger_inr += r["signed_inr"]
+
+        if r["category"] == "transfer":
+            if r["is_credit"]:
+                deposit_count += 1
+                total_added_all_inr += r["amount_inr"]
+                if r["currency"] == "INR":
+                    total_added_inr += r["amount"]
+                elif r["currency"] == "USDT":
+                    total_added_usdt += r["amount"]
+                m_row["Added (₹)"] += r["amount_inr"]
+                m_row["Deposits"] += 1
+            else:
+                withdrawal_count += 1
+                total_withdrawn_all_inr += r["amount_inr"]
+                if r["currency"] == "INR":
+                    total_withdrawn_inr += r["amount"]
+                elif r["currency"] == "USDT":
+                    total_withdrawn_usdt += r["amount"]
+                m_row["Withdrawn (₹)"] += r["amount_inr"]
+                m_row["Withdrawals"] += 1
+            cum_net_cap_inr += r["signed_inr"]
+            if cum_net_cap_inr > peak_net_cap_inr:
+                peak_net_cap_inr = cum_net_cap_inr
+            m_row["Net Flow (₹)"] += r["signed_inr"]
+
+            transfers_rows.append({
+                "Date & Time (IST)": r["dt_str"],
+                "Action": "DEPOSIT (Added to Futures)" if r["is_credit"] else "WITHDRAWAL (Moved Out)",
+                "Type": "CREDIT" if r["is_credit"] else "DEBIT",
+                "Amount": r["amount"],
+                "Currency": r["currency"],
+                "INR Value (₹)": round(r["signed_inr"], 2),
+                "Cumulative Net Capital (₹)": round(cum_net_cap_inr, 2),
+                "Reason": r["reason"],
+            })
+        elif r["category"] == "order":
+            if r["is_credit"]:
+                order_credits_inr += r["amount_inr"]
+            else:
+                order_debits_inr += r["amount_inr"]
+            m_row["Trading & Funding Ledger (₹)"] += r["signed_inr"]
+        elif r["category"] == "funding":
+            if r["is_credit"]:
+                funding_credits_inr += r["amount_inr"]
+            else:
+                funding_debits_inr += r["amount_inr"]
+            m_row["Trading & Funding Ledger (₹)"] += r["signed_inr"]
+        else:
+            other_net_inr += r["signed_inr"]
+            m_row["Trading & Funding Ledger (₹)"] += r["signed_inr"]
+
+        m_row["End Net Capital (₹)"] = round(cum_net_cap_inr, 2)
+        m_row["Est. End Wallet (₹)"] = round(max(0.0, cum_ledger_inr), 2)
+
+        if r["date_str"] != "Unknown":
+            daily_timeline_map[r["date_str"]] = {
+                "date": r["date_str"],
+                "net_capital_inr": round(cum_net_cap_inr, 2),
+                "ledger_wallet_inr": round(cum_ledger_inr, 2),
+                "cumulative_pnl_inr": round(cum_ledger_inr - cum_net_cap_inr, 2),
+            }
+
+    net_capital_inr = round(total_added_all_inr - total_withdrawn_all_inr, 2)
+    cur_realized_inr = round(float(w.get("total_inr", 0.0) or 0.0), 2)
+    available_inr = round(float(w.get("available_inr", cur_realized_inr) or 0.0), 2)
+    locked_inr = round(max(0.0, cur_realized_inr - available_inr), 2)
+    unrealized_pnl_inr = round(
+        sum(float(p.get("pnl_inr", 0.0) or 0.0) for p in (positions or []) if isinstance(p, dict)),
+        2,
+    )
+    cur_equity_inr = round(cur_realized_inr + unrealized_pnl_inr, 2)
+
+    # Realized & Total Growth strictly by accounting identity: Current Value - Net Capital Invested
+    realized_growth_inr = round(cur_realized_inr - net_capital_inr, 2)
+    total_growth_inr = round(cur_equity_inr - net_capital_inr, 2)
+
+    growth_pct_net = round((total_growth_inr / net_capital_inr) * 100.0, 2) if net_capital_inr > 0 else None
+    realized_growth_pct_net = round((realized_growth_inr / net_capital_inr) * 100.0, 2) if net_capital_inr > 0 else None
+    growth_pct_peak = round((total_growth_inr / peak_net_cap_inr) * 100.0, 2) if peak_net_cap_inr > 0 else None
+    growth_pct_added = round((total_growth_inr / total_added_all_inr) * 100.0, 2) if total_added_all_inr > 0 else None
+
+    # Append live "Today" anchor to timeline so chart always terminates at exact Current Equity
+    today_str = datetime.now(IST).strftime("%Y-%m-%d")
+    timeline_list = [daily_timeline_map[k] for k in sorted(daily_timeline_map.keys())]
+    if timeline_list:
+        if timeline_list[-1]["date"] == today_str:
+            timeline_list[-1]["ledger_wallet_inr"] = cur_equity_inr
+            timeline_list[-1]["cumulative_pnl_inr"] = total_growth_inr
+        else:
+            timeline_list.append({
+                "date": today_str,
+                "net_capital_inr": net_capital_inr,
+                "ledger_wallet_inr": cur_equity_inr,
+                "cumulative_pnl_inr": total_growth_inr,
+            })
+
+    monthly_rows = []
+    for ym_k in sorted(monthly_map.keys()):
+        mr = monthly_map[ym_k]
+        base_cap = mr["End Net Capital (₹)"] if mr["End Net Capital (₹)"] > 0 else max(1.0, mr["Added (₹)"])
+        mr_out = {
+            "Month": mr["Month"],
+            "Deposits": mr["Deposits"],
+            "Withdrawals": mr["Withdrawals"],
+            "Added (₹)": round(mr["Added (₹)"], 2),
+            "Withdrawn (₹)": round(mr["Withdrawn (₹)"], 2),
+            "Net Flow (₹)": round(mr["Net Flow (₹)"], 2),
+            "Trading & Funding Ledger (₹)": round(mr["Trading & Funding Ledger (₹)"], 2),
+            "End Net Capital (₹)": round(mr["End Net Capital (₹)"], 2),
+            "Est. End Wallet (₹)": round(mr["Est. End Wallet (₹)"], 2),
+            "Monthly Return %": round((mr["Trading & Funding Ledger (₹)"] / base_cap) * 100.0, 2) if base_cap > 0 else 0.0,
+        }
+        monthly_rows.append(mr_out)
+
+    reason_rows = []
+    for rk_v in sorted(reason_agg.values(), key=lambda x: (-x["INR Equivalent (₹)"], x["Reason"])):
+        reason_rows.append({
+            **rk_v,
+            "Total Amount": round(rk_v["Total Amount"], 4),
+            "INR Equivalent (₹)": round(rk_v["INR Equivalent (₹)"], 2),
+        })
+
+    # Spot wallet INR/USDT summary
+    spot_inr_total = 0.0
+    spot_usdt_total = 0.0
+    for sb in (spot_balances or []):
+        if sb.get("currency") == "INR":
+            spot_inr_total += float(sb.get("total", 0.0) or 0.0)
+        elif sb.get("currency") == "USDT":
+            spot_usdt_total += float(sb.get("total", 0.0) or 0.0)
+
+    first_tx_ist = parsed_rows[0]["dt_str"] if parsed_rows else ""
+    latest_tx_ist = parsed_rows[-1]["dt_str"] if parsed_rows else ""
+
+    return {
+        "total_transactions": len(parsed_rows),
+        "first_tx_ist": first_tx_ist,
+        "latest_tx_ist": latest_tx_ist,
+        "usd_inr_rate": rate,
+        "deposit_count": deposit_count,
+        "withdrawal_count": withdrawal_count,
+        "total_added_inr": round(total_added_inr, 2),
+        "total_withdrawn_inr": round(total_withdrawn_inr, 2),
+        "total_added_usdt": round(total_added_usdt, 4),
+        "total_withdrawn_usdt": round(total_withdrawn_usdt, 4),
+        "total_added_all_inr": round(total_added_all_inr, 2),
+        "total_withdrawn_all_inr": round(total_withdrawn_all_inr, 2),
+        "net_capital_inr": net_capital_inr,
+        "peak_net_capital_inr": round(peak_net_cap_inr, 2),
+        "current_realized_wallet_inr": cur_realized_inr,
+        "available_inr": available_inr,
+        "locked_margin_inr": locked_inr,
+        "unrealized_pnl_inr": unrealized_pnl_inr,
+        "current_equity_inr": cur_equity_inr,
+        "realized_growth_inr": realized_growth_inr,
+        "total_growth_inr": total_growth_inr,
+        "growth_pct_net_capital": growth_pct_net,
+        "realized_growth_pct_net_capital": realized_growth_pct_net,
+        "growth_pct_peak_capital": growth_pct_peak,
+        "growth_pct_total_added": growth_pct_added,
+        "order_credits_inr": round(order_credits_inr, 2),
+        "order_debits_inr": round(order_debits_inr, 2),
+        "net_order_ledger_inr": round(order_credits_inr - order_debits_inr, 2),
+        "funding_credits_inr": round(funding_credits_inr, 2),
+        "funding_debits_inr": round(funding_debits_inr, 2),
+        "net_funding_inr": round(funding_credits_inr - funding_debits_inr, 2),
+        "other_net_inr": round(other_net_inr, 2),
+        "ledger_reconciled_balance_inr": round(cum_ledger_inr, 2),
+        "ledger_reconciliation_diff_inr": round(cur_realized_inr - cum_ledger_inr, 2),
+        "spot_inr_total": round(spot_inr_total, 2),
+        "spot_usdt_total": round(spot_usdt_total, 4),
+        "spot_balances": list(spot_balances or []),
+        "transfers_rows": transfers_rows,
+        "monthly_rows": monthly_rows,
+        "reason_rows": reason_rows,
+        "timeline": timeline_list,
+        "all_rows_desc": list(reversed(parsed_rows)),
+    }
+
+
+def parse_coindcx_statement_csv(raw_bytes: bytes) -> dict:
+    """
+    Parses an optional CoinDCX App/Web exported INR Deposit/Withdrawal or Ledger Statement CSV
+    to summarize Bank <-> Spot INR Deposits, Withdrawals, and Net Cash Invested.
+    """
+    import io
+    try:
+        df = pd.read_csv(io.BytesIO(raw_bytes))
+    except Exception as e:
+        return {"ok": False, "error": f"Could not parse CSV: {e}"}
+
+    if df is None or df.empty:
+        return {"ok": False, "error": "Uploaded CSV is empty."}
+
+    cols_map = {str(c).strip().lower(): c for c in df.columns}
+    type_col = next((cols_map[k] for k in cols_map if any(w in k for w in ("type", "transaction", "action", "nature", "category"))), None)
+    amt_col = next((cols_map[k] for k in cols_map if any(w in k for w in ("amount", "value", "total", "inr", "quantity"))), None)
+    cur_col = next((cols_map[k] for k in cols_map if any(w in k for w in ("currency", "asset", "coin"))), None)
+    status_col = next((cols_map[k] for k in cols_map if "status" in k), None)
+    date_col = next((cols_map[k] for k in cols_map if any(w in k for w in ("date", "time", "created"))), None)
+
+    if not amt_col:
+        return {"ok": False, "error": f"Could not locate an Amount column in CSV headers: {list(df.columns)}"}
+
+    dep_inr, wd_inr, dep_cnt, wd_cnt = 0.0, 0.0, 0, 0
+    matched_rows = []
+    for _, row in df.iterrows():
+        if status_col:
+            st_val = str(row.get(status_col, "")).strip().lower()
+            if st_val and any(bad in st_val for bad in ("fail", "reject", "cancel", "pending", "expire")):
+                continue
+        if cur_col:
+            c_val = str(row.get(cur_col, "")).strip().upper()
+            if c_val and c_val != "INR":
+                continue
+        raw_a = str(row.get(amt_col, "0")).replace(",", "").replace("₹", "").replace("INR", "").strip()
+        try:
+            amt = float(raw_a)
+        except Exception:
+            continue
+        t_txt = str(row.get(type_col, "")).strip().lower() if type_col else ""
+        is_dep = any(w in t_txt for w in ("deposit", "credit", "add", "inr_deposit")) or (not t_txt and amt > 0)
+        is_wd = any(w in t_txt for w in ("withdraw", "debit", "payout", "inr_withdraw")) or (not t_txt and amt < 0)
+        if is_dep and not is_wd:
+            dep_inr += abs(amt)
+            dep_cnt += 1
+            matched_rows.append({"Date": str(row.get(date_col, "")) if date_col else "", "Type": "DEPOSIT", "Amount (₹)": round(abs(amt), 2)})
+        elif is_wd:
+            wd_inr += abs(amt)
+            wd_cnt += 1
+            matched_rows.append({"Date": str(row.get(date_col, "")) if date_col else "", "Type": "WITHDRAWAL", "Amount (₹)": round(-abs(amt), 2)})
+
+    return {
+        "ok": True,
+        "deposit_count": dep_cnt,
+        "withdrawal_count": wd_cnt,
+        "total_deposited_inr": round(dep_inr, 2),
+        "total_withdrawn_inr": round(wd_inr, 2),
+        "net_bank_invested_inr": round(dep_inr - wd_inr, 2),
+        "rows": matched_rows,
+    }
 
 def exit_coindcx_position(position_id: str, pair: str = None) -> tuple[bool, str]:
     """
@@ -2690,6 +3278,15 @@ def run_strategy_backtest(
     df_daily['dt_ist'] = pd.to_datetime(df_daily['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
     df_daily['date_str'] = df_daily['dt_ist'].dt.strftime('%Y-%m-%d')
 
+    if strategy_id in ("box_theory", "box_plus_ema50_200_bear", "box_plus_ema50_200_bull_bear", "box_plus_ema50_200_regime"):
+        _ng_existing = _PERSIST.get("backtest_neutral_guard_map")
+        _first_d = str(df["date_str"].iloc[0]) if not df.empty else ""
+        if not isinstance(_ng_existing, dict) or (_first_d and _first_d not in _ng_existing):
+            try:
+                build_historical_regime_map(duration_days=duration_days)
+            except Exception:
+                pass
+
     strat_ctx = strat.prepare_backtest(df, df_daily)
 
     df_records = df.to_dict('records')
@@ -3340,20 +3937,64 @@ def classify_universe_regime_from_stats(
     return "RANGING_CHOP"
 
 
-def _format_regime_metadata(regime: str, bull_frac: float, bear_frac: float, r14: float, r5: float, r2: float) -> dict:
+def classify_neutral_coin_macro_guard(
+    regime: str,
+    bull_frac: float,
+    bear_frac: float,
+    btc_bias: str = "NEUTRAL",
+) -> str:
+    """
+    Macro tie-breaker strictly for NEUTRAL / RANGE coins (Daily Close between Daily 50 EMA & 200 EMA):
+      - SHORT_ONLY: Broad market is heavily Bearish (STRONG_DOWNTREND or >=70% Bearish breadth) AND BTC Daily Bias is BEARISH.
+                    Blocks counter-market LONG catches on NEUTRAL coins (e.g. NEAR / INJ), while allowing RH/SH SHORTs.
+      - LONG_ONLY : Broad market is heavily Bullish (STRONG_UPTREND or >=70% Bullish breadth) AND BTC Daily Bias is BULLISH.
+                    Blocks counter-market SHORT fades on NEUTRAL coins, while allowing RL/SL LONGs.
+      - BOTH      : Balanced/mixed market — NEUTRAL coins trade both RL/SL LONGs and RH/SH SHORTs.
+    Coins with their OWN confirmed BULLISH or BEARISH Daily Bias are NEVER overridden by this guard.
+    """
+    b_btc = str(btc_bias or "NEUTRAL").upper()
+    if (regime == "STRONG_DOWNTREND" or bear_frac >= 0.70) and "BEARISH" in b_btc:
+        return "SHORT_ONLY"
+    if (regime == "STRONG_UPTREND" or bull_frac >= 0.70) and "BULLISH" in b_btc:
+        return "LONG_ONLY"
+    return "BOTH"
+
+
+def _format_regime_metadata(
+    regime: str,
+    bull_frac: float,
+    bear_frac: float,
+    r14: float,
+    r5: float,
+    r2: float,
+    btc_bias: str = "NEUTRAL",
+) -> dict:
     b_pct = round(bull_frac * 100.0, 0)
     br_pct = round(bear_frac * 100.0, 0)
+    b_btc = str(btc_bias or "NEUTRAL").upper()
+    if "BEARISH" in b_btc:
+        b_btc = "BEARISH"
+    elif "BULLISH" in b_btc:
+        b_btc = "BULLISH"
+    else:
+        b_btc = "NEUTRAL"
+    neutral_guard = classify_neutral_coin_macro_guard(regime, bull_frac, bear_frac, b_btc)
+    ng_note = (
+        " | RANGE coins: SHORT-only (Macro Bear + BTC Bear)"
+        if neutral_guard == "SHORT_ONLY"
+        else (" | RANGE coins: LONG-only (Macro Bull + BTC Bull)" if neutral_guard == "LONG_ONLY" else "")
+    )
     if regime == "STRONG_UPTREND":
         emoji, label = "🟢", "STRONG UPTREND"
-        routing = "Box Sweep (L+S) + Bull 15m 50/200 EMA (LONG)"
+        routing = "Box Sweep (Own Trend / RANGE LONG-only) + Bull 15m 50/200 EMA (LONG)" if neutral_guard == "LONG_ONLY" else "Box Sweep (L+S) + Bull 15m 50/200 EMA (LONG)"
     elif regime == "STRONG_DOWNTREND":
         emoji, label = "🔴", "STRONG DOWNTREND"
-        routing = "Box Sweep (L+S) + Bear 15m 50/200 EMA (SHORT)"
+        routing = "Box Sweep (Own Trend / RANGE SHORT-only) + Bear 15m 50/200 EMA (SHORT)" if neutral_guard == "SHORT_ONLY" else "Box Sweep (L+S) + Bear 15m 50/200 EMA (SHORT)"
     else:
         emoji, label = "🟡", "RANGING / CHOP"
-        routing = "Box Theory Sweep ONLY (15m 50/200 EMA Auto-Paused in Chop)"
+        routing = f"Box Theory Sweep ONLY (15m 50/200 EMA Auto-Paused in Chop){ng_note}"
     summary = (
-        f"{emoji} {label} — Breadth: {b_pct:.0f}% Bull / {br_pct:.0f}% Bear | "
+        f"{emoji} {label} — Breadth: {b_pct:.0f}% Bull / {br_pct:.0f}% Bear (BTC: {b_btc}) | "
         f"14d: {r14:+.1f}% • 5d: {r5:+.1f}% • 2d: {r2:+.1f}% -> {routing}"
     )
     return {
@@ -3363,6 +4004,8 @@ def _format_regime_metadata(regime: str, bull_frac: float, bear_frac: float, r14
         "active_routing": routing,
         "bull_breadth_pct": round(bull_frac * 100.0, 1),
         "bear_breadth_pct": round(bear_frac * 100.0, 1),
+        "btc_bias": b_btc,
+        "neutral_coin_guard": neutral_guard,
         "median_14d_pct": round(r14, 2),
         "median_5d_pct": round(r5, 2),
         "median_2d_pct": round(r2, 2),
@@ -3384,10 +4027,11 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
     now_ms = int(now * 1000)
     bull_cnt, bear_cnt, valid_cnt = 0, 0, 0
     r14_list, r5_list, r2_list = [], [], []
+    btc_bias = ""
 
     for p in pool:
         try:
-            df_d = fetch_coindcx_candles(pair=p, interval="1d", limit=260, sync_live_price=False)
+            df_d = fetch_coindcx_candles(pair=p, interval="1d", limit=1000, sync_live_price=False)
             if df_d is None or df_d.empty or len(df_d) < 20:
                 continue
             closed_d = df_d[df_d["timestamp"] + 86400000 <= now_ms].reset_index(drop=True)
@@ -3402,8 +4046,14 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
             valid_cnt += 1
             if c_last > e50 and c_last > e200:
                 bull_cnt += 1
+                p_bias = "BULLISH"
             elif c_last < e50 and c_last < e200:
                 bear_cnt += 1
+                p_bias = "BEARISH"
+            else:
+                p_bias = "NEUTRAL"
+            if p == "B-BTC_USDT":
+                btc_bias = p_bias
             r14_list.append((c_last / float(closes.iloc[-15]) - 1.0) * 100.0)
             r5_list.append((c_last / float(closes.iloc[-6]) - 1.0) * 100.0)
             r2_list.append((c_last / float(closes.iloc[-3]) - 1.0) * 100.0)
@@ -3411,8 +4061,14 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
             continue
 
     if valid_cnt == 0:
-        fallback = _format_regime_metadata("RANGING_CHOP", 0.0, 0.0, 0.0, 0.0, 0.0)
+        fallback = _format_regime_metadata("RANGING_CHOP", 0.0, 0.0, 0.0, 0.0, 0.0, btc_bias="NEUTRAL")
         return fallback
+
+    if not btc_bias:
+        try:
+            btc_bias = str(compute_market_bias("B-BTC_USDT").get("bias", "NEUTRAL")).upper()
+        except Exception:
+            btc_bias = "NEUTRAL"
 
     r14_med = float(pd.Series(r14_list).median()) if r14_list else 0.0
     r5_med = float(pd.Series(r5_list).median()) if r5_list else 0.0
@@ -3420,7 +4076,7 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
     bull_f = bull_cnt / valid_cnt
     bear_f = bear_cnt / valid_cnt
     reg = classify_universe_regime_from_stats(bull_f, bear_f, r14_med, r5_med, r2_med)
-    out = _format_regime_metadata(reg, bull_f, bear_f, r14_med, r5_med, r2_med)
+    out = _format_regime_metadata(reg, bull_f, bear_f, r14_med, r5_med, r2_med, btc_bias=btc_bias)
     _MARKET_REGIME_CACHE["data"] = dict(out)
     _MARKET_REGIME_CACHE["ts"] = now
     return out
@@ -3428,11 +4084,15 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
 
 def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30, warmup_days: int = 1000) -> dict[str, str]:
     """
-    Builds a date_str -> ('STRONG_UPTREND' | 'STRONG_DOWNTREND' | 'RANGING_CHOP') lookup across the
+    Builds date_str -> ('STRONG_UPTREND' | 'STRONG_DOWNTREND' | 'RANGING_CHOP') AND
+    date_str -> ('SHORT_ONLY' | 'LONG_ONLY' | 'BOTH') neutral-coin macro guard lookup across the
     12-coin universe for historical backtests (strictly using prior completed daily candles, zero lookahead).
     """
     pool = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
+    if "B-BTC_USDT" not in pool:
+        pool.append("B-BTC_USDT")
     bias_by_d: dict[str, list[str]] = {}
+    btc_bias_by_d: dict[str, str] = {}
     r14_by_d: dict[str, list[float]] = {}
     r5_by_d: dict[str, list[float]] = {}
     r2_by_d: dict[str, list[float]] = {}
@@ -3460,6 +4120,8 @@ def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30
                 cur_d = dates[i]
                 pc, pe50, pe200 = float(closes[i - 1]), float(e50_s[i - 1]), float(e200_s[i - 1])
                 b = "BULLISH" if (pc > pe50 and pc > pe200) else ("BEARISH" if (pc < pe50 and pc < pe200) else "NEUTRAL")
+                if p == "B-BTC_USDT":
+                    btc_bias_by_d[cur_d] = b
                 bias_by_d.setdefault(cur_d, []).append(b)
                 r14_by_d.setdefault(cur_d, []).append((pc / float(closes[i - 15]) - 1.0) * 100.0)
                 r5_by_d.setdefault(cur_d, []).append((pc / float(closes[i - 6]) - 1.0) * 100.0)
@@ -3468,6 +4130,7 @@ def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30
             continue
 
     reg_map: dict[str, str] = {}
+    neutral_guard_map: dict[str, str] = {}
     for d_k, b_list in bias_by_d.items():
         nb = max(1, len(b_list))
         bull_f = sum(1 for x in b_list if x == "BULLISH") / nb
@@ -3475,8 +4138,13 @@ def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30
         r14_m = float(pd.Series(r14_by_d.get(d_k, [0.0])).median())
         r5_m = float(pd.Series(r5_by_d.get(d_k, [0.0])).median())
         r2_m = float(pd.Series(r2_by_d.get(d_k, [0.0])).median())
-        reg_map[d_k] = classify_universe_regime_from_stats(bull_f, bear_f, r14_m, r5_m, r2_m)
+        reg_d = classify_universe_regime_from_stats(bull_f, bear_f, r14_m, r5_m, r2_m)
+        reg_map[d_k] = reg_d
+        neutral_guard_map[d_k] = classify_neutral_coin_macro_guard(
+            reg_d, bull_f, bear_f, btc_bias_by_d.get(d_k, "NEUTRAL")
+        )
     _PERSIST["backtest_regime_map"] = reg_map
+    _PERSIST["backtest_neutral_guard_map"] = neutral_guard_map
     return reg_map
 
 
@@ -5503,6 +6171,24 @@ def execute_autotrade_two_entry_signal(
         return False, (
             f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
         ), {"daily_bias": daily_bias, "direction": norm_dir}
+    if daily_bias == "NEUTRAL" and not allow_mode_override:
+        try:
+            _reg_ng = compute_market_regime()
+            _ng_dir = str(_reg_ng.get("neutral_coin_guard") or "BOTH")
+            if _ng_dir == "SHORT_ONLY" and norm_dir != "SHORT":
+                return False, (
+                    f"Macro-Bearish Neutral Guard: {pair} Daily Bias is NEUTRAL/RANGE while Market Breadth is "
+                    f"{_reg_ng.get('bear_breadth_pct', 0):.0f}% Bearish ({_reg_ng.get('label', 'BEAR')}) & BTC is BEARISH — "
+                    f"blocking counter-market {norm_dir} AutoTrade (own BULLISH coins remain unrestricted)."
+                ), {"daily_bias": daily_bias, "neutral_coin_guard": _ng_dir, "direction": norm_dir}
+            if _ng_dir == "LONG_ONLY" and norm_dir != "LONG":
+                return False, (
+                    f"Macro-Bullish Neutral Guard: {pair} Daily Bias is NEUTRAL/RANGE while Market Breadth is "
+                    f"{_reg_ng.get('bull_breadth_pct', 0):.0f}% Bullish ({_reg_ng.get('label', 'BULL')}) & BTC is BULLISH — "
+                    f"blocking counter-market {norm_dir} AutoTrade (own BEARISH coins remain unrestricted)."
+                ), {"daily_bias": daily_bias, "neutral_coin_guard": _ng_dir, "direction": norm_dir}
+        except Exception:
+            pass
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
@@ -5767,7 +6453,7 @@ def run_portfolio_single_slot_backtest(
     max_daily_loss_inr = eff_wallet_inr * (_strategies.DAILY_WALLET_LOSS_STOP_PCT / 100.0)
 
     universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
-    if strategy_id == "box_plus_ema50_200_regime":
+    if strategy_id in ("box_theory", "box_plus_ema50_200_bear", "box_plus_ema50_200_bull_bear", "box_plus_ema50_200_regime"):
         build_historical_regime_map(pairs=universe, duration_days=duration_days)
     all_candidates = []
     standalone_rows = []
@@ -6340,6 +7026,7 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "check_live_daily_loss_stop": check_live_daily_loss_stop,
             "unlock_autotrade_daily_loss_stop": unlock_autotrade_daily_loss_stop,
             "classify_universe_regime_from_stats": classify_universe_regime_from_stats,
+            "classify_neutral_coin_macro_guard": classify_neutral_coin_macro_guard,
             "compute_market_regime": compute_market_regime,
             "build_historical_regime_map": build_historical_regime_map,
             "count_open_ema50_200_slots": count_open_ema50_200_slots,
@@ -6349,6 +7036,10 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "save_autotrade_config": save_autotrade_config,
             "clear_autotrade_active_lock": clear_autotrade_active_lock,
             "register_app_trade_lock": register_app_trade_lock,
+            "fetch_coindcx_spot_balances": fetch_coindcx_spot_balances,
+            "fetch_coindcx_futures_wallet_transactions": fetch_coindcx_futures_wallet_transactions,
+            "compute_futures_funds_summary": compute_futures_funds_summary,
+            "parse_coindcx_statement_csv": parse_coindcx_statement_csv,
         }
         cur_globals = globals()
         for obj in gc.get_objects():

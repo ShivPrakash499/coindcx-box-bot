@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 34
+_DAEMON_VERSION = 35
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -420,10 +420,15 @@ def clean_sym(pair: str) -> str:
 def get_cached_sheet_trades():
     return fetch_all_sheet_trades()
 
+@st.cache_data(ttl=180)
+def get_cached_futures_funds_ledger():
+    return coindcx_engine.fetch_coindcx_futures_wallet_transactions(force_refresh=False)
+
 NAV_SECTIONS = [
     "⚡ Signals",
     "🎯 Execute",
     "📊 Positions",
+    "💰 Funds",
     "📈 Chart & Levels",
     "🧪 Backtest",
     "🤖 AI Advisor",
@@ -1044,7 +1049,7 @@ st.html(f"""
         background: {nav_bg} !important;
         border: 1px solid {card_border} !important;
         border-radius: 8px !important;
-        padding: 9px 12px !important;
+        padding: 9px 8px !important;
         margin: 0 !important;
         cursor: pointer !important;
         display: flex !important;
@@ -1838,6 +1843,7 @@ if active_section == "⚡ Signals":
                             st.error(msg_a)
 
         st.markdown("#### 📡 High-Volatility Watchlist Matrix")
+        _ng_matrix = str((get_cached_market_regime() or {}).get("neutral_coin_guard") or "BOTH")
         matrix_rows = []
         for pair_w in monitor_pairs:
             sym_w = clean_sym(pair_w)
@@ -1854,7 +1860,16 @@ if active_section == "⚡ Signals":
                 else:
                     zone = "⚪ Mid-Range"
                 tb = lv.get("trend_bias", "RANGE")
-                bias_lbl = "🟢 BULL" if tb == "BULLISH" else ("🔴 BEAR" if tb == "BEARISH" else "🟡 RANGE")
+                bias_lbl = (
+                    "🟢 BULL" if tb == "BULLISH"
+                    else (
+                        "🔴 BEAR" if tb == "BEARISH"
+                        else (
+                            "🟡 RANGE (SHORT)" if _ng_matrix == "SHORT_ONLY"
+                            else ("🟡 RANGE (LONG)" if _ng_matrix == "LONG_ONLY" else "🟡 RANGE")
+                        )
+                    )
+                )
                 sh_s, rh_s, mid_s, rl_s, sl_s = fmt_px(lv["SH"]), fmt_px(lv["RH"]), fmt_px(lv["MID"]), fmt_px(lv["RL"]), fmt_px(lv["SL"])
             else:
                 zone, bias_lbl = "—", "—"
@@ -2796,6 +2811,285 @@ elif active_section == "📊 Positions":
                 if c2.button("❌ Cancel", key=f"lt_cancel_pending_{idx}", use_container_width=True):
                     st.session_state.paper_pending_orders.remove(p_ord)
                     st.rerun()
+
+# ==============================================================================
+# SECTION 3B: FUNDS, CAPITAL FLOWS & LIFETIME PORTFOLIO GROWTH
+# ==============================================================================
+elif active_section == "💰 Funds":
+    f_hdr_l, f_hdr_r = st.columns([3.2, 1.1])
+    with f_hdr_l:
+        st.markdown("### 💰 CoinDCX Futures Funds & Lifetime Capital Growth")
+        st.caption(
+            "Live audit of every CoinDCX Futures Wallet credit, debit, transfer, trade settlement, and funding fee "
+            "from Day 1 — reconciled directly against your current Futures Wallet equity."
+        )
+    with f_hdr_r:
+        if st.button("🔄 Refresh CoinDCX Ledger", key="btn_refresh_funds_ledger", type="primary", use_container_width=True):
+            with st.spinner("Fetching complete CoinDCX Futures transaction history from Day 1..."):
+                get_cached_futures_funds_ledger.clear()
+                coindcx_engine._fetch_coindcx_futures_balance_sync()
+                coindcx_engine._fetch_coindcx_active_positions_sync()
+                coindcx_engine.fetch_coindcx_futures_wallet_transactions(force_refresh=True)
+            st.rerun()
+
+    with st.spinner("Loading CoinDCX Futures Wallet ledger from Day 1..."):
+        ledger_res = get_cached_futures_funds_ledger() or {}
+
+    live_pos_funds = get_cached_positions() or []
+    wallet_funds = get_cached_balance() or wallet_data or {}
+
+    if not ledger_res.get("ok"):
+        st.warning(
+            f"⚠️ **CoinDCX Futures Ledger Fetch Notice:** `{ledger_res.get('error') or 'Unable to load transaction history'}`\n\n"
+            f"- Current Synced Futures Wallet Value: **₹{float(wallet_funds.get('total_inr', 0.0) or 0.0):,.2f}** "
+            f"(Available: ₹{float(wallet_funds.get('available_inr', 0.0) or 0.0):,.2f})\n"
+            f"- Click **🔄 Refresh CoinDCX Ledger** above to retry, or upload your exported CoinDCX CSV in the **Bank / Spot Statement** tab below."
+        )
+
+    funds_summary = coindcx_engine.compute_futures_funds_summary(
+        transactions=ledger_res.get("transactions") or [],
+        wallet=wallet_funds,
+        positions=live_pos_funds,
+        spot_balances=ledger_res.get("spot_balances") or [],
+        usd_inr=usd_inr,
+    )
+
+    if funds_summary["total_transactions"] > 0:
+        st.caption(
+            f"📅 **Ledger Coverage:** `{funds_summary['first_tx_ist']}` → `{funds_summary['latest_tx_ist']}` • "
+            f"**{funds_summary['total_transactions']:,} transactions** ({int(ledger_res.get('pages_fetched', 0) or 0)} page(s)) • "
+            f"Synced: `{ledger_res.get('fetched_at_ist') or 'Live'}` • Live USDT/INR: `₹{funds_summary['usd_inr_rate']:.2f}`"
+        )
+
+    # ---- ROW 1 KPI CARDS: CAPITAL FLOW & CURRENT EQUITY ----
+    added_inr = funds_summary["total_added_all_inr"]
+    wd_inr = funds_summary["total_withdrawn_all_inr"]
+    net_cap_inr = funds_summary["net_capital_inr"]
+    peak_cap_inr = funds_summary["peak_net_capital_inr"]
+    cur_realized_inr = funds_summary["current_realized_wallet_inr"]
+    unreal_inr = funds_summary["unrealized_pnl_inr"]
+    cur_equity_inr = funds_summary["current_equity_inr"]
+
+    added_sub = f"{funds_summary['deposit_count']} deposit(s)"
+    if funds_summary["total_added_usdt"] > 0:
+        added_sub += f" (+{funds_summary['total_added_usdt']:,.2f} USDT)"
+    wd_sub = f"{funds_summary['withdrawal_count']} withdrawal(s)"
+    if funds_summary["total_withdrawn_usdt"] > 0:
+        wd_sub += f" (-{funds_summary['total_withdrawn_usdt']:,.2f} USDT)"
+
+    fk1, fk2, fk3, fk4 = st.columns(4)
+    fk1.metric("Total Added to Futures", f"₹{added_inr:,.2f}", added_sub)
+    fk2.metric("Total Withdrawn", f"₹{wd_inr:,.2f}", wd_sub)
+    fk3.metric("Net Capital Invested", f"₹{net_cap_inr:,.2f}", f"Peak Deployed: ₹{peak_cap_inr:,.2f}")
+    fk4.metric(
+        "Current Futures Equity",
+        f"₹{cur_equity_inr:,.2f}",
+        f"Realized ₹{cur_realized_inr:,.0f} | Open {'+' if unreal_inr >= 0 else ''}₹{unreal_inr:,.0f}",
+    )
+
+    # ---- ROW 2 KPI CARDS: PROFIT, % GROWTH, TRADING/FUNDING & SPOT ----
+    tot_pnl = funds_summary["total_growth_inr"]
+    real_pnl = funds_summary["realized_growth_inr"]
+    g_net = funds_summary["growth_pct_net_capital"]
+    g_peak = funds_summary["growth_pct_peak_capital"]
+    g_added = funds_summary["growth_pct_total_added"]
+
+    growth_main_str = f"{g_net:+.2f}%" if g_net is not None else ("House Money ∞" if tot_pnl >= 0 else "N/A")
+    growth_sub_parts = []
+    if g_peak is not None:
+        growth_sub_parts.append(f"Peak ROI: {g_peak:+.2f}%")
+    if g_added is not None:
+        growth_sub_parts.append(f"Added ROI: {g_added:+.2f}%")
+    growth_sub_str = " • ".join(growth_sub_parts) if growth_sub_parts else "No capital added yet"
+
+    spot_str = f"Spot INR ₹{funds_summary['spot_inr_total']:,.0f}"
+    if funds_summary["spot_usdt_total"] > 0:
+        spot_str += f" • {funds_summary['spot_usdt_total']:,.2f} USDT"
+    elif not funds_summary["spot_balances"]:
+        spot_str = f"Locked Margin: ₹{funds_summary['locked_margin_inr']:,.0f}"
+
+    fk5, fk6, fk7, fk8 = st.columns(4)
+    fk5.metric(
+        "Net Profit / Loss (Live)",
+        f"{'+' if tot_pnl >= 0 else ''}₹{tot_pnl:,.2f}",
+        f"Realized: {'+' if real_pnl >= 0 else ''}₹{real_pnl:,.2f}",
+    )
+    fk6.metric("% Growth (vs Net Capital)", growth_main_str, growth_sub_str)
+    fk7.metric(
+        "Trading & Funding Ledger",
+        f"{'+' if (funds_summary['net_order_ledger_inr'] + funds_summary['net_funding_inr']) >= 0 else ''}₹{(funds_summary['net_order_ledger_inr'] + funds_summary['net_funding_inr']):,.2f}",
+        f"Orders ₹{funds_summary['net_order_ledger_inr']:+,.0f} | Funding ₹{funds_summary['net_funding_inr']:+,.0f}",
+    )
+    fk8.metric(
+        "Available Futures Cash",
+        f"₹{funds_summary['available_inr']:,.2f}",
+        spot_str,
+    )
+
+    # ---- INTERACTIVE PLOTLY GROWTH CHART: FUTURES WALLET VALUE VS NET CAPITAL INVESTED ----
+    tl_rows = funds_summary.get("timeline") or []
+    if len(tl_rows) >= 2:
+        tl_df = pd.DataFrame(tl_rows)
+        fig_funds = go.Figure()
+        fig_funds.add_trace(go.Scatter(
+            x=tl_df["date"],
+            y=tl_df["net_capital_inr"],
+            mode="lines",
+            name="Net Capital Invested (₹)",
+            line=dict(color="#f59e0b", width=2.2, dash="dash"),
+            hovertemplate="Date: %{x}<br>Net Invested: ₹%{y:,.2f}<extra></extra>",
+        ))
+        fig_funds.add_trace(go.Scatter(
+            x=tl_df["date"],
+            y=tl_df["ledger_wallet_inr"],
+            mode="lines+markers",
+            name="Futures Wallet Equity (₹)",
+            line=dict(color="#10b981" if tot_pnl >= 0 else "#ef4444", width=2.6),
+            marker=dict(size=4),
+            fill="tonexty",
+            fillcolor="rgba(16,185,129,0.12)" if tot_pnl >= 0 else "rgba(239,68,68,0.12)",
+            hovertemplate="Date: %{x}<br>Wallet Equity: ₹%{y:,.2f}<extra></extra>",
+        ))
+        fig_funds.update_layout(
+            title=dict(text="📈 Futures Wallet Equity vs Net Capital Invested (₹)", font=dict(size=14, color=text_color)),
+            paper_bgcolor=plot_paper,
+            plot_bgcolor=plot_bg,
+            font=dict(color=axis_font),
+            height=340,
+            margin=dict(l=16, r=16, t=42, b=24),
+            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1.0),
+            xaxis=dict(gridcolor=plot_grid, title=""),
+            yaxis=dict(gridcolor=plot_grid, title="INR (₹)", tickprefix="₹"),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_funds, use_container_width=True, key="funds_equity_growth_chart")
+
+    # ---- 4 SUB-TABS FOR DETAILED CAPITAL FLOW, MONTHLY GROWTH, AUDIT & BANK CSV ----
+    ftab_tr, ftab_mo, ftab_aud, ftab_csv = st.tabs([
+        "📥 Deposits & Withdrawals",
+        "📅 Monthly Growth",
+        "🧾 Full Ledger & Audit",
+        "🏦 Bank / Spot Statement CSV",
+    ])
+
+    with ftab_tr:
+        tr_rows = list(funds_summary.get("transfers_rows") or [])
+        if not tr_rows:
+            st.info("No Futures Wallet deposit or withdrawal transfer records found yet.")
+        else:
+            tr_filter = st.radio(
+                "Filter Transfers",
+                ["All Transfers", "Deposits Only", "Withdrawals Only"],
+                horizontal=True,
+                key="funds_transfers_filter",
+                label_visibility="collapsed",
+            )
+            tr_df = pd.DataFrame(list(reversed(tr_rows)))  # newest first
+            if tr_filter == "Deposits Only":
+                tr_df = tr_df[tr_df["Type"] == "CREDIT"].reset_index(drop=True)
+            elif tr_filter == "Withdrawals Only":
+                tr_df = tr_df[tr_df["Type"] == "DEBIT"].reset_index(drop=True)
+
+            st.caption(
+                f"Showing **{len(tr_df)}** transfer(s) • Total Added: **₹{added_inr:,.2f}** • "
+                f"Total Withdrawn: **₹{wd_inr:,.2f}** • Net Invested: **₹{net_cap_inr:,.2f}**"
+            )
+            st.dataframe(tr_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Transfers CSV",
+                data=tr_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"coindcx_futures_transfers_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="dl_funds_transfers_csv",
+            )
+
+    with ftab_mo:
+        mo_rows = list(funds_summary.get("monthly_rows") or [])
+        if not mo_rows:
+            st.info("No monthly Futures transaction history available yet.")
+        else:
+            mo_df = pd.DataFrame(list(reversed(mo_rows)))  # latest month first
+            st.dataframe(mo_df, use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Monthly Summary CSV",
+                data=mo_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"coindcx_futures_monthly_growth_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="dl_funds_monthly_csv",
+            )
+
+    with ftab_aud:
+        r_rows = list(funds_summary.get("reason_rows") or [])
+        rec_bal = funds_summary["ledger_reconciled_balance_inr"]
+        rec_diff = funds_summary["ledger_reconciliation_diff_inr"]
+        st.markdown("#### 🔍 CoinDCX Ledger Category Audit & Reconciliation")
+        ac1, ac2, ac3 = st.columns(3)
+        ac1.metric("Reconciled Ledger Net Sum", f"₹{rec_bal:,.2f}")
+        ac2.metric("Live Realized Futures Wallet", f"₹{cur_realized_inr:,.2f}")
+        ac3.metric("Reconciliation Delta", f"{'+' if rec_diff >= 0 else ''}₹{rec_diff:,.2f}")
+        if r_rows:
+            st.dataframe(pd.DataFrame(r_rows), use_container_width=True, hide_index=True)
+
+        if funds_summary["spot_balances"]:
+            st.markdown("#### 🪙 CoinDCX Spot / Main Wallet Non-Zero Balances")
+            st.dataframe(pd.DataFrame(funds_summary["spot_balances"]), use_container_width=True, hide_index=True)
+
+        all_desc = list(funds_summary.get("all_rows_desc") or [])
+        if all_desc:
+            st.markdown(f"#### 📜 Full Transaction Ledger (Showing latest {min(500, len(all_desc))} of {len(all_desc):,})")
+            search_tx = st.text_input(
+                "Filter ledger by reason, type, currency, or date (e.g. funding, universal, 2026-11)",
+                value="",
+                key="funds_ledger_search",
+            ).strip().lower()
+            full_df = pd.DataFrame([
+                {
+                    "Date & Time (IST)": x["dt_str"],
+                    "Category": x["category"].title(),
+                    "Type": x["transaction_type"].upper(),
+                    "Amount": x["amount"],
+                    "Currency": x["currency"],
+                    "Signed INR (₹)": x["signed_inr"],
+                    "Reason": x["reason"],
+                }
+                for x in all_desc
+            ])
+            if search_tx:
+                mask_tx = full_df.apply(lambda row: search_tx in " ".join(str(v).lower() for v in row.values), axis=1)
+                full_df = full_df[mask_tx].reset_index(drop=True)
+            st.dataframe(full_df.head(500), use_container_width=True, hide_index=True)
+            st.download_button(
+                "⬇️ Download Complete Ledger CSV",
+                data=full_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"coindcx_futures_full_ledger_{datetime.now(IST).strftime('%Y%m%d')}.csv",
+                mime="text/csv",
+                key="dl_funds_full_ledger_csv",
+            )
+
+    with ftab_csv:
+        st.info(
+            "ℹ️ **Why optional CSV upload?** CoinDCX's REST API exposes your complete **Futures Wallet** history "
+            "(Universal Wallet ↔ Futures transfers, orders & funding — shown automatically above), "
+            "but does **not** expose **Bank ↔ CoinDCX Spot INR** deposits/withdrawals via API.\n\n"
+            "If you also want to track your total Bank INR Deposits & Withdrawals, export your INR statement CSV from "
+            "**CoinDCX App/Web → Reports / Statement** and upload it below."
+        )
+        up_csv = st.file_uploader(
+            "Upload CoinDCX INR Deposit / Withdrawal Statement CSV",
+            type=["csv"],
+            key="funds_bank_csv_uploader",
+        )
+        if up_csv is not None:
+            parsed_csv = coindcx_engine.parse_coindcx_statement_csv(up_csv.getvalue())
+            if not parsed_csv.get("ok"):
+                st.error(f"❌ {parsed_csv.get('error')}")
+            else:
+                bc1, bc2, bc3 = st.columns(3)
+                bc1.metric("Bank INR Deposited", f"₹{parsed_csv['total_deposited_inr']:,.2f}", f"{parsed_csv['deposit_count']} deposit(s)")
+                bc2.metric("Bank INR Withdrawn", f"₹{parsed_csv['total_withdrawn_inr']:,.2f}", f"{parsed_csv['withdrawal_count']} withdrawal(s)")
+                bc3.metric("Net Bank Cash Invested", f"₹{parsed_csv['net_bank_invested_inr']:,.2f}")
+                if parsed_csv.get("rows"):
+                    st.dataframe(pd.DataFrame(parsed_csv["rows"]), use_container_width=True, hide_index=True)
 
 # ==============================================================================
 # SECTION 4: INTERACTIVE CHART & KEY BOX LEVELS

@@ -484,11 +484,12 @@ def test_7_ui_render_and_navigation_tabs_integrity():
                 f"CRITICAL UI BUG: Unconditional/non-button st.rerun() found before Navigate Section at line {idx_l}:\n{context_window}"
             )
 
-    # 4. Verify all 6 required navigation tabs exist in NAV_SECTIONS and have matching render blocks
+    # 4. Verify all 7 required navigation tabs exist in NAV_SECTIONS and have matching render blocks
     expected_tabs = [
         "⚡ Signals",
         "🎯 Execute",
         "📊 Positions",
+        "💰 Funds",
         "📈 Chart & Levels",
         "🧪 Backtest",
         "🤖 AI Advisor",
@@ -510,7 +511,7 @@ def test_7_ui_render_and_navigation_tabs_integrity():
     # 7. Parse AST of app.py to ensure clean top-level structure
     tree = ast.parse(app_src, filename="app.py")
     assert len(tree.body) > 20
-    print(f"  -> PASS: All 6 UI tabs ({', '.join(expected_tabs)}) & fragment non-loop invariants verified.")
+    print(f"  -> PASS: All 7 UI tabs ({', '.join(expected_tabs)}) & fragment non-loop invariants verified.")
 
 
 def test_8_stale_cache_expiry_and_nat_pinner():
@@ -1483,6 +1484,154 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
     print("  -> PASS: All 3 v34 Fixes (Strict 3-Slot/Partial-Fill, Exact Sidebar Margin/No Crumbs, Box-Floor/SL-Drift/4h Lock) verified!")
 
 
+def test_15_v35_funds_section_and_neutral_macro_guard():
+    print("[15/15] Verifying Daemon v35 Funds Ledger Analytics & Option 1 Macro-Trend Neutral Coin Guard...")
+    import tempfile
+    from unittest.mock import MagicMock
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+
+    # --- PART A: Funds Transaction Pagination, Capital Accounting & Bank CSV Parser ---
+    page1_tx = [
+        {"id": f"tx_p1_{i}", "transaction_type": "credit", "amount": "1000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": 1760000000000 + i * 1000}
+        for i in range(100)
+    ]
+    page2_tx = [
+        {"id": "tx_p1_99", "transaction_type": "credit", "amount": "1000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": 1760000099000},  # duplicate
+        {"id": "tx_p2_1", "transaction_type": "debit", "amount": "25000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": 1761000000000},
+    ]
+
+    def _fake_signed_req(method, url, payload=None, timeout=10.0):
+        resp = MagicMock()
+        if "users/balances" in url:
+            resp.status_code = 200
+            resp.json.return_value = [{"currency": "INR", "balance": "4500.50", "locked_balance": "0.0"}, {"currency": "USDT", "balance": "12.5", "locked_balance": "0"}]
+            return resp, None
+        if "size=1000" in url or "size=500" in url:
+            resp.status_code = 422
+            resp.text = "size too large"
+            resp.json.return_value = {"message": "size too large"}
+            return resp, None
+        if "page=1&size=100" in url:
+            resp.status_code = 200
+            resp.json.return_value = page1_tx
+            return resp, None
+        if "page=2&size=100" in url:
+            resp.status_code = 200
+            resp.json.return_value = page2_tx
+            return resp, None
+        resp.status_code = 200
+        resp.json.return_value = []
+        return resp, None
+
+    with patch.object(eng, "_get_coindcx_credentials", return_value=("k12345678", "s12345678")), \
+         patch.object(eng, "_send_coindcx_signed_request", side_effect=_fake_signed_req):
+        res_tx = eng.fetch_coindcx_futures_wallet_transactions(force_refresh=True, max_pages=10)
+        assert res_tx["ok"] is True, res_tx
+        assert len(res_tx["transactions"]) == 101, f"Expected 101 deduplicated tx, got {len(res_tx['transactions'])}"
+        assert res_tx["pages_fetched"] == 2
+        assert len(res_tx["spot_balances"]) == 2 and res_tx["spot_balances"][0]["currency"] == "INR"
+
+    sample_tx = [
+        {"id": "1", "transaction_type": "credit", "amount": "100000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": "2026-10-05T10:00:00Z"},
+        {"id": "2", "transaction_type": "credit", "amount": "100", "currency_short_name": "USDT", "reason": "by_universal_wallet", "created_at": "2026-10-12T10:00:00Z"},  # @ 100 INR = 10,000
+        {"id": "3", "transaction_type": "debit", "amount": "20000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": "2026-11-01T10:00:00Z"},
+        {"id": "4", "transaction_type": "credit", "amount": "18500", "currency_short_name": "INR", "reason": "by_futures_order", "created_at": "2026-11-10T10:00:00Z"},
+        {"id": "5", "transaction_type": "debit", "amount": "500", "currency_short_name": "INR", "reason": "by_futures_funding", "created_at": "2026-11-12T10:00:00Z"},
+    ]
+    summ = eng.compute_futures_funds_summary(
+        transactions=sample_tx,
+        wallet={"total_inr": 108000.0, "available_inr": 88000.0, "live_usd_inr": 100.0},
+        positions=[{"pair": "B-BTC_USDT", "pnl_inr": 2000.0}],
+        spot_balances=[{"currency": "INR", "total": 5000.0}],
+        usd_inr=100.0,
+    )
+    assert summ["total_added_all_inr"] == 110000.0, summ
+    assert summ["total_withdrawn_all_inr"] == 20000.0, summ
+    assert summ["net_capital_inr"] == 90000.0, summ
+    assert summ["peak_net_capital_inr"] == 110000.0, summ
+    assert summ["current_realized_wallet_inr"] == 108000.0, summ
+    assert summ["current_equity_inr"] == 110000.0, summ
+    assert summ["realized_growth_inr"] == 18000.0 and summ["total_growth_inr"] == 20000.0, summ
+    assert abs(summ["growth_pct_net_capital"] - 22.22) < 0.02, summ["growth_pct_net_capital"]
+    assert summ["ledger_reconciliation_diff_inr"] == 0.0, summ["ledger_reconciliation_diff_inr"]
+    assert len(summ["monthly_rows"]) == 2 and len(summ["transfers_rows"]) == 3
+
+    # House-money safety (withdrew more than added -> net_capital <= 0 must not crash or divide by zero)
+    hm_summ = eng.compute_futures_funds_summary(
+        transactions=[
+            {"id": "a", "transaction_type": "credit", "amount": "50000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": "2026-10-01T00:00:00Z"},
+            {"id": "b", "transaction_type": "debit", "amount": "60000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": "2026-11-01T00:00:00Z"},
+        ],
+        wallet={"total_inr": 15000.0, "available_inr": 15000.0},
+        usd_inr=100.0,
+    )
+    assert hm_summ["net_capital_inr"] == -10000.0 and hm_summ["growth_pct_net_capital"] is None and hm_summ["total_growth_inr"] == 25000.0
+
+    csv_sample = (
+        "Date,Type,Currency,Amount,Status\n"
+        "2026-10-01,INR Deposit,INR,50000,Success\n"
+        "2026-10-05,INR Deposit,INR,25000,Failed\n"
+        "2026-10-15,INR Withdrawal,INR,15000,Completed\n"
+    ).encode("utf-8")
+    csv_res = eng.parse_coindcx_statement_csv(csv_sample)
+    assert csv_res["ok"] and csv_res["total_deposited_inr"] == 50000.0 and csv_res["total_withdrawn_inr"] == 15000.0 and csv_res["net_bank_invested_inr"] == 35000.0
+
+    # --- PART B: Option 1 Macro-Trend Guard for NEUTRAL/RANGE Coins (Nov 20 NEAR LONG Replay) ---
+    assert eng.classify_neutral_coin_macro_guard("STRONG_DOWNTREND", 0.0, 0.83, "BEARISH") == "SHORT_ONLY"
+    assert eng.classify_neutral_coin_macro_guard("RANGING_CHOP", 0.0, 0.83, "BEARISH") == "SHORT_ONLY"
+    assert eng.classify_neutral_coin_macro_guard("RANGING_CHOP", 0.0, 0.50, "BEARISH") == "BOTH"  # BTC alone < 70% does NOT force SHORT_ONLY
+    assert eng.classify_neutral_coin_macro_guard("STRONG_UPTREND", 0.75, 0.0, "BULLISH") == "LONG_ONLY"
+    assert eng.classify_neutral_coin_macro_guard("RANGING_CHOP", 0.75, 0.0, "BULLISH") == "LONG_ONLY"
+    assert eng.classify_neutral_coin_macro_guard("STRONG_DOWNTREND", 0.0, 0.83, "NEUTRAL") == "BOTH"  # Requires BTC confirmation too
+
+    # Replay exact 2026-11-20 03:45 IST NEAR RL sweep candle ($3.151 -> $3.199) on NEUTRAL box
+    near_box = {"RH": 3.427, "RL": 3.166, "SH": 3.480, "SL": 3.101, "MID": 3.2965, "EMA50": 3.9109, "EMA200": 3.0246, "daily_close": 3.301, "trend_bias": "NEUTRAL"}
+    base_15m = [{"timestamp": 1795120000000 + i * 900000, "open": 3.24, "high": 3.25, "low": 3.22, "close": 3.23, "volume": 100.0, "EMA9": 3.23, "EMA50": 3.29, "EMA200": 3.31} for i in range(25)]
+    base_15m.append({"timestamp": 1795142500000, "open": 3.171, "high": 3.184, "low": 3.156, "close": 3.159, "volume": 100.0, "EMA9": 3.18, "EMA50": 3.292, "EMA200": 3.310})
+    base_15m.append({"timestamp": 1795143400000, "open": 3.160, "high": 3.202, "low": 3.151, "close": 3.199, "volume": 120.0, "EMA9": 3.19, "EMA50": 3.288, "EMA200": 3.309})
+    df_near_15m = pd.DataFrame(base_15m)
+
+    box_strat = strat.BoxTheorySweep()
+    # 1. Under Macro Bear SHORT_ONLY -> NEAR NEUTRAL LONG is BLOCKED in evaluate_signal
+    with patch.object(strat, "_closed_15m", return_value=df_near_15m), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "bear_breadth_pct": 83.3, "bull_breadth_pct": 0.0, "btc_bias": "BEARISH", "neutral_coin_guard": "SHORT_ONLY"}):
+        sig_blocked = box_strat.evaluate_signal("B-NEAR_USDT", levels=near_box, margin_inr=30000.0, leverage=10, usd_inr=90.0)
+        assert sig_blocked["signal"] == "NEUTRAL", f"Expected NEAR NEUTRAL LONG blocked under SHORT_ONLY macro guard, got {sig_blocked['signal']}"
+
+    # 2. Under Balanced Market (BOTH) -> NEAR NEUTRAL LONG fires normally!
+    with patch.object(strat, "_closed_15m", return_value=df_near_15m), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "bear_breadth_pct": 41.7, "bull_breadth_pct": 25.0, "btc_bias": "NEUTRAL", "neutral_coin_guard": "BOTH"}):
+        sig_allowed = box_strat.evaluate_signal("B-NEAR_USDT", levels=near_box, margin_inr=30000.0, leverage=10, usd_inr=90.0)
+        assert sig_allowed["signal"] == "LONG", f"Expected NEAR NEUTRAL LONG allowed in balanced market, got {sig_allowed['signal']}"
+
+    # 3. Own-trend BULLISH coin is NEVER overridden by SHORT_ONLY macro guard!
+    bull_box = {**near_box, "EMA50": 2.90, "EMA200": 2.60, "daily_close": 3.301, "trend_bias": "BULLISH"}
+    with patch.object(strat, "_closed_15m", return_value=df_near_15m), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "bear_breadth_pct": 83.3, "bull_breadth_pct": 0.0, "btc_bias": "BEARISH", "neutral_coin_guard": "SHORT_ONLY"}):
+        sig_own_bull = box_strat.evaluate_signal("B-NEAR_USDT", levels=bull_box, margin_inr=30000.0, leverage=10, usd_inr=90.0)
+        assert sig_own_bull["signal"] == "LONG", f"Expected own-BULLISH coin to remain allowed for LONG even in Macro Bear, got {sig_own_bull['signal']}"
+
+    # 4. Execution gate in execute_autotrade_two_entry_signal also blocks NEUTRAL LONG under SHORT_ONLY
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", os.path.join(tmpdir, "at.json")), \
+             patch.object(eng, "is_staging_environment", return_value=True), \
+             patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+             patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 90000.0, "available_inr": 90000.0}), \
+             patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
+             patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "bear_breadth_pct": 83.3, "bull_breadth_pct": 0.0, "btc_bias": "BEARISH", "neutral_coin_guard": "SHORT_ONLY"}):
+            ok_ng, msg_ng, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-NEAR_USDT",
+                sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 3.198, "tp1": 3.263, "tp2": 3.427, "stop_loss": 3.085, "levels": near_box},
+                single_trade_margin_inr=30000.0, leverage=10,
+            )
+            assert not ok_ng and "Macro-Bearish Neutral Guard" in msg_ng, f"Expected execution gate Macro-Bearish Neutral Guard block, got {ok_ng} {msg_ng}"
+
+    print("  -> PASS: Daemon v35 Funds Ledger Analytics & Option 1 Macro-Trend Neutral Coin Guard verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1498,6 +1647,7 @@ if __name__ == "__main__":
     test_12_sidebar_unlock_autotrade()
     test_13_regime_adaptive_routing_and_structure_tp1()
     test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
+    test_15_v35_funds_section_and_neutral_macro_guard()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
