@@ -3531,7 +3531,14 @@ elif active_section == "🤖 AI Advisor":
             )
         with cfg_c2:
             st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-            st.success("🟢 **Connected via Streamlit Server Secrets (`gen-lang-client-0777980903`)**")
+            if current_gem_key:
+                st.success("🟢 **Gemini LLM Active** — Connected via Streamlit Server Secrets (`GEMINI_API_KEY`)")
+            else:
+                st.info(
+                    "🟡 **Connected via Streamlit Server Secrets (`gen-lang-client-0777980903`)** — "
+                    "Intent-Routed **Live Quant + Sheet Engine** active "
+                    "*(add `GEMINI_API_KEY` in Streamlit Secrets for full conversational Gemini 4 Argon / 3.8 Flash)*"
+                )
 
         # Initialize Chat History in Session State
         if "gemini_chat_messages" not in st.session_state:
@@ -3620,8 +3627,12 @@ elif active_section == "🤖 AI Advisor":
                     )
                 if resp.get("ok"):
                     used_m = resp.get("model_used") or selected_gemini_model
+                    fb_note = str(resp.get("fallback_reason") or "").strip()
                     st.session_state.gemini_last_interaction_id = resp.get("interaction_id")
-                    st.caption(f"🧠 Model: `{used_m}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed")
+                    cap_txt = f"🧠 Model: `{used_m}` • 📊 Grounded on `Crypto_Trades_Journal` + Live CoinDCX Feed"
+                    if active_key and not resp.get("llm_used") and fb_note:
+                        cap_txt += f" • ⚠️ Gemini API fallback: `{fb_note[:140]}`"
+                    st.caption(cap_txt)
                     st.markdown(resp.get("text", ""))
                     st.session_state.gemini_chat_messages.append({
                         "role": "assistant",

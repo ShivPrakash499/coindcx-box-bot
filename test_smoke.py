@@ -663,44 +663,57 @@ def test_9_ai_advisor_and_tick_precision():
     assert ga._fmt_tick("B-ETH_USDT", 2233.35) == "$2233.35"
     assert ga._fmt_tick("B-DOGE_USDT", 0.07691) == "$0.07691"
 
-    # 3. Verify AI Advisor generates complete, tick-exact responses for all quick-action prompts even without an external API key
+    # 2b. Verify zero deprecated gemini-2.5-* / 2.0-* / 1.5-* models remain in AVAILABLE_GEMINI_MODELS or FALLBACK_MODEL_CHAIN
+    all_m_ids = [m[0] for m in ga.AVAILABLE_GEMINI_MODELS] + list(ga.FALLBACK_MODEL_CHAIN)
+    for bad_prefix in ("gemini-2.5", "gemini-2.0", "gemini-1.5"):
+        assert not any(m.startswith(bad_prefix) for m in all_m_ids), f"Deprecated model prefix '{bad_prefix}' in {all_m_ids}"
+
+    # 3. Verify AI Advisor generates distinct, intent-routed, tick-exact responses (with real pnl_inr, NOT Rs.0.00!)
     mock_struct = {
         "pair": "B-INJ_USDT", "symbol": "INJ",
         "live_price": 8.365, "high_24h": 8.510, "low_24h": 7.720, "change_24h": 8.96,
         "SH": 8.288, "RH": 8.081, "MID": 7.542, "RL": 7.003, "SL": 6.861,
         "ema50_d": 8.120, "ema200_d": 7.450, "daily_bias": "BULLISH", "daily_close": 8.210,
-        "ema20_15m": 8.340, "ema50_15m": 8.210, "rsi_15m": 64.2, "rsi_1h": 68.5,
+        "ema20_15m": 8.340, "ema50_15m": 8.210, "ema200_15m": 7.990, "rsi_15m": 64.2, "rsi_1h": 68.5,
         "prev15_high": 8.390, "prev15_low": 8.310, "prev15_close": 8.355,
     }
     mock_sheet = {
         "ok": True,
         "spreadsheet_title": "Crypto_Trades_Journal",
-        "live_trades": [{"Pair": "B-INJ_USDT", "Direction": "SHORT", "Entry Price": "7.870"}],
+        "live_trades": [{"Pair": "B-INJ_USDT", "Direction": "SHORT", "Entry ($)": "7.870"}],
         "closed_trades": [
-            {"Pair": "B-INJ_USDT", "Direction": "LONG", "Entry Price": "7.500", "Exit Price": "7.850", "Result": "WIN", "Realized PnL (INR)": "1800.00"},
-            {"Pair": "B-NEAR_USDT", "Direction": "LONG", "Entry Price": "4.050", "Exit Price": "3.980", "Result": "LOSS", "Realized PnL (INR)": "-549.50"},
+            {"Pair": "B-INJ_USDT", "Direction": "LONG", "Entry": "7.500", "Exit": "7.850", "Result": "WIN", "Realized PnL (INR)": "1800.00"},
+            {"Pair": "B-NEAR_USDT", "Direction": "LONG", "Entry": "4.050", "Exit": "3.980", "Result": "LOSS", "Realized PnL (INR)": "-549.50"},
         ],
     }
+    mock_wl = [
+        {"pair": "B-BTC_USDT", "sym": "BTC", "price": 62000.0, "chg_24h": -2.5, "bias": "BEARISH", "action_side": "SHORT", "target_edge": 63500.0, "dist_pct": 0.4, "zone_status": "IN SELL ZONE (RH–SH)", "SH": 64000.0, "RH": 63500.0, "MID": 62000.0, "RL": 60500.0, "SL": 60000.0},
+    ]
     with patch.object(ga, "_compute_exact_pair_structure", return_value=mock_struct), \
+         patch.object(ga, "_scan_watchlist_opportunities", return_value=mock_wl), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "summary": "RANGING / CHOP — Box Only"}), \
          patch.object(eng, "fetch_coindcx_active_positions", return_value=[{
              "pair": "B-INJ_USDT", "direction": "SHORT", "entry_price": 7.870, "mark_price": 8.365,
              "quantity": 100.0, "leverage": 10, "pnl_inr": -55536.31, "roe_pct": -61.70, "liquidation_price": 12.144
          }]), \
          patch("sheets_logger.fetch_all_sheet_trades", return_value=mock_sheet):
-        for prompt in (
-            "Audit All Sheet Trades",
-            "Best Setup on INJ Now",
-            "Review Open Positions",
-            "On active INJ order, do you think price will come down and I will be able to book profit?",
-        ):
-            resp_txt = ga._generate_live_quant_advisor_response(
-                user_prompt=prompt,
-                selected_pair="B-INJ_USDT",
-            )
-            assert isinstance(resp_txt, str) and len(resp_txt) > 150, f"AI Advisor failed on prompt '{prompt}': {resp_txt}"
-            assert "$8.365" in resp_txt or "$8.288" in resp_txt or "INJ" in resp_txt, f"Expected INJ analysis in response: {resp_txt[:200]}"
+        r_audit = ga._generate_live_quant_advisor_response("Audit All Sheet Trades", selected_pair="B-INJ_USDT")
+        r_setup = ga._generate_live_quant_advisor_response("Best Setup on INJ Now", selected_pair="B-INJ_USDT")
+        r_open = ga._generate_live_quant_advisor_response("Review Open Position Risk", selected_pair="B-INJ_USDT")
+        r_top = ga._generate_live_quant_advisor_response(
+            "Based on our Google Sheet trade history, which coins have performed best for us and what is the gameplan for today's sessions?",
+            selected_pair="B-INJ_USDT",
+        )
+        r_strat = ga._generate_live_quant_advisor_response("Which strategy should I select for today's market regime?", selected_pair="B-INJ_USDT")
 
-    print("  -> PASS: AI Advisor live quant engine & 3-decimal INJ tick precision verified.")
+        assert "Crypto_Trades_Journal" in r_audit and "INJ" in r_audit and "NEAR" in r_audit, r_audit[:250]
+        assert "Live Setup Analysis for `B-INJ_USDT`" in r_setup and "$8.365" in r_setup, r_setup[:250]
+        assert "Open Position #1" in r_open and "-55,536.31" in r_open and "Rs.0.00" not in r_open, r_open[:300]
+        assert "Top Coins to Trade Today" in r_top and "BTC/USDT" in r_top and "Open Position #1" not in r_top, r_top[:300]
+        assert "Live Market Regime, Recommended Strategy" in r_strat and "Open Position #1" not in r_strat, r_strat[:300]
+        assert len({r_audit, r_setup, r_open, r_top, r_strat}) == 5, "All 5 distinct prompts must produce distinct intent-routed responses!"
+
+    print("  -> PASS: AI Advisor intent-routed quant engine, real pnl_inr, non-deprecated Gemini models & tick precision verified.")
 
 
 def _ws_fetch_lock_screen_pill(host: str, max_attempts: int = 6) -> str:
