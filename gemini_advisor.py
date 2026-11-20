@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import re
+import time
 import traceback
 from datetime import datetime
 import pytz
@@ -10,19 +11,186 @@ from google.genai import types as genai_types
 IST = pytz.timezone("Asia/Kolkata")
 
 AVAILABLE_GEMINI_MODELS = [
-    ("gemini-4-argon", "Gemini 4 Argon (Frontier Reasoning — Best for Deep Trade Audits & Strategy)"),
-    ("gemini-3.8-flash", "Gemini 3.8 Flash (High-Speed Agentic — Fast Live Setup & Risk Recommendations)"),
-    ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (Ultra-Low Latency Quick Checks)"),
+    ("auto", "✨ Auto — Latest & Greatest Gemini for Your Subscription"),
+    ("gemini-4-carbon", "Gemini 4 Carbon (Flagship Frontier Reasoning)"),
+    ("gemini-4-argon", "Gemini 4 Argon (Efficient Frontier Reasoning)"),
+    ("gemini-3.8-flash", "Gemini 3.8 Flash (High-Speed Agentic)"),
+    ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (Ultra-Low Latency)"),
 ]
 
 FALLBACK_MODEL_CHAIN = [
+    "gemini-4-carbon",
     "gemini-4-argon",
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
 ]
 
+_EXCLUDED_MODEL_TOKENS = (
+    "embedding", "imagen", "veo", "tts", "audio", "transcribe", "live",
+    "image", "robotics", "computer-use", "aqa", "nano-banana", "omni",
+    "learnlm", "vision", "gemma", "deep-research", "antigravity", "dialog",
+)
+
+_DISCOVERED_MODELS_CACHE: dict = {"key_prefix": "", "ts": 0.0, "result": None}
 _VERTEX_SA_STATE = {"checked": False, "usable": False, "reason": ""}
+
+
+def _normalize_model_id(raw_name: str) -> str:
+    s = str(raw_name or "").strip()
+    if s.startswith("models/"):
+        s = s[len("models/"):]
+    return s
+
+
+def is_chat_reasoning_gemini_model(model_id: str, supported_actions=None) -> bool:
+    """Returns True if `model_id` is a text/reasoning Gemini model suitable for the Trade Advisor."""
+    mid = _normalize_model_id(model_id).lower()
+    if not mid.startswith("gemini-"):
+        return False
+    if any(tok in mid for tok in _EXCLUDED_MODEL_TOKENS):
+        return False
+    if supported_actions:
+        acts_lower = {str(a).lower() for a in supported_actions}
+        if not any(a in acts_lower for a in ("generatecontent", "createinteraction", "generate_content")):
+            return False
+    return True
+
+
+def rank_gemini_model_id(model_id: str) -> tuple[int, int, int, int, str]:
+    """
+    Dynamically scores ANY Gemini model ID (current or future, e.g. gemini-5-pro, gemini-4.5-carbon,
+    gemini-4-carbon, gemini-4-argon, gemini-3.8-flash, etc.) from Latest & Greatest -> Fastest.
+    Tuple order: (major_ver, minor_ver, tier_score, stability_score, model_id).
+    """
+    mid = _normalize_model_id(model_id).lower()
+    m_ver = re.search(r"gemini-(\d+)(?:\.(\d+))?", mid)
+    major = int(m_ver.group(1)) if m_ver else 0
+    minor = int(m_ver.group(2)) if (m_ver and m_ver.group(2)) else 0
+
+    if "carbon" in mid or "ultra" in mid:
+        tier = 50
+    elif "argon" in mid or re.search(r"(^|-)pro($|-)", mid):
+        tier = 40
+    elif "flash-lite" in mid or "lite" in mid:
+        tier = 20
+    elif "flash" in mid:
+        tier = 30
+    else:
+        tier = 10
+
+    if "exp" in mid or "experimental" in mid:
+        stability = 0
+    elif "preview" in mid:
+        stability = 1
+    elif "latest" in mid:
+        stability = 3
+    else:
+        stability = 2
+
+    return (major, minor, tier, stability, mid)
+
+
+def discover_available_gemini_models(api_key: str | None = None, force_refresh: bool = False) -> dict:
+    """
+    Queries the live Gemini API (`client.models.list()`) using the user's configured `GEMINI_API_KEY`
+    to discover every text/reasoning Gemini model unlocked on their subscription, sorted dynamically
+    from Latest & Greatest to Fastest (cached for 1 hour per key prefix).
+    """
+    key = str(api_key or get_gemini_api_key() or "").strip()
+    fallback_tuples = [(m, lbl) for m, lbl in AVAILABLE_GEMINI_MODELS if m != "auto"]
+    if not key:
+        return {
+            "ok": False,
+            "source": "fallback_catalog",
+            "models": fallback_tuples,
+            "model_ids": [m for m, _ in fallback_tuples],
+            "top_model": fallback_tuples[0][0],
+            "error": "",
+        }
+
+    kp = key[:10]
+    now = time.time()
+    if (
+        not force_refresh
+        and _DISCOVERED_MODELS_CACHE.get("key_prefix") == kp
+        and isinstance(_DISCOVERED_MODELS_CACHE.get("result"), dict)
+        and (now - float(_DISCOVERED_MODELS_CACHE.get("ts", 0.0))) < 3600.0
+    ):
+        return dict(_DISCOVERED_MODELS_CACHE["result"])
+
+    try:
+        client = genai.Client(api_key=key)
+        raw_models = list(client.models.list())
+        candidates: list[tuple[tuple, str, str]] = []
+        seen: set[str] = set()
+        for m in raw_models:
+            mid = _normalize_model_id(getattr(m, "name", ""))
+            if not mid or mid in seen:
+                continue
+            actions = getattr(m, "supported_actions", None) or getattr(m, "supported_generation_methods", None)
+            if not is_chat_reasoning_gemini_model(mid, actions):
+                continue
+            seen.add(mid)
+            rk = rank_gemini_model_id(mid)
+            disp = str(getattr(m, "display_name", "") or mid).strip()
+            label = f"{disp} (`{mid}`)" if disp.lower() != mid.lower() else mid
+            candidates.append((rk, mid, label))
+
+        # Prefer current generation (>= 3.0) whenever available; only keep legacy models if nothing >= 3.0 exists
+        modern = [c for c in candidates if c[0][0] >= 3]
+        chosen = modern if modern else candidates
+        chosen.sort(key=lambda item: item[0], reverse=True)
+
+        if chosen:
+            model_tuples = [(mid, lbl) for _, mid, lbl in chosen]
+            res = {
+                "ok": True,
+                "source": "live_api_discovery",
+                "models": model_tuples,
+                "model_ids": [mid for mid, _ in model_tuples],
+                "top_model": model_tuples[0][0],
+                "error": "",
+            }
+            _DISCOVERED_MODELS_CACHE.update({"key_prefix": kp, "ts": now, "result": res})
+            return dict(res)
+
+        res_empty = {
+            "ok": False,
+            "source": "fallback_catalog",
+            "models": fallback_tuples,
+            "model_ids": [m for m, _ in fallback_tuples],
+            "top_model": fallback_tuples[0][0],
+            "error": "No Gemini text/reasoning models returned by API key.",
+        }
+        _DISCOVERED_MODELS_CACHE.update({"key_prefix": kp, "ts": now, "result": res_empty})
+        return dict(res_empty)
+    except Exception as e:
+        err_s = str(e)[:220]
+        res_err = {
+            "ok": False,
+            "source": "fallback_catalog",
+            "models": fallback_tuples,
+            "model_ids": [m for m, _ in fallback_tuples],
+            "top_model": fallback_tuples[0][0],
+            "error": err_s,
+        }
+        _DISCOVERED_MODELS_CACHE.update({"key_prefix": kp, "ts": now, "result": res_err})
+        return dict(res_err)
+
+
+def get_selector_model_options(api_key: str | None = None, force_refresh: bool = False) -> tuple[list[tuple[str, str]], dict]:
+    """
+    Returns `(options_list, discovery_info)` for the UI dropdown, always putting
+    `auto` (Latest & Greatest dynamically discovered for the user's subscription) first!
+    """
+    disc = discover_available_gemini_models(api_key=api_key, force_refresh=force_refresh)
+    if disc.get("ok") and disc.get("top_model"):
+        auto_lbl = f"✨ Auto — Latest & Greatest on Your Subscription (Live: {disc['top_model']})"
+    else:
+        auto_lbl = "✨ Auto — Latest & Greatest Gemini (Auto-Discovers via GEMINI_API_KEY)"
+    options = [("auto", auto_lbl)] + list(disc.get("models") or [])
+    return options, disc
 
 SYSTEM_INSTRUCTION = """You are the Institutional Crypto Futures AI Trading Advisor embedded inside the user's CoinDCX Pro Trading Terminal (`shiv-prakash-trade-assistant`).
 
@@ -893,7 +1061,7 @@ def _extract_interaction_text(interaction) -> str:
 
 def ask_gemini_trade_advisor(
     user_prompt: str,
-    preferred_model: str = "gemini-4-argon",
+    preferred_model: str = "auto",
     previous_interaction_id: str | None = None,
     sheet_markdown_context: str = "",
     market_context: str = "",
@@ -902,8 +1070,10 @@ def ask_gemini_trade_advisor(
 ) -> dict:
     """
     Sends the user's prompt along with the live Google Sheet trade journal and CoinDCX market context
-    to Gemini via the official `google-genai` SDK (`GEMINI_API_KEY` or Vertex AI Service Account if IAM-enabled),
-    falling back cleanly to the Intent-Routed Live Quantitative & Sheet Advisor Engine with transparent diagnostics.
+    to Gemini via the official `google-genai` SDK. When `preferred_model == 'auto'` (default), dynamically
+    discovers all models accessible on the user's subscription via `client.models.list()` and automatically
+    runs the Latest & Greatest model first (with graceful fallback to the next highest-ranked model and
+    finally to the Intent-Routed Live Quantitative & Sheet Advisor Engine).
     """
     key = str(api_key or get_gemini_api_key() or "").strip()
     full_input = (
@@ -912,8 +1082,21 @@ def ask_gemini_trade_advisor(
         f"---\n"
         f"### User Question / Prompt:\n{user_prompt}"
     )
-    models_to_try = [preferred_model] + [m for m in FALLBACK_MODEL_CHAIN if m != preferred_model]
-    last_llm_err = ""
+
+    pref = str(preferred_model or "auto").strip()
+    disc = discover_available_gemini_models(api_key=key) if key else {"ok": False, "model_ids": list(FALLBACK_MODEL_CHAIN)}
+    dynamic_chain = list(disc.get("model_ids") or [])
+    for m_fb in FALLBACK_MODEL_CHAIN:
+        if m_fb not in dynamic_chain:
+            dynamic_chain.append(m_fb)
+
+    if pref.lower() == "auto" or not pref:
+        models_to_try = dynamic_chain
+        primary_target = dynamic_chain[0] if dynamic_chain else "gemini-4-carbon"
+    else:
+        models_to_try = [pref] + [m for m in dynamic_chain if m != pref]
+        primary_target = pref
+    last_llm_err = str(disc.get("error") or "")
 
     # 1. Primary: Official Gemini Developer API using GEMINI_API_KEY (`AIza...`)
     if key:
@@ -926,7 +1109,7 @@ def ask_gemini_trade_advisor(
                         "input": full_input,
                         "system_instruction": SYSTEM_INSTRUCTION,
                     }
-                    if previous_interaction_id and candidate_model == preferred_model:
+                    if previous_interaction_id and candidate_model == primary_target:
                         kwargs["previous_interaction_id"] = previous_interaction_id
                     interaction = client.interactions.create(**kwargs)
                     reply_text = _extract_interaction_text(interaction)
@@ -936,7 +1119,7 @@ def ask_gemini_trade_advisor(
                             "ok": True,
                             "error": None,
                             "text": reply_text,
-                            "model_used": candidate_model,
+                            "model_used": f"{candidate_model} (Auto Latest)" if pref.lower() == "auto" else candidate_model,
                             "interaction_id": interaction_id,
                             "llm_used": True,
                             "fallback_reason": "",
@@ -958,7 +1141,7 @@ def ask_gemini_trade_advisor(
                         "ok": True,
                         "error": None,
                         "text": reply_text,
-                        "model_used": candidate_model,
+                        "model_used": f"{candidate_model} (Auto Latest)" if pref.lower() == "auto" else candidate_model,
                         "interaction_id": None,
                         "llm_used": True,
                         "fallback_reason": "",

@@ -3518,26 +3518,42 @@ elif active_section == "🤖 AI Advisor":
     else:
         current_gem_key = gemini_advisor.get_gemini_api_key()
         entered_gem_key = ""
-        cfg_c1, cfg_c2 = st.columns([2.2, 2.0])
+        selector_opts, disc_info = gemini_advisor.get_selector_model_options(api_key=current_gem_key)
+        cfg_c1, cfg_c_ref, cfg_c2 = st.columns([2.2, 0.55, 2.0])
         with cfg_c1:
-            model_options = [m[0] for m in gemini_advisor.AVAILABLE_GEMINI_MODELS]
-            model_labels = {m[0]: m[1] for m in gemini_advisor.AVAILABLE_GEMINI_MODELS}
+            model_options = [m[0] for m in selector_opts]
+            model_labels = {m[0]: m[1] for m in selector_opts}
+            if st.session_state.get("gemini_model_selector") not in model_options:
+                st.session_state["gemini_model_selector"] = "auto"
             selected_gemini_model = st.selectbox(
-                "🧠 Select Best Gemini Model",
+                "🧠 Gemini Model (Auto-Discovers Latest on Your Subscription)",
                 options=model_options,
                 index=0,
                 format_func=lambda m: model_labels.get(m, m),
                 key="gemini_model_selector",
             )
+        with cfg_c_ref:
+            st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
+            if st.button("🔄 Models", key="btn_refresh_gemini_models", help="Re-discover latest models unlocked on your Gemini API key", use_container_width=True):
+                gemini_advisor.discover_available_gemini_models(api_key=current_gem_key, force_refresh=True)
+                st.rerun()
         with cfg_c2:
             st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-            if current_gem_key:
-                st.success("🟢 **Gemini LLM Active** — Connected via Streamlit Server Secrets (`GEMINI_API_KEY`)")
+            if current_gem_key and disc_info.get("ok"):
+                st.success(
+                    f"🟢 **Gemini LLM Live** — Connected via Streamlit Server Secrets • "
+                    f"Auto-Latest: **`{disc_info.get('top_model')}`** (`{len(disc_info.get('model_ids') or [])}` models unlocked)"
+                )
+            elif current_gem_key and disc_info.get("error"):
+                st.warning(
+                    f"⚠️ **Connected via Streamlit Server Secrets (`GEMINI_API_KEY`) — Key Check Notice:** "
+                    f"`{str(disc_info.get('error'))[:120]}` *(using Live Quant fallback until resolved)*"
+                )
             else:
                 st.info(
                     "🟡 **Connected via Streamlit Server Secrets (`gen-lang-client-0777980903`)** — "
                     "Intent-Routed **Live Quant + Sheet Engine** active "
-                    "*(add `GEMINI_API_KEY` in Streamlit Secrets for full conversational Gemini 4 Argon / 3.8 Flash)*"
+                    "*(add `GEMINI_API_KEY` from Google AI Studio to Streamlit Secrets to auto-discover & run your subscription's latest Gemini model)*"
                 )
 
         # Initialize Chat History in Session State

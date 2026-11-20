@@ -663,10 +663,36 @@ def test_9_ai_advisor_and_tick_precision():
     assert ga._fmt_tick("B-ETH_USDT", 2233.35) == "$2233.35"
     assert ga._fmt_tick("B-DOGE_USDT", 0.07691) == "$0.07691"
 
-    # 2b. Verify zero deprecated gemini-2.5-* / 2.0-* / 1.5-* models remain in AVAILABLE_GEMINI_MODELS or FALLBACK_MODEL_CHAIN
+    # 2b. Verify zero deprecated gemini-2.5-* / 2.0-* / 1.5-* models remain & dynamic Latest-and-Greatest discovery works
     all_m_ids = [m[0] for m in ga.AVAILABLE_GEMINI_MODELS] + list(ga.FALLBACK_MODEL_CHAIN)
     for bad_prefix in ("gemini-2.5", "gemini-2.0", "gemini-1.5"):
         assert not any(m.startswith(bad_prefix) for m in all_m_ids), f"Deprecated model prefix '{bad_prefix}' in {all_m_ids}"
+    assert ga.AVAILABLE_GEMINI_MODELS[0][0] == "auto", "Default model selector option must be 'auto' (dynamic latest & greatest)"
+    assert ga.rank_gemini_model_id("gemini-5.0-pro") > ga.rank_gemini_model_id("gemini-4-carbon") > ga.rank_gemini_model_id("gemini-4-argon") > ga.rank_gemini_model_id("gemini-3.8-flash") > ga.rank_gemini_model_id("gemini-3.5-flash-lite")
+
+    from types import SimpleNamespace as _NS
+    from unittest.mock import MagicMock as _MM
+    fake_api_models = [
+        _NS(name="models/gemini-embedding-2", display_name="Embedding 2", supported_actions=["embedContent"]),
+        _NS(name="models/gemini-3.8-live", display_name="Gemini 3.8 Live", supported_actions=["bidiGenerateContent"]),
+        _NS(name="models/gemini-nano-banana-2.1", display_name="Nano Banana", supported_actions=["generateContent"]),
+        _NS(name="models/gemini-2.5-flash", display_name="Gemini 2.5 Flash", supported_actions=["generateContent"]),
+        _NS(name="models/gemini-3.8-flash", display_name="Gemini 3.8 Flash", supported_actions=["generateContent"]),
+        _NS(name="models/gemini-4-argon", display_name="Gemini 4 Argon", supported_actions=["generateContent"]),
+        _NS(name="models/gemini-5.0-pro", display_name="Gemini 5.0 Pro", supported_actions=["generateContent"]),
+    ]
+    fake_client = _MM()
+    fake_client.models.list.return_value = fake_api_models
+    fake_inter = _NS(output_text="Dynamic latest model answer!", id="inter_123")
+    fake_client.interactions.create.return_value = fake_inter
+    with patch.object(ga.genai, "Client", return_value=fake_client):
+        disc = ga.discover_available_gemini_models(api_key="test_dynamic_discovery_key", force_refresh=True)
+        assert disc["ok"] is True and disc["top_model"] == "gemini-5.0-pro", disc
+        assert disc["model_ids"] == ["gemini-5.0-pro", "gemini-4-argon", "gemini-3.8-flash"], disc["model_ids"]
+        resp_auto = ga.ask_gemini_trade_advisor(
+            user_prompt="Top coins today?", preferred_model="auto", api_key="test_dynamic_discovery_key"
+        )
+        assert resp_auto["ok"] and resp_auto["llm_used"] and "gemini-5.0-pro" in resp_auto["model_used"], resp_auto
 
     # 3. Verify AI Advisor generates distinct, intent-routed, tick-exact responses (with real pnl_inr, NOT Rs.0.00!)
     mock_struct = {
