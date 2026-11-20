@@ -1843,7 +1843,6 @@ if active_section == "⚡ Signals":
                             st.error(msg_a)
 
         st.markdown("#### 📡 High-Volatility Watchlist Matrix")
-        _ng_matrix = str((get_cached_market_regime() or {}).get("neutral_coin_guard") or "BOTH")
         matrix_rows = []
         for pair_w in monitor_pairs:
             sym_w = clean_sym(pair_w)
@@ -1860,16 +1859,7 @@ if active_section == "⚡ Signals":
                 else:
                     zone = "⚪ Mid-Range"
                 tb = lv.get("trend_bias", "RANGE")
-                bias_lbl = (
-                    "🟢 BULL" if tb == "BULLISH"
-                    else (
-                        "🔴 BEAR" if tb == "BEARISH"
-                        else (
-                            "🟡 RANGE (SHORT)" if _ng_matrix == "SHORT_ONLY"
-                            else ("🟡 RANGE (LONG)" if _ng_matrix == "LONG_ONLY" else "🟡 RANGE")
-                        )
-                    )
-                )
+                bias_lbl = "🟢 BULL" if tb == "BULLISH" else ("🔴 BEAR" if tb == "BEARISH" else "🟡 RANGE")
                 sh_s, rh_s, mid_s, rl_s, sl_s = fmt_px(lv["SH"]), fmt_px(lv["RH"]), fmt_px(lv["MID"]), fmt_px(lv["RL"]), fmt_px(lv["SL"])
             else:
                 zone, bias_lbl = "—", "—"

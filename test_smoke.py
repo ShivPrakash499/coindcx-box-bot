@@ -1484,15 +1484,11 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
     print("  -> PASS: All 3 v34 Fixes (Strict 3-Slot/Partial-Fill, Exact Sidebar Margin/No Crumbs, Box-Floor/SL-Drift/4h Lock) verified!")
 
 
-def test_15_v35_funds_section_and_neutral_macro_guard():
-    print("[15/15] Verifying Daemon v35 Funds Ledger Analytics & Option 1 Macro-Trend Neutral Coin Guard...")
-    import tempfile
+def test_15_v35_funds_section_and_wallet_ledger():
+    print("[15/15] Verifying Daemon v35 Funds Section, Transaction Pagination, Capital Accounting & Statement CSV Parser...")
     from unittest.mock import MagicMock
-    import pandas as pd
     import coindcx_engine as eng
-    import strategies as strat
 
-    # --- PART A: Funds Transaction Pagination, Capital Accounting & Bank CSV Parser ---
     page1_tx = [
         {"id": f"tx_p1_{i}", "transaction_type": "credit", "amount": "1000", "currency_short_name": "INR", "reason": "by_universal_wallet", "created_at": 1760000000000 + i * 1000}
         for i in range(100)
@@ -1578,58 +1574,7 @@ def test_15_v35_funds_section_and_neutral_macro_guard():
     csv_res = eng.parse_coindcx_statement_csv(csv_sample)
     assert csv_res["ok"] and csv_res["total_deposited_inr"] == 50000.0 and csv_res["total_withdrawn_inr"] == 15000.0 and csv_res["net_bank_invested_inr"] == 35000.0
 
-    # --- PART B: Option 1 Macro-Trend Guard for NEUTRAL/RANGE Coins (Nov 20 NEAR LONG Replay) ---
-    assert eng.classify_neutral_coin_macro_guard("STRONG_DOWNTREND", 0.0, 0.83, "BEARISH") == "SHORT_ONLY"
-    assert eng.classify_neutral_coin_macro_guard("RANGING_CHOP", 0.0, 0.83, "BEARISH") == "SHORT_ONLY"
-    assert eng.classify_neutral_coin_macro_guard("RANGING_CHOP", 0.0, 0.50, "BEARISH") == "BOTH"  # BTC alone < 70% does NOT force SHORT_ONLY
-    assert eng.classify_neutral_coin_macro_guard("STRONG_UPTREND", 0.75, 0.0, "BULLISH") == "LONG_ONLY"
-    assert eng.classify_neutral_coin_macro_guard("RANGING_CHOP", 0.75, 0.0, "BULLISH") == "LONG_ONLY"
-    assert eng.classify_neutral_coin_macro_guard("STRONG_DOWNTREND", 0.0, 0.83, "NEUTRAL") == "BOTH"  # Requires BTC confirmation too
-
-    # Replay exact 2026-11-20 03:45 IST NEAR RL sweep candle ($3.151 -> $3.199) on NEUTRAL box
-    near_box = {"RH": 3.427, "RL": 3.166, "SH": 3.480, "SL": 3.101, "MID": 3.2965, "EMA50": 3.9109, "EMA200": 3.0246, "daily_close": 3.301, "trend_bias": "NEUTRAL"}
-    base_15m = [{"timestamp": 1795120000000 + i * 900000, "open": 3.24, "high": 3.25, "low": 3.22, "close": 3.23, "volume": 100.0, "EMA9": 3.23, "EMA50": 3.29, "EMA200": 3.31} for i in range(25)]
-    base_15m.append({"timestamp": 1795142500000, "open": 3.171, "high": 3.184, "low": 3.156, "close": 3.159, "volume": 100.0, "EMA9": 3.18, "EMA50": 3.292, "EMA200": 3.310})
-    base_15m.append({"timestamp": 1795143400000, "open": 3.160, "high": 3.202, "low": 3.151, "close": 3.199, "volume": 120.0, "EMA9": 3.19, "EMA50": 3.288, "EMA200": 3.309})
-    df_near_15m = pd.DataFrame(base_15m)
-
-    box_strat = strat.BoxTheorySweep()
-    # 1. Under Macro Bear SHORT_ONLY -> NEAR NEUTRAL LONG is BLOCKED in evaluate_signal
-    with patch.object(strat, "_closed_15m", return_value=df_near_15m), \
-         patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "bear_breadth_pct": 83.3, "bull_breadth_pct": 0.0, "btc_bias": "BEARISH", "neutral_coin_guard": "SHORT_ONLY"}):
-        sig_blocked = box_strat.evaluate_signal("B-NEAR_USDT", levels=near_box, margin_inr=30000.0, leverage=10, usd_inr=90.0)
-        assert sig_blocked["signal"] == "NEUTRAL", f"Expected NEAR NEUTRAL LONG blocked under SHORT_ONLY macro guard, got {sig_blocked['signal']}"
-
-    # 2. Under Balanced Market (BOTH) -> NEAR NEUTRAL LONG fires normally!
-    with patch.object(strat, "_closed_15m", return_value=df_near_15m), \
-         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "bear_breadth_pct": 41.7, "bull_breadth_pct": 25.0, "btc_bias": "NEUTRAL", "neutral_coin_guard": "BOTH"}):
-        sig_allowed = box_strat.evaluate_signal("B-NEAR_USDT", levels=near_box, margin_inr=30000.0, leverage=10, usd_inr=90.0)
-        assert sig_allowed["signal"] == "LONG", f"Expected NEAR NEUTRAL LONG allowed in balanced market, got {sig_allowed['signal']}"
-
-    # 3. Own-trend BULLISH coin is NEVER overridden by SHORT_ONLY macro guard!
-    bull_box = {**near_box, "EMA50": 2.90, "EMA200": 2.60, "daily_close": 3.301, "trend_bias": "BULLISH"}
-    with patch.object(strat, "_closed_15m", return_value=df_near_15m), \
-         patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "bear_breadth_pct": 83.3, "bull_breadth_pct": 0.0, "btc_bias": "BEARISH", "neutral_coin_guard": "SHORT_ONLY"}):
-        sig_own_bull = box_strat.evaluate_signal("B-NEAR_USDT", levels=bull_box, margin_inr=30000.0, leverage=10, usd_inr=90.0)
-        assert sig_own_bull["signal"] == "LONG", f"Expected own-BULLISH coin to remain allowed for LONG even in Macro Bear, got {sig_own_bull['signal']}"
-
-    # 4. Execution gate in execute_autotrade_two_entry_signal also blocks NEUTRAL LONG under SHORT_ONLY
-    with tempfile.TemporaryDirectory() as tmpdir:
-        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", os.path.join(tmpdir, "at.json")), \
-             patch.object(eng, "is_staging_environment", return_value=True), \
-             patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-             patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
-             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 90000.0, "available_inr": 90000.0}), \
-             patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
-             patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "bear_breadth_pct": 83.3, "bull_breadth_pct": 0.0, "btc_bias": "BEARISH", "neutral_coin_guard": "SHORT_ONLY"}):
-            ok_ng, msg_ng, _ = eng.execute_autotrade_two_entry_signal(
-                pair="B-NEAR_USDT",
-                sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 3.198, "tp1": 3.263, "tp2": 3.427, "stop_loss": 3.085, "levels": near_box},
-                single_trade_margin_inr=30000.0, leverage=10,
-            )
-            assert not ok_ng and "Macro-Bearish Neutral Guard" in msg_ng, f"Expected execution gate Macro-Bearish Neutral Guard block, got {ok_ng} {msg_ng}"
-
-    print("  -> PASS: Daemon v35 Funds Ledger Analytics & Option 1 Macro-Trend Neutral Coin Guard verified!")
+    print("  -> PASS: Daemon v35 Funds Section, Transaction Pagination, Capital Accounting & Statement CSV Parser verified!")
 
 
 if __name__ == "__main__":
@@ -1647,7 +1592,7 @@ if __name__ == "__main__":
     test_12_sidebar_unlock_autotrade()
     test_13_regime_adaptive_routing_and_structure_tp1()
     test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
-    test_15_v35_funds_section_and_neutral_macro_guard()
+    test_15_v35_funds_section_and_wallet_ledger()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

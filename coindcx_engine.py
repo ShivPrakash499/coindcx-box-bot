@@ -3278,15 +3278,6 @@ def run_strategy_backtest(
     df_daily['dt_ist'] = pd.to_datetime(df_daily['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
     df_daily['date_str'] = df_daily['dt_ist'].dt.strftime('%Y-%m-%d')
 
-    if strategy_id in ("box_theory", "box_plus_ema50_200_bear", "box_plus_ema50_200_bull_bear", "box_plus_ema50_200_regime"):
-        _ng_existing = _PERSIST.get("backtest_neutral_guard_map")
-        _first_d = str(df["date_str"].iloc[0]) if not df.empty else ""
-        if not isinstance(_ng_existing, dict) or (_first_d and _first_d not in _ng_existing):
-            try:
-                build_historical_regime_map(duration_days=duration_days)
-            except Exception:
-                pass
-
     strat_ctx = strat.prepare_backtest(df, df_daily)
 
     df_records = df.to_dict('records')
@@ -3937,64 +3928,20 @@ def classify_universe_regime_from_stats(
     return "RANGING_CHOP"
 
 
-def classify_neutral_coin_macro_guard(
-    regime: str,
-    bull_frac: float,
-    bear_frac: float,
-    btc_bias: str = "NEUTRAL",
-) -> str:
-    """
-    Macro tie-breaker strictly for NEUTRAL / RANGE coins (Daily Close between Daily 50 EMA & 200 EMA):
-      - SHORT_ONLY: Broad market is heavily Bearish (STRONG_DOWNTREND or >=70% Bearish breadth) AND BTC Daily Bias is BEARISH.
-                    Blocks counter-market LONG catches on NEUTRAL coins (e.g. NEAR / INJ), while allowing RH/SH SHORTs.
-      - LONG_ONLY : Broad market is heavily Bullish (STRONG_UPTREND or >=70% Bullish breadth) AND BTC Daily Bias is BULLISH.
-                    Blocks counter-market SHORT fades on NEUTRAL coins, while allowing RL/SL LONGs.
-      - BOTH      : Balanced/mixed market — NEUTRAL coins trade both RL/SL LONGs and RH/SH SHORTs.
-    Coins with their OWN confirmed BULLISH or BEARISH Daily Bias are NEVER overridden by this guard.
-    """
-    b_btc = str(btc_bias or "NEUTRAL").upper()
-    if (regime == "STRONG_DOWNTREND" or bear_frac >= 0.70) and "BEARISH" in b_btc:
-        return "SHORT_ONLY"
-    if (regime == "STRONG_UPTREND" or bull_frac >= 0.70) and "BULLISH" in b_btc:
-        return "LONG_ONLY"
-    return "BOTH"
-
-
-def _format_regime_metadata(
-    regime: str,
-    bull_frac: float,
-    bear_frac: float,
-    r14: float,
-    r5: float,
-    r2: float,
-    btc_bias: str = "NEUTRAL",
-) -> dict:
+def _format_regime_metadata(regime: str, bull_frac: float, bear_frac: float, r14: float, r5: float, r2: float) -> dict:
     b_pct = round(bull_frac * 100.0, 0)
     br_pct = round(bear_frac * 100.0, 0)
-    b_btc = str(btc_bias or "NEUTRAL").upper()
-    if "BEARISH" in b_btc:
-        b_btc = "BEARISH"
-    elif "BULLISH" in b_btc:
-        b_btc = "BULLISH"
-    else:
-        b_btc = "NEUTRAL"
-    neutral_guard = classify_neutral_coin_macro_guard(regime, bull_frac, bear_frac, b_btc)
-    ng_note = (
-        " | RANGE coins: SHORT-only (Macro Bear + BTC Bear)"
-        if neutral_guard == "SHORT_ONLY"
-        else (" | RANGE coins: LONG-only (Macro Bull + BTC Bull)" if neutral_guard == "LONG_ONLY" else "")
-    )
     if regime == "STRONG_UPTREND":
         emoji, label = "🟢", "STRONG UPTREND"
-        routing = "Box Sweep (Own Trend / RANGE LONG-only) + Bull 15m 50/200 EMA (LONG)" if neutral_guard == "LONG_ONLY" else "Box Sweep (L+S) + Bull 15m 50/200 EMA (LONG)"
+        routing = "Box Sweep (L+S) + Bull 15m 50/200 EMA (LONG)"
     elif regime == "STRONG_DOWNTREND":
         emoji, label = "🔴", "STRONG DOWNTREND"
-        routing = "Box Sweep (Own Trend / RANGE SHORT-only) + Bear 15m 50/200 EMA (SHORT)" if neutral_guard == "SHORT_ONLY" else "Box Sweep (L+S) + Bear 15m 50/200 EMA (SHORT)"
+        routing = "Box Sweep (L+S) + Bear 15m 50/200 EMA (SHORT)"
     else:
         emoji, label = "🟡", "RANGING / CHOP"
-        routing = f"Box Theory Sweep ONLY (15m 50/200 EMA Auto-Paused in Chop){ng_note}"
+        routing = "Box Theory Sweep ONLY (15m 50/200 EMA Auto-Paused in Chop)"
     summary = (
-        f"{emoji} {label} — Breadth: {b_pct:.0f}% Bull / {br_pct:.0f}% Bear (BTC: {b_btc}) | "
+        f"{emoji} {label} — Breadth: {b_pct:.0f}% Bull / {br_pct:.0f}% Bear | "
         f"14d: {r14:+.1f}% • 5d: {r5:+.1f}% • 2d: {r2:+.1f}% -> {routing}"
     )
     return {
@@ -4004,8 +3951,6 @@ def _format_regime_metadata(
         "active_routing": routing,
         "bull_breadth_pct": round(bull_frac * 100.0, 1),
         "bear_breadth_pct": round(bear_frac * 100.0, 1),
-        "btc_bias": b_btc,
-        "neutral_coin_guard": neutral_guard,
         "median_14d_pct": round(r14, 2),
         "median_5d_pct": round(r5, 2),
         "median_2d_pct": round(r2, 2),
@@ -4027,11 +3972,10 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
     now_ms = int(now * 1000)
     bull_cnt, bear_cnt, valid_cnt = 0, 0, 0
     r14_list, r5_list, r2_list = [], [], []
-    btc_bias = ""
 
     for p in pool:
         try:
-            df_d = fetch_coindcx_candles(pair=p, interval="1d", limit=1000, sync_live_price=False)
+            df_d = fetch_coindcx_candles(pair=p, interval="1d", limit=260, sync_live_price=False)
             if df_d is None or df_d.empty or len(df_d) < 20:
                 continue
             closed_d = df_d[df_d["timestamp"] + 86400000 <= now_ms].reset_index(drop=True)
@@ -4046,14 +3990,8 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
             valid_cnt += 1
             if c_last > e50 and c_last > e200:
                 bull_cnt += 1
-                p_bias = "BULLISH"
             elif c_last < e50 and c_last < e200:
                 bear_cnt += 1
-                p_bias = "BEARISH"
-            else:
-                p_bias = "NEUTRAL"
-            if p == "B-BTC_USDT":
-                btc_bias = p_bias
             r14_list.append((c_last / float(closes.iloc[-15]) - 1.0) * 100.0)
             r5_list.append((c_last / float(closes.iloc[-6]) - 1.0) * 100.0)
             r2_list.append((c_last / float(closes.iloc[-3]) - 1.0) * 100.0)
@@ -4061,14 +3999,8 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
             continue
 
     if valid_cnt == 0:
-        fallback = _format_regime_metadata("RANGING_CHOP", 0.0, 0.0, 0.0, 0.0, 0.0, btc_bias="NEUTRAL")
+        fallback = _format_regime_metadata("RANGING_CHOP", 0.0, 0.0, 0.0, 0.0, 0.0)
         return fallback
-
-    if not btc_bias:
-        try:
-            btc_bias = str(compute_market_bias("B-BTC_USDT").get("bias", "NEUTRAL")).upper()
-        except Exception:
-            btc_bias = "NEUTRAL"
 
     r14_med = float(pd.Series(r14_list).median()) if r14_list else 0.0
     r5_med = float(pd.Series(r5_list).median()) if r5_list else 0.0
@@ -4076,7 +4008,7 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
     bull_f = bull_cnt / valid_cnt
     bear_f = bear_cnt / valid_cnt
     reg = classify_universe_regime_from_stats(bull_f, bear_f, r14_med, r5_med, r2_med)
-    out = _format_regime_metadata(reg, bull_f, bear_f, r14_med, r5_med, r2_med, btc_bias=btc_bias)
+    out = _format_regime_metadata(reg, bull_f, bear_f, r14_med, r5_med, r2_med)
     _MARKET_REGIME_CACHE["data"] = dict(out)
     _MARKET_REGIME_CACHE["ts"] = now
     return out
@@ -4084,15 +4016,11 @@ def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) 
 
 def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30, warmup_days: int = 1000) -> dict[str, str]:
     """
-    Builds date_str -> ('STRONG_UPTREND' | 'STRONG_DOWNTREND' | 'RANGING_CHOP') AND
-    date_str -> ('SHORT_ONLY' | 'LONG_ONLY' | 'BOTH') neutral-coin macro guard lookup across the
+    Builds a date_str -> ('STRONG_UPTREND' | 'STRONG_DOWNTREND' | 'RANGING_CHOP') lookup across the
     12-coin universe for historical backtests (strictly using prior completed daily candles, zero lookahead).
     """
     pool = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
-    if "B-BTC_USDT" not in pool:
-        pool.append("B-BTC_USDT")
     bias_by_d: dict[str, list[str]] = {}
-    btc_bias_by_d: dict[str, str] = {}
     r14_by_d: dict[str, list[float]] = {}
     r5_by_d: dict[str, list[float]] = {}
     r2_by_d: dict[str, list[float]] = {}
@@ -4120,8 +4048,6 @@ def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30
                 cur_d = dates[i]
                 pc, pe50, pe200 = float(closes[i - 1]), float(e50_s[i - 1]), float(e200_s[i - 1])
                 b = "BULLISH" if (pc > pe50 and pc > pe200) else ("BEARISH" if (pc < pe50 and pc < pe200) else "NEUTRAL")
-                if p == "B-BTC_USDT":
-                    btc_bias_by_d[cur_d] = b
                 bias_by_d.setdefault(cur_d, []).append(b)
                 r14_by_d.setdefault(cur_d, []).append((pc / float(closes[i - 15]) - 1.0) * 100.0)
                 r5_by_d.setdefault(cur_d, []).append((pc / float(closes[i - 6]) - 1.0) * 100.0)
@@ -4130,7 +4056,6 @@ def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30
             continue
 
     reg_map: dict[str, str] = {}
-    neutral_guard_map: dict[str, str] = {}
     for d_k, b_list in bias_by_d.items():
         nb = max(1, len(b_list))
         bull_f = sum(1 for x in b_list if x == "BULLISH") / nb
@@ -4138,13 +4063,8 @@ def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30
         r14_m = float(pd.Series(r14_by_d.get(d_k, [0.0])).median())
         r5_m = float(pd.Series(r5_by_d.get(d_k, [0.0])).median())
         r2_m = float(pd.Series(r2_by_d.get(d_k, [0.0])).median())
-        reg_d = classify_universe_regime_from_stats(bull_f, bear_f, r14_m, r5_m, r2_m)
-        reg_map[d_k] = reg_d
-        neutral_guard_map[d_k] = classify_neutral_coin_macro_guard(
-            reg_d, bull_f, bear_f, btc_bias_by_d.get(d_k, "NEUTRAL")
-        )
+        reg_map[d_k] = classify_universe_regime_from_stats(bull_f, bear_f, r14_m, r5_m, r2_m)
     _PERSIST["backtest_regime_map"] = reg_map
-    _PERSIST["backtest_neutral_guard_map"] = neutral_guard_map
     return reg_map
 
 
@@ -6171,24 +6091,6 @@ def execute_autotrade_two_entry_signal(
         return False, (
             f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
         ), {"daily_bias": daily_bias, "direction": norm_dir}
-    if daily_bias == "NEUTRAL" and not allow_mode_override:
-        try:
-            _reg_ng = compute_market_regime()
-            _ng_dir = str(_reg_ng.get("neutral_coin_guard") or "BOTH")
-            if _ng_dir == "SHORT_ONLY" and norm_dir != "SHORT":
-                return False, (
-                    f"Macro-Bearish Neutral Guard: {pair} Daily Bias is NEUTRAL/RANGE while Market Breadth is "
-                    f"{_reg_ng.get('bear_breadth_pct', 0):.0f}% Bearish ({_reg_ng.get('label', 'BEAR')}) & BTC is BEARISH — "
-                    f"blocking counter-market {norm_dir} AutoTrade (own BULLISH coins remain unrestricted)."
-                ), {"daily_bias": daily_bias, "neutral_coin_guard": _ng_dir, "direction": norm_dir}
-            if _ng_dir == "LONG_ONLY" and norm_dir != "LONG":
-                return False, (
-                    f"Macro-Bullish Neutral Guard: {pair} Daily Bias is NEUTRAL/RANGE while Market Breadth is "
-                    f"{_reg_ng.get('bull_breadth_pct', 0):.0f}% Bullish ({_reg_ng.get('label', 'BULL')}) & BTC is BULLISH — "
-                    f"blocking counter-market {norm_dir} AutoTrade (own BEARISH coins remain unrestricted)."
-                ), {"daily_bias": daily_bias, "neutral_coin_guard": _ng_dir, "direction": norm_dir}
-        except Exception:
-            pass
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
@@ -6453,7 +6355,7 @@ def run_portfolio_single_slot_backtest(
     max_daily_loss_inr = eff_wallet_inr * (_strategies.DAILY_WALLET_LOSS_STOP_PCT / 100.0)
 
     universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
-    if strategy_id in ("box_theory", "box_plus_ema50_200_bear", "box_plus_ema50_200_bull_bear", "box_plus_ema50_200_regime"):
+    if strategy_id == "box_plus_ema50_200_regime":
         build_historical_regime_map(pairs=universe, duration_days=duration_days)
     all_candidates = []
     standalone_rows = []
@@ -7026,7 +6928,6 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "check_live_daily_loss_stop": check_live_daily_loss_stop,
             "unlock_autotrade_daily_loss_stop": unlock_autotrade_daily_loss_stop,
             "classify_universe_regime_from_stats": classify_universe_regime_from_stats,
-            "classify_neutral_coin_macro_guard": classify_neutral_coin_macro_guard,
             "compute_market_regime": compute_market_regime,
             "build_historical_regime_map": build_historical_regime_map,
             "count_open_ema50_200_slots": count_open_ema50_200_slots,
