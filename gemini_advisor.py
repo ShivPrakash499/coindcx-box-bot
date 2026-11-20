@@ -30,6 +30,7 @@ _EXCLUDED_MODEL_TOKENS = (
     "embedding", "imagen", "veo", "tts", "audio", "transcribe", "live",
     "image", "robotics", "computer-use", "aqa", "nano-banana", "omni",
     "learnlm", "vision", "gemma", "deep-research", "antigravity", "dialog",
+    "customtools",
 )
 
 _DISCOVERED_MODELS_CACHE: dict = {"key_prefix": "", "ts": 0.0, "result": None}
@@ -1126,7 +1127,8 @@ def ask_gemini_trade_advisor(
                         }
             except Exception as e:
                 last_llm_err = str(e)[:220]
-                if "api_key_invalid" in last_llm_err.lower() or "api key not valid" in last_llm_err.lower():
+                err_l = last_llm_err.lower()
+                if any(fatal in err_l for fatal in ("api_key_invalid", "api key not valid", "prepayment credits are depleted", "billing", "402 resource_exhausted")):
                     break
 
             try:
@@ -1148,7 +1150,8 @@ def ask_gemini_trade_advisor(
                     }
             except Exception as e2:
                 last_llm_err = str(e2)[:220]
-                if "api_key_invalid" in last_llm_err.lower() or "api key not valid" in last_llm_err.lower():
+                err_l2 = last_llm_err.lower()
+                if any(fatal in err_l2 for fatal in ("api_key_invalid", "api key not valid", "prepayment credits are depleted", "billing", "402 resource_exhausted")):
                     break
                 continue
     else:
