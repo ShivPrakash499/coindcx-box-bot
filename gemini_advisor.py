@@ -1,4 +1,5 @@
 from __future__ import annotations
+import json
 import os
 import re
 import time
@@ -14,6 +15,7 @@ AVAILABLE_GEMINI_MODELS = [
     ("auto", "✨ Auto — Latest & Greatest Gemini for Your Subscription"),
     ("gemini-4-carbon", "Gemini 4 Carbon (Flagship Frontier Reasoning)"),
     ("gemini-4-argon", "Gemini 4 Argon (Efficient Frontier Reasoning)"),
+    ("gemini-4-hydrogen", "Gemini 4 Hydrogen (Fast Gemini 4)"),
     ("gemini-3.8-flash", "Gemini 3.8 Flash (High-Speed Agentic)"),
     ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite (Ultra-Low Latency)"),
 ]
@@ -21,6 +23,7 @@ AVAILABLE_GEMINI_MODELS = [
 FALLBACK_MODEL_CHAIN = [
     "gemini-4-carbon",
     "gemini-4-argon",
+    "gemini-4-hydrogen",
     "gemini-3.8-flash",
     "gemini-3.5-flash-lite",
     "gemini-3.1-flash-lite",
@@ -34,6 +37,7 @@ _EXCLUDED_MODEL_TOKENS = (
 )
 
 _DISCOVERED_MODELS_CACHE: dict = {"key_prefix": "", "ts": 0.0, "result": None}
+_VERTEX_WORKING_MODEL_CACHE: dict = {"ts": 0.0, "model": "", "project": ""}
 _VERTEX_SA_STATE = {"checked": False, "usable": False, "reason": ""}
 
 
@@ -73,9 +77,11 @@ def rank_gemini_model_id(model_id: str) -> tuple[int, int, int, int, str]:
         tier = 50
     elif "argon" in mid or re.search(r"(^|-)pro($|-)", mid):
         tier = 40
+    elif "neon" in mid:
+        tier = 35
     elif "flash-lite" in mid or "lite" in mid:
         tier = 20
-    elif "flash" in mid:
+    elif "hydrogen" in mid or "flash" in mid:
         tier = 30
     else:
         tier = 10
@@ -185,11 +191,19 @@ def get_selector_model_options(api_key: str | None = None, force_refresh: bool =
     Returns `(options_list, discovery_info)` for the UI dropdown, always putting
     `auto` (Latest & Greatest dynamically discovered for the user's subscription) first!
     """
+    if force_refresh:
+        _VERTEX_WORKING_MODEL_CACHE.update({"ts": 0.0, "model": ""})
     disc = discover_available_gemini_models(api_key=api_key, force_refresh=force_refresh)
-    if disc.get("ok") and disc.get("top_model"):
+    v_top = _VERTEX_WORKING_MODEL_CACHE.get("model", "")
+    has_v, v_proj = has_vertex_adc_credentials()
+    if has_v and v_top:
+        auto_lbl = f"✨ Auto — Latest & Greatest on Your Subscription (Vertex Live: {v_top})"
+    elif has_v:
+        auto_lbl = f"✨ Auto — Latest & Greatest on Your Subscription (Vertex AI • {v_proj})"
+    elif disc.get("ok") and disc.get("top_model"):
         auto_lbl = f"✨ Auto — Latest & Greatest on Your Subscription (Live: {disc['top_model']})"
     else:
-        auto_lbl = "✨ Auto — Latest & Greatest Gemini (Auto-Discovers via GEMINI_API_KEY)"
+        auto_lbl = "✨ Auto — Latest & Greatest Gemini (Auto-Discovers via Vertex AI / GEMINI_API_KEY)"
     options = [("auto", auto_lbl)] + list(disc.get("models") or [])
     return options, disc
 
@@ -1026,6 +1040,100 @@ def _generate_live_quant_advisor_response(user_prompt: str, selected_pair: str =
     return "\n\n".join(sections)
 
 
+def _load_vertex_adc_dict() -> tuple[dict | None, str]:
+    """
+    Loads Vertex AI Authorized User ADC (`VERTEX_ADC_JSON` or local gcloud ADC) and `VERTEX_PROJECT_ID`
+    from Streamlit Secrets, environment variables, or local gcloud config (for ₹0 Cloud/Ultra credit billing).
+    """
+    adc_raw = None
+    proj_id = ""
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets"):
+            if "VERTEX_PROJECT_ID" in st.secrets:
+                proj_id = str(st.secrets["VERTEX_PROJECT_ID"]).strip()
+            if "VERTEX_ADC_JSON" in st.secrets:
+                adc_raw = st.secrets["VERTEX_ADC_JSON"]
+            elif "vertex_adc" in st.secrets and hasattr(st.secrets["vertex_adc"], "items"):
+                adc_raw = dict(st.secrets["vertex_adc"])
+            if not proj_id and "gcp_service_account" in st.secrets and hasattr(st.secrets["gcp_service_account"], "items"):
+                proj_id = str(st.secrets["gcp_service_account"].get("project_id", "") or "").strip()
+    except Exception:
+        pass
+
+    if not proj_id:
+        proj_id = str(os.environ.get("VERTEX_PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+    if adc_raw is None:
+        env_adc = str(os.environ.get("VERTEX_ADC_JSON", "") or "").strip()
+        if env_adc:
+            adc_raw = env_adc
+
+    adc_dict = None
+    if isinstance(adc_raw, dict):
+        adc_dict = dict(adc_raw)
+    elif isinstance(adc_raw, str) and adc_raw.strip():
+        try:
+            adc_dict = json.loads(adc_raw.strip())
+        except Exception:
+            adc_dict = None
+
+    if not adc_dict:
+        # Fallback to local gcloud ADC file on developer machines
+        for cand_path in (
+            os.path.expandvars(r"%APPDATA%\gcloud\application_default_credentials.json"),
+            os.path.expanduser("~/.config/gcloud/application_default_credentials.json"),
+        ):
+            try:
+                if cand_path and os.path.isfile(cand_path):
+                    with open(cand_path, "r", encoding="utf-8") as f:
+                        d_local = json.load(f)
+                    if isinstance(d_local, dict) and d_local.get("refresh_token"):
+                        adc_dict = d_local
+                        if not proj_id and d_local.get("quota_project_id"):
+                            proj_id = str(d_local["quota_project_id"]).strip()
+                        break
+            except Exception:
+                pass
+
+    if not proj_id:
+        try:
+            import sheets_logger
+            sa_d = sheets_logger._load_service_account_dict()
+            if isinstance(sa_d, dict) and sa_d.get("project_id"):
+                proj_id = str(sa_d["project_id"]).strip()
+        except Exception:
+            pass
+
+    if not proj_id:
+        proj_id = "gen-lang-client-0777980903"
+
+    if isinstance(adc_dict, dict) and adc_dict.get("refresh_token") and adc_dict.get("client_id"):
+        return adc_dict, proj_id
+    return None, proj_id
+
+
+def has_vertex_adc_credentials() -> tuple[bool, str]:
+    """Returns `(True, project_id)` when `VERTEX_ADC_JSON` or local gcloud ADC is ready for Vertex AI."""
+    adc_d, proj = _load_vertex_adc_dict()
+    return (adc_d is not None), proj
+
+
+def _get_vertex_adc_client():
+    """Creates a Vertex AI OAuth2 credential from `VERTEX_ADC_JSON` (Streamlit Secrets or local gcloud ADC)."""
+    try:
+        from google.oauth2.credentials import Credentials
+        adc_dict, proj_id = _load_vertex_adc_dict()
+        if not adc_dict:
+            return None, None
+        creds = Credentials.from_authorized_user_info(
+            adc_dict,
+            scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        )
+        return creds, proj_id
+    except Exception:
+        return None, None
+
+
 def _get_gcp_service_account_client():
     """Creates a Google Cloud OAuth2 credential from `[gcp_service_account]` in Streamlit secrets if available."""
     try:
@@ -1060,6 +1168,17 @@ def _extract_interaction_text(interaction) -> str:
     return ""
 
 
+def _build_gen_config(model_id: str) -> genai_types.GenerateContentConfig:
+    """Builds GenerateContentConfig with SYSTEM_INSTRUCTION and responsive LOW thinking on Gemini 4 models."""
+    kwargs = {"system_instruction": SYSTEM_INSTRUCTION}
+    if "gemini-4" in str(model_id or "").lower():
+        try:
+            kwargs["thinking_config"] = genai_types.ThinkingConfig(thinking_level="LOW")
+        except Exception:
+            pass
+    return genai_types.GenerateContentConfig(**kwargs)
+
+
 def ask_gemini_trade_advisor(
     user_prompt: str,
     preferred_model: str = "auto",
@@ -1071,12 +1190,16 @@ def ask_gemini_trade_advisor(
 ) -> dict:
     """
     Sends the user's prompt along with the live Google Sheet trade journal and CoinDCX market context
-    to Gemini via the official `google-genai` SDK. When `preferred_model == 'auto'` (default), dynamically
-    discovers all models accessible on the user's subscription via `client.models.list()` and automatically
-    runs the Latest & Greatest model first (with graceful fallback to the next highest-ranked model and
-    finally to the Intent-Routed Live Quantitative & Sheet Advisor Engine).
+    to Gemini via the official `google-genai` SDK:
+      1. Priority 1: Vertex AI via `VERTEX_ADC_JSON` (Google Cloud + AI Ultra Credits — bypasses AI Studio 402 prepay!).
+      2. Priority 2: Official Gemini Developer API via `GEMINI_API_KEY`.
+      3. Priority 3: Vertex AI via `[gcp_service_account]` (if Vertex AI IAM role is granted).
+      4. Priority 4: Intent-Routed Built-In Live Quantitative & Sheet Advisor Engine.
+    When `preferred_model == 'auto'` (default), dynamically discovers and selects the Latest & Greatest
+    accessible Gemini model on the user's subscription.
     """
-    key = str(api_key or get_gemini_api_key() or "").strip()
+    explicit_key = str(api_key or "").strip()
+    key = str(explicit_key or get_gemini_api_key() or "").strip()
     full_input = (
         f"{sheet_markdown_context}\n\n"
         f"{market_context}\n\n"
@@ -1092,14 +1215,64 @@ def ask_gemini_trade_advisor(
             dynamic_chain.append(m_fb)
 
     if pref.lower() == "auto" or not pref:
-        models_to_try = dynamic_chain
+        models_to_try = list(dynamic_chain)
         primary_target = dynamic_chain[0] if dynamic_chain else "gemini-4-carbon"
     else:
         models_to_try = [pref] + [m for m in dynamic_chain if m != pref]
         primary_target = pref
-    last_llm_err = str(disc.get("error") or "")
+    last_llm_err = ""
 
-    # 1. Primary: Official Gemini Developer API using GEMINI_API_KEY (`AIza...`)
+    # 1. Priority 1: Vertex AI Cloud Credits (`VERTEX_ADC_JSON` / local gcloud ADC) unless caller passed an explicit test API key
+    if not explicit_key:
+        v_creds, v_proj = _get_vertex_adc_client()
+        if v_creds and v_proj:
+            try:
+                v_models = list(models_to_try)
+                # If we already verified the #1 accessible Vertex model within the last hour in Auto mode, start there for instant response!
+                cached_vm = _VERTEX_WORKING_MODEL_CACHE.get("model", "")
+                if (
+                    pref.lower() == "auto"
+                    and cached_vm
+                    and _VERTEX_WORKING_MODEL_CACHE.get("project") == v_proj
+                    and (time.time() - float(_VERTEX_WORKING_MODEL_CACHE.get("ts", 0.0))) < 3600.0
+                    and cached_vm in v_models
+                ):
+                    v_models = [cached_vm] + [m for m in v_models if m != cached_vm]
+
+                v_client = genai.Client(
+                    vertexai=True,
+                    credentials=v_creds,
+                    project=v_proj,
+                    location="global",
+                    http_options=genai_types.HttpOptions(timeout=45000),
+                )
+                for candidate_model in v_models:
+                    try:
+                        gen_resp = v_client.models.generate_content(
+                            model=candidate_model,
+                            contents=full_input,
+                            config=_build_gen_config(candidate_model),
+                        )
+                        reply_text = (getattr(gen_resp, "text", "") or "").strip()
+                        if reply_text:
+                            if pref.lower() == "auto":
+                                _VERTEX_WORKING_MODEL_CACHE.update({"ts": time.time(), "model": candidate_model, "project": v_proj})
+                            return {
+                                "ok": True,
+                                "error": None,
+                                "text": reply_text,
+                                "model_used": f"{candidate_model} (Vertex AI • Auto Latest)" if pref.lower() == "auto" else f"{candidate_model} (Vertex AI)",
+                                "interaction_id": None,
+                                "llm_used": True,
+                                "fallback_reason": "",
+                            }
+                    except Exception as ve:
+                        last_llm_err = str(ve)[:220]
+                        continue
+            except Exception as ve_init:
+                last_llm_err = str(ve_init)[:220]
+
+    # 2. Priority 2: Official Gemini Developer API using GEMINI_API_KEY (`AIza...`)
     if key:
         client = genai.Client(api_key=key)
         for candidate_model in models_to_try:
@@ -1135,7 +1308,7 @@ def ask_gemini_trade_advisor(
                 gen_resp = client.models.generate_content(
                     model=candidate_model,
                     contents=full_input,
-                    config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
+                    config=_build_gen_config(candidate_model),
                 )
                 reply_text = (getattr(gen_resp, "text", "") or "").strip()
                 if reply_text:
@@ -1155,7 +1328,7 @@ def ask_gemini_trade_advisor(
                     break
                 continue
     else:
-        # 2. Secondary: Try Vertex AI via [gcp_service_account] ONCE if IAM Vertex AI User role is granted
+        # 3. Priority 3: Try Vertex AI via [gcp_service_account] ONCE if IAM Vertex AI User role is granted
         if not _VERTEX_SA_STATE["checked"] or _VERTEX_SA_STATE["usable"]:
             sa_creds, sa_project = _get_gcp_service_account_client()
             if sa_creds and sa_project:
@@ -1165,13 +1338,14 @@ def ask_gemini_trade_advisor(
                         credentials=sa_creds,
                         project=sa_project,
                         location="global",
+                        http_options=genai_types.HttpOptions(timeout=45000),
                     )
                     for candidate_model in models_to_try:
                         try:
                             gen_resp = v_client.models.generate_content(
                                 model=candidate_model,
                                 contents=full_input,
-                                config=genai_types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION),
+                                config=_build_gen_config(candidate_model),
                             )
                             reply_text = (getattr(gen_resp, "text", "") or "").strip()
                             if reply_text:
@@ -1189,16 +1363,15 @@ def ask_gemini_trade_advisor(
                             ve_s = str(ve)
                             last_llm_err = ve_s[:220]
                             if "403" in ve_s or "PERMISSION_DENIED" in ve_s or "aiplatform" in ve_s.lower():
-                                _VERTEX_SA_STATE.update({"checked": True, "usable": False, "reason": "Service account lacks Vertex AI IAM role (add GEMINI_API_KEY in Streamlit Secrets for live Gemini LLM)"})
+                                _VERTEX_SA_STATE.update({"checked": True, "usable": False, "reason": "Service account lacks Vertex AI IAM role (add VERTEX_ADC_JSON or GEMINI_API_KEY in Streamlit Secrets)"})
                                 break
                 except Exception as ve_outer:
                     _VERTEX_SA_STATE.update({"checked": True, "usable": False, "reason": str(ve_outer)[:180]})
             else:
-                _VERTEX_SA_STATE.update({"checked": True, "usable": False, "reason": "No GEMINI_API_KEY configured in Streamlit Secrets"})
+                _VERTEX_SA_STATE.update({"checked": True, "usable": False, "reason": "No VERTEX_ADC_JSON or GEMINI_API_KEY configured in Streamlit Secrets"})
 
     fallback_reason = (
-        last_llm_err if key
-        else (_VERTEX_SA_STATE.get("reason") or "No GEMINI_API_KEY configured in Streamlit Secrets")
+        last_llm_err or _VERTEX_SA_STATE.get("reason") or "No VERTEX_ADC_JSON or GEMINI_API_KEY configured in Streamlit Secrets"
     )
 
     # 3. Intent-Routed Built-In Live Quantitative & Sheet Grounded Advisor

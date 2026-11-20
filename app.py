@@ -3539,7 +3539,14 @@ elif active_section == "🤖 AI Advisor":
                 st.rerun()
         with cfg_c2:
             st.markdown("<div style='height:28px;'></div>", unsafe_allow_html=True)
-            if current_gem_key and disc_info.get("ok"):
+            _has_v_adc, _v_proj_ui = gemini_advisor.has_vertex_adc_credentials()
+            if _has_v_adc:
+                _v_top_lbl = gemini_advisor._VERTEX_WORKING_MODEL_CACHE.get("model") or disc_info.get("top_model") or "gemini-4-argon"
+                st.success(
+                    f"🟢 **Vertex AI Live (Cloud / AI Ultra Credits)** — Connected via Streamlit Server Secrets "
+                    f"(`{_v_proj_ui}`) • Auto-Latest: **`{_v_top_lbl}`**"
+                )
+            elif current_gem_key and disc_info.get("ok"):
                 st.success(
                     f"🟢 **Gemini LLM Live** — Connected via Streamlit Server Secrets • "
                     f"Auto-Latest: **`{disc_info.get('top_model')}`** (`{len(disc_info.get('model_ids') or [])}` models unlocked)"
@@ -3553,7 +3560,7 @@ elif active_section == "🤖 AI Advisor":
                 st.info(
                     "🟡 **Connected via Streamlit Server Secrets (`gen-lang-client-0777980903`)** — "
                     "Intent-Routed **Live Quant + Sheet Engine** active "
-                    "*(add `GEMINI_API_KEY` from Google AI Studio to Streamlit Secrets to auto-discover & run your subscription's latest Gemini model)*"
+                    "*(add `VERTEX_ADC_JSON` or `GEMINI_API_KEY` to Streamlit Secrets to unlock live Gemini 4 Argon / Carbon)*"
                 )
 
         # Initialize Chat History in Session State
