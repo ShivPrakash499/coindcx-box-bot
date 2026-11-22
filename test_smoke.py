@@ -1080,6 +1080,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
         with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
              patch.object(eng, "is_staging_environment", return_value=False), \
+             patch.object(eng, "is_experiment_environment", return_value=False), \
              patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
              patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 60000.0, "available_inr": 60000.0}), \
@@ -1434,6 +1435,7 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
             # --- FIX #2B: Anti-Crumb Guard blocks leftover-cash dust trades (Rs.893 free vs Rs.26,500 Sidebar margin) ---
             w_crumb = {"is_live_api": True, "total_inr": 53750.0, "available_inr": 893.64}
             with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "is_experiment_environment", return_value=False), \
                  patch.object(eng, "fetch_coindcx_futures_balance", return_value=w_crumb), \
                  patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})):
                 ok_cr, msg_cr, _ = eng.execute_autotrade_two_entry_signal(
@@ -1471,6 +1473,7 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
             # With 1 filled position (INJ) + 2 resting entry limit orders (APT, FET) = 3 slots -> 4th trade (BTC) MUST be blocked!
             w_full = {"is_live_api": True, "total_inr": 60000.0, "available_inr": 40000.0}
             with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "is_experiment_environment", return_value=False), \
                  patch.object(eng, "fetch_coindcx_futures_balance", return_value=w_full), \
                  patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=open_pos_1), \
@@ -1651,6 +1654,119 @@ def test_15_v35_funds_section_and_wallet_ledger():
     print("  -> PASS: Daemon v35 Funds Section, Transaction Pagination, Capital Accounting & Statement CSV Parser verified!")
 
 
+def test_16_three_tier_main_staging_experiment_parity():
+    print("[16/16] Verifying 3-Tier Architecture (Main Live / Staging Paper + Staging_Trades / Experiment Parity Backtest)...")
+    import tempfile
+    import pandas as pd
+    import coindcx_engine as eng
+    import sheets_logger as sl
+
+    # 1. Verify mutually exclusive 3-tier environment detection (main / staging / experiment)
+    with patch.dict(os.environ, {"APP_ENV": "experiment"}):
+        assert eng.is_experiment_environment() is True and eng.is_staging_environment() is False and eng.get_environment_tier() == "experiment"
+    with patch.dict(os.environ, {"APP_ENV": "staging"}):
+        assert eng.is_staging_environment() is True and eng.is_experiment_environment() is False and eng.get_environment_tier() == "staging"
+    with patch.dict(os.environ, {"APP_ENV": "main"}):
+        assert eng.is_staging_environment() is False and eng.is_experiment_environment() is False and eng.get_environment_tier() == "main"
+
+    # 2. Verify Staging Paper Trading mirrors Main setup, enforces 5% Daily SL Threshold & Free-Margin Guard, and routes to Staging_Trades
+    assert sl.STAGING_TRADES_SHEET_NAME == "Staging_Trades"
+    assert sl._is_staging_paper_record({"status": "PAPER_AUTOTRADE_OPEN"}) is True
+    assert sl._is_staging_paper_record({"exit_reason": "[STAGING PAPER] Stop Loss Hit"}) is True
+    assert sl._is_staging_paper_record({"status": "LOGGED_PENDING", "strategy_name": "Box Theory Sweep (App Live Order)"}) is False
+
+    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.dict(os.environ, {"APP_ENV": "staging"}):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            fake_main_setup = {
+                "wallet_balance_inr": 24423.86,
+                "single_trade_margin_inr": 8000.0,
+                "user_custom_margin": True,
+                "leverage": 10,
+                "autotrade_strategy_mode": "box_plus_ema50_200_regime",
+            }
+            with patch.object(sl, "load_main_live_setup_from_sheet", return_value=fake_main_setup):
+                ok_sy, msg_sy, cfg_sy = eng.sync_setup_from_main(reset_paper_wallet=True)
+                assert ok_sy and abs(float(cfg_sy["paper_wallet_inr"]) - 24423.86) < 0.01, (ok_sy, msg_sy, cfg_sy)
+                assert abs(float(cfg_sy["single_trade_margin_inr"]) - 8000.0) < 0.01
+
+            # Simulate paper wallet dropping by Rs.1,500 (> 5% of Rs.24,423.86 = Rs.1,221.19) -> MUST lock Staging AutoTrade!
+            eng.save_autotrade_config({
+                "paper_wallet_inr": 22900.0,
+                "paper_daily_start_wallet": {"date": today_s, "inr": 24423.86},
+            })
+            pw_snap = eng.get_paper_wallet_snapshot()
+            hit_stg, msg_stg, info_stg = eng.check_live_daily_loss_stop(pw_snap)
+            assert hit_stg and "5% Daily Loss Stop (Staging Paper)" in msg_stg, (hit_stg, msg_stg)
+            assert info_stg.get("is_paper_wallet") is True
+
+            # Verify execute_autotrade_two_entry_signal blocks new Staging paper trades while locked by 5% SL threshold
+            ok_blk_sl, msg_blk_sl, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-SOL_USDT",
+                sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 70.0, "tp1": 69.0, "tp2": 67.5, "stop_loss": 71.5, "levels": {"trend_bias": "BEARISH", "RH": 70.5, "RL": 67.5, "MID": 69.0, "SH": 71.2, "SL": 66.5}},
+                single_trade_margin_inr=8000.0, leverage=10,
+            )
+            assert not ok_blk_sl and "5% Daily Loss Stop" in msg_blk_sl, (ok_blk_sl, msg_blk_sl)
+
+            # Unlock Staging AutoTrade -> baseline syncs to Rs.22,900 and unlocks cleanly
+            eng.unlock_autotrade_daily_loss_stop(pw_snap)
+            hit_after_u, _, _ = eng.check_live_daily_loss_stop(eng.get_paper_wallet_snapshot())
+            assert not hit_after_u
+
+            # Verify Staging Paper Free-Margin Anti-Crumb Guard blocks 3rd trade when free paper margin < 90% of slot margin
+            eng.save_autotrade_config({
+                "paper_wallet_inr": 20000.0,
+                "paper_daily_start_wallet": {"date": today_s, "inr": 20000.0},
+                "daily_loss_stop_hit": "",
+                "active_trade_locks": {
+                    "B-BTC_USDT": {"pair": "B-BTC_USDT", "margin_inr": 8000.0, "is_live_exchange": False, "opened_ts": time.time()},
+                    "B-ETH_USDT": {"pair": "B-ETH_USDT", "margin_inr": 8000.0, "is_live_exchange": False, "opened_ts": time.time()},
+                },
+            })
+            # Remaining free paper margin = 20000 - 16000 = Rs.4,000 (< 90% of Rs.8,000)
+            ok_fm_stg, msg_fm_stg, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-SOL_USDT",
+                sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 70.0, "tp1": 69.0, "tp2": 67.5, "stop_loss": 71.5, "levels": {"trend_bias": "BEARISH", "RH": 70.5, "RL": 67.5, "MID": 69.0, "SH": 71.2, "SL": 66.5}},
+                single_trade_margin_inr=8000.0, leverage=10,
+            )
+            assert not ok_fm_stg and "Insufficient Free Margin Guard" in msg_fm_stg, (ok_fm_stg, msg_fm_stg)
+
+    # 3. Verify Experiment Backtest Engine enforces Main's 5% SL Threshold, Free-Margin Guard, & Guard Telemetry
+    synth_trades = pd.DataFrame([
+        # Trade 1 loses Rs.1,500 on 2026-11-10 (> 5% of Rs.24,000 = Rs.1,200) -> locks 2026-11-10!
+        {"pair": "B-BTC_USDT", "strategy": "Box Theory Sweep", "direction": "SHORT", "entry_time": "2026-11-10 08:00", "exit_time": "2026-11-10 09:00", "entry_price": 60000.0, "exit_price": 61200.0, "roe_pct": -18.75, "net_pnl_inr": -1500.0, "fees_inr": 40.0, "is_win": False, "exit_reason": "SL"},
+        # Trade 2 enters later on the SAME locked day 2026-11-10 -> MUST be blocked by 5% SL Threshold!
+        {"pair": "B-ETH_USDT", "strategy": "Box Theory Sweep", "direction": "SHORT", "entry_time": "2026-11-10 11:00", "exit_time": "2026-11-10 13:00", "entry_price": 1700.0, "exit_price": 1650.0, "roe_pct": 25.0, "net_pnl_inr": 2000.0, "fees_inr": 40.0, "is_win": True, "exit_reason": "TP2"},
+        # Trade 3 enters NEXT day 2026-11-11 -> allowed again!
+        {"pair": "B-SOL_USDT", "strategy": "Box Theory Sweep", "direction": "SHORT", "entry_time": "2026-11-11 08:00", "exit_time": "2026-11-11 10:00", "entry_price": 70.0, "exit_price": 68.0, "roe_pct": 25.0, "net_pnl_inr": 2000.0, "fees_inr": 40.0, "is_win": True, "exit_reason": "TP2"},
+    ])
+    def _mock_bt(pair, **kwargs):
+        sub = synth_trades[synth_trades["pair"] == pair].copy()
+        return {"total_trades": len(sub), "win_count": int((sub["is_win"] == True).sum()), "loss_count": int((sub["is_win"] == False).sum()), "win_rate_pct": 50.0, "net_profit_inr": float(sub["net_pnl_inr"].sum()), "profit_factor": 1.0, "trades_df": sub}
+
+    with patch.object(eng, "run_strategy_backtest", side_effect=_mock_bt):
+        bt_res = eng.run_portfolio_single_slot_backtest(
+            pairs=["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"],
+            duration_days=30,
+            margin_inr=8000.0,
+            leverage=10,
+            wallet_inr=24000.0,
+            daily_loss_stop_pct=5.0,
+            enforce_free_margin_guard=True,
+        )
+        ga_bt = bt_res["guards_audit"]
+        assert bt_res["total_trades"] == 2, f"Expected ETH trade on locked day blocked, got {bt_res['total_trades']}"
+        assert ga_bt["days_locked_by_sl_threshold"] == 1 and ga_bt["blocked_by_sl_threshold"] == 1, ga_bt
+        assert ga_bt["locked_dates"] == ["2026-11-10"], ga_bt
+        assert abs(bt_res["ending_wallet_inr"] - 24500.0) < 0.01, bt_res["ending_wallet_inr"]
+        assert len(bt_res["equity_curve"]) == 2
+
+    print("  -> PASS: 3-Tier Architecture (Main Live / Staging Paper + Staging_Trades / Experiment Parity Backtest) verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1667,6 +1783,7 @@ if __name__ == "__main__":
     test_13_regime_adaptive_routing_and_structure_tp1()
     test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
     test_15_v35_funds_section_and_wallet_ledger()
+    test_16_three_tier_main_staging_experiment_parity()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

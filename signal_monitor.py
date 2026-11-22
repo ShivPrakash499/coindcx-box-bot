@@ -159,12 +159,15 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
     if leverage is None or leverage <= 0:
         leverage = int(auto_cfg.get("leverage", 10))
     if autotrade is None:
-        if eng.is_staging_environment():
+        if eng.is_experiment_environment():
+            autotrade = False
+        elif eng.is_staging_environment():
             autotrade = bool(auto_cfg.get("paper_autotrade_enabled", True))
         else:
             autotrade = bool(auto_cfg.get("enabled", False))
-    # Always honor saved `email_alerts_enabled` setting (defaults to False on staging so staging never duplicates main emails)
-    email_cfg_enabled = bool(auto_cfg.get("email_alerts_enabled", False if eng.is_staging_environment() else True))
+    # Always honor saved `email_alerts_enabled` setting (defaults to False on staging & Experiment so neither duplicates main emails)
+    _non_live_env = eng.is_staging_environment() or eng.is_experiment_environment()
+    email_cfg_enabled = bool(auto_cfg.get("email_alerts_enabled", False if _non_live_env else True))
     send = bool(send) and email_cfg_enabled
 
     if not pairs:
@@ -246,11 +249,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         except Exception:
             pass
 
-        # Live 5% Daily Loss Stop: if hit, keep scanning/alerting but place no new AutoTrades today
+        # Live & Staging-Paper 5% Daily Loss Stop (SL Threshold): if hit, keep scanning/alerting but lock new AutoTrades for the IST day!
         daily_stop_hit, daily_stop_msg = False, ""
-        if autotrade and not eng.is_staging_environment():
+        if autotrade and not eng.is_experiment_environment():
             try:
-                daily_stop_hit, daily_stop_msg, _ = eng.check_live_daily_loss_stop()
+                _dl_w = eng.get_paper_wallet_snapshot(auto_cfg) if eng.is_staging_environment() else None
+                daily_stop_hit, daily_stop_msg, _ = eng.check_live_daily_loss_stop(_dl_w)
             except Exception as e:
                 print(f"[Daily Loss Stop Check Notice]: {e}")
 

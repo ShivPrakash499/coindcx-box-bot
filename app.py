@@ -210,19 +210,22 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
                 _reload_if_updated(sheets_logger)
                 _reload_if_updated(coindcx_engine)
                 _reload_if_updated(signal_monitor)
-                if not coindcx_engine._PERSIST.get("session_verified") or (time.time() - float(coindcx_engine._WALLET_BALANCE_CACHE.get("ts", 0.0))) > 25.0:
-                    coindcx_engine._fetch_coindcx_futures_balance_sync()
-                if (time.time() - float(coindcx_engine._ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) > 25.0:
-                    coindcx_engine._fetch_coindcx_active_positions_sync()
-                coindcx_engine._trigger_bg_sheet_account_publish()
-                if signal_monitor:
+                _is_exp_worker = coindcx_engine.is_experiment_environment()
+                _is_stg_worker = coindcx_engine.is_staging_environment()
+                if not _is_exp_worker:
+                    if not coindcx_engine._PERSIST.get("session_verified") or (time.time() - float(coindcx_engine._WALLET_BALANCE_CACHE.get("ts", 0.0))) > 25.0:
+                        coindcx_engine._fetch_coindcx_futures_balance_sync()
+                    if (time.time() - float(coindcx_engine._ACTIVE_POSITIONS_CACHE.get("ts", 0.0))) > 25.0:
+                        coindcx_engine._fetch_coindcx_active_positions_sync()
+                    if not _is_stg_worker:
+                        coindcx_engine._trigger_bg_sheet_account_publish()
+                if signal_monitor and not _is_exp_worker:
                     auto_cfg = coindcx_engine.get_autotrade_config()
                     rot = coindcx_engine.get_rotational_margin_inr(leverage=10)
                     m_inr = float(auto_cfg.get("single_trade_margin_inr") or rot.get("margin_inr", 15762.39))
                     lev = int(auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
                     u_inr = float(coindcx_engine.get_coindcx_live_usdt_inr_rate())
                     watch_pairs = coindcx_engine.get_high_volatility_watchlist(top_n=12)
-                    _is_stg_worker = coindcx_engine.is_staging_environment()
                     _auto_flag = (
                         bool(auto_cfg.get("paper_autotrade_enabled", True))
                         if _is_stg_worker
@@ -642,24 +645,71 @@ def check_and_update_paper_orders():
 check_and_update_paper_orders()
 
 # ----------------- SIDEBAR: COMPACT PRO CONTROLS -----------------
+_is_experiment_env = coindcx_engine.is_experiment_environment()
+_is_staging_env = coindcx_engine.is_staging_environment()
+_env_tier = coindcx_engine.get_environment_tier()
+
 st.sidebar.markdown("### ⚡ Pro Terminal Setup")
+if _is_experiment_env:
+    st.sidebar.info("🧪 **EXPERIMENT LAB** (`Experiment` branch) — Mirrors Main setup for Backtesting & Testing. Live orders disabled.")
+elif _is_staging_env:
+    st.sidebar.warning("📝 **STAGING PAPER** (`staging` branch) — Live-Market Paper Trading mirroring Main setup → logs to **`Staging_Trades`** tab.")
+else:
+    st.sidebar.success("🟢 **MAIN LIVE** (`main` branch) — Production CoinDCX Live Trading → logs to **`Live_Trades`** / **`Closed_Trades`**.")
 
 wallet_data = dict(get_cached_balance() or {})
 _auto_cfg = coindcx_engine.get_autotrade_config()
+
+# Auto-mirror Main's exact Funds, Margin-per-Trade, Leverage & Strategy Mode ONCE on fresh Staging/Experiment boot
+if (_is_staging_env or _is_experiment_env) and not st.session_state.get("_main_mirror_boot_checked"):
+    st.session_state["_main_mirror_boot_checked"] = True
+    _need_sync = (
+        (_is_staging_env and float(_auto_cfg.get("paper_wallet_inr", 0.0) or 0.0) <= 0)
+        or (_is_experiment_env and not _auto_cfg.get("synced_from_main_at"))
+    )
+    if _need_sync:
+        _ok_ms, _, _synced_cfg = coindcx_engine.sync_setup_from_main(reset_paper_wallet=False)
+        if _ok_ms and isinstance(_synced_cfg, dict):
+            _auto_cfg = _synced_cfg
+
+if _is_staging_env:
+    wallet_data = coindcx_engine.get_paper_wallet_snapshot(_auto_cfg, wallet_data)
+elif _is_experiment_env and float(_auto_cfg.get("wallet_balance_inr", 0.0) or 0.0) > 0 and not wallet_data.get("is_live_api"):
+    _mw_exp = float(_auto_cfg["wallet_balance_inr"])
+    wallet_data["total_inr"] = _mw_exp
+    wallet_data["available_inr"] = _mw_exp
 
 # Allow live sync or manual override of Futures Wallet Balance (defaults to ₹47,287.18 if API is offline/expired)
 _init_wallet_inr = float(wallet_data.get("total_inr", 47287.18) or 47287.18)
 if _init_wallet_inr in (30000.0, 250000.0, 40569.80):
     _init_wallet_inr = 47287.18
 wallet_data["total_inr"] = _init_wallet_inr
-if float(wallet_data.get("available_inr", 0.0) or 0.0) in (0.0, 30000.0, 250000.0, 40569.80):
+if float(wallet_data.get("available_inr", 0.0) or 0.0) in (0.0, 30000.0, 250000.0, 40569.80) and not wallet_data.get("is_paper_wallet"):
     wallet_data["available_inr"] = _init_wallet_inr
 
-st.sidebar.metric(
-    "Futures Wallet",
-    f"₹{wallet_data['total_inr']:,.2f}",
-    f"Free: ₹{wallet_data['available_inr']:,.2f}"
+_wallet_lbl = (
+    "📝 Paper Wallet (Mirrors Main)"
+    if _is_staging_env
+    else ("🧪 Backtest Wallet (Mirrors Main)" if _is_experiment_env else "Futures Wallet")
 )
+_wallet_delta = (
+    f"Free: ₹{wallet_data['available_inr']:,.2f} | PnL: {'+' if float(wallet_data.get('net_pnl_inr', 0.0)) >= 0 else ''}₹{float(wallet_data.get('net_pnl_inr', 0.0)):,.2f}"
+    if _is_staging_env
+    else f"Free: ₹{wallet_data['available_inr']:,.2f}"
+)
+st.sidebar.metric(_wallet_lbl, f"₹{wallet_data['total_inr']:,.2f}", _wallet_delta)
+
+if _is_staging_env or _is_experiment_env:
+    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, Margin, Leverage & Strategy Mode from Google Sheet."):
+        _ok_s, _msg_s, _ = coindcx_engine.sync_setup_from_main(reset_paper_wallet=_is_staging_env)
+        st.session_state["_sb_main_sync_msg"] = (_ok_s, _msg_s)
+        st.session_state.pop("sidebar_single_trade_margin_input", None)
+        st.session_state.pop("sidebar_autotrade_strategy_mode", None)
+        get_cached_signals_scan.clear()
+        st.rerun()
+    if st.session_state.get("_sb_main_sync_msg"):
+        _sm_ok, _sm_txt = st.session_state.pop("_sb_main_sync_msg")
+        (st.sidebar.success if _sm_ok else st.sidebar.warning)(_sm_txt)
 
 if not wallet_data.get("is_live_api"):
     _manual_wallet_inr = st.sidebar.number_input(
@@ -736,9 +786,20 @@ usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 🤖 AutoTrade (3-Slot)")
-_is_staging_env = coindcx_engine.is_staging_environment()
 
-if _is_staging_env:
+if _is_experiment_env:
+    if _auto_cfg.get("enabled") or _auto_cfg.get("paper_autotrade_enabled"):
+        _auto_cfg = coindcx_engine.save_autotrade_config({"enabled": False, "paper_autotrade_enabled": False})
+    st.sidebar.toggle(
+        "Enable AutoTrade (10x Maker Limit) [LIVE]",
+        value=False,
+        disabled=True,
+        key="sidebar_live_autotrade_disabled_exp",
+        help="Live & Paper AutoTrade are disabled on Experiment branch. Use Backtest & Signals to validate changes before pushing to staging.",
+    )
+    autotrade_on = False
+    st.sidebar.caption("🧪 **Experiment (`Experiment` branch):** Backtesting & Strategy Lab only — Live orders & background AutoTrade are safely disabled.")
+elif _is_staging_env:
     if _auto_cfg.get("enabled"):
         _auto_cfg = coindcx_engine.save_autotrade_config({"enabled": False, "paper_autotrade_enabled": True})
     st.sidebar.toggle(
@@ -761,9 +822,9 @@ if _is_staging_env:
         value=_disk_paper_auto,
         key="sidebar_paper_autotrade_toggle",
         on_change=_on_sidebar_paper_autotrade_change,
-        help="Staging Mode: Executes AutoTrade strictly as Paper Trading on Live Market data and logs entries & results to Google Sheets.",
+        help="Staging Mode: Executes AutoTrade strictly as Paper Trading on Live Market data with Main's exact guards & 5% SL threshold, logging to 'Staging_Trades'.",
     )
-    st.sidebar.caption("🧪 **Staging (`staging` branch):** Live AutoTrade is disabled. AutoTrade runs **strictly as Paper Trading** on Live Market data.")
+    st.sidebar.caption("📝 **Staging (`staging` branch):** Live AutoTrade is disabled. Paper AutoTrade mirrors Main's Funds, Margin, & **5% Daily SL Lock** → logs to **`Staging_Trades`**.")
 else:
     # Sync stale browser session toggle state if v9 disarmed AutoTrade on disk
     _disk_auto_enabled = bool(_auto_cfg.get("enabled", False))
@@ -896,7 +957,7 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
         ["🌙 Dark Pro Terminal", "☀️ Crisp Light Theme"],
         index=0
     )
-    _saved_email_on = bool(_auto_cfg.get("email_alerts_enabled", False if _is_staging_env else True))
+    _saved_email_on = bool(_auto_cfg.get("email_alerts_enabled", False if (_is_staging_env or _is_experiment_env) else True))
     if "monitor_on" not in st.session_state:
         st.session_state["monitor_on"] = _saved_email_on
 
@@ -1603,7 +1664,7 @@ live_price = float(ticker.get("last_price", 0.0))
 # 2. RESPONSIVE SECTION SELECTOR (VERTICAL ON MOBILE/IPHONE, HORIZONTAL ON DESKTOP)
 # ==============================================================================
 if st.session_state.get("active_nav_section") not in NAV_SECTIONS:
-    st.session_state.active_nav_section = NAV_SECTIONS[0]
+    st.session_state.active_nav_section = "🧪 Backtest" if _is_experiment_env else NAV_SECTIONS[0]
 
 active_section = st.radio(
     "Navigate Section",
@@ -2293,7 +2354,7 @@ elif active_section == "🎯 Execute":
                 exec_mode = st.radio(
                     "Target",
                     ["⚡ Live CoinDCX", "📝 Paper Trade"],
-                    index=1 if coindcx_engine.is_staging_environment() else (0 if wallet["is_live_api"] else 1),
+                    index=1 if (coindcx_engine.is_staging_environment() or coindcx_engine.is_experiment_environment()) else (0 if wallet["is_live_api"] else 1),
                     horizontal=True,
                     key=f"exec_mode_choice_{selected_pair}",
                     label_visibility="collapsed"
@@ -3223,34 +3284,81 @@ elif active_section == "📈 Chart & Levels":
         st.warning(f"Key levels unavailable for {selected_pair}.")
 
 # ==============================================================================
-# SECTION 5: 1-CRYPTO-AT-A-TIME HIGH-VOLATILITY BACKTEST
+# SECTION 5: MAIN-PARITY 3-SLOT HIGH-VOLATILITY BACKTEST (EXPERIMENT & LAB)
 # ==============================================================================
 elif active_section == "🧪 Backtest":
-    st.markdown("#### 🧪 3-Slot Portfolio High-Volatility Backtest (Up to 3 Concurrent Trades @ 10x Leverage)")
+    _bt_hdr = (
+        "#### 🧪 Experiment Lab — Main-Parity 3-Slot Backtest (Mirrors Main Funds, Margin, Signals & SL Threshold)"
+        if _is_experiment_env
+        else "#### 🧪 3-Slot Portfolio High-Volatility Backtest (Main-Parity Guards & SL Threshold)"
+    )
+    st.markdown(_bt_hdr)
     _bt_mode_keys = [k for k, _ in strategy_registry.AUTOTRADE_MODE_CHOICES]
     _bt_mode_labels = dict(strategy_registry.AUTOTRADE_MODE_CHOICES)
     if st.session_state.get("bt_multi_strat_mode") not in _bt_mode_keys:
         st.session_state["bt_multi_strat_mode"] = selected_autotrade_mode
 
-    bc0, bc1, bc2, bc3 = st.columns([1.8, 1.0, 1.1, 1.0])
+    bc0, bc1, bc2, bc3 = st.columns([1.8, 0.9, 1.1, 1.0])
     bt_strat_mode = bc0.selectbox(
         "Strategy Mode",
         options=_bt_mode_keys,
         format_func=lambda k: _bt_mode_labels.get(k, k),
         key="bt_multi_strat_mode",
     )
-    st.caption(
-        f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` — matches 24/7 AutoTrade execution "
-        "(`Box Theory Sweep` Priority 1 at outer `RH`/`SH`/`RL`/`SL` zones + Daily `50 EMA`; `15m 50/200 EMA Pullback` Priority 2 "
-        "with 3h Structure-Aware `TP1`, `SL` beyond `15m 200 EMA`, `TP2` at `RL` / `RH`, and Max 2 Concurrent EMA Slots). *Backtest results use historical CoinDCX data and are hypothetical.*"
-    )
     bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days"], index=0, key="bt_multi_dur")
-    bt_capital = bc2.number_input("Single-Trade Margin (₹)", min_value=5000, value=int(margin_inr), step=5000, key="bt_multi_cap")
-    bt_lev = bc3.slider("Leverage (x)", 1, 20, 10, key="bt_multi_lev")
+    _default_bt_wallet = max(1000.0, round(float(wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
+    bt_wallet_inr = bc2.number_input(
+        "Starting Funds / Wallet (₹)",
+        min_value=1000.0,
+        max_value=10000000.0,
+        value=float(_default_bt_wallet),
+        step=1000.0,
+        format="%.2f",
+        key="bt_multi_wallet",
+        help="Mirrors Main's Futures Wallet balance so the 5% Daily Loss Stop (SL Threshold) & Free-Margin Guard behave identically to Main.",
+    )
+    bt_capital = bc3.number_input(
+        "Single-Trade Margin (₹)",
+        min_value=1000,
+        max_value=5000000,
+        value=max(1000, int(round(margin_inr))),
+        step=1000,
+        key="bt_multi_cap",
+        help="Mirrors Main's exact Single-Trade Margin per slot.",
+    )
 
-    if st.button("🏆 Run 3-Slot Portfolio Backtest (All 12 High-Vol Movers — Up to 3 Concurrent Trades)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
+    bg1, bg2, bg3, bg4 = st.columns([1.0, 1.1, 0.9, 1.4])
+    bt_lev = bg1.slider("Leverage (x)", 1, 20, int(leverage), key="bt_multi_lev")
+    bt_sl_threshold_pct = bg2.number_input(
+        "Daily Loss Stop / SL Threshold (%)",
+        min_value=0.0,
+        max_value=25.0,
+        value=float(getattr(strategy_registry, "DAILY_WALLET_LOSS_STOP_PCT", 5.0)),
+        step=0.5,
+        format="%.1f",
+        key="bt_daily_loss_stop_pct",
+        help="Locks new trades for the rest of the IST day when realized daily loss reaches this % of day-start wallet (Main = 5.0%; set 0.0 to A/B test without guard).",
+    )
+    bt_max_slots = bg3.selectbox("Max Slots", [1, 2, 3, 4], index=2, key="bt_max_slots")
+    with bg4:
+        st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
+        bt_free_margin_guard = st.checkbox(
+            "Enforce Main <90% Free-Margin Guard",
+            value=True,
+            key="bt_free_margin_guard",
+            help="Skips new entries when remaining free wallet equity is below 90% of Single-Trade Margin (identical to Main).",
+        )
+
+    st.caption(
+        f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` • "
+        f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Margin/Trade:** `₹{bt_capital:,.0f}` @ `{bt_lev}x` | "
+        f"**SL Threshold Lock:** `{bt_sl_threshold_pct:.1f}%/day` (`₹{bt_wallet_inr * bt_sl_threshold_pct / 100.0:,.0f}`) | "
+        f"**Slots:** `{bt_max_slots}` (Max 2 EMA + 4h Zone Lock). *Backtest results use historical CoinDCX data and are hypothetical.*"
+    )
+
+    if st.button("🏆 Run Main-Parity Portfolio Backtest (All 12 High-Vol Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
-        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
+        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x, {bt_sl_threshold_pct:.1f}% SL stop)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
                 pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
                 duration_days=days_p,
@@ -3258,6 +3366,10 @@ elif active_section == "🧪 Backtest":
                 leverage=bt_lev,
                 usd_inr=usd_inr,
                 strategy_id=bt_strat_mode,
+                wallet_inr=float(bt_wallet_inr),
+                max_concurrent_trades=int(bt_max_slots),
+                daily_loss_stop_pct=float(bt_sl_threshold_pct),
+                enforce_free_margin_guard=bool(bt_free_margin_guard),
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 
@@ -3272,13 +3384,67 @@ elif active_section == "🧪 Backtest":
         _tot_l = int(port_out["loss_count"])
         _tot_wr = float(port_out["win_rate_pct"])
         _tot_pf = float(port_out["profit_factor"])
+        _start_w = float(port_out.get("starting_wallet_inr") or bt_wallet_inr or (_used_m * 3.0))
+        _end_w = float(port_out.get("ending_wallet_inr") or (_start_w + _tot_net))
+        _w_roi = float(port_out.get("wallet_roi_pct") or ((_tot_net / _start_w * 100.0) if _start_w > 0 else 0.0))
+        _max_dd = float(port_out.get("max_drawdown_pct") or 0.0)
+        _ga = port_out.get("guards_audit") or {}
         _eq_1l_profit = (_tot_roi / 100.0) * 100000.0
 
-        pk1, pk2, pk3, pk4 = st.columns(4)
-        pk1.metric("Net Portfolio Profit", f"₹{_tot_net:,.2f}", f"{_tot_roi:+.2f}% ROI")
-        pk2.metric("Total Trades (3 Slots)", _tot_tr)
-        pk3.metric("Win Rate", f"{_tot_wr}%", f"{_tot_w}W / {_tot_l}L")
-        pk4.metric("Profit Factor", f"{_tot_pf}")
+        pk1, pk2, pk3, pk4, pk5 = st.columns(5)
+        pk1.metric("Net Portfolio Profit", f"{'+' if _tot_net >= 0 else ''}₹{_tot_net:,.2f}", f"{_w_roi:+.2f}% on Wallet")
+        pk2.metric("Ending Wallet Equity", f"₹{_end_w:,.2f}", f"Start ₹{_start_w:,.0f} • DD -{_max_dd:.1f}%")
+        pk3.metric("Total Trades", _tot_tr, f"{bt_max_slots}-Slot Portfolio")
+        pk4.metric("Win Rate", f"{_tot_wr}%", f"{_tot_w}W / {_tot_l}L")
+        pk5.metric("Profit Factor", f"{_tot_pf}", f"Margin ROI {_tot_roi:+.1f}%")
+
+        # Main-Parity Guard Audit Strip (SL Threshold Locks, Slot Cap, EMA Cap, Free-Margin & 4h Lock)
+        if _ga:
+            _lk_days = int(_ga.get("days_locked_by_sl_threshold", 0) or 0)
+            _blk_sl = int(_ga.get("blocked_by_sl_threshold", 0) or 0)
+            _blk_slot = int(_ga.get("blocked_by_slot_cap", 0) or 0)
+            _blk_ema = int(_ga.get("blocked_by_ema_cap", 0) or 0)
+            _blk_fm = int(_ga.get("blocked_by_free_margin", 0) or 0)
+            _blk_z4 = int(_ga.get("blocked_by_4h_zone_lock", 0) or 0)
+            _lk_dates_s = ", ".join((_ga.get("locked_dates") or [])[:8])
+            st.info(
+                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold):** "
+                f"**{_lk_days} day(s)** hit Daily Loss Stop (`{_blk_sl}` trades blocked{f': {_lk_dates_s}' if _lk_dates_s else ''}) • "
+                f"Slot Cap Blocked: `{_blk_slot}` • Max 2 EMA Cap Blocked: `{_blk_ema}` • "
+                f"<90% Free-Margin Blocked: `{_blk_fm}` • 4h Zone Lock Blocked: `{_blk_z4}`"
+            )
+
+        _eq_curve = port_out.get("equity_curve") or []
+        if len(_eq_curve) >= 2:
+            _eq_x = [pt["time"] for pt in _eq_curve]
+            _eq_y = [float(pt["equity_inr"]) for pt in _eq_curve]
+            _eq_fig = go.Figure()
+            _eq_fig.add_trace(go.Scatter(
+                x=_eq_x, y=_eq_y, mode="lines", name="Wallet Equity (₹)",
+                line=dict(color="#10b981" if _end_w >= _start_w else "#ef4444", width=2.4),
+                fill="tozeroy",
+                fillcolor="rgba(16,185,129,0.12)" if _end_w >= _start_w else "rgba(239,68,68,0.12)",
+            ))
+            _lk_pts = [pt for pt in _eq_curve if pt.get("day_locked")]
+            if _lk_pts:
+                _eq_fig.add_trace(go.Scatter(
+                    x=[pt["time"] for pt in _lk_pts],
+                    y=[float(pt["equity_inr"]) for pt in _lk_pts],
+                    mode="markers",
+                    name="Daily SL Threshold Lock",
+                    marker=dict(color="#ef4444", size=7, symbol="x"),
+                ))
+            _eq_fig.add_hline(y=_start_w, line_dash="dot", line_color="#64748b", line_width=1.2)
+            _eq_fig.update_layout(
+                height=240,
+                template="plotly_dark" if not is_light_theme else "plotly_white",
+                paper_bgcolor=plot_paper, plot_bgcolor=plot_bg,
+                margin=dict(l=10, r=10, t=22, b=10),
+                title=dict(text="📈 Portfolio Wallet Equity Curve (₹)", font=dict(size=13)),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+            )
+            st.plotly_chart(_eq_fig, use_container_width=True)
 
         _sb = port_out.get("strategy_breakdown") or {}
         if _sb:
@@ -3537,6 +3703,39 @@ elif active_section == "🤖 AI Advisor":
                 f"<thead><tr><th>#</th><th>Exit Time</th><th>Pair</th><th>Side</th><th>Entry ($)</th>"
                 f"<th>Exit ($)</th><th>SL ($)</th><th>Net PnL (₹)</th><th>Outcome & Diagnostic</th></tr></thead>"
                 f"<tbody>{''.join(_ct_rows)}</tbody></table></div>"
+            )
+        staging_list = sheet_data.get("staging_trades", [])
+        if staging_list:
+            st.markdown("#### 3. `Staging_Trades` Worksheet (Staging Live-Market Paper Trading Ledger)")
+            _st_rows = []
+            for idx_st, r_st in enumerate(reversed(staging_list), 1):
+                _sp_raw = str(r_st.get("Net PnL (INR)", "")).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
+                try:
+                    _sp_f = float(_sp_raw) if _sp_raw else None
+                except Exception:
+                    _sp_f = None
+                _sp_col = ("#10b981" if _sp_f >= 0 else "#ef4444") if _sp_f is not None else "#3b82f6"
+                _sp_txt = (f"{'+' if _sp_f >= 0 else ''}₹{_sp_f:,.2f}") if _sp_f is not None else "Open"
+                _dir_st = str(r_st.get("Direction", ""))
+                _b_cls = "badge-buy" if _dir_st in ("LONG", "BUY") else "badge-sell"
+                _st_rows.append(
+                    f"<tr>"
+                    f"<td>{idx_st}</td>"
+                    f"<td>{r_st.get('Timestamp (IST)', '')}</td>"
+                    f"<td style='font-weight:800;'>{r_st.get('Pair', '')}</td>"
+                    f"<td><span class='{_b_cls}'>{_dir_st}</span></td>"
+                    f"<td>${r_st.get('Entry ($)', '')}</td>"
+                    f"<td>{('$' + str(r_st.get('Exit Price ($)', ''))) if r_st.get('Exit Price ($)') else '—'}</td>"
+                    f"<td>₹{r_st.get('Margin (INR)', '')} ({r_st.get('Leverage', '')})</td>"
+                    f"<td style='color:{_sp_col};font-weight:800;'>{_sp_txt}</td>"
+                    f"<td>{r_st.get('Status', '')}</td>"
+                    f"</tr>"
+                )
+            st.html(
+                f"<div class='pro-table-wrap'><table class='pro-table'>"
+                f"<thead><tr><th>#</th><th>Timestamp (IST)</th><th>Pair</th><th>Side</th><th>Entry ($)</th>"
+                f"<th>Exit ($)</th><th>Margin (Lev)</th><th>Net PnL (₹)</th><th>Status</th></tr></thead>"
+                f"<tbody>{''.join(_st_rows)}</tbody></table></div>"
             )
 
     st.markdown("---")

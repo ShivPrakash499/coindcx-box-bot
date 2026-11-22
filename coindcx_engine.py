@@ -4192,13 +4192,18 @@ _DURABLE_AUTOTRADE_KEYS = (
     "leverage",
     "daily_start_wallet",
     "daily_loss_stop_hit",
+    "paper_wallet_inr",
+    "paper_starting_wallet_inr",
+    "paper_daily_start_wallet",
+    "paper_realized_pnl_inr",
+    "synced_from_main_at",
     "active_trade_lock",
     "active_trade_locks",
 )
 
 
 def get_git_branch_name() -> str:
-    """Returns the active git branch / deployment name ('staging', 'main', etc.) in both local and cloud runs."""
+    """Returns the active git branch / deployment name ('Experiment', 'staging', 'main', etc.) in both local and cloud runs."""
     env_id = str(os.getenv("APP_DEPLOYMENT_ID", "") or os.getenv("STREAMLIT_BRANCH", "") or "").strip()
     if env_id:
         return env_id
@@ -4213,12 +4218,39 @@ def get_git_branch_name() -> str:
     return ""
 
 
+def is_experiment_environment() -> bool:
+    """
+    True when running on the `Experiment` branch or Experiment deployment.
+    On Experiment, Live CoinDCX orders and 24/7 background AutoTrade/Emails are disabled by default;
+    it mirrors Main's live setup strictly for testing new changes and full-parity backtesting.
+    """
+    app_env = str(os.getenv("APP_ENV", "") or "").strip().lower()
+    if app_env == "experiment":
+        return True
+    if app_env in ("staging", "main", "production"):
+        return False
+    branch = get_git_branch_name().lower()
+    if branch == "experiment" or "experiment" in branch:
+        return True
+    host = str(os.getenv("HOSTNAME", "") or os.getenv("STREAMLIT_SERVER_ADDRESS", "") or os.getenv("APP_WEB_URL", "") or "").lower()
+    if "experiment" in host:
+        return True
+    return False
+
+
 def is_staging_environment() -> bool:
     """
     True when running on the `staging` branch or staging deployment (`np-shiv-prakash-trade-assistant`).
     On staging, Live CoinDCX AutoTrade is disabled and AutoTrade executes strictly as Paper Trading
-    on live market data.
+    on live market data (mirroring Main's Funds, Margin, Leverage, Strategy & 5% SL Threshold).
     """
+    app_env = str(os.getenv("APP_ENV", "") or "").strip().lower()
+    if app_env == "staging":
+        return True
+    if app_env in ("experiment", "main", "production"):
+        return False
+    if is_experiment_environment():
+        return False
     branch = get_git_branch_name().lower()
     if branch == "staging" or "staging" in branch:
         return True
@@ -4228,9 +4260,108 @@ def is_staging_environment() -> bool:
     return False
 
 
+def get_environment_tier() -> str:
+    """Returns the active 3-tier deployment role: 'experiment', 'staging', or 'main'."""
+    if is_experiment_environment():
+        return "experiment"
+    if is_staging_environment():
+        return "staging"
+    return "main"
+
+
+def get_paper_wallet_snapshot(cfg: dict | None = None, live_wallet: dict | None = None) -> dict:
+    """
+    Returns Staging's live-market Paper Trading wallet snapshot with exact CoinDCX wallet keys
+    (`total_inr`, `available_inr`, `locked_inr`, `starting_inr`, `net_pnl_inr`, `is_live_api=True`),
+    accounting for locked margin in open paper trades and realized PnL from closed paper trades.
+    """
+    c = dict(cfg) if isinstance(cfg, dict) else get_autotrade_config()
+    pw = float(c.get("paper_wallet_inr", 0.0) or 0.0)
+    if pw <= 0:
+        lw_tot = float((live_wallet or {}).get("total_inr", 0.0) or 0.0) if isinstance(live_wallet, dict) else 0.0
+        pw = lw_tot if lw_tot > 0 else float(c.get("wallet_balance_inr", 47287.18) or 47287.18)
+    start_pw = float(c.get("paper_starting_wallet_inr", 0.0) or 0.0) or pw
+    locks_map = _get_active_locks_map(c)
+    locked_inr = round(
+        sum(
+            float(lk.get("margin_inr", 0.0) or 0.0)
+            for lk in locks_map.values()
+            if isinstance(lk, dict) and not lk.get("is_live_exchange")
+        ),
+        2,
+    )
+    avail_inr = round(max(0.0, pw - locked_inr), 2)
+    net_pnl = round(pw - start_pw, 2)
+    return {
+        "total_inr": round(pw, 2),
+        "available_inr": avail_inr,
+        "inr_cash": avail_inr,
+        "locked_inr": locked_inr,
+        "usdt_cash": 0.0,
+        "available_usdt": 0.0,
+        "locked_margin_usd": 0.0,
+        "cross_user_margin_usd": 0.0,
+        "starting_inr": round(start_pw, 2),
+        "net_pnl_inr": net_pnl,
+        "live_usd_inr": float((live_wallet or {}).get("live_usd_inr", 0.0) or 0.0) or get_coindcx_live_usdt_inr_rate(),
+        "is_live_api": True,
+        "is_paper_wallet": True,
+        "source": "Staging Paper Wallet (Mirrors Main)",
+    }
+
+
+def sync_setup_from_main(reset_paper_wallet: bool = False) -> tuple[bool, str, dict]:
+    """
+    Mirrors Main's exact live setup (Funds/Wallet Balance, Single-Trade Margin, Leverage, and
+    Strategy Mode) from the shared Google Sheet into Staging (Paper Trading) or Experiment (Backtest Lab).
+    """
+    try:
+        import sheets_logger as _sl
+        main_setup = _sl.load_main_live_setup_from_sheet(force_refresh=True)
+        if not isinstance(main_setup, dict):
+            return False, "Could not load Main live setup from Google Sheet (`_AutoTrade_State` / `_Live_Account_Sync`).", {}
+        cfg = get_autotrade_config()
+        today = datetime.now(IST).strftime("%Y-%m-%d")
+        now_s = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        m_wallet = float(main_setup.get("wallet_balance_inr", 0.0) or 0.0)
+        m_margin = float(main_setup.get("single_trade_margin_inr", 0.0) or 0.0)
+        m_custom = bool(main_setup.get("user_custom_margin", False))
+        m_lev = int(main_setup.get("leverage", 10) or 10)
+        m_mode = str(main_setup.get("autotrade_strategy_mode") or "box_plus_ema50_200_regime")
+
+        updates = {
+            "autotrade_strategy_mode": m_mode,
+            "leverage": m_lev,
+            "user_custom_margin": m_custom,
+            "synced_from_main_at": now_s,
+        }
+        if m_wallet > 0:
+            updates["wallet_balance_inr"] = round(m_wallet, 2)
+        if m_margin > 0:
+            updates["single_trade_margin_inr"] = round(m_margin, 2)
+        elif m_wallet > 0:
+            updates["single_trade_margin_inr"] = round(m_wallet * TRADE_ALLOCATION_FRACTION, 2)
+
+        cur_pw = float(cfg.get("paper_wallet_inr", 0.0) or 0.0)
+        if m_wallet > 0 and (reset_paper_wallet or cur_pw <= 0):
+            updates["paper_wallet_inr"] = round(m_wallet, 2)
+            updates["paper_starting_wallet_inr"] = round(m_wallet, 2)
+            updates["paper_daily_start_wallet"] = {"date": today, "inr": round(m_wallet, 2)}
+            updates["paper_realized_pnl_inr"] = 0.0
+            updates["daily_loss_stop_hit"] = ""
+
+        saved = save_autotrade_config(updates)
+        return True, (
+            f"Synced from Main: Wallet ₹{m_wallet:,.2f} | Margin ₹{updates.get('single_trade_margin_inr', m_margin):,.2f} "
+            f"@ {m_lev}x | Mode `{m_mode}`"
+        ), saved
+    except Exception as e:
+        return False, f"Sync from Main failed: {e}", {}
+
+
 def _get_deployment_id() -> str:
     """
-    Identifies this deployment ('main' / 'staging') so main and staging never share AutoTrade state.
+    Identifies this deployment ('main' / 'staging' / 'Experiment') so tiers never share AutoTrade state.
     Only active on Streamlit Cloud (/mount/src/...) so local runs and tests never touch the shared Google Sheet.
     """
     env_id = str(os.getenv("APP_DEPLOYMENT_ID", "") or "").strip()
@@ -4292,11 +4423,12 @@ def get_autotrade_config() -> dict:
     _restore_autotrade_state_once()
 
     _is_stg = is_staging_environment()
+    _is_exp = is_experiment_environment()
     default_cfg = {
         "enabled": False,
         "paper_autotrade_enabled": True if _is_stg else False,
-        "email_alerts_enabled": False if _is_stg else True,
-        "paper_only": _is_stg,
+        "email_alerts_enabled": False if (_is_stg or _is_exp) else True,
+        "paper_only": (_is_stg or _is_exp),
         "autotrade_strategy_mode": "box_plus_ema50_200_regime",
         "wallet_balance_inr": 47287.18,
         "single_trade_margin_inr": 15762.39,
@@ -4316,7 +4448,7 @@ def get_autotrade_config() -> dict:
             if isinstance(cached_data, dict) and _AUTOTRADE_CFG_MEM_CACHE.get("mtime") == mtime:
                 res = dict(default_cfg)
                 res.update(cached_data)
-                res["paper_only"] = _is_stg
+                res["paper_only"] = (_is_stg or _is_exp)
                 wb_c = float(res.get("wallet_balance_inr", 47287.18) or 47287.18)
                 sm_c = float(res.get("single_trade_margin_inr", 0) or 0)
                 if sm_c <= 0 or sm_c in (15762.39, 30000.0, 250000.0, 100000.0) or not res.get("user_custom_margin"):
@@ -4328,7 +4460,7 @@ def get_autotrade_config() -> dict:
                     _AUTOTRADE_CFG_MEM_CACHE["data"] = dict(saved)
                     _AUTOTRADE_CFG_MEM_CACHE["mtime"] = mtime
                     default_cfg.update(saved)
-                    default_cfg["paper_only"] = _is_stg
+                    default_cfg["paper_only"] = (_is_stg or _is_exp)
                     wb = float(default_cfg.get("wallet_balance_inr", 47287.18) or 47287.18)
                     sm_val = float(default_cfg.get("single_trade_margin_inr", 0) or 0)
                     if sm_val <= 0 or sm_val in (15762.39, 30000.0, 250000.0, 100000.0) or not default_cfg.get("user_custom_margin"):
@@ -4808,6 +4940,7 @@ def register_app_trade_lock(
                 lev_f = int(leverage or 10)
                 proj_tp1 = round(abs(tp1_f - e_f) / e_f * m_f * lev_f, 2) if e_f > 0 else 0.0
                 proj_sl = round(-abs(e_f - sl_f) / e_f * m_f * lev_f, 2) if e_f > 0 else 0.0
+                _pw_snap = get_paper_wallet_snapshot(cfg) if is_paper_autotrade else {}
                 sheets_logger.log_trade_to_google_sheet({
                     "timestamp": now_str,
                     "pair": pair,
@@ -4824,6 +4957,9 @@ def register_app_trade_lock(
                     "status": _sheet_status,
                     "strategy_name": _sheet_strat_name,
                     "trigger_reason": f"{mode} | E1: ${e_f}, E2: ${float(entry2_sweep or 0.0)}",
+                    "is_staging_paper": bool(is_paper_autotrade),
+                    "worksheet_name": "Staging_Trades" if is_paper_autotrade else "Live_Trades",
+                    "paper_wallet_inr": _pw_snap.get("total_inr", "") if is_paper_autotrade else "",
                 })
             except Exception as _se:
                 print(f"[Auto Sheet Log Notice]: {_se}")
@@ -5567,32 +5703,72 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                     def _log_paper_close_async(exit_p: float, reason_str: str):
                         if is_live_ex:
                             return
+                        e_p = float(lock.get("entry", 0.0) or 0.0)
+                        m_inr = float(lock.get("margin_inr", 20000.0) or 20000.0)
+                        lev_v = int(lock.get("leverage", 10) or 10)
+                        raw_pct = ((exit_p - e_p) / e_p) if (is_long and e_p > 0) else (((e_p - exit_p) / e_p) if e_p > 0 else 0.0)
+                        # If TP1 was already hit on a 50/50 strategy, blend 50% at TP1 + 50% at exit_p
+                        is_s3_p = (str(lock.get("strategy_id", "")) == "ema9_retest")
+                        if lock.get("tp1_hit") and not is_s3_p and l_tp1 > 0 and e_p > 0:
+                            tp1_pct = ((l_tp1 - e_p) / e_p) if is_long else ((e_p - l_tp1) / e_p)
+                            raw_pct = 0.5 * tp1_pct + 0.5 * raw_pct
+                        roe_v = round((raw_pct * lev_v - 0.0118) * 100.0, 2)
+                        net_inr = round(m_inr * (roe_v / 100.0), 2)
+
+                        # Synchronously settle Staging Paper Wallet & immediately check 5% Daily Loss Stop (SL Threshold)!
+                        pw_after = 0.0
+                        try:
+                            cur_cfg_p = get_autotrade_config()
+                            pw_snap_before = get_paper_wallet_snapshot(cur_cfg_p)
+                            cur_pw = float(pw_snap_before.get("total_inr", 0.0) or 0.0)
+                            pw_after = round(max(0.0, cur_pw + net_inr), 2)
+                            tot_real_pnl = round(float(cur_cfg_p.get("paper_realized_pnl_inr", 0.0) or 0.0) + net_inr, 2)
+                            today_p = datetime.now(IST).strftime("%Y-%m-%d")
+                            p_ds = cur_cfg_p.get("paper_daily_start_wallet")
+                            if not (isinstance(p_ds, dict) and p_ds.get("date") == today_p and float(p_ds.get("inr", 0.0) or 0.0) > 0):
+                                p_ds = {"date": today_p, "inr": round(cur_pw, 2)}
+                            save_autotrade_config({
+                                "paper_wallet_inr": pw_after,
+                                "paper_starting_wallet_inr": float(cur_cfg_p.get("paper_starting_wallet_inr", 0.0) or cur_pw),
+                                "paper_daily_start_wallet": p_ds,
+                                "paper_realized_pnl_inr": tot_real_pnl,
+                            })
+                            check_live_daily_loss_stop(get_paper_wallet_snapshot())
+                        except Exception as _pwe:
+                            print(f"[Paper Wallet Settle Notice]: {_pwe}")
+
+                        outcome_lbl = "PAPER_WIN" if net_inr >= 0 else "PAPER_LOSS"
+                        sign_s = "+" if net_inr >= 0 else "-"
+                        status_cell = f"{outcome_lbl} ({'+' if roe_v >= 0 else ''}{roe_v:.2f}% ROE | {sign_s}Rs.{abs(net_inr):,.0f} @ ${exit_p})"
+                        _strat_names_p = {
+                            "box_theory": "Strategy 1: Box Theory Sweep (Staging Paper AutoTrade)",
+                            "ema50_200": "Strategy 4: 15m 50/200 EMA Pullback (Staging Paper AutoTrade)",
+                            "ema9_retest": "Strategy 3: 9 EMA Touch & Confirm (Staging Paper AutoTrade)",
+                        }
+                        _s_name_p = _strat_names_p.get(str(lock.get("strategy_id", "box_theory")), "Staging Paper AutoTrade")
+
                         def _worker_close():
                             try:
                                 import sheets_logger
-                                e_p = float(lock.get("entry", 0.0) or 0.0)
-                                m_inr = float(lock.get("margin_inr", 20000.0) or 20000.0)
-                                lev_v = int(lock.get("leverage", 10) or 10)
-                                raw_pct = ((exit_p - e_p) / e_p) if (is_long and e_p > 0) else (((e_p - exit_p) / e_p) if e_p > 0 else 0.0)
-                                # If TP1 was already hit on a 50/50 strategy, blend 50% at TP1 + 50% at exit_p
-                                is_s3_p = (str(lock.get("strategy_id", "")) == "ema9_retest")
-                                if lock.get("tp1_hit") and not is_s3_p and l_tp1 > 0 and e_p > 0:
-                                    tp1_pct = ((l_tp1 - e_p) / e_p) if is_long else ((e_p - l_tp1) / e_p)
-                                    raw_pct = 0.5 * tp1_pct + 0.5 * raw_pct
-                                roe_v = round((raw_pct * lev_v - 0.0118) * 100.0, 2)
-                                net_inr = round(m_inr * (roe_v / 100.0), 2)
-                                outcome_lbl = "PAPER_WIN" if net_inr >= 0 else "PAPER_LOSS"
-                                sign_s = "+" if net_inr >= 0 else "-"
-                                status_cell = f"{outcome_lbl} ({'+' if roe_v >= 0 else ''}{roe_v:.2f}% ROE | {sign_s}Rs.{abs(net_inr):,.0f} @ ${exit_p})"
                                 sheets_logger.log_trade_closed({
+                                    "entry_time": lock.get("opened_at", ""),
                                     "exit_time": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
                                     "pair": l_pair,
                                     "direction": l_dir,
                                     "entry_price": e_p,
                                     "stop_loss": l_sl,
+                                    "tp1": l_tp1,
+                                    "tp2": l_tp2,
+                                    "qty": round(float(lock.get("qty1", 0.0) or 0.0) + float(lock.get("qty2", 0.0) or 0.0), 4),
+                                    "margin_inr": m_inr,
+                                    "leverage": lev_v,
+                                    "strategy_name": _s_name_p,
                                     "exit_price": exit_p,
                                     "exit_reason": f"[STAGING PAPER] {reason_str}",
                                     "net_pnl_inr": net_inr,
+                                    "roe_pct": roe_v,
+                                    "paper_wallet_after_inr": pw_after,
+                                    "is_staging_paper": True,
                                     "update_live_sheet_status": status_cell,
                                 })
                             except Exception as _ce:
@@ -5809,10 +5985,20 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
 def unlock_autotrade_daily_loss_stop(wallet: dict | None = None) -> dict:
     """
     Unlocks AutoTrade from the Sidebar when blocked by the 5% Daily Loss Stop (for example after
-    transferring funds from the Futures Wallet to the INR Wallet) by syncing today's start-wallet
-    baseline to the current Futures Wallet balance and clearing `daily_loss_stop_hit`.
+    transferring funds from the Futures Wallet to the INR Wallet, or resetting Staging Paper stop)
+    by syncing today's start-wallet baseline to the current wallet balance and clearing `daily_loss_stop_hit`.
     """
     today = datetime.now(IST).strftime("%Y-%m-%d")
+    is_stg = is_staging_environment()
+    if is_stg and not (isinstance(wallet, dict) and wallet.get("is_live_api") and not wallet.get("is_paper_wallet")):
+        w = wallet if isinstance(wallet, dict) else get_paper_wallet_snapshot()
+        cur = float((w or {}).get("total_inr", 0.0) or 0.0)
+        if cur <= 0:
+            cur = float(get_autotrade_config().get("paper_wallet_inr", 0.0) or get_autotrade_config().get("wallet_balance_inr", 0.0) or 0.0)
+        ds = {"date": today, "inr": round(cur, 2)}
+        save_autotrade_config({"paper_daily_start_wallet": ds, "daily_start_wallet": ds, "daily_loss_stop_hit": ""})
+        return ds
+
     w = wallet if isinstance(wallet, dict) else fetch_coindcx_futures_balance()
     cur = float((w or {}).get("total_inr", 0.0) or 0.0)
     if cur <= 0:
@@ -5824,23 +6010,60 @@ def unlock_autotrade_daily_loss_stop(wallet: dict | None = None) -> dict:
 
 def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, dict]:
     """
-    Live 5% Daily Loss Stop (IST day):
-      - Day-start baseline = first verified live futures wallet balance seen after 00:00 IST (persisted).
-      - Wallet balance = realized balance incl. locked margin (excludes unrealized PnL), so it already includes fees.
-      - If (baseline - current) >= DAILY_WALLET_LOSS_STOP_PCT% of baseline -> block new trades until next IST day
-        (or until unlocked via `unlock_autotrade_daily_loss_stop` from the Sidebar).
-    Fails open (does not block) only when the live wallet cannot be verified (orders would fail anyway).
+    Live & Staging-Paper 5% Daily Loss Stop (IST day — SL Threshold AutoTrade Lock):
+      - On `main`: Day-start baseline = first verified live futures wallet balance after 00:00 IST.
+      - On `staging`: Enforces the EXACT SAME 5% Daily Loss Stop against Staging's mirrored virtual
+        Paper Wallet (`paper_wallet_inr` vs `paper_daily_start_wallet`) so hitting SL thresholds locks
+        Staging Paper AutoTrade identically to Main!
+      - If (baseline - current) >= DAILY_WALLET_LOSS_STOP_PCT% of baseline -> block new trades until
+        next IST day (or until unlocked via `unlock_autotrade_daily_loss_stop` from the Sidebar).
     """
     import strategies as _strategies
     pct = float(getattr(_strategies, "DAILY_WALLET_LOSS_STOP_PCT", 5.0) or 5.0)
     today = datetime.now(IST).strftime("%Y-%m-%d")
+    cfg = get_autotrade_config()
+    is_stg_paper = (
+        isinstance(wallet, dict) and bool(wallet.get("is_paper_wallet"))
+    ) or (
+        is_staging_environment() and (wallet is None or not bool((wallet or {}).get("is_live_api")))
+    ) or (
+        is_staging_environment() and float(cfg.get("paper_wallet_inr", 0.0) or 0.0) > 0
+    )
+
+    if is_stg_paper:
+        pw_snap = wallet if (isinstance(wallet, dict) and wallet.get("is_paper_wallet")) else get_paper_wallet_snapshot(cfg, wallet)
+        cur = float((pw_snap or {}).get("total_inr", 0.0) or 0.0)
+        if cur <= 0:
+            return False, "Staging daily loss stop: paper wallet unavailable", {}
+        ds = cfg.get("paper_daily_start_wallet")
+        if not (isinstance(ds, dict) and ds.get("date") == today and float(ds.get("inr", 0) or 0) > 0):
+            ds = {"date": today, "inr": round(cur, 2)}
+            save_autotrade_config({"paper_daily_start_wallet": ds, "daily_loss_stop_hit": ""})
+        start = float(ds["inr"])
+        loss = start - cur
+        limit = start * pct / 100.0
+        info = {
+            "date": today, "day_start_inr": start, "current_inr": cur,
+            "loss_inr": round(loss, 2), "limit_inr": round(limit, 2), "is_paper_wallet": True,
+        }
+        if loss >= limit:
+            if cfg.get("daily_loss_stop_hit") != today:
+                save_autotrade_config({"daily_loss_stop_hit": today})
+            return True, (
+                f"5% Daily Loss Stop (Staging Paper): paper wallet down ₹{loss:,.2f} today "
+                f"(start ₹{start:,.2f} -> now ₹{cur:,.2f}, limit ₹{limit:,.2f}). "
+                f"Paper AutoTrade is locked until next IST day (or click 'Unlock AutoTrade' in sidebar)."
+            ), info
+        if cfg.get("daily_loss_stop_hit") == today:
+            save_autotrade_config({"daily_loss_stop_hit": ""})
+        return False, f"Staging paper daily loss ₹{max(loss, 0):,.2f} / limit ₹{limit:,.2f}", info
+
     w = wallet if isinstance(wallet, dict) else fetch_coindcx_futures_balance()
     if not (isinstance(w, dict) and w.get("is_live_api")):
         return False, "Daily loss stop: live wallet not verified (not enforced this tick)", {}
     cur = float(w.get("total_inr", 0.0) or 0.0)
     if cur <= 0:
         return False, "Daily loss stop: wallet balance unavailable", {}
-    cfg = get_autotrade_config()
     ds = cfg.get("daily_start_wallet")
     if not (isinstance(ds, dict) and ds.get("date") == today and float(ds.get("inr", 0) or 0) > 0):
         ds = {"date": today, "inr": round(cur, 2)}
@@ -5922,16 +6145,27 @@ def execute_autotrade_two_entry_signal(
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
 
     max_slots = int(cfg.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)
-    staging_paper_only = is_staging_environment() or bool(cfg.get("paper_only", False))
+    is_exp_env = is_experiment_environment()
+    staging_paper_only = is_staging_environment() or is_exp_env or bool(cfg.get("paper_only", False))
 
-    # Live 5% Daily Loss Stop + wallet-aware sizing (never request more margin than the futures wallet holds)
-    _wallet_now = fetch_coindcx_futures_balance()
+    # Live & Staging-Paper 5% Daily Loss Stop + wallet-aware sizing (same guards on Staging as Main!)
+    _live_wallet_raw = fetch_coindcx_futures_balance()
+    _wallet_now = (
+        get_paper_wallet_snapshot(cfg, _live_wallet_raw)
+        if (is_staging_environment() and float(cfg.get("paper_wallet_inr", 0.0) or 0.0) > 0)
+        else _live_wallet_raw
+    )
     _stop_hit, _stop_msg, _stop_info = check_live_daily_loss_stop(_wallet_now)
     if _stop_hit:
         return False, _stop_msg, {"daily_loss_stop": _stop_info}
 
-    # Anti-Crumb Free-Margin Guard: never downsize a ₹20k–₹26.5k slot into a ₹666–₹1,002 leftover-cash dust trade!
-    if isinstance(_wallet_now, dict) and _wallet_now.get("is_live_api") and not staging_paper_only:
+    # Anti-Crumb Free-Margin Guard (enforced on BOTH Main Live Wallet AND Staging Paper Wallet!):
+    # never downsize a full slot into a leftover-cash dust trade!
+    _enforce_free_margin = isinstance(_wallet_now, dict) and (
+        (_wallet_now.get("is_live_api") and not staging_paper_only)
+        or bool(_wallet_now.get("is_paper_wallet"))
+    )
+    if _enforce_free_margin:
         _tot_w = float(_wallet_now.get("total_inr", 0.0) or 0.0)
         _avail_w = float(_wallet_now.get("available_inr", _tot_w) or 0.0)
         _target_slot_m = (
@@ -6342,17 +6576,26 @@ def run_portfolio_single_slot_backtest(
     wallet_inr: float = None,
     exit_mode: str = "smart_hybrid",
     max_concurrent_trades: int = MAX_CONCURRENT_TRADES,
+    daily_loss_stop_pct: float = None,
+    enforce_free_margin_guard: bool = True,
 ) -> dict:
     """
-    Simulates the exact '1 Crypto at a Time @ 10x Leverage' Portfolio across the High-Volatility
-    Futures Universe:
+    Simulates the exact Main Live Portfolio Engine across the High-Volatility Futures Universe
+    with full Main-Parity Guards (used on `Experiment` & `🧪 Backtest`):
       - Scans all pairs in `pairs` (defaults to HIGH_VOL_FUTURES_UNIVERSE).
-      - Strictly allows ONLY 1 active trade across the entire portfolio at any time.
-      - Enforces the 5% Total Futures Wallet Daily Loss Stop (including fees).
+      - Enforces Max Concurrent Portfolio Slots (default 3) & 1 active trade per coin.
+      - Enforces Max 2 Concurrent 15m 50/200 EMA Slots + 4h same-zone re-entry lock.
+      - Enforces IST Daily Loss Stop / SL Threshold (default 5.0% of IST day-start wallet equity).
+      - Enforces Main's <90% Free-Margin Anti-Crumb Guard against running wallet equity.
+      - Returns full Guard Telemetry (`guards_audit`) and chronological `equity_curve`.
     """
     import strategies as _strategies
     eff_wallet_inr = float(wallet_inr) if (wallet_inr and wallet_inr > 0) else (margin_inr / TRADE_ALLOCATION_FRACTION)
-    max_daily_loss_inr = eff_wallet_inr * (_strategies.DAILY_WALLET_LOSS_STOP_PCT / 100.0)
+    dl_stop_pct = (
+        float(_strategies.DAILY_WALLET_LOSS_STOP_PCT)
+        if daily_loss_stop_pct is None
+        else max(0.0, float(daily_loss_stop_pct))
+    )
 
     universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
     if strategy_id == "box_plus_ema50_200_regime":
@@ -6393,6 +6636,21 @@ def run_portfolio_single_slot_backtest(
     if not standalone_df.empty:
         standalone_df = standalone_df.sort_values(by="Net_Profit_INR", ascending=False).reset_index(drop=True)
 
+    empty_guards = {
+        "starting_wallet_inr": round(eff_wallet_inr, 2),
+        "ending_wallet_inr": round(eff_wallet_inr, 2),
+        "wallet_roi_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+        "daily_loss_stop_pct": dl_stop_pct,
+        "days_locked_by_sl_threshold": 0,
+        "locked_dates": [],
+        "blocked_by_sl_threshold": 0,
+        "blocked_by_slot_cap": 0,
+        "blocked_by_dup_pair": 0,
+        "blocked_by_ema_cap": 0,
+        "blocked_by_free_margin": 0,
+        "blocked_by_4h_zone_lock": 0,
+    }
     if not all_candidates:
         return {
             "total_trades": 0, "win_count": 0, "loss_count": 0, "win_rate_pct": 0.0,
@@ -6400,6 +6658,12 @@ def run_portfolio_single_slot_backtest(
             "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(),
             "coin_summary_df": pd.DataFrame(), "standalone_summary_df": standalone_df,
             "strategy_id": strategy_id, "strategy_breakdown": {},
+            "starting_wallet_inr": round(eff_wallet_inr, 2),
+            "ending_wallet_inr": round(eff_wallet_inr, 2),
+            "wallet_roi_pct": 0.0,
+            "max_drawdown_pct": 0.0,
+            "guards_audit": empty_guards,
+            "equity_curve": [],
         }
 
     df_all = pd.DataFrame(all_candidates).sort_values(by=["entry_time", "vol_rank"]).reset_index(drop=True)
@@ -6408,12 +6672,25 @@ def run_portfolio_single_slot_backtest(
     max_slots = max(1, int(max_concurrent_trades or MAX_CONCURRENT_TRADES))
     day_counts = {}
     day_pnl = {}
+    day_start_wallet: dict[str, float] = {}
     locked_days = set()
 
+    current_wallet_inr = float(eff_wallet_inr)
+    peak_wallet_inr = float(eff_wallet_inr)
+    max_drawdown_pct = 0.0
+    equity_curve: list[dict] = []
+
+    blocked_sl = 0
+    blocked_slot = 0
+    blocked_dup = 0
+    blocked_ema = 0
+    blocked_margin = 0
+    blocked_zone = 0
+
     def _settle_closed_trades(up_to_time: str):
-        nonlocal active_open_trades
+        nonlocal active_open_trades, current_wallet_inr, peak_wallet_inr, max_drawdown_pct
         still_open = []
-        # Sort closing trades chronologically by exit_time so daily 5% wallet loss stop triggers at exact close time
+        # Sort closing trades chronologically by exit_time so daily SL threshold triggers at exact close time
         closing = [t for t in active_open_trades if str(t["exit_time"]) <= up_to_time]
         for t in active_open_trades:
             if str(t["exit_time"]) > up_to_time:
@@ -6422,33 +6699,66 @@ def run_portfolio_single_slot_backtest(
         for t in closing:
             t_ent_day = str(t["entry_time"])[:10]
             t_ext_day = str(t["exit_time"])[:10]
+            if t_ext_day not in day_start_wallet:
+                day_start_wallet[t_ext_day] = max(1.0, current_wallet_inr)
+            if t_ent_day not in day_start_wallet:
+                day_start_wallet[t_ent_day] = max(1.0, current_wallet_inr)
             pnl_v = float(t["net_pnl_inr"])
+            current_wallet_inr = round(max(0.0, current_wallet_inr + pnl_v), 2)
+            if current_wallet_inr > peak_wallet_inr:
+                peak_wallet_inr = current_wallet_inr
+            if peak_wallet_inr > 0:
+                dd_pct = ((peak_wallet_inr - current_wallet_inr) / peak_wallet_inr) * 100.0
+                if dd_pct > max_drawdown_pct:
+                    max_drawdown_pct = dd_pct
             day_pnl[t_ext_day] = day_pnl.get(t_ext_day, 0.0) + pnl_v
             if t_ent_day != t_ext_day:
                 day_pnl[t_ent_day] = day_pnl.get(t_ent_day, 0.0) + pnl_v
-            if day_pnl.get(t_ext_day, 0.0) <= -max_daily_loss_inr:
-                locked_days.add(t_ext_day)
-            if day_pnl.get(t_ent_day, 0.0) <= -max_daily_loss_inr:
-                locked_days.add(t_ent_day)
+            if dl_stop_pct > 0:
+                lim_ext = day_start_wallet[t_ext_day] * (dl_stop_pct / 100.0)
+                lim_ent = day_start_wallet[t_ent_day] * (dl_stop_pct / 100.0)
+                if day_pnl.get(t_ext_day, 0.0) <= -lim_ext:
+                    locked_days.add(t_ext_day)
+                if day_pnl.get(t_ent_day, 0.0) <= -lim_ent:
+                    locked_days.add(t_ent_day)
+            equity_curve.append({
+                "time": str(t["exit_time"]),
+                "pair": str(t.get("pair", "")),
+                "pnl_inr": round(pnl_v, 2),
+                "equity_inr": current_wallet_inr,
+                "day_locked": t_ext_day in locked_days,
+            })
         active_open_trades = still_open
 
     last_ema_zone_by_pair: dict[str, tuple] = {}
     for _, tr in df_all.iterrows():
         ent_t = str(tr["entry_time"])
-        ext_t = str(tr["exit_time"])
         day_str = ent_t[:10]
         _settle_closed_trades(ent_t)
+        if day_str not in day_start_wallet:
+            day_start_wallet[day_str] = max(1.0, current_wallet_inr)
         if day_str in locked_days:
+            blocked_sl += 1
             continue
         # Only 1 active trade per coin at a time, and at most `max_slots` (3) concurrent trades across the wallet
         if any(t.get("pair") == tr["pair"] for t in active_open_trades):
+            blocked_dup += 1
             continue
         if len(active_open_trades) >= max_slots:
+            blocked_slot += 1
             continue
+        # Main-Parity <90% Free-Margin Anti-Crumb Guard against running wallet equity
+        if enforce_free_margin_guard and margin_inr >= 2500.0:
+            locked_m = sum(float(t.get("_bt_margin_inr", margin_inr) or margin_inr) for t in active_open_trades)
+            avail_m = max(0.0, current_wallet_inr - locked_m)
+            if (avail_m * 0.98) < (margin_inr * 0.90):
+                blocked_margin += 1
+                continue
         is_ema_tr = "50/200 EMA" in str(tr.get("strategy", ""))
         if is_ema_tr:
             open_ema_bt = sum(1 for t in active_open_trades if "50/200 EMA" in str(t.get("strategy", "")))
             if open_ema_bt >= MAX_EMA_CONCURRENT_TRADES:
+                blocked_ema += 1
                 continue
             prev_z = last_ema_zone_by_pair.get(str(tr["pair"]))
             cur_ep = float(tr.get("entry_price", 0.0) or 0.0)
@@ -6461,8 +6771,10 @@ def run_portfolio_single_slot_backtest(
                     and (cur_dt - prev_dt).total_seconds() < zone_lock_sec
                     and abs(cur_ep - prev_ep) / cur_ep < 0.008
                 ):
+                    blocked_zone += 1
                     continue
         tr_dict = tr.to_dict()
+        tr_dict["_bt_margin_inr"] = float(margin_inr)
         if is_ema_tr:
             last_ema_zone_by_pair[str(tr["pair"])] = (
                 pd.to_datetime(ent_t),
@@ -6473,6 +6785,43 @@ def run_portfolio_single_slot_backtest(
         accepted.append(tr_dict)
         active_open_trades.append(tr_dict)
         day_counts[day_str] = day_counts.get(day_str, 0) + 1
+
+    # Settle any remaining open trades chronologically at end of simulation
+    _settle_closed_trades("9999-12-31 23:59:59")
+
+    wallet_roi_pct = round(((current_wallet_inr - eff_wallet_inr) / eff_wallet_inr) * 100.0, 2) if eff_wallet_inr > 0 else 0.0
+    guards_audit = {
+        "starting_wallet_inr": round(eff_wallet_inr, 2),
+        "ending_wallet_inr": round(current_wallet_inr, 2),
+        "wallet_roi_pct": wallet_roi_pct,
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "daily_loss_stop_pct": dl_stop_pct,
+        "days_locked_by_sl_threshold": len(locked_days),
+        "locked_dates": sorted(locked_days),
+        "blocked_by_sl_threshold": blocked_sl,
+        "blocked_by_slot_cap": blocked_slot,
+        "blocked_by_dup_pair": blocked_dup,
+        "blocked_by_ema_cap": blocked_ema,
+        "blocked_by_free_margin": blocked_margin,
+        "blocked_by_4h_zone_lock": blocked_zone,
+    }
+
+    if not accepted:
+        return {
+            "total_trades": 0, "win_count": 0, "loss_count": 0, "win_rate_pct": 0.0,
+            "net_profit_inr": 0.0, "total_roi_pct": 0.0, "profit_factor": 0.0,
+            "total_fees_paid_inr": 0.0, "total_gross_profit": 0.0, "total_gross_loss": 0.0,
+            "trades_df": pd.DataFrame(), "coin_summary_df": pd.DataFrame(),
+            "standalone_summary_df": standalone_df, "strategy_id": strategy_id,
+            "strategy_breakdown": {}, "margin_inr": margin_inr, "leverage": leverage,
+            "duration_days": duration_days,
+            "starting_wallet_inr": round(eff_wallet_inr, 2),
+            "ending_wallet_inr": round(current_wallet_inr, 2),
+            "wallet_roi_pct": wallet_roi_pct,
+            "max_drawdown_pct": round(max_drawdown_pct, 2),
+            "guards_audit": guards_audit,
+            "equity_curve": equity_curve,
+        }
 
     pdf = pd.DataFrame(accepted)
     wins = pdf[pdf["is_win"] == True]
@@ -6546,6 +6895,12 @@ def run_portfolio_single_slot_backtest(
         "margin_inr": margin_inr,
         "leverage": leverage,
         "duration_days": duration_days,
+        "starting_wallet_inr": round(eff_wallet_inr, 2),
+        "ending_wallet_inr": round(current_wallet_inr, 2),
+        "wallet_roi_pct": wallet_roi_pct,
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "guards_audit": guards_audit,
+        "equity_curve": equity_curve,
     }
 
 

@@ -52,11 +52,17 @@ def _load_service_account_dict() -> dict | None:
     return None
 
 
-def _get_ws(book, title):
+def _get_ws(book, title, min_cols: int = 25):
     try:
-        return book.worksheet(title)
+        ws = book.worksheet(title)
+        if getattr(ws, "col_count", 25) < min_cols:
+            try:
+                ws.resize(cols=min_cols)
+            except Exception:
+                pass
+        return ws
     except gspread.exceptions.WorksheetNotFound:
-        return book.add_worksheet(title=title, rows=1000, cols=20)
+        return book.add_worksheet(title=title, rows=1000, cols=max(25, min_cols))
 
 
 def _client():
@@ -85,10 +91,62 @@ def log_failed_trade_diagnostic(trade: dict, return_details: bool = False):
         return (False, str(e)) if return_details else False
 
 
-def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
+STAGING_TRADES_SHEET_NAME = "Staging_Trades"
+
+LIVE_TRADES_HEADERS = [
+    "Timestamp (IST)", "Pair", "Direction", "Entry ($)",
+    "Stop Loss ($)", "TP1 Mid ($)", "TP2 Target ($)", "Qty",
+    "Margin (INR)", "Leverage", "Proj Profit TP1 (INR)", "Proj Loss SL (INR)", "Status",
+    "Strategy", "Trigger Reason",
+]
+
+STAGING_TRADES_HEADERS = LIVE_TRADES_HEADERS + [
+    "Exit Time (IST)", "Exit Price ($)", "Net PnL (INR)", "ROE (%)",
+    "Paper Wallet After (INR)", "Exit Reason",
+]
+
+
+def _is_staging_paper_record(data: dict) -> bool:
+    """Returns True if a trade entry/exit dict belongs to Staging Live-Market Paper Trading."""
+    if not isinstance(data, dict):
+        return False
+    if data.get("is_staging_paper"):
+        return True
+    ws_hint = str(data.get("worksheet_name") or "").strip().lower()
+    if ws_hint in ("staging_trades", "staging trades"):
+        return True
+    strat_s = str(data.get("strategy_name") or "").lower()
+    stat_s = str(data.get("status") or data.get("update_live_sheet_status") or "").upper()
+    reason_s = str(data.get("exit_reason") or data.get("trigger_reason") or "").lower()
+    return (
+        "staging paper" in strat_s
+        or "staging paper" in reason_s
+        or stat_s.startswith("PAPER_")
+    )
+
+
+def ensure_staging_trades_sheet(sheet_name: str | None = None) -> tuple[bool, str]:
+    """Ensures the dedicated 'Staging_Trades' worksheet exists with full headers in Crypto_Trades_Journal."""
+    target_sheet = sheet_name or os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+    try:
+        book = _client().open(target_sheet)
+        ws = _get_ws(book, STAGING_TRADES_SHEET_NAME)
+        vals = ws.get_all_values()
+        if not vals:
+            ws.append_row(STAGING_TRADES_HEADERS)
+        elif len(vals[0]) < len(STAGING_TRADES_HEADERS):
+            for col in range(len(vals[0]) + 1, len(STAGING_TRADES_HEADERS) + 1):
+                ws.update_cell(1, col, STAGING_TRADES_HEADERS[col - 1])
+        return True, f"Worksheet '{STAGING_TRADES_SHEET_NAME}' ready in '{target_sheet}'."
+    except Exception as e:
+        return False, str(e)
+
+
+def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False, worksheet_name: str | None = None):
     """
-    Logs executed signals or trade plans to Google Sheets.
-    Appends trade data to 'Crypto_Trades_Journal' using Service Account credentials.
+    Logs executed signals or trade plans to Google Sheets ('Crypto_Trades_Journal').
+    - Staging Paper AutoTrade entries route cleanly to the dedicated 'Staging_Trades' worksheet.
+    - Main Live Trading entries route to 'Live_Trades' (never polluted by Staging paper orders).
     """
     sheet_name = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
     sa_dict = _load_service_account_dict()
@@ -98,6 +156,10 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
         print(msg)
         return (False, msg) if return_details else False
 
+    is_stg_tab = (worksheet_name == STAGING_TRADES_SHEET_NAME) or _is_staging_paper_record(trade_data)
+    target_ws_name = worksheet_name or (STAGING_TRADES_SHEET_NAME if is_stg_tab else "Live_Trades")
+    headers = STAGING_TRADES_HEADERS if target_ws_name == STAGING_TRADES_SHEET_NAME else LIVE_TRADES_HEADERS
+
     try:
         scope = [
             "https://spreadsheets.google.com/feeds",
@@ -105,16 +167,10 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
         ]
         creds = ServiceAccountCredentials.from_json_keyfile_dict(sa_dict, scope)
         client = gspread.authorize(creds)
-        sheet = _get_ws(client.open(sheet_name), "Live_Trades")
+        sheet = _get_ws(client.open(sheet_name), target_ws_name)
 
         # Check if headers exist; if empty, insert them (older sheets get the new columns appended)
         records = sheet.get_all_values()
-        headers = [
-            "Timestamp (IST)", "Pair", "Direction", "Entry ($)",
-            "Stop Loss ($)", "TP1 Mid ($)", "TP2 Target ($)", "Qty",
-            "Margin (INR)", "Leverage", "Proj Profit TP1 (INR)", "Proj Loss SL (INR)", "Status",
-            "Strategy", "Trigger Reason"
-        ]
         if len(records) == 0:
             sheet.append_row(headers)
         elif len(records[0]) < len(headers):
@@ -137,12 +193,17 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
             leverage_val,
             trade_data["profit_tp1_inr"],
             trade_data["loss_sl_inr"],
-            trade_data.get("status", "LOGGED_PENDING"),
+            trade_data.get("status", "PAPER_AUTOTRADE_OPEN" if is_stg_tab else "LOGGED_PENDING"),
             trade_data.get("strategy_name", "Box Theory Sweep"),
-            trade_data.get("trigger_reason", "")
+            trade_data.get("trigger_reason", ""),
         ]
+        if target_ws_name == STAGING_TRADES_SHEET_NAME:
+            row.extend(["", "", "", "", trade_data.get("paper_wallet_inr", ""), ""])
         sheet.append_row(row)
-        success_msg = f"[OK] Trade successfully logged to Google Sheet '{sheet_name}': {trade_data['signal']} on {trade_data['pair']}"
+        success_msg = (
+            f"[OK] Trade successfully logged to Google Sheet '{sheet_name}' ({target_ws_name}): "
+            f"{trade_data['signal']} on {trade_data['pair']}"
+        )
         print(success_msg)
         return (True, success_msg) if return_details else True
     except gspread.exceptions.SpreadsheetNotFound:
@@ -156,9 +217,73 @@ def log_trade_to_google_sheet(trade_data: dict, return_details: bool = False):
 
 
 def log_trade_closed(trade: dict, return_details: bool = False):
-    """Logs the final result of a closed position to the 'Closed_Trades' worksheet (and updates PAPER_AUTOTRADE_OPEN in Live_Trades)."""
+    """
+    Logs the final result of a closed position:
+      - Staging Paper AutoTrade closes update/append strictly inside 'Staging_Trades' (never polluting Main).
+      - Main Live closes append to 'Closed_Trades' and update 'Live_Trades'.
+    """
     try:
         book = _client().open(os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal"))
+        if _is_staging_paper_record(trade):
+            ws_stg = _get_ws(book, STAGING_TRADES_SHEET_NAME)
+            rows_stg = ws_stg.get_all_values()
+            if not rows_stg:
+                ws_stg.append_row(STAGING_TRADES_HEADERS)
+                rows_stg = [STAGING_TRADES_HEADERS]
+            elif len(rows_stg[0]) < len(STAGING_TRADES_HEADERS):
+                for col in range(len(rows_stg[0]) + 1, len(STAGING_TRADES_HEADERS) + 1):
+                    ws_stg.update_cell(1, col, STAGING_TRADES_HEADERS[col - 1])
+
+            status_txt = str(
+                trade.get("update_live_sheet_status")
+                or ("PAPER_WIN" if float(trade.get("net_pnl_inr", 0.0) or 0.0) >= 0 else "PAPER_LOSS")
+            )
+            exit_t = str(trade.get("exit_time", ""))
+            exit_p = trade.get("exit_price", "")
+            net_p = trade.get("net_pnl_inr", 0.0)
+            roe_p = trade.get("roe_pct", "")
+            wallet_after = trade.get("paper_wallet_after_inr", "")
+            exit_r = str(trade.get("exit_reason", ""))
+
+            updated_row = False
+            pair_target = str(trade.get("pair", ""))
+            for r_idx in range(len(rows_stg), 1, -1):
+                r = rows_stg[r_idx - 1]
+                if len(r) >= 13 and r[1] == pair_target and str(r[12]).startswith(("PAPER_AUTOTRADE_OPEN", "LOGGED_PENDING")):
+                    ws_stg.update_cell(r_idx, 13, status_txt)
+                    ws_stg.update(
+                        f"P{r_idx}:U{r_idx}",
+                        [[exit_t, exit_p, net_p, roe_p, wallet_after, exit_r]],
+                    )
+                    updated_row = True
+                    break
+
+            if not updated_row:
+                ws_stg.append_row([
+                    trade.get("entry_time") or exit_t,
+                    pair_target,
+                    trade.get("direction", ""),
+                    trade.get("entry_price", ""),
+                    trade.get("stop_loss", ""),
+                    trade.get("tp1", ""),
+                    trade.get("tp2", ""),
+                    trade.get("qty", ""),
+                    trade.get("margin_inr", ""),
+                    f"{trade.get('leverage', 10)}x" if trade.get("leverage") else "",
+                    "",
+                    "",
+                    status_txt,
+                    trade.get("strategy_name", "Staging Paper AutoTrade"),
+                    "Closed Staging Paper Trade",
+                    exit_t,
+                    exit_p,
+                    net_p,
+                    roe_p,
+                    wallet_after,
+                    exit_r,
+                ])
+            return (True, "logged to Staging_Trades") if return_details else True
+
         ws = _get_ws(book, "Closed_Trades")
         if len(ws.get_all_values()) == 0:
             ws.append_row(["Exit Time", "Pair", "Direction", "Entry", "Stop Loss", "Exit", "Exit Reason", "Net PnL (INR)"])
@@ -455,9 +580,15 @@ def fetch_all_sheet_trades(sheet_name: str | None = None) -> dict:
         "error": None,
         "live_trades": [],
         "closed_trades": [],
+        "staging_trades": [],
         "failed_diagnostics": [],
         "total_logged": 0,
         "total_closed": 0,
+        "staging_total_logged": 0,
+        "staging_total_closed": 0,
+        "staging_win_count": 0,
+        "staging_loss_count": 0,
+        "staging_net_realized_pnl_inr": 0.0,
         "net_realized_pnl_inr": 0.0,
         "win_count": 0,
         "loss_count": 0,
@@ -487,13 +618,35 @@ def fetch_all_sheet_trades(sheet_name: str | None = None) -> dict:
 
         live_rows = _read_ws_records("Live_Trades")
         closed_rows = _read_ws_records("Closed_Trades")
+        staging_rows = _read_ws_records(STAGING_TRADES_SHEET_NAME)
         failed_rows = _read_ws_records("Failed_Trade_Diagnostics")
 
         result["live_trades"] = live_rows
         result["closed_trades"] = closed_rows
+        result["staging_trades"] = staging_rows
         result["failed_diagnostics"] = failed_rows
         result["total_logged"] = len(live_rows)
         result["total_closed"] = len(closed_rows)
+        result["staging_total_logged"] = len(staging_rows)
+
+        stg_net, stg_w, stg_l, stg_closed = 0.0, 0, 0, 0
+        for sr in staging_rows:
+            raw_sp = str(sr.get("Net PnL (INR)", "")).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
+            if raw_sp:
+                try:
+                    sv = float(raw_sp)
+                    stg_closed += 1
+                    stg_net += sv
+                    if sv > 0:
+                        stg_w += 1
+                    elif sv < 0:
+                        stg_l += 1
+                except Exception:
+                    pass
+        result["staging_total_closed"] = stg_closed
+        result["staging_win_count"] = stg_w
+        result["staging_loss_count"] = stg_l
+        result["staging_net_realized_pnl_inr"] = round(stg_net, 2)
 
         net_pnl = 0.0
         wins = 0
@@ -552,6 +705,21 @@ def fetch_all_sheet_trades(sheet_name: str | None = None) -> dict:
                     f"{idx}. [{r.get('Entry Time', '')} -> {r.get('Exit Time', '')}] **{r.get('Pair', '')}** `{r.get('Direction', '')}` | "
                     f"Entry: `${r.get('Entry', '')}`, SL: `${r.get('Stop Loss', '')}`, Exit: `${r.get('Exit', '')}` | "
                     f"Net PnL: `Rs.{r.get('Net PnL (INR)', '')}` | Reason: {r.get('Exit Reason', '')}"
+                )
+
+        if staging_rows:
+            md_lines.append("")
+            md_lines.append(
+                f"#### 4. `{STAGING_TRADES_SHEET_NAME}` Worksheet (Staging Live-Market Paper Trading — "
+                f"{len(staging_rows)} Logged, {stg_closed} Closed: {stg_w}W/{stg_l}L, Net Rs.{round(stg_net, 2):,.2f}):"
+            )
+            for idx, r in enumerate(staging_rows[-20:], 1):
+                md_lines.append(
+                    f"{idx}. [{r.get('Timestamp (IST)', '')}] **{r.get('Pair', '')}** `{r.get('Direction', '')}` | "
+                    f"Entry: `${r.get('Entry ($)', '')}` -> Exit: `${r.get('Exit Price ($)', '')}` | "
+                    f"Margin: `Rs.{r.get('Margin (INR)', '')}` ({r.get('Leverage', '')}) | "
+                    f"Net PnL: `Rs.{r.get('Net PnL (INR)', '')}` | Status: `{r.get('Status', '')}` | "
+                    f"Strategy: `{r.get('Strategy', '')}`"
                 )
 
         result["markdown_summary"] = "\n".join(md_lines)
@@ -722,6 +890,74 @@ def load_autotrade_state_from_sheet(deployment_id: str) -> dict | None:
                 data = json.loads(r[1])
                 return data if isinstance(data, dict) else None
         return None
+    except Exception:
+        return None
+
+
+_MAIN_SETUP_MIRROR_CACHE: dict = {"ts": 0.0, "data": None}
+
+
+def load_main_live_setup_from_sheet(force_refresh: bool = False) -> dict | None:
+    """
+    Reads Main's exact live trading setup (`_AutoTrade_State` ['main'] + live CoinDCX wallet balance
+    from `_Live_Account_Sync`) so both `staging` (Live-Market Paper Trading) and `Experiment`
+    (Backtesting Lab) mirror Main's exact Funds, Margin-per-Trade, Leverage, and Strategy Mode!
+    Cached for 120 seconds.
+    """
+    now_t = _time.time()
+    if (
+        not force_refresh
+        and isinstance(_MAIN_SETUP_MIRROR_CACHE.get("data"), dict)
+        and (now_t - float(_MAIN_SETUP_MIRROR_CACHE.get("ts", 0.0))) < 120.0
+    ):
+        return dict(_MAIN_SETUP_MIRROR_CACHE["data"])
+
+    try:
+        target_sheet = os.getenv("GOOGLE_SHEET_NAME", "Crypto_Trades_Journal")
+        book = _client().open(target_sheet)
+        main_state = {}
+        try:
+            ws_st = book.worksheet("_AutoTrade_State")
+            for r in ws_st.get_all_values()[1:]:
+                if r and str(r[0]).strip().lower() == "main" and len(r) >= 2 and str(r[1]).strip():
+                    d_st = json.loads(r[1])
+                    if isinstance(d_st, dict):
+                        main_state = d_st
+                    break
+        except Exception:
+            pass
+
+        main_wallet_inr = 0.0
+        main_wallet_ts = ""
+        try:
+            ws_sync = book.worksheet("_Live_Account_Sync")
+            vals_s = ws_sync.get_all_values()
+            if len(vals_s) >= 2 and vals_s[1] and str(vals_s[1][0]).strip():
+                snap = json.loads(str(vals_s[1][0]).strip())
+                w_obj = snap.get("wallet") if isinstance(snap, dict) else None
+                if isinstance(w_obj, dict) and float(w_obj.get("total_inr", 0.0) or 0.0) > 0:
+                    main_wallet_inr = round(float(w_obj["total_inr"]), 2)
+                    main_wallet_ts = str(snap.get("updated_ist") or "")
+        except Exception:
+            pass
+
+        if main_wallet_inr <= 0 and isinstance(main_state.get("daily_start_wallet"), dict):
+            main_wallet_inr = round(float(main_state["daily_start_wallet"].get("inr", 0.0) or 0.0), 2)
+
+        if not main_state and main_wallet_inr <= 0:
+            return None
+
+        setup = {
+            "wallet_balance_inr": main_wallet_inr,
+            "wallet_updated_ist": main_wallet_ts,
+            "single_trade_margin_inr": round(float(main_state.get("single_trade_margin_inr", 0.0) or 0.0), 2),
+            "user_custom_margin": bool(main_state.get("user_custom_margin", False)),
+            "leverage": int(main_state.get("leverage", 10) or 10),
+            "autotrade_strategy_mode": str(main_state.get("autotrade_strategy_mode") or "box_plus_ema50_200_regime"),
+            "source": "Main Live Sheet Sync",
+        }
+        _MAIN_SETUP_MIRROR_CACHE.update({"ts": now_t, "data": setup})
+        return dict(setup)
     except Exception:
         return None
 
