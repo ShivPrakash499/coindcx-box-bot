@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 36
+_DAEMON_VERSION = 37
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -700,11 +700,11 @@ _wallet_delta = (
 st.sidebar.metric(_wallet_lbl, f"₹{wallet_data['total_inr']:,.2f}", _wallet_delta)
 
 if _is_staging_env or _is_experiment_env:
-    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, Margin, Leverage & Strategy Mode from Google Sheet."):
+    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, Margin, Leverage, Concurrent Trades & Strategy Mode from Google Sheet."):
         _ok_s, _msg_s, _ = coindcx_engine.sync_setup_from_main(reset_paper_wallet=_is_staging_env)
         st.session_state["_sb_main_sync_msg"] = (_ok_s, _msg_s)
-        st.session_state.pop("sidebar_single_trade_margin_input", None)
-        st.session_state.pop("sidebar_autotrade_strategy_mode", None)
+        for _k_clr in ("sidebar_single_trade_margin_input", "sidebar_autotrade_strategy_mode", "sidebar_max_concurrent_trades", "sidebar_auto_split_wallet"):
+            st.session_state.pop(_k_clr, None)
         get_cached_signals_scan.clear()
         st.rerun()
     if st.session_state.get("_sb_main_sync_msg"):
@@ -727,54 +727,117 @@ if not wallet_data.get("is_live_api"):
         _auto_cfg = coindcx_engine.save_autotrade_config({"wallet_balance_inr": round(_manual_wallet_inr, 2)})
         get_cached_balance.clear()
 
-_one_third_wallet = round(float(wallet_data["total_inr"]) * coindcx_engine.TRADE_ALLOCATION_FRACTION, 2)
+_saved_max_slots = coindcx_engine.get_configured_max_slots(_auto_cfg)
+_saved_auto_split = coindcx_engine.is_auto_split_enabled(_auto_cfg)
+if "sidebar_max_concurrent_trades" not in st.session_state:
+    st.session_state["sidebar_max_concurrent_trades"] = int(_saved_max_slots)
+if "sidebar_auto_split_wallet" not in st.session_state:
+    st.session_state["sidebar_auto_split_wallet"] = bool(_saved_auto_split)
+
+
+def _on_sidebar_slots_or_split_change():
+    new_slots = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
+    new_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
+    w_tot = round(float(wallet_data["total_inr"]), 2)
+    upd = {
+        "max_concurrent_trades": new_slots,
+        "auto_split_wallet_by_slots": new_auto_split,
+        "user_custom_margin": not new_auto_split,
+        "wallet_balance_inr": w_tot,
+    }
+    if new_auto_split and w_tot > 0:
+        auto_m = round(w_tot / new_slots, 2)
+        upd["single_trade_margin_inr"] = auto_m
+        st.session_state["sidebar_single_trade_margin_input"] = float(auto_m)
+    coindcx_engine.save_autotrade_config(upd)
+    get_cached_signals_scan.clear()
+    get_cached_positions.clear()
+
+
+max_concurrent_trades = int(
+    st.sidebar.number_input(
+        "Number of Concurrent Trades",
+        min_value=1,
+        max_value=6,
+        step=1,
+        key="sidebar_max_concurrent_trades",
+        on_change=_on_sidebar_slots_or_split_change,
+        help="Maximum simultaneous open positions + resting entry orders AutoTrade can hold at once (default 3).",
+    )
+)
+auto_split_wallet = bool(
+    st.sidebar.toggle(
+        "⚖️ Auto-Split Wallet by Concurrent Trades",
+        key="sidebar_auto_split_wallet",
+        on_change=_on_sidebar_slots_or_split_change,
+        help="When ON, automatically divides your Futures Wallet evenly by Number of Concurrent Trades (Wallet ÷ N) and updates whenever your wallet changes. Turn OFF to type a custom Single-Trade Margin.",
+    )
+)
+
+_auto_split_margin = round(float(wallet_data["total_inr"]) / max(1, max_concurrent_trades), 2)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
-if (
-    _saved_margin <= 0
-    or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0)
-    or not _auto_cfg.get("user_custom_margin")
-):
-    default_margin = _one_third_wallet
+if auto_split_wallet or _saved_margin <= 0 or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0):
+    default_margin = _auto_split_margin
 else:
     default_margin = _saved_margin
 
-# Keep Streamlit widget state synced to 1/3 of live wallet whenever wallet updates and user hasn't set custom margin
-if not _auto_cfg.get("user_custom_margin"):
-    if st.session_state.get("_last_synced_one_third_margin") != _one_third_wallet:
-        st.session_state["_last_synced_one_third_margin"] = _one_third_wallet
-        st.session_state["sidebar_single_trade_margin_input"] = float(_one_third_wallet)
+# Keep Streamlit widget state synced to (Wallet ÷ Concurrent Trades) whenever Auto-Split is ON
+if auto_split_wallet:
+    if st.session_state.get("_last_synced_split_margin") != (_auto_split_margin, max_concurrent_trades):
+        st.session_state["_last_synced_split_margin"] = (_auto_split_margin, max_concurrent_trades)
+        st.session_state["sidebar_single_trade_margin_input"] = float(_auto_split_margin)
 
 
 def _on_sidebar_margin_change():
-    new_m = round(float(st.session_state.get("sidebar_single_trade_margin_input", _one_third_wallet)), 2)
-    coindcx_engine.save_autotrade_config({
-        "single_trade_margin_inr": new_m,
-        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
-        "user_custom_margin": True,
-    })
+    raw_in = st.session_state.get("sidebar_single_trade_margin_input")
+    if raw_in is None or float(raw_in or 0.0) <= 0.0:
+        # Blank / cleared margin -> seamlessly fall back to Wallet ÷ Concurrent Trades
+        fallback_m = round(float(wallet_data["total_inr"]) / max(1, max_concurrent_trades), 2)
+        coindcx_engine.save_autotrade_config({
+            "single_trade_margin_inr": fallback_m,
+            "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+            "auto_split_wallet_by_slots": True,
+            "user_custom_margin": False,
+        })
+    else:
+        new_m = round(float(raw_in), 2)
+        coindcx_engine.save_autotrade_config({
+            "single_trade_margin_inr": new_m,
+            "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+            "auto_split_wallet_by_slots": False,
+            "user_custom_margin": True,
+        })
     get_cached_signals_scan.clear()
 
 
-margin_inr = st.sidebar.number_input(
+_margin_widget_val = st.sidebar.number_input(
     "Single-Trade Margin (INR)",
     min_value=500.0,
     max_value=max(float(wallet_data["total_inr"]) * 2.0, 1000000.0),
     value=float(default_margin),
     step=500.0,
     format="%.2f",
+    disabled=auto_split_wallet,
     key="sidebar_single_trade_margin_input",
     on_change=_on_sidebar_margin_change,
-    help="Exact per-trade margin used by AutoTrade & Execute (defaults to 1/3rd of Futures Wallet until customized; never downsized into dust trades)."
+    help="Per-trade margin ceiling used by AutoTrade & Execute. Auto-calculated as (Wallet ÷ Concurrent Trades) when Auto-Split is ON, or when left blank.",
 )
+margin_inr = float(_auto_split_margin if (auto_split_wallet or _margin_widget_val is None or float(_margin_widget_val) <= 0) else _margin_widget_val)
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
-st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (100% Single-Slot Maker Limit) @ {leverage}x")
+if auto_split_wallet:
+    st.sidebar.caption(
+        f"⚖️ **Auto-Split:** `₹{wallet_data['total_inr']:,.2f} ÷ {max_concurrent_trades}` = **₹{margin_inr:,.2f}/trade** @ {leverage}x *(1.5% Risk Sizing active)*"
+    )
+else:
+    st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (Custom Margin, max {max_concurrent_trades} concurrent) @ {leverage}x")
 try:
     _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(
         float(margin_inr),
         int(leverage),
         wallet_data,
-        honor_custom_margin=bool(_auto_cfg.get("user_custom_margin", False)),
+        max_slots=max_concurrent_trades,
+        honor_custom_margin=not auto_split_wallet,
     )
     if _eff_note:
         st.sidebar.warning(f"⚠️ AutoTrade will use **₹{_eff_margin:,.2f}** per trade. {_eff_note}")
@@ -785,7 +848,7 @@ live_crypto_rate = get_coindcx_live_usdt_inr_rate()
 usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 🤖 AutoTrade (3-Slot)")
+st.sidebar.markdown(f"### 🤖 AutoTrade ({max_concurrent_trades}-Slot)")
 
 if _is_experiment_env:
     if _auto_cfg.get("enabled") or _auto_cfg.get("paper_autotrade_enabled"):
@@ -885,22 +948,27 @@ st.sidebar.caption(
 if (
     round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
+    or int(max_concurrent_trades) != int(_auto_cfg.get("max_concurrent_trades", 3) or 3)
+    or bool(auto_split_wallet) != coindcx_engine.is_auto_split_enabled(_auto_cfg)
 ):
     _auto_cfg = coindcx_engine.save_autotrade_config({
         "single_trade_margin_inr": round(float(margin_inr), 2),
         "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
         "leverage": int(leverage),
+        "max_concurrent_trades": int(max_concurrent_trades),
+        "auto_split_wallet_by_slots": bool(auto_split_wallet),
+        "user_custom_margin": not bool(auto_split_wallet),
     })
     get_cached_signals_scan.clear()
     get_cached_positions.clear()
 
 _slot_status = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
 _slot_cnt = int(_slot_status.get("count", 0) or 0)
-_slot_max = int(_slot_status.get("max_slots", 3) or 3)
+_slot_max = int(_slot_status.get("max_slots", max_concurrent_trades) or max_concurrent_trades)
 _slot_pairs_list = _slot_status.get("active_pairs") or ([_slot_status.get("active_pair")] if _slot_status.get("active_pair") else [])
 _slot_pairs_str = ", ".join(clean_sym(p) for p in _slot_pairs_list if p)
 if _slot_status.get("is_occupied"):
-    st.sidebar.warning(f"🔒 **3-Slot Full ({_slot_cnt}/{_slot_max}):** `{_slot_pairs_str}`")
+    st.sidebar.warning(f"🔒 **{_slot_max}-Slot Full ({_slot_cnt}/{_slot_max}):** `{_slot_pairs_str}`")
     if st.sidebar.button("🔓 Release App Trade Lock", key="btn_clear_autotrade_lock", use_container_width=True):
         coindcx_engine.clear_autotrade_active_lock()
         st.rerun()
@@ -916,10 +984,19 @@ if st.session_state.get("_sb_autotrade_unlocked_msg"):
     st.sidebar.success(st.session_state.pop("_sb_autotrade_unlocked_msg"))
 
 _dl_blocked_sb, _dl_msg_sb, _dl_info_sb = coindcx_engine.check_live_daily_loss_stop(wallet_data)
+_unr_paused_sb, _unr_msg_sb, _unr_info_sb = coindcx_engine.check_unrealized_pnl_daily_sl_pause(wallet_data, allow_live_ticker=False)
 if _dl_blocked_sb:
     st.sidebar.warning(
         f"🛑 **AutoTrade Locked (5% Stop):** ₹{float(_dl_info_sb.get('day_start_inr', 0.0)):,.0f} → "
         f"₹{float(_dl_info_sb.get('current_inr', 0.0)):,.0f}"
+    )
+elif _unr_paused_sb:
+    st.sidebar.warning(
+        f"⏸️ **New Trades Paused (Unrealized SL Guard):** Open unrealized loss "
+        f"`₹{float(_unr_info_sb.get('unrealized_loss_inr', 0.0)):,.0f}` "
+        f"(combined `₹{float(_unr_info_sb.get('combined_loss_inr', 0.0)):,.0f}`) ≥ Daily SL "
+        f"`₹{float(_unr_info_sb.get('limit_inr', 0.0)):,.0f}`. Waiting for "
+        f"{int(_unr_info_sb.get('open_positions', 0))} live position(s) to close."
     )
 if st.sidebar.button(
     "🔓 Unlock AutoTrade",
@@ -3339,7 +3416,9 @@ elif active_section == "🧪 Backtest":
         key="bt_daily_loss_stop_pct",
         help="Locks new trades for the rest of the IST day when realized daily loss reaches this % of day-start wallet (Main = 5.0%; set 0.0 to A/B test without guard).",
     )
-    bt_max_slots = bg3.selectbox("Max Slots", [1, 2, 3, 4], index=2, key="bt_max_slots")
+    _bt_slot_opts = [1, 2, 3, 4, 5, 6]
+    _bt_slot_def_idx = _bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2
+    bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=_bt_slot_def_idx, key="bt_max_slots")
     with bg4:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
         bt_free_margin_guard = st.checkbox(

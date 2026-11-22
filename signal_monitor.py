@@ -234,6 +234,8 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         autotrade_daily_key = f"AUTOTRADE_DAILY_COUNT|{today_ist}"
         autotrade_daily_count = int(state.get(autotrade_daily_key, 0))
 
+        eff_max_slots = int(eng.get_configured_max_slots(auto_cfg) if hasattr(eng, "get_configured_max_slots") else MAX_CONCURRENT_PORTFOLIO_TRADES)
+
         # Collect all pairs currently in a Live CoinDCX position, resting Entry Limit order, or active App Trade Lock
         # (normalized by base symbol via `_canon_pair` so `B-INJ_USDT` == `I-INJ_INR` == `INJUSDT`)
         open_live_pairs = set()
@@ -242,12 +244,13 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
             if _ap:
                 open_live_pairs.add(_ap)
                 open_live_bases.add(_canon_pair(_ap))
-        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
+        if len(open_live_bases) >= eff_max_slots:
             portfolio_occupied = True
             if not active_Slot_pair:
                 active_Slot_pair = next(iter(open_live_pairs), None)
 
         live_pos_verified = False
+        live_pos_list = []
         try:
             if is_daemon_thread or send:
                 # Whenever `send=True` (email alerts enabled), ALWAYS perform a synchronous live check
@@ -268,11 +271,11 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     p_raw = pos["pair"]
                     open_live_pairs.add(p_raw)
                     open_live_bases.add(_canon_pair(p_raw))
-                    if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
+                    if len(open_live_bases) >= eff_max_slots:
                         portfolio_occupied = True
                         active_Slot_pair = p_raw
 
-            # Also count unfilled resting Entry Limit Orders on CoinDCX toward the 3-slot cap (prevents 4th concurrent trade race)
+            # Also count unfilled resting Entry Limit Orders on CoinDCX toward the slot cap
             if (is_daemon_thread or autotrade) and hasattr(eng, "get_open_entry_limit_orders"):
                 _w_chk = eng.fetch_coindcx_futures_balance(force_refresh=False) or {}
                 if _w_chk.get("is_live_api"):
@@ -281,18 +284,27 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         if _ep_pair:
                             open_live_pairs.add(_ep_pair)
                             open_live_bases.add(_canon_pair(_ep_pair))
-                            if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
+                            if len(open_live_bases) >= eff_max_slots:
                                 portfolio_occupied = True
                                 active_Slot_pair = _ep_pair
         except Exception:
             pass
 
-        # Live & Staging-Paper 5% Daily Loss Stop (SL Threshold): if hit, keep scanning/alerting but lock new AutoTrades for the IST day!
+        # Live & Staging-Paper 5% Daily Loss Stop + Unrealized PnL Daily SL Pause:
+        #   - Realized daily loss >= 5% -> lock AutoTrade for the IST day.
+        #   - Open unrealized loss >= 5% Daily SL -> pause new trades until open live positions close!
         daily_stop_hit, daily_stop_msg = False, ""
         if autotrade and not eng.is_experiment_environment():
             try:
                 _dl_w = eng.get_paper_wallet_snapshot(auto_cfg) if eng.is_staging_environment() else None
                 daily_stop_hit, daily_stop_msg, _ = eng.check_live_daily_loss_stop(_dl_w)
+                if not daily_stop_hit and hasattr(eng, "check_unrealized_pnl_daily_sl_pause"):
+                    _unr_pos_arg = None if eng.is_staging_environment() else live_pos_list
+                    _unr_hit, _unr_msg, _ = eng.check_unrealized_pnl_daily_sl_pause(
+                        _dl_w, positions=_unr_pos_arg, allow_live_ticker=True
+                    )
+                    if _unr_hit:
+                        daily_stop_hit, daily_stop_msg = True, _unr_msg
             except Exception as e:
                 print(f"[Daily Loss Stop Check Notice]: {e}")
 
@@ -500,7 +512,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     if ok_auto:
                         open_live_pairs.add(pair)
                         open_live_bases.add(pair_base)
-                        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
+                        if len(open_live_bases) >= eff_max_slots:
                             portfolio_occupied = True
                             active_Slot_pair = pair
                         state[key] = {

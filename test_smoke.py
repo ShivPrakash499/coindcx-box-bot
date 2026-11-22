@@ -1947,6 +1947,134 @@ def test_17_v36_six_sl_reduction_fixes():
     print("  -> PASS: All 6 Daemon v36 SL-Reduction Fixes (EMA/Box/OpenBlackout/CrossStrat/BTC/SameDir/1.5%Risk/MultiSlot/PostOnly) verified!")
 
 
+def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
+    print("[18/18] Verifying Daemon v37: Configurable Concurrent Trades, Auto-Split Wallet Toggle & Unrealized PnL Daily SL Pause...")
+    import coindcx_engine as eng
+    import signal_monitor as sm
+
+    # 1. Verify Sidebar UI controls & durable keys exist
+    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as fh:
+        app_src = fh.read()
+    assert '"Number of Concurrent Trades"' in app_src
+    assert '"⚖️ Auto-Split Wallet by Concurrent Trades"' in app_src
+    assert "Unrealized SL Guard" in app_src
+    assert "max_concurrent_trades" in eng._DURABLE_AUTOTRADE_KEYS
+    assert "auto_split_wallet_by_slots" in eng._DURABLE_AUTOTRADE_KEYS
+
+    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+
+            # 2. Configurable Concurrent Trades + Auto-Split Wallet (Rs.24,000 / 4 = Rs.6,000, then / 2 = Rs.12,000)
+            eng.save_autotrade_config({
+                "wallet_balance_inr": 24000.0,
+                "max_concurrent_trades": 4,
+                "auto_split_wallet_by_slots": True,
+                "single_trade_margin_inr": 6000.0,
+            })
+            cfg4 = eng.get_autotrade_config()
+            assert eng.get_configured_max_slots(cfg4) == 4 and eng.is_auto_split_enabled(cfg4) is True
+            assert abs(float(cfg4["single_trade_margin_inr"]) - 6000.0) < 0.01, cfg4
+
+            # Balance refresh auto-recalculates margin to Wallet / 4 when Auto-Split is ON!
+            def _fake_w32(method, url, payload=None, timeout=3.5):
+                return _MockResponse(200, [{"currency_short_name": "INR", "balance": "32000.0", "locked_balance": "0.0", "cross_user_margin": "0.0"}]), None
+            with patch.object(eng, "_send_coindcx_signed_request", side_effect=_fake_w32):
+                eng._fetch_coindcx_futures_balance_sync()
+            assert abs(float(eng.get_autotrade_config()["single_trade_margin_inr"]) - 8000.0) < 0.01
+
+            # Setting max_concurrent_trades = 2 enforces 2-Slot cap (blocks 3rd trade!)
+            eng.save_autotrade_config({
+                "max_concurrent_trades": 2,
+                "auto_split_wallet_by_slots": True,
+                "wallet_balance_inr": 32000.0,
+                "daily_start_wallet": {"date": today_s, "inr": 32000.0},
+                "daily_loss_stop_hit": "",
+            })
+            with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "is_experiment_environment", return_value=False), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 32000.0, "available_inr": 32000.0}), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
+                     {"pair": "B-NEAR_USDT", "direction": "SHORT", "pnl_inr": 100.0},
+                     {"pair": "B-INJ_USDT", "direction": "LONG", "pnl_inr": 50.0},
+                 ]), \
+                 patch.object(eng, "fetch_coindcx_open_orders", return_value=[]), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-NEAR_USDT", "B-INJ_USDT"]}):
+                ok_2cap, msg_2cap, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-SOL_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 70.0, "tp1": 69.0, "tp2": 67.5, "stop_loss": 71.5, "levels": bear_box},
+                    single_trade_margin_inr=None, leverage=10,
+                )
+                assert not ok_2cap and "2-Slot Wallet Guard (2/2" in msg_2cap, (ok_2cap, msg_2cap)
+
+            # 3. Unrealized PnL Daily SL Pause (Live):
+            # Day-start Rs.24,000 -> 5% Daily SL = Rs.1,200. Open position has unrealized PnL = -Rs.1,450 -> PAUSE!
+            eng.save_autotrade_config({
+                "max_concurrent_trades": 3,
+                "daily_start_wallet": {"date": today_s, "inr": 24000.0},
+                "daily_loss_stop_hit": "",
+            })
+            w_live24 = {"is_live_api": True, "total_inr": 24000.0, "available_inr": 16000.0}
+            losing_open_pos = [{"pair": "B-RENDER_USDT", "direction": "SHORT", "pnl_inr": -1450.0}]
+            paused, p_msg, p_info = eng.check_unrealized_pnl_daily_sl_pause(w_live24, positions=losing_open_pos)
+            assert paused and "Unrealized PnL Daily SL Pause" in p_msg, (paused, p_msg)
+            assert p_info["unrealized_loss_inr"] == 1450.0 and p_info["limit_inr"] == 1200.0
+            # Must NOT permanently lock daily_loss_stop_hit!
+            assert eng.get_autotrade_config().get("daily_loss_stop_hit", "") == ""
+
+            # execute_autotrade_two_entry_signal MUST block new trades while open unrealized loss >= Daily SL!
+            with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "is_experiment_environment", return_value=False), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value=w_live24), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=losing_open_pos), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-RENDER_USDT"]}):
+                ok_unr, msg_unr, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.30, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.45, "levels": bear_box},
+                    single_trade_margin_inr=8000.0, leverage=10,
+                )
+                assert not ok_unr and "Unrealized PnL Daily SL Pause" in msg_unr, (ok_unr, msg_unr)
+
+            # Combined loss check: realized loss -Rs.700 + open unrealized loss -Rs.600 = -Rs.1,300 >= Rs.1,200 -> PAUSE!
+            w_live_part = {"is_live_api": True, "total_inr": 23300.0, "available_inr": 15300.0}
+            p_comb, _, p_cinfo = eng.check_unrealized_pnl_daily_sl_pause(
+                w_live_part, positions=[{"pair": "B-SOL_USDT", "direction": "SHORT", "pnl_inr": -600.0}]
+            )
+            assert p_comb and p_cinfo["combined_loss_inr"] == 1300.0, (p_comb, p_cinfo)
+
+            # Once all live positions close (positions=[]) with realized loss < 5% -> Pause AUTOMATICALLY lifts!
+            p_closed, _, _ = eng.check_unrealized_pnl_daily_sl_pause(w_live_part, positions=[])
+            assert p_closed is False, "Expected unrealized PnL pause to lift automatically once open positions close!"
+
+            # Staging Paper Unrealized PnL Pause: open paper lock down -Rs.1,600 on live ticker -> PAUSE!
+            with patch.dict(os.environ, {"APP_ENV": "staging"}):
+                eng.save_autotrade_config({
+                    "paper_wallet_inr": 24000.0,
+                    "paper_daily_start_wallet": {"date": today_s, "inr": 24000.0},
+                    "daily_loss_stop_hit": "",
+                    "active_trade_locks": {
+                        "B-NEAR_USDT": {
+                            "pair": "B-NEAR_USDT", "direction": "SHORT", "strategy_id": "box_theory",
+                            "entry": 3.00, "margin_inr": 8000.0, "leverage": 10, "tp1_hit": False,
+                            "entry1_pending": False, "is_live_exchange": False, "opened_ts": time.time(),
+                        }
+                    },
+                })
+                # Price moved +2% against SHORT ($3.00 -> $3.06) -> -20% ROE on Rs.8,000 = -Rs.1,600 >= Rs.1,200!
+                with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 3.06}):
+                    p_stg, msg_stg_u, info_stg_u = eng.check_unrealized_pnl_daily_sl_pause(
+                        eng.get_paper_wallet_snapshot(), allow_live_ticker=True
+                    )
+                    assert p_stg and "Unrealized PnL Daily SL Pause" in msg_stg_u, (p_stg, msg_stg_u, info_stg_u)
+                    assert abs(info_stg_u["unrealized_loss_inr"] - 1600.0) < 1.0, info_stg_u
+
+    print("  -> PASS: Daemon v37 Configurable Concurrent Trades, Auto-Split Wallet Toggle & Unrealized PnL Daily SL Pause verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1965,6 +2093,7 @@ if __name__ == "__main__":
     test_15_v35_funds_section_and_wallet_ledger()
     test_16_three_tier_main_staging_experiment_parity()
     test_17_v36_six_sl_reduction_fixes()
+    test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

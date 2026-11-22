@@ -442,7 +442,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 36
+_REQUIRED_DAEMON_VERSION = 37
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
@@ -1150,9 +1150,9 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
             try:
                 _cur_cfg = get_autotrade_config()
                 _upd = {"wallet_balance_inr": round(total_inr, 2)}
-                _cur_sm = float(_cur_cfg.get("single_trade_margin_inr", 0.0) or 0.0)
-                if not _cur_cfg.get("user_custom_margin") and _cur_sm in (0.0, 15762.39, 30000.0, 250000.0, 100000.0):
-                    _upd["single_trade_margin_inr"] = round(total_inr * TRADE_ALLOCATION_FRACTION, 2)
+                _eff_slots_u = get_configured_max_slots(_cur_cfg)
+                if is_auto_split_enabled(_cur_cfg):
+                    _upd["single_trade_margin_inr"] = round(total_inr / _eff_slots_u, 2)
                 save_autotrade_config(_upd)
             except Exception:
                 pass
@@ -1211,9 +1211,9 @@ def _fetch_coindcx_futures_balance_sync() -> dict:
                 if _b_tot > 0:
                     _cur_cfg_b = get_autotrade_config()
                     _upd_b = {"wallet_balance_inr": round(_b_tot, 2)}
-                    _cur_sm_b = float(_cur_cfg_b.get("single_trade_margin_inr", 0.0) or 0.0)
-                    if not _cur_cfg_b.get("user_custom_margin") and _cur_sm_b in (0.0, 15762.39, 30000.0, 250000.0, 100000.0):
-                        _upd_b["single_trade_margin_inr"] = round(_b_tot * TRADE_ALLOCATION_FRACTION, 2)
+                    _eff_slots_b = get_configured_max_slots(_cur_cfg_b)
+                    if is_auto_split_enabled(_cur_cfg_b):
+                        _upd_b["single_trade_margin_inr"] = round(_b_tot / _eff_slots_b, 2)
                     save_autotrade_config(_upd_b)
             except Exception:
                 pass
@@ -4293,6 +4293,8 @@ _DURABLE_AUTOTRADE_KEYS = (
     "regime_mode_migrated_v33",
     "single_trade_margin_inr",
     "user_custom_margin",
+    "max_concurrent_trades",
+    "auto_split_wallet_by_slots",
     "leverage",
     "daily_start_wallet",
     "daily_loss_stop_hit",
@@ -4304,6 +4306,27 @@ _DURABLE_AUTOTRADE_KEYS = (
     "active_trade_lock",
     "active_trade_locks",
 )
+
+
+def get_configured_max_slots(cfg: dict | None = None) -> int:
+    """Returns the user-configured Number of Concurrent Trades (clamped 1..10, default MAX_CONCURRENT_TRADES=3)."""
+    c = cfg if isinstance(cfg, dict) else get_autotrade_config()
+    try:
+        val = int(c.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)
+    except Exception:
+        val = MAX_CONCURRENT_TRADES
+    return max(1, min(10, val))
+
+
+def is_auto_split_enabled(cfg: dict | None = None) -> bool:
+    """
+    True when 'Auto-Split Futures Wallet by Number of Concurrent Trades' is ON.
+    Backwards-compatible with legacy configs where only `user_custom_margin` was persisted.
+    """
+    c = cfg if isinstance(cfg, dict) else get_autotrade_config()
+    if "auto_split_wallet_by_slots" in c and c.get("auto_split_wallet_by_slots") is not None:
+        return bool(c.get("auto_split_wallet_by_slots"))
+    return not bool(c.get("user_custom_margin", False))
 
 
 def get_git_branch_name() -> str:
@@ -4430,21 +4453,31 @@ def sync_setup_from_main(reset_paper_wallet: bool = False) -> tuple[bool, str, d
         m_wallet = float(main_setup.get("wallet_balance_inr", 0.0) or 0.0)
         m_margin = float(main_setup.get("single_trade_margin_inr", 0.0) or 0.0)
         m_custom = bool(main_setup.get("user_custom_margin", False))
+        m_slots = max(1, min(10, int(main_setup.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)))
+        m_auto_split = (
+            bool(main_setup["auto_split_wallet_by_slots"])
+            if "auto_split_wallet_by_slots" in main_setup
+            else (not m_custom)
+        )
         m_lev = int(main_setup.get("leverage", 10) or 10)
         m_mode = str(main_setup.get("autotrade_strategy_mode") or "box_plus_ema50_200_regime")
 
         updates = {
             "autotrade_strategy_mode": m_mode,
             "leverage": m_lev,
-            "user_custom_margin": m_custom,
+            "max_concurrent_trades": m_slots,
+            "auto_split_wallet_by_slots": m_auto_split,
+            "user_custom_margin": not m_auto_split,
             "synced_from_main_at": now_s,
         }
         if m_wallet > 0:
             updates["wallet_balance_inr"] = round(m_wallet, 2)
-        if m_margin > 0:
+        if m_auto_split and m_wallet > 0:
+            updates["single_trade_margin_inr"] = round(m_wallet / m_slots, 2)
+        elif m_margin > 0:
             updates["single_trade_margin_inr"] = round(m_margin, 2)
         elif m_wallet > 0:
-            updates["single_trade_margin_inr"] = round(m_wallet * TRADE_ALLOCATION_FRACTION, 2)
+            updates["single_trade_margin_inr"] = round(m_wallet / m_slots, 2)
 
         cur_pw = float(cfg.get("paper_wallet_inr", 0.0) or 0.0)
         if m_wallet > 0 and (reset_paper_wallet or cur_pw <= 0):
@@ -4537,6 +4570,8 @@ def get_autotrade_config() -> dict:
         "wallet_balance_inr": 47287.18,
         "single_trade_margin_inr": 15762.39,
         "user_custom_margin": False,
+        "max_concurrent_trades": MAX_CONCURRENT_TRADES,
+        "auto_split_wallet_by_slots": None,
         "leverage": 10,
         "one_crypto_at_a_time": True,
         "high_vol_scan_enabled": True,
@@ -4553,10 +4588,14 @@ def get_autotrade_config() -> dict:
                 res = dict(default_cfg)
                 res.update(cached_data)
                 res["paper_only"] = (_is_stg or _is_exp)
+                eff_sl_c = max(1, min(10, int(res.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)))
+                res["max_concurrent_trades"] = eff_sl_c
+                auto_sp_c = is_auto_split_enabled(res)
+                res["auto_split_wallet_by_slots"] = auto_sp_c
                 wb_c = float(res.get("wallet_balance_inr", 47287.18) or 47287.18)
                 sm_c = float(res.get("single_trade_margin_inr", 0) or 0)
-                if sm_c <= 0 or sm_c in (15762.39, 30000.0, 250000.0, 100000.0) or not res.get("user_custom_margin"):
-                    res["single_trade_margin_inr"] = round(wb_c * TRADE_ALLOCATION_FRACTION, 2)
+                if sm_c <= 0 or sm_c in (15762.39, 30000.0, 250000.0, 100000.0) or auto_sp_c:
+                    res["single_trade_margin_inr"] = round(wb_c / eff_sl_c, 2)
                 return res
             with open(AUTOTRADE_CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
@@ -4565,12 +4604,18 @@ def get_autotrade_config() -> dict:
                     _AUTOTRADE_CFG_MEM_CACHE["mtime"] = mtime
                     default_cfg.update(saved)
                     default_cfg["paper_only"] = (_is_stg or _is_exp)
+                    eff_sl = max(1, min(10, int(default_cfg.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)))
+                    default_cfg["max_concurrent_trades"] = eff_sl
+                    auto_sp = is_auto_split_enabled(default_cfg)
+                    default_cfg["auto_split_wallet_by_slots"] = auto_sp
                     wb = float(default_cfg.get("wallet_balance_inr", 47287.18) or 47287.18)
                     sm_val = float(default_cfg.get("single_trade_margin_inr", 0) or 0)
-                    if sm_val <= 0 or sm_val in (15762.39, 30000.0, 250000.0, 100000.0) or not default_cfg.get("user_custom_margin"):
-                        default_cfg["single_trade_margin_inr"] = round(wb * TRADE_ALLOCATION_FRACTION, 2)
+                    if sm_val <= 0 or sm_val in (15762.39, 30000.0, 250000.0, 100000.0) or auto_sp:
+                        default_cfg["single_trade_margin_inr"] = round(wb / eff_sl, 2)
     except Exception:
         pass
+    if default_cfg.get("auto_split_wallet_by_slots") is None:
+        default_cfg["auto_split_wallet_by_slots"] = not bool(default_cfg.get("user_custom_margin", False))
     return default_cfg
 
 
@@ -4578,6 +4623,15 @@ def save_autotrade_config(updates: dict) -> dict:
     """Saves updated AutoTrade settings to .cache/autotrade_config.json without triggering any API calls."""
     cfg = get_autotrade_config()
     updates = dict(updates or {})
+    if "auto_split_wallet_by_slots" in updates and "user_custom_margin" not in updates:
+        updates["user_custom_margin"] = not bool(updates["auto_split_wallet_by_slots"])
+    elif "user_custom_margin" in updates and "auto_split_wallet_by_slots" not in updates:
+        updates["auto_split_wallet_by_slots"] = not bool(updates["user_custom_margin"])
+    if "max_concurrent_trades" in updates:
+        try:
+            updates["max_concurrent_trades"] = max(1, min(10, int(updates["max_concurrent_trades"] or MAX_CONCURRENT_TRADES)))
+        except Exception:
+            updates["max_concurrent_trades"] = MAX_CONCURRENT_TRADES
     if "active_trade_lock" in updates and "active_trade_locks" not in updates:
         lk_upd = updates.get("active_trade_lock")
         if lk_upd is None:
@@ -5458,6 +5512,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
           Cancels remaining resting orders, records a 4h cross-strategy Post-SL Lock on loss, and releases the slot.
     """
     cfg = get_autotrade_config()
+    eff_max_slots = get_configured_max_slots(cfg)
     locks_map = _get_active_locks_map(cfg)
     if not manage_exchange and locks_map and _PERSIST.get("session_verified"):
         _cached_p = _ACTIVE_POSITIONS_CACHE.get("data")
@@ -5475,7 +5530,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                     clear_autotrade_active_lock(_lp_k)
                     locks_map.pop(_lp_k, None)
             if not locks_map and len(_cached_p) == 0:
-                return {"is_occupied": False, "has_active_trade": False, "active_pair": None, "active_pairs": [], "count": 0, "max_slots": MAX_CONCURRENT_TRADES, "source": "Slot Free (App Trade Closed on Exchange)"}
+                return {"is_occupied": False, "has_active_trade": False, "active_pair": None, "active_pairs": [], "count": 0, "max_slots": eff_max_slots, "source": "Slot Free (App Trade Closed on Exchange)"}
 
     if locks_map:
         sorted_locks = sorted(
@@ -5493,7 +5548,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             ))
             _cnt = max(1, len(_act_pairs))
             return {
-                "is_occupied": _cnt >= MAX_CONCURRENT_TRADES,
+                "is_occupied": _cnt >= eff_max_slots,
                 "has_active_trade": True,
                 "active_pair": l_pair,
                 "active_pairs": _act_pairs,
@@ -5508,7 +5563,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 "stop_loss": float(lock.get("stop_loss", 0.0) or 0.0),
                 "source": lock.get("mode", "App/API Active Trade"),
                 "count": _cnt,
-                "max_slots": MAX_CONCURRENT_TRADES,
+                "max_slots": eff_max_slots,
             }
 
         # Daemon management path: fetch live CoinDCX positions ONCE, then independently manage EVERY active lock slot!
@@ -6002,7 +6057,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             ))
             _cnt2 = max(1, len(_act_pairs2))
             return {
-                "is_occupied": _cnt2 >= MAX_CONCURRENT_TRADES,
+                "is_occupied": _cnt2 >= eff_max_slots,
                 "has_active_trade": True,
                 "active_pair": p_pair,
                 "active_pairs": _act_pairs2,
@@ -6017,14 +6072,14 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 "stop_loss": float(primary_lock.get("stop_loss", 0.0) or 0.0),
                 "source": primary_lock.get("mode", "App/API Active Trade"),
                 "count": _cnt2,
-                "max_slots": MAX_CONCURRENT_TRADES,
+                "max_slots": eff_max_slots,
             }
 
         if isinstance(live_positions, list) and len(live_positions) > 0:
             other_p = live_positions[0]
             _act_pairs_lp = [p.get("pair") for p in live_positions if p.get("pair")]
             return {
-                "is_occupied": len(live_positions) >= MAX_CONCURRENT_TRADES,
+                "is_occupied": len(live_positions) >= eff_max_slots,
                 "has_active_trade": True,
                 "active_pair": other_p.get("pair"),
                 "active_pairs": _act_pairs_lp,
@@ -6033,7 +6088,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 "stop_loss": float(other_p.get("stop_loss", 0.0) or 0.0),
                 "source": "CoinDCX Live Active Position" + (f" ({'; '.join(closed_notes)})" if closed_notes else ""),
                 "count": len(live_positions),
-                "max_slots": MAX_CONCURRENT_TRADES,
+                "max_slots": eff_max_slots,
             }
 
         return {
@@ -6042,7 +6097,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             "active_pair": None,
             "active_pairs": [],
             "count": 0,
-            "max_slots": MAX_CONCURRENT_TRADES,
+            "max_slots": eff_max_slots,
             "source": f"Slot Free ({'; '.join(closed_notes) if closed_notes else 'Previous App Trade Completed'})",
         }
 
@@ -6061,7 +6116,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             first_p = live_pos[0]
             _act_pairs3 = [p.get("pair") for p in live_pos if p.get("pair")]
             return {
-                "is_occupied": len(live_pos) >= MAX_CONCURRENT_TRADES,
+                "is_occupied": len(live_pos) >= eff_max_slots,
                 "has_active_trade": True,
                 "active_pair": first_p.get("pair"),
                 "active_pairs": _act_pairs3,
@@ -6070,12 +6125,12 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 "stop_loss": float(first_p.get("stop_loss", 0.0) or 0.0),
                 "source": "CoinDCX Live Active Position",
                 "count": len(live_pos),
-                "max_slots": MAX_CONCURRENT_TRADES,
+                "max_slots": eff_max_slots,
             }
     except Exception:
         pass
 
-    return {"is_occupied": False, "has_active_trade": False, "active_pair": None, "active_pairs": [], "count": 0, "max_slots": MAX_CONCURRENT_TRADES, "source": f"Slots Free (0/{MAX_CONCURRENT_TRADES} Active)"}
+    return {"is_occupied": False, "has_active_trade": False, "active_pair": None, "active_pairs": [], "count": 0, "max_slots": eff_max_slots, "source": f"Slots Free (0/{eff_max_slots} Active)"}
 
 
 def unlock_autotrade_daily_loss_stop(wallet: dict | None = None) -> dict:
@@ -6180,6 +6235,116 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
     return False, f"Daily loss ₹{max(loss, 0):,.2f} / limit ₹{limit:,.2f}", info
 
 
+def check_unrealized_pnl_daily_sl_pause(
+    wallet: dict | None = None,
+    positions: list | None = None,
+    allow_live_ticker: bool = True,
+) -> tuple[bool, str, dict]:
+    """
+    Unrealized PnL Daily SL Pause Guard (Live & Staging Paper):
+      - Checks total live unrealized PnL across all open positions (or open Staging paper locks).
+      - If open positions exist AND open unrealized loss (or realized daily loss + open unrealized loss)
+        is >= DAILY_WALLET_LOSS_STOP_PCT (5.0%) of day-start wallet:
+        PAUSES new trade initiation until open live positions are closed!
+      - Unlike `check_live_daily_loss_stop`, this does NOT lock `daily_loss_stop_hit` for the day:
+        once the open positions close, trading resumes automatically if realized loss stayed < 5%,
+        or locks normally via `check_live_daily_loss_stop` if realized loss hit >= 5%.
+    """
+    import strategies as _strategies
+    pct = float(getattr(_strategies, "DAILY_WALLET_LOSS_STOP_PCT", 5.0) or 5.0)
+    _, _, base_info = check_live_daily_loss_stop(wallet)
+    limit_inr = float((base_info or {}).get("limit_inr", 0.0) or 0.0)
+    day_start_inr = float((base_info or {}).get("day_start_inr", 0.0) or 0.0)
+    realized_loss_today = max(0.0, float((base_info or {}).get("loss_inr", 0.0) or 0.0))
+    if limit_inr <= 0:
+        return False, "", {}
+
+    is_paper = bool((base_info or {}).get("is_paper_wallet")) or (
+        isinstance(wallet, dict) and bool(wallet.get("is_paper_wallet"))
+    )
+
+    open_count = 0
+    total_unrealized_pnl = 0.0
+
+    if isinstance(positions, list):
+        open_count = len(positions)
+        for p in positions:
+            if isinstance(p, dict):
+                total_unrealized_pnl += float(p.get("pnl_inr", 0.0) or 0.0)
+    elif is_paper:
+        cfg = get_autotrade_config()
+        locks_map = _get_active_locks_map(cfg)
+        paper_locks = [
+            lk for lk in locks_map.values()
+            if isinstance(lk, dict) and not bool(lk.get("is_live_exchange", False)) and not bool(lk.get("entry1_pending", False))
+        ]
+        open_count = len(paper_locks)
+        tk_map = _TICKER_MAP_CACHE.get("data") or {}
+        for lk in paper_locks:
+            l_pair = str(lk.get("pair", "") or "")
+            l_entry = float(lk.get("entry", 0.0) or 0.0)
+            l_margin = float(lk.get("margin_inr", 0.0) or 0.0)
+            l_lev = int(lk.get("leverage", 10) or 10)
+            l_dir = str(lk.get("direction", "LONG")).upper()
+            if not l_pair or l_entry <= 0 or l_margin <= 0:
+                continue
+            px = 0.0
+            if allow_live_ticker:
+                try:
+                    px = float((fetch_live_ticker(l_pair) or {}).get("last_price", 0.0) or 0.0)
+                except Exception:
+                    px = 0.0
+            elif isinstance(tk_map.get(l_pair), dict):
+                px = float(tk_map[l_pair].get("last_price", 0.0) or 0.0)
+            if px <= 0:
+                continue
+            rem_frac = 0.5 if (bool(lk.get("tp1_hit", False)) and str(lk.get("strategy_id", "")) != "ema9_retest") else 1.0
+            raw_pct = ((px - l_entry) / l_entry) if l_dir in ("LONG", "BUY") else ((l_entry - px) / l_entry)
+            total_unrealized_pnl += (raw_pct * l_lev) * (l_margin * rem_frac)
+    else:
+        cached_pos = _ACTIVE_POSITIONS_CACHE.get("data") or []
+        if isinstance(cached_pos, list):
+            open_count = len(cached_pos)
+            for p in cached_pos:
+                if isinstance(p, dict):
+                    total_unrealized_pnl += float(p.get("pnl_inr", 0.0) or 0.0)
+
+    if open_count <= 0:
+        return False, "", {
+            "open_positions": 0,
+            "unrealized_pnl_inr": 0.0,
+            "unrealized_loss_inr": 0.0,
+            "combined_loss_inr": round(realized_loss_today, 2),
+            "limit_inr": round(limit_inr, 2),
+            "day_start_inr": round(day_start_inr, 2),
+        }
+
+    unrealized_loss_inr = max(0.0, -total_unrealized_pnl)
+    combined_loss_inr = realized_loss_today + unrealized_loss_inr
+    u_info = {
+        "open_positions": open_count,
+        "unrealized_pnl_inr": round(total_unrealized_pnl, 2),
+        "unrealized_loss_inr": round(unrealized_loss_inr, 2),
+        "realized_loss_inr": round(realized_loss_today, 2),
+        "combined_loss_inr": round(combined_loss_inr, 2),
+        "limit_inr": round(limit_inr, 2),
+        "day_start_inr": round(day_start_inr, 2),
+        "is_paper_wallet": is_paper,
+    }
+    if unrealized_loss_inr >= limit_inr or combined_loss_inr >= limit_inr:
+        comb_part = (
+            f" (combined with today's realized loss: ₹{combined_loss_inr:,.2f})"
+            if realized_loss_today > 1.0
+            else ""
+        )
+        return True, (
+            f"Unrealized PnL Daily SL Pause: Open unrealized loss ₹{unrealized_loss_inr:,.2f}{comb_part} "
+            f">= {pct:.1f}% Daily SL limit ₹{limit_inr:,.2f} across {open_count} open position(s). "
+            f"Pausing new trades until live positions close."
+        ), u_info
+    return False, "", u_info
+
+
 def compute_wallet_capped_margin(
     margin_inr: float,
     leverage: int,
@@ -6235,12 +6400,12 @@ def execute_autotrade_two_entry_signal(
       3. Rejects Maker Limit placement if live price has drifted within `< 0.35%` of Stop Loss.
     """
     cfg = get_autotrade_config()
-    raw_requested_margin = float(single_trade_margin_inr or cfg.get("single_trade_margin_inr", 30000.0))
-    honor_custom_margin = bool(cfg.get("user_custom_margin", False))
+    max_slots = get_configured_max_slots(cfg)
+    auto_split_on = is_auto_split_enabled(cfg)
+    honor_custom_margin = (not auto_split_on) and bool(cfg.get("user_custom_margin", False))
     lev = int(leverage or cfg.get("leverage", 10))
     u_inr = float(usd_inr or get_coindcx_live_usdt_inr_rate())
 
-    max_slots = int(cfg.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)
     is_exp_env = is_experiment_environment()
     staging_paper_only = is_staging_environment() or is_exp_env or bool(cfg.get("paper_only", False))
 
@@ -6251,6 +6416,19 @@ def execute_autotrade_two_entry_signal(
         if (is_staging_environment() and float(cfg.get("paper_wallet_inr", 0.0) or 0.0) > 0)
         else _live_wallet_raw
     )
+    _w_tot_fallback = float((_wallet_now or {}).get("total_inr", 0.0) or cfg.get("wallet_balance_inr", 0.0) or 0.0)
+    _req_m_arg = float(single_trade_margin_inr or 0.0)
+    _cfg_m_val = float(cfg.get("single_trade_margin_inr", 0.0) or 0.0)
+    if auto_split_on and _w_tot_fallback > 0 and _req_m_arg <= 0:
+        raw_requested_margin = round(_w_tot_fallback / max_slots, 2)
+    elif _req_m_arg > 0:
+        raw_requested_margin = _req_m_arg
+    elif _cfg_m_val > 0:
+        raw_requested_margin = _cfg_m_val
+    elif _w_tot_fallback > 0:
+        raw_requested_margin = round(_w_tot_fallback / max_slots, 2)
+    else:
+        raw_requested_margin = 30000.0
     _stop_hit, _stop_msg, _stop_info = check_live_daily_loss_stop(_wallet_now)
     if _stop_hit:
         return False, _stop_msg, {"daily_loss_stop": _stop_info}
@@ -6308,6 +6486,18 @@ def execute_autotrade_two_entry_signal(
             f"blocking {pair} AutoTrade until exchange positions are verified."
         ), {"live_ex_pos": None}
 
+    # Unrealized PnL Daily SL Pause Guard (v37):
+    # If open unrealized loss (or realized + open unrealized loss today) >= 5% Daily SL,
+    # pause initiating new trades until the open live/paper positions are closed!
+    _is_paper_w_now = isinstance(_wallet_now, dict) and bool(_wallet_now.get("is_paper_wallet"))
+    _unr_paused, _unr_msg, _unr_info = check_unrealized_pnl_daily_sl_pause(
+        _wallet_now,
+        positions=None if _is_paper_w_now else (live_ex_pos if isinstance(live_ex_pos, list) else []),
+        allow_live_ticker=True,
+    )
+    if _unr_paused:
+        return False, _unr_msg, {"unrealized_pnl_pause": _unr_info}
+
     open_entry_orders = None
     occupied_pairs: list[str] = []
     for _lp in (live_ex_pos or []):
@@ -6336,8 +6526,9 @@ def execute_autotrade_two_entry_signal(
         ), {"live_ex_pos": live_ex_pos, "occupied_pairs": occupied_pairs}
     if len(occupied_pairs) >= max_slots:
         open_names = ", ".join(occupied_pairs[:max_slots])
+        slot_lbl = f"{max_slots}-Slot Wallet Guard"
         return False, (
-            f"3-Slot Wallet Guard ({len(occupied_pairs)}/{max_slots} active, incl. resting limit orders): "
+            f"{slot_lbl} ({len(occupied_pairs)}/{max_slots} active, incl. resting limit orders): "
             f"CoinDCX already has {len(occupied_pairs)} active trades/orders ({open_names}). "
             f"Skipping {pair} (max {max_slots} concurrent trades)."
         ), {"live_ex_pos": live_ex_pos, "occupied_pairs": occupied_pairs}
@@ -7511,22 +7702,27 @@ def get_recent_coindcx_notifications(limit: int = 10) -> list[dict]:
 
 def get_rotational_margin_inr(leverage: int = 10) -> dict:
     """
-    Rotational capital sizing: 1/3rd of live CoinDCX Futures wallet equity per trade (or user's saved single-trade margin).
+    Rotational capital sizing: splits live CoinDCX Futures wallet equity by the configured
+    Number of Concurrent Trades (`max_concurrent_trades`, default 3).
     Uses cached wallet equity in 0ms without blocking or recursing.
     """
     _check_and_kill_obsolete_daemon()
     equity, live = DEFAULT_WALLET_INR, False
+    slots = MAX_CONCURRENT_TRADES
     try:
         bal = _WALLET_BALANCE_CACHE.get("data") or _WALLET_BALANCE_CACHE.get("last_good_live")
         if isinstance(bal, dict) and float(bal.get("total_inr", 0)) > 0:
             equity, live = float(bal["total_inr"]), bool(bal.get("is_live_api", True))
         else:
             equity, live = _get_saved_wallet_balance_default(), True
+        cfg_r = _AUTOTRADE_CFG_MEM_CACHE.get("data")
+        if isinstance(cfg_r, dict) and cfg_r.get("max_concurrent_trades"):
+            slots = max(1, min(10, int(cfg_r.get("max_concurrent_trades") or MAX_CONCURRENT_TRADES)))
     except Exception as e:
         print(f"[Wallet Sizing Fallback]: {e}")
-    margin = round(equity * TRADE_ALLOCATION_FRACTION, 2)
+    margin = round(equity / max(1, slots), 2)
     return {"wallet_equity_inr": equity, "margin_inr": margin, "leverage": leverage,
-            "notional_inr": margin * leverage, "is_live_api": live}
+            "notional_inr": margin * leverage, "is_live_api": live, "max_slots": slots}
 
 
 def _upgrade_all_in_memory_functions_and_disarm():
