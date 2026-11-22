@@ -22,6 +22,7 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", 
 DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
 COOLDOWN_MIN = 60          # per strategy + pair + direction, plus pair-level anti-spam guard
 SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zone in the same direction
+POST_SL_LOCK_MIN = 240     # 4h unified cross-strategy lock on (pair, direction) after any SL hit
 MAX_DAILY_ALERTS_PER_PAIR = 3
 MAX_DAILY_PORTFOLIO_TRADES = 999
 MAX_CONCURRENT_PORTFOLIO_TRADES = int(getattr(eng, "MAX_CONCURRENT_TRADES", 3) or 3)  # 3-slot wallet
@@ -120,6 +121,43 @@ def scan_pair(pair: str, margin_inr: float, leverage: int, usd_inr: float, strat
 def _state_key(strategy_id: str, pair: str, sig: dict) -> str:
     base = f"{pair}|{sig['signal_kind']}|{sig['signal']}"
     return base if strategy_id == strat_registry.DEFAULT_STRATEGY_ID else f"{strategy_id}|{base}"
+
+
+def record_post_sl_lock(pair: str, direction: str, reason: str = "SL Hit") -> None:
+    """
+    Records a 4-hour unified cross-strategy lock on `(pair_base, direction)` whenever any trade
+    stops out (Live or Staging Paper). Prevents Box Theory and 15m 50/200 EMA from immediately
+    re-entering the exact same losing direction on a coin that just hit SL.
+    """
+    pair_base = _canon_pair(pair)
+    if not pair_base:
+        return
+    norm_dir = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
+    state = _load()
+    state[f"POST_SL_LOCK|{pair_base}|{norm_dir}"] = {
+        "locked_at": time.time(),
+        "pair": pair,
+        "direction": norm_dir,
+        "reason": str(reason or "SL Hit"),
+    }
+    _save(state)
+
+
+def is_post_sl_locked(pair: str, direction: str, state: dict | None = None) -> tuple[bool, float]:
+    """Returns `(is_locked, remaining_minutes)` for a `(pair, direction)` post-SL cooldown."""
+    pair_base = _canon_pair(pair)
+    if not pair_base:
+        return False, 0.0
+    norm_dir = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
+    st = state if isinstance(state, dict) else _load()
+    rec = st.get(f"POST_SL_LOCK|{pair_base}|{norm_dir}")
+    if not isinstance(rec, dict):
+        return False, 0.0
+    elapsed = time.time() - float(rec.get("locked_at", 0.0) or 0.0)
+    limit_sec = POST_SL_LOCK_MIN * 60.0
+    if 0.0 <= elapsed < limit_sec:
+        return True, round((limit_sec - elapsed) / 60.0, 1)
+    return False, 0.0
 
 
 def _note(strategy_id: str, sig: dict) -> str:
@@ -325,6 +363,17 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 key = _state_key(s.id, pair, sig)
                 last = state.get(key, {})
                 now_ts = time.time()
+                norm_sig_dir = "LONG" if str(sig.get("signal", "")).upper() in ("LONG", "BUY") else "SHORT"
+
+                # Unified Cross-Strategy Post-SL 4h Lock: if ANY strategy hit SL on (pair, direction) within 4h, block ALL strategies!
+                post_sl_lk, post_sl_rem = is_post_sl_locked(pair, norm_sig_dir, state=state)
+                if post_sl_lk:
+                    results.append({
+                        **row,
+                        "message": f"post-SL 4h cross-strategy lock active on {pair_base} {norm_sig_dir} ({post_sl_rem:.0f}m left)"
+                    })
+                    continue
+
                 is_new_candle = last.get("candle_ts") != sig["candle_ts"]
                 cooled = (now_ts - last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
                 pair_cooled = (now_ts - pair_last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
@@ -340,10 +389,28 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 )
                 same_setup_locked = same_price_zone and ((now_ts - last.get("sent_at", 0)) < SAME_SETUP_LOCK_MIN * 60)
 
+                # Unified Cross-Strategy Re-Entry Lock on (pair_base, direction):
+                # Blocks Box <-> EMA flip-flop re-entries on the same breaking coin for 4h (1h only if previous trade won TP1).
+                cross_key = f"CROSS_STRAT_LOCK|{pair_base}|{norm_sig_dir}"
+                cross_last = state.get(cross_key, {}) if isinstance(state.get(cross_key), dict) else {}
+                cross_at = float(cross_last.get("autotraded_at", 0.0) or 0.0)
+                _cross_prev_tp1_won = any(
+                    isinstance(_h, dict)
+                    and _canon_pair(_h.get("pair", "")) == pair_base
+                    and str(_h.get("direction", "")).upper() == norm_sig_dir
+                    and bool(_h.get("tp1_hit", False))
+                    and float(_h.get("opened_ts", 0.0) or 0.0) >= (cross_at - 15.0)
+                    for _h in (auto_cfg.get("history") or [])[:15]
+                )
+                _cross_lock_sec = (COOLDOWN_MIN * 60) if _cross_prev_tp1_won else (SAME_SETUP_LOCK_MIN * 60)
+                cross_strat_locked = cross_at > 0 and ((now_ts - cross_at) < _cross_lock_sec)
+
                 if not is_new_candle:
                     msg = "already alerted for this candle"
                 elif same_setup_locked:
                     msg = "already alerted for this setup zone"
+                elif cross_strat_locked:
+                    msg = f"cross-strategy 4h lock on {pair_base} {norm_sig_dir}"
                 elif not (cooled and pair_cooled):
                     msg = "on cooldown"
                 else:
@@ -365,9 +432,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 )
                 _zone_lock_sec = (COOLDOWN_MIN * 60) if _prev_hist_tp1_won else (SAME_SETUP_LOCK_MIN * 60)
                 already_autotraded_setup = (
-                    bool(last.get("autotraded", False))
-                    and same_price_zone
-                    and ((now_ts - last_autotraded_at) < _zone_lock_sec)
+                    (
+                        bool(last.get("autotraded", False))
+                        and same_price_zone
+                        and ((now_ts - last_autotraded_at) < _zone_lock_sec)
+                    )
+                    or cross_strat_locked
                 )
 
                 if (
@@ -441,6 +511,13 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             "tp1": float(sig.get("tp1", 0.0) or 0.0),
                             "autotraded": True,
                             "autotraded_at": now_exec,
+                        }
+                        state[cross_key] = {
+                            "autotraded_at": now_exec,
+                            "strategy_id": s.id,
+                            "entry": cur_entry,
+                            "direction": norm_sig_dir,
+                            "pair": pair,
                         }
                         autotrade_daily_count += 1
                         state[autotrade_daily_key] = autotrade_daily_count

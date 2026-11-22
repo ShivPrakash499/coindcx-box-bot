@@ -200,7 +200,7 @@ def test_4_strategy_and_two_entry_levels():
         f"Expected 4-decimal manual Execute levels preserved without rounding off, got: {manual_4d}"
     )
 
-    # Verify build_two_entry_runner_plan uses 100% Single Entry (entry2_sweep == 0.0) while anchoring Catastrophe SL beyond SH (> $7.43)
+    # Verify build_two_entry_runner_plan uses 100% Single Entry (entry2_sweep == 0.0) while anchoring structural Catastrophe SL beyond SH (> $7.43)
     inj_plan = strat.build_two_entry_runner_plan("SHORT", entry=7.30, sweep_level=7.43, struct_tp1=7.10, struct_tp2=6.89, leverage=10)
     assert inj_plan is not None
     assert inj_plan["entry2_sweep"] == 0.0, f"Expected Entry 2 removed (0.0), got {inj_plan['entry2_sweep']}"
@@ -254,7 +254,8 @@ def test_5_daily_bias_enforcement():
     }
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]):
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")):
         bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
         with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
             ok_b, msg_b, _ = eng.execute_autotrade_two_entry_signal(
@@ -394,15 +395,16 @@ def test_6_deployment_regression_guards():
     assert 'st.markdown(f"""\n<style>' not in app_src, "app.py must use st.html() for <style> blocks, never st.markdown()"
     assert "on_change=_on_sidebar_autotrade_toggle_change" in app_src
 
+    # Fix 5: Post-TP1 SL moves to fee-covered breakeven (+/- 0.20%) instead of choking runner at 50% TP1 / prev 15m wick
     sl_short_base = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10)
-    assert abs(sl_short_base - 7.20) < 1e-4
+    assert abs(sl_short_base - eng.format_order_price("B-INJ_USDT", 7.30 * 0.9980)) < 1e-4, sl_short_base
     sl_short_prev15m = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10, prev_candle_high=7.16)
-    assert abs(sl_short_prev15m - 7.16) < 1e-4
+    assert abs(sl_short_prev15m - eng.format_order_price("B-INJ_USDT", 7.30 * 0.9980)) < 1e-4, sl_short_prev15m
 
     sl_long_base = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00)
-    assert abs(sl_long_base - 3.90) < 1e-4
+    assert abs(sl_long_base - eng.format_order_price("B-NEAR_USDT", 3.80 * 1.0020)) < 1e-4, sl_long_base
     sl_long_prev15m = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00, prev_candle_low=3.94)
-    assert abs(sl_long_prev15m - 3.94) < 1e-4
+    assert abs(sl_long_prev15m - eng.format_order_price("B-NEAR_USDT", 3.80 * 1.0020)) < 1e-4, sl_long_prev15m
 
     assert sm._canon_pair("B-INJ_USDT") == sm._canon_pair("I-INJ_INR") == sm._canon_pair("INJUSDT") == "INJ"
     fake_sig = {
@@ -937,7 +939,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
     )
     assert sig_ok_long["tp1"] <= 87.21, f"Expected TP1 capped inside 15m 50 EMA ($87.21), got: {sig_ok_long['tp1']}"
 
-    # Improvement 4B: Early 80% TP1 Breakeven SL Ratchet in get_active_portfolio_trade_status
+    # Fix 5: Verify Pre-TP1 80% breakeven choke is REMOVED (SL stays untouched at 93% of TP1, ratchets only once TP1 hits!)
     fake_lock = {
         "pair": "B-XRP_USDT",
         "direction": "SHORT",
@@ -953,15 +955,35 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         "mode": "Staging Paper AutoTrade (Live Market)",
     }
     saved_locks = []
-    # Price reaches $1.0760 (93% of distance from 1.0905 to 1.0749, shy of TP1 by $0.0011)
-    with patch.object(eng, "get_autotrade_config", return_value={"active_trade_lock": dict(fake_lock)}),          patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.0760}),          patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)),          patch.object(eng, "save_autotrade_config", side_effect=lambda d: saved_locks.append(d) or {}):
+    # Price reaches $1.0760 (93% of distance to TP1, shy of TP1 by $0.0011) -> SL MUST remain untouched at $1.1020!
+    with patch.object(eng, "get_autotrade_config", return_value={"active_trade_lock": dict(fake_lock)}), \
+         patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.0760}), \
+         patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)), \
+         patch.object(eng, "save_autotrade_config", side_effect=lambda d: saved_locks.append(d) or {}):
         st_res = eng.get_active_portfolio_trade_status(manage_exchange=True)
-        assert st_res["stop_loss"] < 1.0905 and abs(st_res["stop_loss"] - round(1.0905 * 0.9982, 4)) <= 0.0002, (
-            f"Expected 80% TP1 breakeven ratchet below entry 1.0905, got: {st_res['stop_loss']}"
+        assert abs(st_res["stop_loss"] - 1.1020) < 1e-4, (
+            f"Expected SL untouched at $1.1020 prior to TP1 (80% choke removed), got: {st_res['stop_loss']}"
+        )
+    # Price hits TP1 ($1.0745 <= $1.0749) -> SL ratchets cleanly to fee-covered breakeven (entry * 0.9980)!
+    with patch.object(eng, "get_autotrade_config", return_value={"active_trade_lock": dict(fake_lock)}), \
+         patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.0745}), \
+         patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)), \
+         patch.object(eng, "save_autotrade_config", side_effect=lambda d: saved_locks.append(d) or {}):
+        st_res_tp1 = eng.get_active_portfolio_trade_status(manage_exchange=True)
+        exp_be = eng.round_asset_price(1.0905 * 0.9980, 1.0905)
+        assert st_res_tp1["tp1_hit"] is True and abs(st_res_tp1["stop_loss"] - exp_be) <= 0.0002, (
+            f"Expected TP1 fee-covered breakeven ratchet {exp_be}, got: {st_res_tp1}"
         )
 
     # Staging Paper-Only AutoTrade Guard: verify place_coindcx_futures_order is NEVER called on staging
-    with patch.object(eng, "is_staging_environment", return_value=True),          patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}),          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]),          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}),          patch.object(eng, "place_coindcx_futures_order") as mock_live_order,          patch.object(eng, "save_autotrade_config", return_value={}),          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+    with patch.object(eng, "is_staging_environment", return_value=True), \
+         patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
+         patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+         patch.object(eng, "place_coindcx_futures_order") as mock_live_order, \
+         patch.object(eng, "save_autotrade_config", return_value={}), \
+         patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
         ok_stg, msg_stg, meta_stg = eng.execute_autotrade_two_entry_signal(
             pair="B-AVAX_USDT",
             sig={
@@ -1085,6 +1107,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
              patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 60000.0, "available_inr": 60000.0}), \
              patch.object(eng, "_get_coindcx_credentials", return_value=("k1", "s1")), \
+             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.300, "bid": 7.299, "ask": 7.301}), \
              patch.object(eng, "place_coindcx_futures_order", side_effect=_fake_place_limit), \
@@ -1110,8 +1133,13 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
             assert ok_lim, f"Expected Live Maker Limit AutoTrade success, got: {ok_lim} {msg_lim}"
             assert len(placed_orders) == 1, f"Expected strictly 1 Single-Slot Maker Limit Entry 1 order (Entry 2 removed), got: {placed_orders}"
             assert placed_orders[0]["order_type"] == "limit_order", f"Expected strictly limit_order, got: {placed_orders}"
+            assert placed_orders[0]["post_only"] is True, f"Expected Post-Only Maker limit order, got: {placed_orders[0]}"
             assert placed_orders[0]["price"] >= 7.301, f"Expected Maker SELL price >= 7.301, got {placed_orders[0]}"
-            assert placed_orders[0]["quantity"] >= 25.0, f"Expected 100% slot margin sizing (~32 INJ at 10x), got {placed_orders[0]['quantity']}"
+            # Fixed 1.5% Wallet Risk Sizing: on Rs.60,000 wallet with ~2.59% SL @ 10x, max risk = Rs.900 -> ~Rs.3,476 margin!
+            assert 0 < meta_lim["lock"]["margin_inr"] <= 4000.0, (
+                f"Expected Fixed 1.5% Risk Sizing to cap wide-SL margin to <= Rs.4,000, got {meta_lim['lock']['margin_inr']}"
+            )
+            assert placed_orders[0]["quantity"] > 0, f"Expected positive risk-sized INJ quantity, got {placed_orders[0]['quantity']}"
             assert meta_lim["lock"]["entry2_sweep"] == 0.0 and meta_lim["lock"]["qty2"] == 0.0
             assert meta_lim["lock"]["entry1_pending"] is True and meta_lim["lock"]["entry1_order_id"] == "oid_1"
 
@@ -1239,6 +1267,7 @@ def test_11_ema50_200_pullback_and_combo_modes():
              patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
              patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.090}), \
              patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
             eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
@@ -1352,6 +1381,7 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
              patch.object(eng, "is_staging_environment", return_value=True), \
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
              patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.090}), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
              patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
@@ -1519,6 +1549,7 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
                  patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
                  patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+                 patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
                  patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
                  patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
                  patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.4079, "bid": 1.4078, "ask": 1.4080}):
@@ -1747,7 +1778,8 @@ def test_16_three_tier_main_staging_experiment_parity():
         sub = synth_trades[synth_trades["pair"] == pair].copy()
         return {"total_trades": len(sub), "win_count": int((sub["is_win"] == True).sum()), "loss_count": int((sub["is_win"] == False).sum()), "win_rate_pct": 50.0, "net_profit_inr": float(sub["net_pnl_inr"].sum()), "profit_factor": 1.0, "trades_df": sub}
 
-    with patch.object(eng, "run_strategy_backtest", side_effect=_mock_bt):
+    with patch.object(eng, "run_strategy_backtest", side_effect=_mock_bt), \
+         patch.object(eng, "fetch_historical_candles_paginated", return_value=pd.DataFrame()):
         bt_res = eng.run_portfolio_single_slot_backtest(
             pairs=["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"],
             duration_days=30,
@@ -1767,6 +1799,154 @@ def test_16_three_tier_main_staging_experiment_parity():
     print("  -> PASS: 3-Tier Architecture (Main Live / Staging Paper + Staging_Trades / Experiment Parity Backtest) verified!")
 
 
+def test_17_v36_six_sl_reduction_fixes():
+    print("[17/17] Verifying Daemon v36 SL-Reduction & Drawdown-Control Upgrades (EMA Sep/SL Floor, Cross-Strat Post-SL/BTC/Same-Dir, 1.5% Fixed Risk, Fee-BE/60% Runner, Multi-Slot & Post-Only)...")
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+
+    # --- FIX 1: Ema50200PullbackStrategy tangled-EMA filter (<0.20%) & 0.65% minimum SL floor ---
+    bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
+    recs_base = [
+        {"open": 7.04, "high": 7.06, "low": 7.01, "close": 7.03},
+        {"open": 7.03, "high": 7.05, "low": 7.02, "close": 7.04},
+        {"open": 7.04, "high": 7.07, "low": 7.03, "close": 7.05},
+        {"open": 7.05, "high": 7.08, "low": 7.04, "close": 7.06},
+        {"open": 7.06, "high": 7.10, "low": 7.05, "close": 7.08},
+        {"open": 7.08, "high": 7.14, "low": 7.07, "close": 7.11},
+        {"open": 7.11, "high": 7.14, "low": 7.07, "close": 7.09},
+    ]
+    # 1A: Dead-flat tangled EMAs (<0.20% spread) must be blocked
+    assert strat._detect_ema50_200_setup(
+        recs_base, 6, bear_box, ema50_val=7.12, ema200_val=7.13, prior_e50=[7.12] * 6, prior_e200=[7.13] * 6,
+        allow_bear=True, allow_bull=False,
+    ) is None, "Expected dead-flat tangled EMA (<0.20% spread) blocked"
+    # 1B: Tight EMA200 (0.25% spread, raw SL ~0.50%) must be floored at >= 0.65% (no 0.40% noise stop-out!)
+    sig_floored = strat._detect_ema50_200_setup(
+        recs_base, 6, bear_box, ema50_val=7.10, ema200_val=7.12, prior_e50=[7.12] * 6, prior_e200=[7.12] * 6,
+        allow_bear=True, allow_bull=False,
+    )
+    assert sig_floored is not None and ((sig_floored["stop"] - sig_floored["entry"]) / sig_floored["entry"]) >= 0.00649, (
+        f"Expected EMA SL floored >= 0.65%, got {sig_floored}"
+    )
+
+    # --- FIX 2: normalize_two_entry_runner_levels preserves explicit single-entry SL (never silently inflates to SH*1.005!) ---
+    wide_sh_box = {"RH": 7.30, "RL": 6.80, "MID": 7.05, "SH": 7.60, "SL": 6.60, "trend_bias": "BEARISH"}
+    norm_capped = eng.normalize_two_entry_runner_levels(
+        pair="B-INJ_USDT", direction="SHORT", entry1_px=7.30, entry2_px=None,
+        tp1_px=7.15, tp2_px=6.80, sl_px=7.41, live_px=7.30, levels=wide_sh_box,
+    )
+    assert abs(norm_capped["stop_loss"] - 7.41) < 1e-4, f"Expected explicit SL $7.41 preserved, got {norm_capped}"
+
+    # --- FIX 4: Cross-Strategy Post-SL 4h Lock, Max 2 Same-Direction Guard & BTC 15m Impulse Veto ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_st = os.path.join(tmpdir, "alert_state.json")
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(sm, "STATE_FILE", temp_st), patch.dict(sm._MEM_STATE, {}, clear=True):
+            sm.record_post_sl_lock("B-RENDER_USDT", "SHORT", reason="Stop Loss Hit")
+            is_lk, rem_m = sm.is_post_sl_locked("B-RENDER_USDT", "SHORT")
+            assert is_lk and rem_m > 200.0, (is_lk, rem_m)
+            # Both box_theory AND ema50_200 must be blocked on B-RENDER_USDT SHORT!
+            fake_ren_sig = {
+                "signal": "SHORT", "signal_kind": "EMA50_200", "strategy_id": "ema50_200",
+                "entry": 1.45, "entry2_sweep": 0.0, "tp1": 1.42, "tp2": 1.38, "stop_loss": 1.47,
+                "roe_tp1": 20.0, "candle_ts": int(time.time() * 1000), "margin_inr": 8000.0, "leverage": 10,
+                "trigger_zone": "EMA", "trigger_reason": "Test", "levels": bear_box,
+            }
+            with patch.object(sm, "scan_pair", return_value=fake_ren_sig), \
+                 patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND"}), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": []}), \
+                 patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
+                 patch.object(eng, "execute_autotrade_two_entry_signal") as mock_ex_sl:
+                sm._LAST_SCAN_CACHE["results"] = []
+                res_psl = sm.scan_and_alert(pairs=["B-RENDER_USDT"], send=False, strategy_ids=["ema50_200"], autotrade=True)
+                assert not mock_ex_sl.called and "post-SL 4h cross-strategy lock" in res_psl[0]["message"], res_psl
+
+        # Max 2 Same-Direction Guard blocks 3rd SHORT while allowing opposite LONG
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "is_staging_environment", return_value=True), \
+             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
+             patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-NEAR_USDT", "B-RENDER_USDT"]}), \
+             patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
+                 {"pair": "B-NEAR_USDT", "direction": "SHORT", "id": "p1"},
+                 {"pair": "B-RENDER_USDT", "direction": "SHORT", "id": "p2"},
+             ]), \
+             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
+             patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            ok_3s, msg_3s, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-SUI_USDT",
+                sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 0.90, "tp1": 0.88, "tp2": 0.85, "stop_loss": 0.915, "levels": bear_box},
+                single_trade_margin_inr=8000.0, leverage=10,
+            )
+            assert not ok_3s and "Same-Direction Risk Guard (2/2 SHORT" in msg_3s, (ok_3s, msg_3s)
+
+        # BTC 15m Impulse Veto blocks altcoin SHORT when BTC jumped +0.95% on last closed 15m candle
+        eng._BTC_IMPULSE_CACHE["ts"] = 0.0
+        now_ms_t = int(time.time() * 1000)
+        btc_pump_df = pd.DataFrame([
+            {"timestamp": now_ms_t - 2700000, "open": 60000.0, "high": 60100.0, "low": 59950.0, "close": 60050.0, "volume": 100.0},
+            {"timestamp": now_ms_t - 1800000, "open": 60050.0, "high": 60680.0, "low": 60020.0, "close": 60620.0, "volume": 300.0},  # +0.95% closed
+            {"timestamp": now_ms_t - 60000, "open": 60620.0, "high": 60650.0, "low": 60580.0, "close": 60610.0, "volume": 50.0},     # forming
+        ])
+        with patch.object(eng, "fetch_coindcx_candles", return_value=btc_pump_df):
+            veto_s, v_msg_s = eng.check_btc_impulse_veto("B-RENDER_USDT", "SHORT")
+            assert veto_s is True and "BTC 15m Impulse Veto" in v_msg_s, (veto_s, v_msg_s)
+            veto_l, _ = eng.check_btc_impulse_veto("B-RENDER_USDT", "LONG")
+            assert veto_l is False, "BTC pump should NOT block altcoin LONG"
+            veto_btc, _ = eng.check_btc_impulse_veto("B-BTC_USDT", "SHORT")
+            assert veto_btc is False, "BTC impulse veto must not self-veto B-BTC_USDT"
+        eng._BTC_IMPULSE_CACHE["ts"] = 0.0
+
+        # --- FIX 5: Fixed 1.5% Risk Sizing + Multi-Slot Independent Management Loop + Post-Only Flag ---
+        m_15, _ = eng.compute_risk_based_margin_inr(wallet_inr=24670.0, entry_px=10.0, sl_px=10.18, leverage=10, max_margin_inr=8000.0, risk_pct=1.5)
+        # 1.5% of 24670 = Rs.370.05; (1.8% SL + 0.12% fee cushion) @ 10x = 19.2% ROE -> 370.05 / 0.192 = Rs.1,927.34
+        assert abs(m_15 - 1927.34) < 1.0, f"Expected 1.5% risk margin ~Rs.1,927.34, got {m_15}"
+
+        # Multi-slot management loop manages BOTH Slot 1 (hits SL -> triggers POST_SL_LOCK) and Slot 2 (hits TP1 -> ratchets to Fee-BE) in ONE tick!
+        eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(sm, "STATE_FILE", temp_st), \
+             patch.dict(sm._MEM_STATE, {}, clear=True), \
+             patch("sheets_logger.log_trade_closed", return_value=True):
+            now_m = time.time() - 120.0
+            eng.save_autotrade_config({
+                "paper_wallet_inr": 24670.0,
+                "active_trade_locks": {
+                    "B-NEAR_USDT": {
+                        "pair": "B-NEAR_USDT", "direction": "SHORT", "strategy_id": "box_theory",
+                        "entry": 3.00, "tp1": 2.94, "tp2": 2.85, "stop_loss": 3.05, "tp1_hit": False,
+                        "margin_inr": 2000.0, "leverage": 10, "opened_ts": now_m, "is_live_exchange": False,
+                        "mode": "Staging Paper AutoTrade (Live Market)",
+                    },
+                    "B-INJ_USDT": {
+                        "pair": "B-INJ_USDT", "direction": "SHORT", "strategy_id": "box_theory",
+                        "entry": 7.30, "tp1": 7.15, "tp2": 6.90, "stop_loss": 7.42, "tp1_hit": False,
+                        "margin_inr": 2000.0, "leverage": 10, "opened_ts": now_m - 30.0, "is_live_exchange": False,
+                        "mode": "Staging Paper AutoTrade (Live Market)",
+                    },
+                },
+            })
+            def _multi_tk(pair):
+                if pair == "B-NEAR_USDT":
+                    return {"last_price": 3.06}  # Hits SL!
+                return {"last_price": 7.14}      # Hits TP1!
+            with patch.object(eng, "fetch_live_ticker", side_effect=_multi_tk), \
+                 patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)):
+                st_multi = eng.get_active_portfolio_trade_status(manage_exchange=True)
+                locks_after = eng._get_active_locks_map()
+                assert "B-NEAR_USDT" not in locks_after, f"Expected Slot 1 (NEAR) closed on SL, got {locks_after}"
+                assert "B-INJ_USDT" in locks_after and locks_after["B-INJ_USDT"]["tp1_hit"] is True, (
+                    f"Expected Slot 2 (INJ) independently managed & TP1 ratcheted in same tick, got {locks_after}"
+                )
+                assert abs(locks_after["B-INJ_USDT"]["stop_loss"] - eng.format_order_price("B-INJ_USDT", 7.30 * 0.9980)) < 1e-4
+                assert sm.is_post_sl_locked("B-NEAR_USDT", "SHORT")[0] is True, "Expected POST_SL_LOCK set on NEAR SHORT after SL hit"
+                assert st_multi["active_pair"] == "B-INJ_USDT"
+
+    print("  -> PASS: All 6 Daemon v36 SL-Reduction Fixes (EMA/Box/OpenBlackout/CrossStrat/BTC/SameDir/1.5%Risk/MultiSlot/PostOnly) verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1784,6 +1964,7 @@ if __name__ == "__main__":
     test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
     test_15_v35_funds_section_and_wallet_ledger()
     test_16_three_tier_main_staging_experiment_parity()
+    test_17_v36_six_sl_reduction_fixes()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

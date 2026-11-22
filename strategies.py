@@ -265,11 +265,11 @@ def build_two_entry_runner_plan(
     tp1_roe = round((tp1_dist / entry) * lev * 100.0, 1)
     tp2_roe = round((tp2_dist / entry) * lev * 100.0, 1)
     tp1_label = (
-        f"50% Book ({tp1_roe:.0f}% ROE -> Profit-Lock SL)"
+        f"50% Book ({tp1_roe:.0f}% ROE -> Fee-BE SL)"
         if tp1_dist < struct_tp1_dist
-        else f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)"
+        else f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> Fee-BE SL)"
     )
-    tp2_label = f"50% Structural Runner (Halfway Ratchet -> TP2, ref {tp2_roe:.0f}% ROE)"
+    tp2_label = f"50% Structural Runner (60% Ratchet -> TP2, ref {tp2_roe:.0f}% ROE)"
 
     return {
         "entry": entry,
@@ -1894,6 +1894,9 @@ def _detect_ema50_200_setup(
     p_close = float(prev["close"])
 
     if allow_bear and bias == "BEARISH" and e50 < e200:
+        # Skip dead-flat tangled EMAs (<0.20% spread) that cause noise whipsaw stop-outs
+        if ((e200 - e50) / c_close) < 0.0020:
+            return None
         below_cnt = sum(1 for r, em in zip(prior, prior_e50) if float(r["close"]) < float(em))
         above_e200_cnt = sum(1 for r, em2 in zip(prior, prior_e200) if float(r["close"]) > float(em2))
         if below_cnt >= 3 and above_e200_cnt <= 1:
@@ -1917,8 +1920,9 @@ def _detect_ema50_200_setup(
                     bottom_box_blocked = (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
                     if not bottom_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = max(e200, reach_high) * 1.0025
-                        if ((stop_px - c_close) / c_close) * 100.0 < 0.30:
-                            stop_px = c_close * 1.004
+                        # Minimum 0.65% SL floor (eliminates 0.40% routine altcoin wick stop-outs)
+                        if ((stop_px - c_close) / c_close) < 0.0065:
+                            stop_px = c_close * 1.0065
                         rew_dist = c_close - rl
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RL)"
@@ -1937,8 +1941,8 @@ def _detect_ema50_200_setup(
                                 "stop": stop_px,
                                 "tp1": tp1_px,
                                 "tp2": rl,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
-                                "tp2_label": f"50% Runner @ RL (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
+                                "tp2_label": f"50% Runner @ RL (60% Ratchet, ref {tp2_roe:.0f}% ROE)",
                                 "reason": f"Bear 15m 50<200 EMA Pullback Rejection -> RL (TP1: {tp1_src_lbl})",
                                 "trigger_zone": "15m 50/200 EMA CEILING",
                                 "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
@@ -1947,6 +1951,9 @@ def _detect_ema50_200_setup(
                             }
 
     if allow_bull and bias == "BULLISH" and e50 > e200:
+        # Skip dead-flat tangled EMAs (<0.20% spread) that cause noise whipsaw stop-outs
+        if ((e50 - e200) / c_close) < 0.0020:
+            return None
         above_cnt = sum(1 for r, em in zip(prior, prior_e50) if float(r["close"]) > float(em))
         below_e200_cnt = sum(1 for r, em2 in zip(prior, prior_e200) if float(r["close"]) < float(em2))
         if above_cnt >= 3 and below_e200_cnt <= 1:
@@ -1970,8 +1977,9 @@ def _detect_ema50_200_setup(
                     top_box_blocked = (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
                     if not top_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = min(e200, reach_low) * 0.9975
-                        if ((c_close - stop_px) / c_close) * 100.0 < 0.30:
-                            stop_px = c_close * 0.996
+                        # Minimum 0.65% SL floor (eliminates 0.40% routine altcoin wick stop-outs)
+                        if ((c_close - stop_px) / c_close) < 0.0065:
+                            stop_px = c_close * 0.9935
                         rew_dist = rh - c_close
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RH)"
@@ -1990,8 +1998,8 @@ def _detect_ema50_200_setup(
                                 "stop": stop_px,
                                 "tp1": tp1_px,
                                 "tp2": rh,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
-                                "tp2_label": f"50% Runner @ RH (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
+                                "tp2_label": f"50% Runner @ RH (60% Ratchet, ref {tp2_roe:.0f}% ROE)",
                                 "reason": f"Bull 15m 50>200 EMA Pullback Bounce -> RH (TP1: {tp1_src_lbl})",
                                 "trigger_zone": "15m 50/200 EMA FLOOR",
                                 "strategy_tag": "Strategy 4 (15m 50/200 EMA)",

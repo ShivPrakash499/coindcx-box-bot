@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 35
+_DAEMON_VERSION = 36
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -3398,7 +3398,7 @@ elif active_section == "🧪 Backtest":
         pk4.metric("Win Rate", f"{_tot_wr}%", f"{_tot_w}W / {_tot_l}L")
         pk5.metric("Profit Factor", f"{_tot_pf}", f"Margin ROI {_tot_roi:+.1f}%")
 
-        # Main-Parity Guard Audit Strip (SL Threshold Locks, Slot Cap, EMA Cap, Free-Margin & 4h Lock)
+        # Main-Parity Guard Audit Strip (SL Threshold Locks, Slot Cap, Same-Dir, Post-SL, BTC Veto, EMA Cap, Free-Margin & 4h Lock)
         if _ga:
             _lk_days = int(_ga.get("days_locked_by_sl_threshold", 0) or 0)
             _blk_sl = int(_ga.get("blocked_by_sl_threshold", 0) or 0)
@@ -3406,12 +3406,15 @@ elif active_section == "🧪 Backtest":
             _blk_ema = int(_ga.get("blocked_by_ema_cap", 0) or 0)
             _blk_fm = int(_ga.get("blocked_by_free_margin", 0) or 0)
             _blk_z4 = int(_ga.get("blocked_by_4h_zone_lock", 0) or 0)
+            _blk_sd = int(_ga.get("blocked_by_same_dir", 0) or 0)
+            _blk_psl = int(_ga.get("blocked_by_post_sl_lock", 0) or 0)
+            _blk_btc = int(_ga.get("blocked_by_btc_veto", 0) or 0)
             _lk_dates_s = ", ".join((_ga.get("locked_dates") or [])[:8])
             st.info(
-                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold):** "
+                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold | 1.5% Fixed Risk Sizing):** "
                 f"**{_lk_days} day(s)** hit Daily Loss Stop (`{_blk_sl}` trades blocked{f': {_lk_dates_s}' if _lk_dates_s else ''}) • "
-                f"Slot Cap Blocked: `{_blk_slot}` • Max 2 EMA Cap Blocked: `{_blk_ema}` • "
-                f"<90% Free-Margin Blocked: `{_blk_fm}` • 4h Zone Lock Blocked: `{_blk_z4}`"
+                f"Same-Dir (>2) Blocked: `{_blk_sd}` • Post-SL 4h Lock: `{_blk_psl}` • BTC Impulse Veto: `{_blk_btc}` • "
+                f"Slot Cap: `{_blk_slot}` • Max 2 EMA: `{_blk_ema}` • <90% Free-Margin: `{_blk_fm}` • 4h Zone: `{_blk_z4}`"
             )
 
         _eq_curve = port_out.get("equity_curve") or []
