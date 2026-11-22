@@ -476,7 +476,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 38
+_REQUIRED_DAEMON_VERSION = 39
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
@@ -4331,6 +4331,8 @@ _DURABLE_AUTOTRADE_KEYS = (
     "user_custom_margin",
     "max_concurrent_trades",
     "auto_split_wallet_by_slots",
+    "fixed_risk_sizing_enabled",
+    "risk_per_trade_pct",
     "leverage",
     "daily_start_wallet",
     "daily_loss_stop_hit",
@@ -4497,6 +4499,7 @@ def sync_setup_from_main(reset_paper_wallet: bool = False) -> tuple[bool, str, d
         )
         m_lev = int(main_setup.get("leverage", 10) or 10)
         m_mode = str(main_setup.get("autotrade_strategy_mode") or "box_plus_ema50_200_regime")
+        m_fixed_risk = bool(main_setup.get("fixed_risk_sizing_enabled", False))
 
         updates = {
             "autotrade_strategy_mode": m_mode,
@@ -4504,6 +4507,7 @@ def sync_setup_from_main(reset_paper_wallet: bool = False) -> tuple[bool, str, d
             "max_concurrent_trades": m_slots,
             "auto_split_wallet_by_slots": m_auto_split,
             "user_custom_margin": not m_auto_split,
+            "fixed_risk_sizing_enabled": m_fixed_risk,
             "synced_from_main_at": now_s,
         }
         if m_wallet > 0:
@@ -4608,6 +4612,8 @@ def get_autotrade_config() -> dict:
         "user_custom_margin": False,
         "max_concurrent_trades": MAX_CONCURRENT_TRADES,
         "auto_split_wallet_by_slots": None,
+        "fixed_risk_sizing_enabled": False,
+        "risk_per_trade_pct": FIXED_RISK_PER_TRADE_PCT,
         "leverage": 10,
         "one_crypto_at_a_time": True,
         "high_vol_scan_enabled": True,
@@ -6750,9 +6756,9 @@ def execute_autotrade_two_entry_signal(
                 f"(< 0.35% minimum buffer). Aborting {pair} to prevent instant stop-out."
             ), {"entry1_px": entry1_px, "sl_px": sl_px}
 
-    # Fixed 1.5% Wallet Risk Position Sizing (Fix 5):
-    # Caps trade margin so a full SL hit costs strictly <= 1.5% of total wallet equity regardless of SL width!
-    if bool(cfg.get("fixed_risk_sizing_enabled", True)) and entry1_px > 0 and sl_px > 0:
+    # Optional Fixed 1.5% Wallet Risk Position Sizing (default OFF = E0b Full Slot Margin):
+    # When enabled in Sidebar, caps trade margin so a full SL hit costs <= 1.5% of total wallet equity.
+    if bool(cfg.get("fixed_risk_sizing_enabled", False)) and entry1_px > 0 and sl_px > 0:
         _w_risk_total = (
             float(_wallet_now.get("total_inr", 0.0) or 0.0)
             if isinstance(_wallet_now, dict) and (_wallet_now.get("is_live_api") or _wallet_now.get("is_paper_wallet"))
@@ -6981,7 +6987,7 @@ def run_portfolio_single_slot_backtest(
     enforce_same_dir_guard: bool = True,
     enforce_post_sl_lock: bool = True,
     enforce_btc_impulse_veto: bool = True,
-    use_fixed_risk_sizing: bool = True,
+    use_fixed_risk_sizing: bool = False,
     risk_per_trade_pct: float = FIXED_RISK_PER_TRADE_PCT,
 ) -> dict:
     """

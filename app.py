@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 38
+_DAEMON_VERSION = 39
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -703,7 +703,7 @@ if _is_staging_env or _is_experiment_env:
     if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, Margin, Leverage, Concurrent Trades & Strategy Mode from Google Sheet."):
         _ok_s, _msg_s, _ = coindcx_engine.sync_setup_from_main(reset_paper_wallet=_is_staging_env)
         st.session_state["_sb_main_sync_msg"] = (_ok_s, _msg_s)
-        for _k_clr in ("sidebar_single_trade_margin_input", "sidebar_autotrade_strategy_mode", "sidebar_max_concurrent_trades", "sidebar_auto_split_wallet"):
+        for _k_clr in ("sidebar_single_trade_margin_input", "sidebar_autotrade_strategy_mode", "sidebar_max_concurrent_trades", "sidebar_auto_split_wallet", "sidebar_fixed_risk_cap_toggle"):
             st.session_state.pop(_k_clr, None)
         get_cached_signals_scan.clear()
         st.rerun()
@@ -823,14 +823,36 @@ _margin_widget_val = st.sidebar.number_input(
     help="Per-trade margin ceiling used by AutoTrade & Execute. Auto-calculated as (Wallet ÷ Concurrent Trades) when Auto-Split is ON, or when left blank.",
 )
 margin_inr = float(_auto_split_margin if (auto_split_wallet or _margin_widget_val is None or float(_margin_widget_val) <= 0) else _margin_widget_val)
+
+_saved_fixed_risk_on = bool(_auto_cfg.get("fixed_risk_sizing_enabled", False))
+if "sidebar_fixed_risk_cap_toggle" not in st.session_state:
+    st.session_state["sidebar_fixed_risk_cap_toggle"] = _saved_fixed_risk_on
+
+
+def _on_sidebar_fixed_risk_change():
+    new_fr = bool(st.session_state.get("sidebar_fixed_risk_cap_toggle", False))
+    coindcx_engine.save_autotrade_config({"fixed_risk_sizing_enabled": new_fr})
+    get_cached_signals_scan.clear()
+
+
+fixed_risk_sizing_on = bool(
+    st.sidebar.toggle(
+        "🛡️ Cap Margin by 1.5% Wallet Risk",
+        key="sidebar_fixed_risk_cap_toggle",
+        on_change=_on_sidebar_fixed_risk_change,
+        help="OFF (E0b Default): deploys full Single-Trade Margin / Auto-Split (Wallet ÷ N) for maximum compounding (+₹58k / PF 1.97 in 30d backtest). ON (E0 Safe): shrinks margin on wide SLs so max SL loss <= 1.5% of wallet.",
+    )
+)
+
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
+_sizing_badge = "1.5% Risk Cap ON" if fixed_risk_sizing_on else "E0b Full Slot Margin"
 if auto_split_wallet:
     st.sidebar.caption(
-        f"⚖️ **Auto-Split:** `₹{wallet_data['total_inr']:,.2f} ÷ {max_concurrent_trades}` = **₹{margin_inr:,.2f}/trade** @ {leverage}x *(1.5% Risk Sizing active)*"
+        f"⚖️ **Auto-Split:** `₹{wallet_data['total_inr']:,.2f} ÷ {max_concurrent_trades}` = **₹{margin_inr:,.2f}/trade** @ {leverage}x *({_sizing_badge})*"
     )
 else:
-    st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (Custom Margin, max {max_concurrent_trades} concurrent) @ {leverage}x")
+    st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (Custom Margin, max {max_concurrent_trades} concurrent) @ {leverage}x *({_sizing_badge})*")
 try:
     _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(
         float(margin_inr),
@@ -950,6 +972,7 @@ if (
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
     or int(max_concurrent_trades) != int(_auto_cfg.get("max_concurrent_trades", 3) or 3)
     or bool(auto_split_wallet) != coindcx_engine.is_auto_split_enabled(_auto_cfg)
+    or bool(fixed_risk_sizing_on) != bool(_auto_cfg.get("fixed_risk_sizing_enabled", False))
 ):
     _auto_cfg = coindcx_engine.save_autotrade_config({
         "single_trade_margin_inr": round(float(margin_inr), 2),
@@ -958,6 +981,7 @@ if (
         "max_concurrent_trades": int(max_concurrent_trades),
         "auto_split_wallet_by_slots": bool(auto_split_wallet),
         "user_custom_margin": not bool(auto_split_wallet),
+        "fixed_risk_sizing_enabled": bool(fixed_risk_sizing_on),
     })
     get_cached_signals_scan.clear()
     get_cached_positions.clear()
@@ -3405,10 +3429,10 @@ elif active_section == "🧪 Backtest":
         help="Mirrors Main's exact Single-Trade Margin per slot.",
     )
 
-    bg1, bg2, bg3, bg4 = st.columns([1.0, 1.1, 0.9, 1.4])
+    bg1, bg2, bg3, bg4, bg5 = st.columns([0.9, 1.0, 0.8, 1.3, 1.3])
     bt_lev = bg1.slider("Leverage (x)", 1, 20, int(leverage), key="bt_multi_lev")
     bt_sl_threshold_pct = bg2.number_input(
-        "Daily Loss Stop / SL Threshold (%)",
+        "Daily Loss Stop (%)",
         min_value=0.0,
         max_value=25.0,
         value=float(getattr(strategy_registry, "DAILY_WALLET_LOSS_STOP_PCT", 5.0)),
@@ -3423,17 +3447,26 @@ elif active_section == "🧪 Backtest":
     with bg4:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
         bt_free_margin_guard = st.checkbox(
-            "Enforce Main <90% Free-Margin Guard",
+            "<90% Free-Margin Guard",
             value=True,
             key="bt_free_margin_guard",
             help="Skips new entries when remaining free wallet equity is below 90% of Single-Trade Margin (identical to Main).",
         )
+    with bg5:
+        st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
+        bt_fixed_risk_cap = st.checkbox(
+            "Cap Margin by 1.5% Risk",
+            value=fixed_risk_sizing_on,
+            key="bt_fixed_risk_cap",
+            help="OFF (E0b Default): deploys full Single-Trade Margin per slot. ON (E0): shrinks margin on wide SLs so max SL loss <= 1.5% of wallet.",
+        )
 
     st.caption(
         f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` • "
+        f"**Sizing:** `{'1.5% Fixed Risk Cap (E0)' if bt_fixed_risk_cap else 'Full Slot Margin (E0b)'}` • "
         f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Margin/Trade:** `₹{bt_capital:,.0f}` @ `{bt_lev}x` | "
         f"**SL Threshold Lock:** `{bt_sl_threshold_pct:.1f}%/day` (`₹{bt_wallet_inr * bt_sl_threshold_pct / 100.0:,.0f}`) | "
-        f"**Slots:** `{bt_max_slots}` (Max 2 EMA + 4h Zone Lock). *Backtest results use historical CoinDCX data and are hypothetical.*"
+        f"**Slots:** `{bt_max_slots}`. *Backtest results use historical CoinDCX data and are hypothetical.*"
     )
 
     if st.button("🏆 Run Main-Parity Portfolio Backtest (All 12 High-Vol Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
@@ -3450,6 +3483,7 @@ elif active_section == "🧪 Backtest":
                 max_concurrent_trades=int(bt_max_slots),
                 daily_loss_stop_pct=float(bt_sl_threshold_pct),
                 enforce_free_margin_guard=bool(bt_free_margin_guard),
+                use_fixed_risk_sizing=bool(bt_fixed_risk_cap),
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 
@@ -3490,8 +3524,9 @@ elif active_section == "🧪 Backtest":
             _blk_psl = int(_ga.get("blocked_by_post_sl_lock", 0) or 0)
             _blk_btc = int(_ga.get("blocked_by_btc_veto", 0) or 0)
             _lk_dates_s = ", ".join((_ga.get("locked_dates") or [])[:8])
+            _sz_lbl_ga = "1.5% Fixed Risk Sizing (E0)" if _ga.get("use_fixed_risk_sizing") else "Full Slot Margin (E0b)"
             st.info(
-                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold | 1.5% Fixed Risk Sizing):** "
+                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold | {_sz_lbl_ga}):** "
                 f"**{_lk_days} day(s)** hit Daily Loss Stop (`{_blk_sl}` trades blocked{f': {_lk_dates_s}' if _lk_dates_s else ''}) • "
                 f"Same-Dir (>2) Blocked: `{_blk_sd}` • Post-SL 4h Lock: `{_blk_psl}` • BTC Impulse Veto: `{_blk_btc}` • "
                 f"Slot Cap: `{_blk_slot}` • Max 2 EMA: `{_blk_ema}` • <90% Free-Margin: `{_blk_fm}` • 4h Zone: `{_blk_z4}`"

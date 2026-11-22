@@ -1135,11 +1135,11 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
             assert placed_orders[0]["order_type"] == "limit_order", f"Expected strictly limit_order, got: {placed_orders}"
             assert placed_orders[0]["post_only"] is True, f"Expected Post-Only Maker limit order, got: {placed_orders[0]}"
             assert placed_orders[0]["price"] >= 7.301, f"Expected Maker SELL price >= 7.301, got {placed_orders[0]}"
-            # Fixed 1.5% Wallet Risk Sizing: on Rs.60,000 wallet with ~2.59% SL @ 10x, max risk = Rs.900 -> ~Rs.3,476 margin!
-            assert 0 < meta_lim["lock"]["margin_inr"] <= 4000.0, (
-                f"Expected Fixed 1.5% Risk Sizing to cap wide-SL margin to <= Rs.4,000, got {meta_lim['lock']['margin_inr']}"
+            # E0b Default (fixed_risk_sizing_enabled=False): deploys full configured slot margin (Rs.20,000 -> >=25 INJ @ 10x)
+            assert abs(meta_lim["lock"]["margin_inr"] - 20000.0) < 1.0, (
+                f"Expected E0b default to deploy full slot margin Rs.20,000, got {meta_lim['lock']['margin_inr']}"
             )
-            assert placed_orders[0]["quantity"] > 0, f"Expected positive risk-sized INJ quantity, got {placed_orders[0]['quantity']}"
+            assert placed_orders[0]["quantity"] >= 25.0, f"Expected full slot INJ quantity (~32 INJ @ 10x), got {placed_orders[0]['quantity']}"
             assert meta_lim["lock"]["entry2_sweep"] == 0.0 and meta_lim["lock"]["qty2"] == 0.0
             assert meta_lim["lock"]["entry1_pending"] is True and meta_lim["lock"]["entry1_order_id"] == "oid_1"
 
@@ -1957,9 +1957,11 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
         app_src = fh.read()
     assert '"Number of Concurrent Trades"' in app_src
     assert '"⚖️ Auto-Split Wallet by Concurrent Trades"' in app_src
+    assert '"🛡️ Cap Margin by 1.5% Wallet Risk"' in app_src
     assert "Unrealized SL Guard" in app_src
     assert "max_concurrent_trades" in eng._DURABLE_AUTOTRADE_KEYS
     assert "auto_split_wallet_by_slots" in eng._DURABLE_AUTOTRADE_KEYS
+    assert "fixed_risk_sizing_enabled" in eng._DURABLE_AUTOTRADE_KEYS
 
     today_s = eng.get_crypto_trading_day_str()
     # Verify Crypto Day reset clock aligns strictly to 00:00 UTC (05:30 AM IST), NOT 00:00 IST!
@@ -2077,7 +2079,49 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
                     assert p_stg and "Unrealized PnL Daily SL Pause" in msg_stg_u, (p_stg, msg_stg_u, info_stg_u)
                     assert abs(info_stg_u["unrealized_loss_inr"] - 1600.0) < 1.0, info_stg_u
 
-    print("  -> PASS: Daemon v37 Configurable Concurrent Trades, Auto-Split Wallet Toggle & Unrealized PnL Daily SL Pause verified!")
+            # 4. E0b (Full Slot Margin default) vs E0 (Optional 1.5% Wallet Risk Cap toggle) parity check:
+            # Wide SL: Entry $7.30, SL $7.49 (~2.60% distance) on Rs.60,000 wallet @ 10x with Rs.20,000 slot margin:
+            # - E0b (fixed_risk_sizing_enabled=False, default): deploys full Rs.20,000 margin!
+            # - E0  (fixed_risk_sizing_enabled=True): scales margin down so 1.5% wallet risk (~Rs.900) caps margin <= Rs.4,000!
+            wide_sig = {
+                "signal": "SHORT", "strategy_id": "box_theory",
+                "entry": 7.30, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.49,
+                "levels": {"trend_bias": "BEARISH", "RH": 7.40, "RL": 6.80, "MID": 7.10, "SH": 7.49, "SL": 6.72},
+            }
+            with patch.dict(os.environ, {"APP_ENV": "staging"}):
+                for _fr_flag, _expect_full in ((False, True), (True, False)):
+                    eng.save_autotrade_config({
+                        "paper_wallet_inr": 60000.0,
+                        "paper_starting_wallet_inr": 60000.0,
+                        "paper_daily_start_wallet": {"date": today_s, "inr": 60000.0},
+                        "daily_loss_stop_hit": "",
+                        "active_trade_locks": {},
+                        "active_trade_lock": {},
+                        "max_concurrent_trades": 3,
+                        "auto_split_wallet_by_slots": False,
+                        "single_trade_margin_inr": 20000.0,
+                        "fixed_risk_sizing_enabled": _fr_flag,
+                    })
+                    with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.30, "bid": 7.299, "ask": 7.301}), \
+                         patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+                         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
+                         patch.object(eng, "get_coindcx_live_usdt_inr_rate", return_value=95.0), \
+                         patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+                        ok_sz, msg_sz, det_sz = eng.execute_autotrade_two_entry_signal(
+                            pair="B-INJ_USDT", sig=wide_sig, single_trade_margin_inr=20000.0, leverage=10,
+                        )
+                        assert ok_sz, (f"flag={_fr_flag}", ok_sz, msg_sz)
+                        used_m = float(
+                            ((det_sz or {}).get("lock") or {}).get("margin_inr", 0.0)
+                            or (det_sz or {}).get("margin_inr", 0.0)
+                            or eng.get_autotrade_config().get("active_trade_locks", {}).get("B-INJ_USDT", {}).get("margin_inr", 0.0)
+                        )
+                        if _expect_full:
+                            assert abs(used_m - 20000.0) < 1.0, f"Expected E0b full Rs.20,000 margin, got {used_m}"
+                        else:
+                            assert 250.0 < used_m <= 4000.0, f"Expected E0 1.5% risk-capped margin <= Rs.4,000, got {used_m}"
+
+    print("  -> PASS: Daemon v37/v38/v39 (Concurrent Slots, Auto-Split, 00:00 UTC Reset, Unrealized SL Pause & E0b/E0 Sizing Toggle) verified!")
 
 
 if __name__ == "__main__":

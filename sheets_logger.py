@@ -958,6 +958,7 @@ def load_main_live_setup_from_sheet(force_refresh: bool = False) -> dict | None:
                 if "auto_split_wallet_by_slots" in main_state
                 else (not bool(main_state.get("user_custom_margin", False)))
             ),
+            "fixed_risk_sizing_enabled": bool(main_state.get("fixed_risk_sizing_enabled", False)),
             "leverage": int(main_state.get("leverage", 10) or 10),
             "autotrade_strategy_mode": str(main_state.get("autotrade_strategy_mode") or "box_plus_ema50_200_regime"),
             "source": "Main Live Sheet Sync",
