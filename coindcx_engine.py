@@ -3377,12 +3377,17 @@ def run_strategy_backtest(
     if df_exec_raw.empty or len(df_exec_raw) < 20:
         return {"error": f"Insufficient historical candle data available for {pair} on {interval}."}
     if interval == "15m":
+        df_exec_raw = df_exec_raw.copy()
+        df_exec_raw["EMA9_15m"] = df_exec_raw["close"].astype(float).ewm(span=9, adjust=False).mean()
+        df_exec_raw["EMA21_15m"] = df_exec_raw["close"].astype(float).ewm(span=21, adjust=False).mean()
         cutoff_ms = int(df_exec_raw["timestamp"].iloc[-1]) - int(duration_days * 86400 * 1000)
         df_sub = df_exec_raw[df_exec_raw["timestamp"] >= cutoff_ms].copy().reset_index(drop=True)
         df = df_sub if len(df_sub) >= 20 else df_exec_raw.copy().reset_index(drop=True)
         df.attrs["df_full_15m"] = df_exec_raw.copy().reset_index(drop=True)
     else:
-        df = df_exec_raw
+        df = df_exec_raw.copy()
+        df["EMA9_15m"] = df["close"].astype(float).ewm(span=9, adjust=False).mean()
+        df["EMA21_15m"] = df["close"].astype(float).ewm(span=21, adjust=False).mean()
 
     # 2. Fetch daily candles for daily box & ATR establishment
     df_daily = fetch_historical_candles_paginated(
@@ -3466,6 +3471,8 @@ def run_strategy_backtest(
                 "Strategy 3" in str(active_trade.get("strategy", ""))
                 or strategy_id == "ema9_retest"
             )
+            is_ema9_21_mode = exit_mode in ("ema9_21_1to3_full", "ema9_21_1to3_hybrid")
+            is_ema9_21_full = (exit_mode == "ema9_21_1to3_full")
             use_full_s3_mode = (exit_mode == "strategy3_full") or (exit_mode == "smart_hybrid" and is_s3_active)
 
             # Trailing 15m Candle High/Low Stop Loss is used only in Strategy 3 full-runner mode;
@@ -3607,6 +3614,64 @@ def run_strategy_backtest(
                                     exit_reason = f"100% Exit: Confirmed 5m 9 EMA Cross{scale_tag}"
                                     break
 
+                elif is_ema9_21_mode:
+                    # Experiment Mode: Uncapped 1:3 R:R TP + 15m 9/21 EMA Cross/Touch/Prev-Candle Exit + 21 EMA Trailing SL (8 ticks)
+                    tp_3r = float(active_trade.get("tp_3r", tp2_p) or tp2_p)
+                    if is_ema9_21_full:
+                        if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
+                            exit_triggered = True
+                            exit_price = sl_p
+                            exit_reason = (
+                                f"Trailing 21 EMA SL (8t){scale_tag}"
+                                if active_trade.get("ema21_trailed")
+                                else f"Catastrophe Stop Loss{scale_tag}"
+                            )
+                            break
+                        if (pos_dir == "LONG" and tp_3r > 0 and s5_high >= tp_3r) or (pos_dir == "SHORT" and tp_3r > 0 and s5_low <= tp_3r):
+                            exit_triggered = True
+                            exit_price = tp_3r
+                            active_trade["tp2_hit"] = True
+                            exit_reason = f"100% 1:3 TP Target Hit{scale_tag}"
+                            break
+                    else:
+                        # 50/50 Hybrid: 50% Book at TP1 -> remaining 50% rides uncapped to 1:3 TP with 15m 9/21 EMA Exit + 21 EMA Trail
+                        if not active_trade.get("tp1_hit", False):
+                            if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
+                                exit_triggered = True
+                                exit_price = sl_p
+                                exit_reason = (
+                                    f"Trailing 21 EMA SL (8t){scale_tag}"
+                                    if active_trade.get("ema21_trailed")
+                                    else f"Catastrophe Stop Loss{scale_tag}"
+                                )
+                                break
+                            if (pos_dir == "LONG" and s5_high >= tp1_p) or (pos_dir == "SHORT" and s5_low <= tp1_p):
+                                active_trade["tp1_hit"] = True
+                                new_be_sl = compute_tp1_profit_lock_sl(pair, pos_dir, entry_p, tp1_p)
+                                if (pos_dir == "LONG" and new_be_sl > sl_p) or (pos_dir == "SHORT" and new_be_sl < sl_p):
+                                    sl_p = new_be_sl
+                                    active_trade["stop_loss"] = sl_p
+                                if (pos_dir == "LONG" and tp_3r > 0 and s5_high >= tp_3r) or (pos_dir == "SHORT" and tp_3r > 0 and s5_low <= tp_3r):
+                                    exit_triggered = True
+                                    exit_price = 0.5 * tp1_p + 0.5 * tp_3r
+                                    active_trade["tp2_hit"] = True
+                                    exit_reason = f"TP1 (50% Booked) + 50% 1:3 TP Target Hit{scale_tag}"
+                                    break
+                                continue
+                        else:
+                            if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
+                                exit_triggered = True
+                                exit_price = 0.5 * tp1_p + 0.5 * sl_p
+                                r_lbl = "Trailing 21 EMA SL (8t)" if active_trade.get("ema21_trailed") else "Runner Fee-BE SL"
+                                exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
+                                break
+                            if (pos_dir == "LONG" and tp_3r > 0 and s5_high >= tp_3r) or (pos_dir == "SHORT" and tp_3r > 0 and s5_low <= tp_3r):
+                                exit_triggered = True
+                                exit_price = 0.5 * tp1_p + 0.5 * tp_3r
+                                active_trade["tp2_hit"] = True
+                                exit_reason = f"TP1 (50% Booked) + 50% 1:3 TP Target Hit{scale_tag}"
+                                break
+
                 else:
                     # Variant 2 (Default Structural Runner): Book 50% at TP1, lock runner SL in profit
                     # (`compute_tp1_profit_lock_sl`), ratchet SL to TP1 halfway to TP2, and hold 50% runner for TP2
@@ -3668,6 +3733,84 @@ def run_strategy_backtest(
                                 active_trade["stop_loss"] = sl_p
                                 active_trade["halfway_ratcheted"] = True
 
+            # Closed 15m candle management for `ema9_21_1to3_*` exit modes:
+            #   - In `ema9_21_1to3_hybrid` (50/50), arm 9/21 EMA + 21 EMA trailing SL strictly AFTER TP1 is booked
+            #     so trades never get choked on Bar 1 while 21 EMA sits near entry!
+            #   - In `ema9_21_1to3_full` (100%), arm as soon as price establishes on the trend side of 9 & 21 EMA.
+            if (not exit_triggered) and is_ema9_21_mode and (is_ema9_21_full or active_trade.get("tp1_hit", False)):
+                e9_15 = float(candle.get("EMA9_15m", 0.0) or 0.0)
+                e21_15 = float(candle.get("EMA21_15m", 0.0) or 0.0)
+                prev_15 = df_records[idx - 1] if idx > 0 else candle
+                pair_tick = float(get_pair_lot_spec(pair).get("tick_size", 0.01) or 0.01)
+                tick_buf = 8.0 * pair_tick
+                if e9_15 > 0 and e21_15 > 0:
+                    if pos_dir == "LONG":
+                        if c_close > e9_15 and c_close > e21_15:
+                            active_trade["ema9_21_armed"] = True
+                        if active_trade.get("ema9_21_armed", False):
+                            if c_close > e9_15 and c_low > e21_15:
+                                active_trade["ema9_crossed"] = False
+                                active_trade["ema21_touched"] = False
+                            if c_close < e9_15 or c_low <= e9_15:
+                                active_trade["ema9_crossed"] = True
+                            if active_trade.get("ema9_crossed", False) and c_low <= e21_15:
+                                active_trade["ema21_touched"] = True
+                            if (
+                                active_trade.get("ema9_crossed", False)
+                                and active_trade.get("ema21_touched", False)
+                                and c_close < float(prev_15["low"])
+                            ):
+                                exit_triggered = True
+                                exit_price = (
+                                    (0.5 * tp1_p + 0.5 * c_close)
+                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
+                                    else c_close
+                                )
+                                exit_reason = (
+                                    f"TP1 (50% Booked) + 50% 15m 9/21 EMA Prev-Low Exit{scale_tag}"
+                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
+                                    else f"15m 9/21 EMA Cross + Prev-Low Exit{scale_tag}"
+                                )
+                            else:
+                                cand_tr = format_order_price(pair, e21_15 - tick_buf)
+                                if cand_tr > sl_p and cand_tr < c_close:
+                                    sl_p = cand_tr
+                                    active_trade["stop_loss"] = sl_p
+                                    active_trade["ema21_trailed"] = True
+                    else:
+                        if c_close < e9_15 and c_close < e21_15:
+                            active_trade["ema9_21_armed"] = True
+                        if active_trade.get("ema9_21_armed", False):
+                            if c_close < e9_15 and c_high < e21_15:
+                                active_trade["ema9_crossed"] = False
+                                active_trade["ema21_touched"] = False
+                            if c_close > e9_15 or c_high >= e9_15:
+                                active_trade["ema9_crossed"] = True
+                            if active_trade.get("ema9_crossed", False) and c_high >= e21_15:
+                                active_trade["ema21_touched"] = True
+                            if (
+                                active_trade.get("ema9_crossed", False)
+                                and active_trade.get("ema21_touched", False)
+                                and c_close > float(prev_15["high"])
+                            ):
+                                exit_triggered = True
+                                exit_price = (
+                                    (0.5 * tp1_p + 0.5 * c_close)
+                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
+                                    else c_close
+                                )
+                                exit_reason = (
+                                    f"TP1 (50% Booked) + 50% 15m 9/21 EMA Prev-High Exit{scale_tag}"
+                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
+                                    else f"15m 9/21 EMA Cross + Prev-High Exit{scale_tag}"
+                                )
+                            else:
+                                cand_tr = format_order_price(pair, e21_15 + tick_buf)
+                                if cand_tr < sl_p and cand_tr > c_close:
+                                    sl_p = cand_tr
+                                    active_trade["stop_loss"] = sl_p
+                                    active_trade["ema21_trailed"] = True
+
             if exit_triggered:
                 if pos_dir == "LONG":
                     gross_pnl_usd = (exit_price - entry_p) * qty
@@ -3677,7 +3820,7 @@ def run_strategy_backtest(
                 gross_pnl_inr = gross_pnl_usd * usd_inr
                 entry_fee_inr = notional_inr * maker_fee_rate
                 exit_notional_inr = (qty * exit_price) * usd_inr
-                if active_trade.get("tp1_hit", False) and not use_full_s3_mode:
+                if active_trade.get("tp1_hit", False) and not use_full_s3_mode and not is_ema9_21_full:
                     tp1_notional_inr = (0.5 * qty * tp1_p) * usd_inr
                     exit_fee_inr = (tp1_notional_inr * maker_fee_rate) + (max(0.0, exit_notional_inr - tp1_notional_inr) * taker_fee_rate)
                 else:
@@ -3755,6 +3898,13 @@ def run_strategy_backtest(
 
                 sess_name = _strategies.backtest_session_name(c_time)
 
+                sl_dist_init = abs(entry_p - sl_p)
+                tp_3r_px = (
+                    format_order_price(pair, entry_p + 3.0 * sl_dist_init)
+                    if trade_dir == "LONG"
+                    else format_order_price(pair, max(entry_p * 0.05, entry_p - 3.0 * sl_dist_init))
+                )
+
                 active_trade = {
                     "direction": trade_dir,
                     "entry_time": c_time.strftime("%Y-%m-%d %H:%M"),
@@ -3768,6 +3918,11 @@ def run_strategy_backtest(
                     "initial_stop_loss": sl_p,
                     "tp1": tp1_p,
                     "tp2": tp2_p,
+                    "tp_3r": tp_3r_px,
+                    "ema9_21_armed": False,
+                    "ema9_crossed": False,
+                    "ema21_touched": False,
+                    "ema21_trailed": False,
                     "quantity": qty,
                     "notional_inr": notional_inr,
                     "deployed_margin_inr": margin_inr,

@@ -3405,10 +3405,10 @@ elif active_section == "🧪 Backtest":
         help="Mirrors Main's exact Single-Trade Margin per slot.",
     )
 
-    bg1, bg2, bg3, bg4 = st.columns([1.0, 1.1, 0.9, 1.4])
+    bg1, bg2, bg3, bg4, bg5 = st.columns([0.9, 1.0, 0.7, 1.8, 1.2])
     bt_lev = bg1.slider("Leverage (x)", 1, 20, int(leverage), key="bt_multi_lev")
     bt_sl_threshold_pct = bg2.number_input(
-        "Daily Loss Stop / SL Threshold (%)",
+        "Daily Loss Stop (%)",
         min_value=0.0,
         max_value=25.0,
         value=float(getattr(strategy_registry, "DAILY_WALLET_LOSS_STOP_PCT", 5.0)),
@@ -3420,10 +3420,23 @@ elif active_section == "🧪 Backtest":
     _bt_slot_opts = [1, 2, 3, 4, 5, 6]
     _bt_slot_def_idx = _bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2
     bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=_bt_slot_def_idx, key="bt_max_slots")
-    with bg4:
+    _bt_exit_modes = {
+        "smart_hybrid": "Structural Runner (50% TP1 + Fee-BE -> TP2)",
+        "ema9_21_1to3_full": "15m 9/21 EMA Exit + 1:3 TP (100% Full + 21 EMA Trail 8t)",
+        "ema9_21_1to3_hybrid": "15m 9/21 EMA Exit + 1:3 TP (50% TP1 + Uncapped 1:3 Runner)",
+    }
+    bt_exit_mode = bg4.selectbox(
+        "Exit Mode",
+        options=list(_bt_exit_modes.keys()),
+        format_func=lambda k: _bt_exit_modes.get(k, k),
+        index=1 if _is_experiment_env else 0,
+        key="bt_exit_mode_sel",
+        help="Compare v38 Structural Runner against the Experiment 15m 9/21 EMA Crossover + 21 EMA Trailing SL (8 ticks) + Uncapped 1:3 TP exit.",
+    )
+    with bg5:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
         bt_free_margin_guard = st.checkbox(
-            "Enforce Main <90% Free-Margin Guard",
+            "<90% Free-Margin Guard",
             value=True,
             key="bt_free_margin_guard",
             help="Skips new entries when remaining free wallet equity is below 90% of Single-Trade Margin (identical to Main).",
@@ -3431,14 +3444,15 @@ elif active_section == "🧪 Backtest":
 
     st.caption(
         f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` • "
+        f"**Exit:** `{_bt_exit_modes.get(bt_exit_mode, bt_exit_mode)}` • "
         f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Margin/Trade:** `₹{bt_capital:,.0f}` @ `{bt_lev}x` | "
         f"**SL Threshold Lock:** `{bt_sl_threshold_pct:.1f}%/day` (`₹{bt_wallet_inr * bt_sl_threshold_pct / 100.0:,.0f}`) | "
-        f"**Slots:** `{bt_max_slots}` (Max 2 EMA + 4h Zone Lock). *Backtest results use historical CoinDCX data and are hypothetical.*"
+        f"**Slots:** `{bt_max_slots}`. *Backtest results use historical CoinDCX data and are hypothetical.*"
     )
 
     if st.button("🏆 Run Main-Parity Portfolio Backtest (All 12 High-Vol Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
-        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x, {bt_sl_threshold_pct:.1f}% SL stop)..."):
+        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} [{bt_exit_mode}] across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
                 pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
                 duration_days=days_p,
@@ -3447,6 +3461,7 @@ elif active_section == "🧪 Backtest":
                 usd_inr=usd_inr,
                 strategy_id=bt_strat_mode,
                 wallet_inr=float(bt_wallet_inr),
+                exit_mode=bt_exit_mode,
                 max_concurrent_trades=int(bt_max_slots),
                 daily_loss_stop_pct=float(bt_sl_threshold_pct),
                 enforce_free_margin_guard=bool(bt_free_margin_guard),
