@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 37
+_DAEMON_VERSION = 38
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -987,7 +987,8 @@ _dl_blocked_sb, _dl_msg_sb, _dl_info_sb = coindcx_engine.check_live_daily_loss_s
 _unr_paused_sb, _unr_msg_sb, _unr_info_sb = coindcx_engine.check_unrealized_pnl_daily_sl_pause(wallet_data, allow_live_ticker=False)
 if _dl_blocked_sb:
     st.sidebar.warning(
-        f"🛑 **AutoTrade Locked (5% Stop):** ₹{float(_dl_info_sb.get('day_start_inr', 0.0)):,.0f} → "
+        f"🛑 **AutoTrade Locked (5% Stop — resets 05:30 IST / 00:00 UTC):** "
+        f"₹{float(_dl_info_sb.get('day_start_inr', 0.0)):,.0f} → "
         f"₹{float(_dl_info_sb.get('current_inr', 0.0)):,.0f}"
     )
 elif _unr_paused_sb:
@@ -3414,7 +3415,7 @@ elif active_section == "🧪 Backtest":
         step=0.5,
         format="%.1f",
         key="bt_daily_loss_stop_pct",
-        help="Locks new trades for the rest of the IST day when realized daily loss reaches this % of day-start wallet (Main = 5.0%; set 0.0 to A/B test without guard).",
+        help="Locks new trades until the next Crypto Day reset (00:00 UTC / 05:30 AM IST) when realized daily loss reaches this % of day-start wallet (Main = 5.0%; set 0.0 to A/B test without guard).",
     )
     _bt_slot_opts = [1, 2, 3, 4, 5, 6]
     _bt_slot_def_idx = _bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2

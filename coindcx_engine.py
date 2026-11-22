@@ -14,6 +14,40 @@ load_dotenv()
 
 IST = pytz.timezone('Asia/Kolkata')
 
+
+def get_crypto_trading_day_str(dt=None) -> str:
+    """
+    Returns the Crypto Daily Candle date key (`YYYY-MM-DD`, UTC day = resets at 00:00 UTC / 05:30 AM IST)
+    so the 5% Daily Loss Stop resets in exact lockstep with CoinDCX/Binance 1d candles, Daily Box levels
+    (SH/RH/MID/RL/SL), Daily Bias, and Market Regime:
+      - e.g. `2026-11-23 00:15 IST` (18:45 UTC on Nov 22) -> `'2026-11-22'` (still on Nov 22's Daily Box)
+      - e.g. `2026-11-23 05:30 IST` (00:00 UTC on Nov 23) -> `'2026-11-23'` (new Daily Box & fresh 5% daily budget)
+    """
+    if dt is None:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if isinstance(dt, str):
+        s = dt.strip()
+        if len(s) == 10:
+            return s
+        try:
+            ts = pd.to_datetime(s)
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(IST)
+            return ts.tz_convert(timezone.utc).strftime("%Y-%m-%d")
+        except Exception:
+            return s[:10]
+    if isinstance(dt, datetime):
+        if dt.tzinfo is None:
+            dt = IST.localize(dt)
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        ts = pd.to_datetime(dt)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        return ts.tz_convert(timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
 # Curated list of major global crypto futures markets
 GLOBAL_FUTURES_PAIRS = [
     "B-BTC_USDT",
@@ -442,7 +476,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 37
+_REQUIRED_DAEMON_VERSION = 38
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
@@ -3400,6 +3434,7 @@ def run_strategy_backtest(
     for idx, candle in enumerate(df_records):
         c_date = candle['date_str']
         c_time = candle['dt_ist']
+        c_crypto_day = get_crypto_trading_day_str(c_time)
         c_high = float(candle['high'])
         c_low = float(candle['low'])
         c_close = float(candle['close'])
@@ -3653,16 +3688,16 @@ def run_strategy_backtest(
 
                 current_equity += net_pnl_inr
 
-                entry_day = active_trade.get("entry_date", c_date)
+                entry_day = active_trade.get("entry_crypto_day") or get_crypto_trading_day_str(active_trade.get("entry_time", c_time))
                 day_realized_pnl[entry_day] = day_realized_pnl.get(entry_day, 0.0) + net_pnl_inr
-                if c_date != entry_day:
-                    day_realized_pnl[c_date] = day_realized_pnl.get(c_date, 0.0) + net_pnl_inr
+                if c_crypto_day != entry_day:
+                    day_realized_pnl[c_crypto_day] = day_realized_pnl.get(c_crypto_day, 0.0) + net_pnl_inr
 
-                # New Discipline Rule: STOP Trading for the day if 5% of total futures wallet is lost including fees
+                # Discipline Rule: STOP Trading for the Crypto Day (resets 00:00 UTC / 05:30 AM IST) if 5% of wallet is lost
                 if day_realized_pnl.get(entry_day, 0.0) <= -max_daily_loss_inr:
                     day_locked.add(entry_day)
-                if day_realized_pnl.get(c_date, 0.0) <= -max_daily_loss_inr:
-                    day_locked.add(c_date)
+                if day_realized_pnl.get(c_crypto_day, 0.0) <= -max_daily_loss_inr:
+                    day_locked.add(c_crypto_day)
 
                 trades.append({
                     "trade_id": len(trades) + 1,
@@ -3697,8 +3732,8 @@ def run_strategy_backtest(
                 active_trade = None
                 last_exit_idx = idx
 
-        # Daily Discipline Gate: Only stop trading for the day if 5% of total futures wallet is lost including fees
-        if c_date in day_locked:
+        # Daily Discipline Gate: STOP trading until next Crypto Day (00:00 UTC / 05:30 AM IST) if 5% wallet lost
+        if c_crypto_day in day_locked:
             continue
 
         # If no active trade, ask the strategy whether this closed candle is an entry
@@ -3724,6 +3759,7 @@ def run_strategy_backtest(
                     "direction": trade_dir,
                     "entry_time": c_time.strftime("%Y-%m-%d %H:%M"),
                     "entry_date": c_date,
+                    "entry_crypto_day": c_crypto_day,
                     "entry_idx": idx,
                     "entry_price": entry_p,
                     "entry2_sweep": entry2_p,
@@ -4448,7 +4484,7 @@ def sync_setup_from_main(reset_paper_wallet: bool = False) -> tuple[bool, str, d
         if not isinstance(main_setup, dict):
             return False, "Could not load Main live setup from Google Sheet (`_AutoTrade_State` / `_Live_Account_Sync`).", {}
         cfg = get_autotrade_config()
-        today = datetime.now(IST).strftime("%Y-%m-%d")
+        today = get_crypto_trading_day_str()
         now_s = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
         m_wallet = float(main_setup.get("wallet_balance_inr", 0.0) or 0.0)
         m_margin = float(main_setup.get("single_trade_margin_inr", 0.0) or 0.0)
@@ -5854,7 +5890,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                 cur_pw = float(pw_snap_before.get("total_inr", 0.0) or 0.0)
                                 pw_after = round(max(0.0, cur_pw + net_inr), 2)
                                 tot_real_pnl = round(float(cur_cfg_p.get("paper_realized_pnl_inr", 0.0) or 0.0) + net_inr, 2)
-                                today_p = datetime.now(IST).strftime("%Y-%m-%d")
+                                today_p = get_crypto_trading_day_str()
                                 p_ds = cur_cfg_p.get("paper_daily_start_wallet")
                                 if not (isinstance(p_ds, dict) and p_ds.get("date") == today_p and float(p_ds.get("inr", 0.0) or 0.0) > 0):
                                     p_ds = {"date": today_p, "inr": round(cur_pw, 2)}
@@ -6137,9 +6173,10 @@ def unlock_autotrade_daily_loss_stop(wallet: dict | None = None) -> dict:
     """
     Unlocks AutoTrade from the Sidebar when blocked by the 5% Daily Loss Stop (for example after
     transferring funds from the Futures Wallet to the INR Wallet, or resetting Staging Paper stop)
-    by syncing today's start-wallet baseline to the current wallet balance and clearing `daily_loss_stop_hit`.
+    by syncing the current Crypto Day's (00:00 UTC / 05:30 AM IST) start-wallet baseline to the
+    current wallet balance and clearing `daily_loss_stop_hit`.
     """
-    today = datetime.now(IST).strftime("%Y-%m-%d")
+    today = get_crypto_trading_day_str()
     is_stg = is_staging_environment()
     if is_stg and not (isinstance(wallet, dict) and wallet.get("is_live_api") and not wallet.get("is_paper_wallet")):
         w = wallet if isinstance(wallet, dict) else get_paper_wallet_snapshot()
@@ -6161,17 +6198,17 @@ def unlock_autotrade_daily_loss_stop(wallet: dict | None = None) -> dict:
 
 def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, dict]:
     """
-    Live & Staging-Paper 5% Daily Loss Stop (IST day — SL Threshold AutoTrade Lock):
-      - On `main`: Day-start baseline = first verified live futures wallet balance after 00:00 IST.
+    Live & Staging-Paper 5% Daily Loss Stop (Crypto Day: resets 00:00 UTC / 05:30 AM IST):
+      - Aligned 100% with CoinDCX/Binance `1d` candle close & Daily Box / Daily Bias refresh (05:30 AM IST).
+      - On `main`: Day-start baseline = first verified live futures wallet balance after 00:00 UTC (05:30 AM IST).
       - On `staging`: Enforces the EXACT SAME 5% Daily Loss Stop against Staging's mirrored virtual
-        Paper Wallet (`paper_wallet_inr` vs `paper_daily_start_wallet`) so hitting SL thresholds locks
-        Staging Paper AutoTrade identically to Main!
+        Paper Wallet (`paper_wallet_inr` vs `paper_daily_start_wallet`).
       - If (baseline - current) >= DAILY_WALLET_LOSS_STOP_PCT% of baseline -> block new trades until
-        next IST day (or until unlocked via `unlock_autotrade_daily_loss_stop` from the Sidebar).
+        next Crypto Day at 00:00 UTC (05:30 AM IST), or until unlocked via Sidebar 'Unlock AutoTrade'.
     """
     import strategies as _strategies
     pct = float(getattr(_strategies, "DAILY_WALLET_LOSS_STOP_PCT", 5.0) or 5.0)
-    today = datetime.now(IST).strftime("%Y-%m-%d")
+    today = get_crypto_trading_day_str()
     cfg = get_autotrade_config()
     is_stg_paper = (
         isinstance(wallet, dict) and bool(wallet.get("is_paper_wallet"))
@@ -6203,7 +6240,7 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
             return True, (
                 f"5% Daily Loss Stop (Staging Paper): paper wallet down ₹{loss:,.2f} today "
                 f"(start ₹{start:,.2f} -> now ₹{cur:,.2f}, limit ₹{limit:,.2f}). "
-                f"Paper AutoTrade is locked until next IST day (or click 'Unlock AutoTrade' in sidebar)."
+                f"Paper AutoTrade is locked until next Crypto Day at 05:30 AM IST / 00:00 UTC (or click 'Unlock AutoTrade' in sidebar)."
             ), info
         if cfg.get("daily_loss_stop_hit") == today:
             save_autotrade_config({"daily_loss_stop_hit": ""})
@@ -6228,7 +6265,7 @@ def check_live_daily_loss_stop(wallet: dict | None = None) -> tuple[bool, str, d
             save_autotrade_config({"daily_loss_stop_hit": today})
         return True, (
             f"5% Daily Loss Stop: wallet down ₹{loss:,.2f} today (start ₹{start:,.2f} -> now ₹{cur:,.2f}, "
-            f"limit ₹{limit:,.2f}). Click 'Unlock AutoTrade' in the sidebar if you transferred funds out."
+            f"limit ₹{limit:,.2f}). Resets at 05:30 AM IST (00:00 UTC) — click 'Unlock AutoTrade' in the sidebar if you transferred funds out."
         ), info
     if cfg.get("daily_loss_stop_hit") == today:
         save_autotrade_config({"daily_loss_stop_hit": ""})
@@ -7106,8 +7143,8 @@ def run_portfolio_single_slot_backtest(
                 still_open.append(t)
         closing.sort(key=lambda x: str(x["exit_time"]))
         for t in closing:
-            t_ent_day = str(t["entry_time"])[:10]
-            t_ext_day = str(t["exit_time"])[:10]
+            t_ent_day = get_crypto_trading_day_str(str(t["entry_time"]))
+            t_ext_day = get_crypto_trading_day_str(str(t["exit_time"]))
             if t_ext_day not in day_start_wallet:
                 day_start_wallet[t_ext_day] = max(1.0, current_wallet_inr)
             if t_ent_day not in day_start_wallet:
@@ -7149,7 +7186,7 @@ def run_portfolio_single_slot_backtest(
     last_ema_zone_by_pair: dict[str, tuple] = {}
     for _, tr in df_all.iterrows():
         ent_t = str(tr["entry_time"])
-        day_str = ent_t[:10]
+        day_str = get_crypto_trading_day_str(ent_t)
         tr_pair = str(tr["pair"])
         tr_dir = str(tr.get("direction", "")).upper()
         cur_dt = pd.to_datetime(ent_t)

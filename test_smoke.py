@@ -343,7 +343,7 @@ def test_5_daily_bias_enforcement():
     assert unv_m == 20000.0 and unv_note == ""
 
     # Live 5% daily loss stop: day-start Rs.5,500 -> Rs.5,200 (-Rs.300 >= Rs.275 limit) blocks; Rs.5,300 does not
-    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    today_s = eng.get_crypto_trading_day_str()
     cfg_ds = {"enabled": True, "daily_start_wallet": {"date": today_s, "inr": 5500.0}}
     with patch.object(eng, "get_autotrade_config", return_value=dict(cfg_ds)), \
          patch.object(eng, "save_autotrade_config", return_value={}):
@@ -1300,7 +1300,7 @@ def test_12_sidebar_unlock_autotrade():
         app_src = f_app.read()
     assert '"🔓 Unlock AutoTrade"' in app_src and "unlock_autotrade_daily_loss_stop" in app_src
 
-    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    today_s = eng.get_crypto_trading_day_str()
     with tempfile.TemporaryDirectory() as tmpdir:
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
         with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg):
@@ -1706,7 +1706,7 @@ def test_16_three_tier_main_staging_experiment_parity():
     assert sl._is_staging_paper_record({"exit_reason": "[STAGING PAPER] Stop Loss Hit"}) is True
     assert sl._is_staging_paper_record({"status": "LOGGED_PENDING", "strategy_name": "Box Theory Sweep (App Live Order)"}) is False
 
-    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    today_s = eng.get_crypto_trading_day_str()
     with tempfile.TemporaryDirectory() as tmpdir:
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
         with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
@@ -1961,7 +1961,12 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
     assert "max_concurrent_trades" in eng._DURABLE_AUTOTRADE_KEYS
     assert "auto_split_wallet_by_slots" in eng._DURABLE_AUTOTRADE_KEYS
 
-    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
+    today_s = eng.get_crypto_trading_day_str()
+    # Verify Crypto Day reset clock aligns strictly to 00:00 UTC (05:30 AM IST), NOT 00:00 IST!
+    assert eng.get_crypto_trading_day_str("2026-11-22 21:00") == "2026-11-22"
+    assert eng.get_crypto_trading_day_str("2026-11-23 00:15") == "2026-11-22", "00:15 IST must still belong to prior Crypto Day (until 05:30 IST)"
+    assert eng.get_crypto_trading_day_str("2026-11-23 05:29") == "2026-11-22", "05:29 IST must still belong to prior Crypto Day"
+    assert eng.get_crypto_trading_day_str("2026-11-23 05:30") == "2026-11-23", "05:30 IST (00:00 UTC) must open the new Crypto Day"
     bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
 
     with tempfile.TemporaryDirectory() as tmpdir:
