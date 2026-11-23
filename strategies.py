@@ -2361,17 +2361,24 @@ class BoxPlusEma50200Strategy(Strategy):
 
 
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
-    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Chop Box (No Bear L) + Trend 50/200 EMA] (Recommended)"),
-    ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA"),
-    ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
-    ("box_theory", "Box Theory Sweep Only (v27)"),
-    ("ema50_200", "15m 50/200 EMA Pullback Only"),
+    ("box_plus_ema50_200_regime", "🤖 Auto (Market-Trend Adaptive)"),
+    ("box_theory", "📦 Box Theory Sweep (Chop)"),
+    ("ema50_200", "📈 15m 50/200 EMA Pullback (Trend)"),
 ]
+_LEGACY_AUTOTRADE_MODES: set[str] = {"box_plus_ema50_200_bear", "box_plus_ema50_200_both"}
 DEFAULT_AUTOTRADE_MODE = "box_plus_ema50_200_regime"
 
 
+def recommended_strategy_for_regime(regime: str | None) -> str:
+    """Returns the single best-suited strategy ID for a given live market trend regime."""
+    r = str(regime or "RANGING_CHOP").upper()
+    if r in ("STRONG_UPTREND", "STRONG_DOWNTREND"):
+        return Ema50200PullbackStrategy.id
+    return BoxTheorySweep.id
+
+
 def resolve_autotrade_mode(mode: str | None) -> str:
-    valid = {k for k, _ in AUTOTRADE_MODE_CHOICES}
+    valid = {k for k, _ in AUTOTRADE_MODE_CHOICES} | _LEGACY_AUTOTRADE_MODES
     m = str(mode or "").strip()
     return m if m in valid else DEFAULT_AUTOTRADE_MODE
 
@@ -2438,11 +2445,10 @@ def get_strategy(strategy_id: str | None) -> Strategy:
 
 
 def list_strategies() -> list[Strategy]:
+    """User-facing active strategies (legacy ATR Reversal & 5m 9 EMA Retest stay in STRATEGY_REGISTRY only)."""
     return [
         STRATEGY_REGISTRY[BoxTheorySweep.id],
         STRATEGY_REGISTRY[Ema50200PullbackStrategy.id],
-        STRATEGY_REGISTRY[AtrReversal.id],
-        STRATEGY_REGISTRY[Ema9RetestStrategy.id],
     ]
 
 

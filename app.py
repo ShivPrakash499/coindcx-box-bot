@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 40
+_DAEMON_VERSION = 41
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -930,16 +930,30 @@ else:
         on_change=_on_sidebar_autotrade_toggle_change,
     )
 
+_live_regime_info = get_cached_market_regime()
+_cur_reg_code = str(_live_regime_info.get("regime", "RANGING_CHOP"))
+_best_strat_id_for_regime = strategy_registry.recommended_strategy_for_regime(_cur_reg_code)
+_best_strat_obj_for_regime = strategy_registry.get_strategy(_best_strat_id_for_regime)
+_reg_active_eng = (
+    "Box Sweep (No Bear L)"
+    if _cur_reg_code == "RANGING_CHOP"
+    else ("15m 50/200 EMA LONG" if _cur_reg_code == "STRONG_UPTREND" else "15m 50/200 EMA SHORT")
+)
+
 _auto_mode_keys = [k for k, _ in strategy_registry.AUTOTRADE_MODE_CHOICES]
 _auto_mode_labels = dict(strategy_registry.AUTOTRADE_MODE_CHOICES)
-if not _auto_cfg.get("regime_mode_migrated_v33"):
-    _mig_updates = {"regime_mode_migrated_v33": True}
-    if _auto_cfg.get("autotrade_strategy_mode") in (None, "", "box_plus_ema50_200_bear"):
+_auto_mode_labels["box_plus_ema50_200_regime"] = f"🤖 Auto ({_reg_active_eng})"
+
+if (not _auto_cfg.get("regime_mode_migrated_v41")) or (_auto_cfg.get("autotrade_strategy_mode") not in _auto_mode_keys):
+    _mig_updates = {"regime_mode_migrated_v41": True}
+    if _auto_cfg.get("autotrade_strategy_mode") not in _auto_mode_keys:
         _mig_updates["autotrade_strategy_mode"] = "box_plus_ema50_200_regime"
         st.session_state.pop("sidebar_autotrade_strategy_mode", None)
         st.session_state.pop("monitor_strategies", None)
     _auto_cfg = coindcx_engine.save_autotrade_config(_mig_updates)
 _saved_auto_mode = strategy_registry.resolve_autotrade_mode(_auto_cfg.get("autotrade_strategy_mode"))
+if _saved_auto_mode not in _auto_mode_keys:
+    _saved_auto_mode = strategy_registry.DEFAULT_AUTOTRADE_MODE
 if st.session_state.get("sidebar_autotrade_strategy_mode") not in _auto_mode_keys:
     st.session_state["sidebar_autotrade_strategy_mode"] = _saved_auto_mode
 
@@ -948,6 +962,7 @@ def _on_sidebar_autotrade_strategy_change():
     coindcx_engine.save_autotrade_config({"autotrade_strategy_mode": new_m})
     new_ids = strategy_registry.autotrade_mode_strategy_ids(new_m)
     st.session_state["monitor_strategies"] = [strategy_registry.get_strategy(sid).name for sid in new_ids]
+    st.session_state.pop("exec_strategy_mode", None)
     get_cached_signals_scan.clear()
     get_cached_positions.clear()
 
@@ -957,17 +972,9 @@ selected_autotrade_mode = st.sidebar.selectbox(
     format_func=lambda k: _auto_mode_labels.get(k, k),
     key="sidebar_autotrade_strategy_mode",
     on_change=_on_sidebar_autotrade_strategy_change,
-    help="Select what 24/7 AutoTrade & the default Scanner run: Regime-Adaptive v40 Row 9 (Chop-Only Box Sweep with No-Bear-Long Guard in RANGING/CHOP; Trend-Only 15m 50/200 EMA in Strong Trends with Box paused), Bear EMA, Bull & Bear EMA, Box Only, or EMA Only.",
+    help="🤖 Auto automatically switches to the best-suited strategy for the live Market Trend: Box Theory Sweep (No Bear Long) in RANGING/CHOP, or 15m 50/200 EMA Pullback in Strong Uptrend/Downtrend.",
 )
-_live_regime_info = get_cached_market_regime()
 _active_mode_strats = strategy_registry.autotrade_mode_strategy_ids(selected_autotrade_mode)
-st.sidebar.caption(f"🎯 **Mode:** `{_auto_mode_labels.get(selected_autotrade_mode, selected_autotrade_mode)}`")
-_cur_reg_code = str(_live_regime_info.get("regime", "RANGING_CHOP"))
-_reg_active_eng = (
-    "Box Sweep (No Bear L)"
-    if _cur_reg_code == "RANGING_CHOP"
-    else ("15m 50/200 EMA LONG (Box Paused)" if _cur_reg_code == "STRONG_UPTREND" else "15m 50/200 EMA SHORT (Box Paused)")
-)
 _reg_route_suffix = f" → **{_reg_active_eng}**" if selected_autotrade_mode == "box_plus_ema50_200_regime" else ""
 st.sidebar.caption(
     f"🧭 **Market Trend:** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
@@ -1085,7 +1092,16 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
     _strategy_names = [s.name for s in strategy_registry.list_strategies()]
     _default_strat_names = [strategy_registry.get_strategy(sid).name for sid in _active_mode_strats if strategy_registry.get_strategy(sid).name in _strategy_names]
     if not _default_strat_names:
-        _default_strat_names = [strategy_registry.get_strategy(strategy_registry.DEFAULT_STRATEGY_ID).name]
+        _default_strat_names = [_best_strat_obj_for_regime.name]
+    # Clean out legacy strategy names & auto-sync scanner default whenever live Market Trend flips in Auto mode
+    _prev_mon = st.session_state.get("monitor_strategies")
+    if isinstance(_prev_mon, list):
+        _cleaned_mon = [n for n in _prev_mon if n in _strategy_names]
+        if len(_cleaned_mon) != len(_prev_mon) or not _cleaned_mon:
+            st.session_state["monitor_strategies"] = _cleaned_mon or _default_strat_names
+    if selected_autotrade_mode == "box_plus_ema50_200_regime" and st.session_state.get("_last_synced_regime") != _cur_reg_code:
+        st.session_state["_last_synced_regime"] = _cur_reg_code
+        st.session_state["monitor_strategies"] = list(_default_strat_names)
     monitor_strategy_names = st.multiselect("Scanner Strategies (Signals Tab)", _strategy_names, default=_default_strat_names, key="monitor_strategies")
     monitor_strategy_ids = [s.id for s in strategy_registry.list_strategies() if s.name in monitor_strategy_names]
     _default_watch = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
@@ -2168,17 +2184,13 @@ elif active_section == "🎯 Execute":
 
         trade_usd_inr = float(usd_inr)
 
-        _all_label = "All Strategies (Auto-Detect)"
-        _combo_bear_lbl = "Combo: Box + Bear 15m 50/200 EMA"
-        _combo_both_lbl = "Combo: Box + Bull & Bear 15m 50/200 EMA"
-        _mode_opts = [_all_label, _combo_bear_lbl, _combo_both_lbl] + [f"{s.name} Only" for s in strategy_registry.list_strategies()]
+        _auto_exec_lbl = f"🤖 Auto — Best for Market Trend ({_best_strat_obj_for_regime.name})"
+        _mode_opts = [_auto_exec_lbl] + [f"{s.name} Only" for s in strategy_registry.list_strategies()]
         if st.session_state.get("exec_strategy_mode") not in _mode_opts:
-            st.session_state["exec_strategy_mode"] = _mode_opts[0]
+            st.session_state["exec_strategy_mode"] = _auto_exec_lbl
         exec_strategy_mode = st.selectbox("Strategy", _mode_opts, key="exec_strategy_mode", label_visibility="collapsed")
-        if exec_strategy_mode == _all_label:
-            armed_strats = strategy_registry.list_strategies()
-        elif exec_strategy_mode in (_combo_bear_lbl, _combo_both_lbl):
-            armed_strats = [strategy_registry.get_strategy("box_theory"), strategy_registry.get_strategy("ema50_200")]
+        if exec_strategy_mode == _auto_exec_lbl:
+            armed_strats = [strategy_registry.get_strategy(sid) for sid in _active_mode_strats] or [_best_strat_obj_for_regime]
         else:
             armed_strats = [s for s in strategy_registry.list_strategies() if f"{s.name} Only" == exec_strategy_mode]
 

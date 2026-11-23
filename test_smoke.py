@@ -1364,7 +1364,12 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
         f"Expected TP1 capped above 3h swing low $7.01, got {sig_cap}"
     )
 
-    # 3. Regime-Adaptive v40 Row 9 Routing: Chop-Only Box (No Bear Long) + Trend-Only 15m 50/200 EMA + Max 2 EMA Slots
+    # 3. Regime-Adaptive v40 Row 9 Routing + v41 Clean 3-Option UI & Market-Trend Auto-Defaulting
+    assert [k for k, _ in strat.AUTOTRADE_MODE_CHOICES] == ["box_plus_ema50_200_regime", "box_theory", "ema50_200"]
+    assert [s.id for s in strat.list_strategies()] == ["box_theory", "ema50_200"]
+    assert strat.recommended_strategy_for_regime("RANGING_CHOP") == "box_theory"
+    assert strat.recommended_strategy_for_regime("STRONG_UPTREND") == "ema50_200"
+    assert strat.recommended_strategy_for_regime("STRONG_DOWNTREND") == "ema50_200"
     with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}):
         assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory"]
         assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is True
