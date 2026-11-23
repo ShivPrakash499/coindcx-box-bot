@@ -2321,12 +2321,14 @@ def compute_box_swing_levels(
     if atr_d <= 0:
         try:
             if len(dfc_atr) >= 2:
-                _pc = dfc_atr["close"].shift(1)
-                _tr = pd.concat(
-                    [dfc_atr["high"] - dfc_atr["low"], (dfc_atr["high"] - _pc).abs(), (dfc_atr["low"] - _pc).abs()],
-                    axis=1,
-                ).max(axis=1)
-                atr_d = float(_tr.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean().iloc[-1])
+                _hi_a = dfc_atr["high"].to_numpy(dtype=float)
+                _lo_a = dfc_atr["low"].to_numpy(dtype=float)
+                _cl_a = dfc_atr["close"].to_numpy(dtype=float)
+                _pc_a = np.empty_like(_cl_a)
+                _pc_a[0] = _cl_a[0]
+                _pc_a[1:] = _cl_a[:-1]
+                _tr_a = np.maximum(_hi_a - _lo_a, np.maximum(np.abs(_hi_a - _pc_a), np.abs(_lo_a - _pc_a)))
+                atr_d = float(pd.Series(_tr_a).ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean().iloc[-1])
             else:
                 atr_d = max(pdh - pdl, prev_close * 0.03)
         except Exception:
@@ -2446,11 +2448,13 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
     # so Daily Bias stays fixed for the entire 24h day (matching prepare_backtest() and never flickering intrabar)
     ema50_val = float(df_all_completed['close'].ewm(span=50, adjust=False).mean().iloc[-1])
     ema200_val = float(df_all_completed['close'].ewm(span=200, adjust=False).mean().iloc[-1])
-    _pc_d = df_all_completed['close'].shift(1)
-    _tr_d = pd.concat(
-        [df_all_completed['high'] - df_all_completed['low'], (df_all_completed['high'] - _pc_d).abs(), (df_all_completed['low'] - _pc_d).abs()],
-        axis=1,
-    ).max(axis=1)
+    _hi_d = df_all_completed['high'].to_numpy(dtype=float)
+    _lo_d = df_all_completed['low'].to_numpy(dtype=float)
+    _cl_d = df_all_completed['close'].to_numpy(dtype=float)
+    _pc_d = np.empty_like(_cl_d)
+    _pc_d[0] = _cl_d[0]
+    _pc_d[1:] = _cl_d[:-1]
+    _tr_d = pd.Series(np.maximum(_hi_d - _lo_d, np.maximum(np.abs(_hi_d - _pc_d), np.abs(_lo_d - _pc_d))))
     _atr_s = _tr_d.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=14).mean()
     _atr_last = float(_atr_s.iloc[-1]) if len(_atr_s) > 0 and pd.notna(_atr_s.iloc[-1]) else None
 

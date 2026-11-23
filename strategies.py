@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from datetime import datetime
 
+import numpy as np
 import pandas as pd
 
 import coindcx_engine as eng
@@ -100,12 +101,14 @@ def _add_box_v2_15m_indicators(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = df
     if {"high", "low", "close"}.issubset(out.columns):
-        pc = out["close"].shift(1)
-        tr = pd.concat(
-            [out["high"] - out["low"], (out["high"] - pc).abs(), (out["low"] - pc).abs()],
-            axis=1,
-        ).max(axis=1)
-        out["ATR14"] = tr.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean()
+        _hi = out["high"].to_numpy(dtype=float)
+        _lo = out["low"].to_numpy(dtype=float)
+        _cl = out["close"].to_numpy(dtype=float)
+        _pc = np.empty_like(_cl)
+        _pc[0] = _cl[0]
+        _pc[1:] = _cl[:-1]
+        _tr = np.maximum(_hi - _lo, np.maximum(np.abs(_hi - _pc), np.abs(_lo - _pc)))
+        out["ATR14"] = pd.Series(_tr, index=out.index).ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean()
     if "volume" in out.columns:
         out["VOL_SMA20"] = out["volume"].rolling(20, min_periods=5).mean()
     if "timestamp" in out.columns and "date_str" not in out.columns:
@@ -1082,12 +1085,14 @@ class BoxTheorySweep(Strategy):
         ema50_15m_list = df["close"].ewm(span=50, adjust=False).mean().tolist()
         ema9_15m_list = df["close"].ewm(span=9, adjust=False).mean().tolist()
         if {"high", "low", "close"}.issubset(df.columns):
-            _pc15 = df["close"].shift(1)
-            _tr15 = pd.concat(
-                [df["high"] - df["low"], (df["high"] - _pc15).abs(), (df["low"] - _pc15).abs()],
-                axis=1,
-            ).max(axis=1)
-            atr14_15m_list = _tr15.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean().tolist()
+            _hi15 = df["high"].to_numpy(dtype=float)
+            _lo15 = df["low"].to_numpy(dtype=float)
+            _cl15 = df["close"].to_numpy(dtype=float)
+            _pc15 = np.empty_like(_cl15)
+            _pc15[0] = _cl15[0]
+            _pc15[1:] = _cl15[:-1]
+            _tr15 = np.maximum(_hi15 - _lo15, np.maximum(np.abs(_hi15 - _pc15), np.abs(_lo15 - _pc15)))
+            atr14_15m_list = pd.Series(_tr15).ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean().tolist()
         else:
             atr14_15m_list = [0.0] * len(df)
         if "volume" in df.columns:
@@ -1202,8 +1207,13 @@ SL_BUFFER = 0.0015        # LONG SL = flush_low x 0.9985 ; SHORT SL = spike_high
 def daily_sma_atr(df_daily: pd.DataFrame) -> pd.DataFrame:
     """Adds EMA50, EMA200, SMA50 and Wilder ATR_14 columns to a daily OHLC frame (ascending)."""
     d = df_daily.copy()
-    prev_close = d["close"].shift(1)
-    tr = pd.concat([d["high"] - d["low"], (d["high"] - prev_close).abs(), (d["low"] - prev_close).abs()], axis=1).max(axis=1)
+    _hi = d["high"].to_numpy(dtype=float)
+    _lo = d["low"].to_numpy(dtype=float)
+    _cl = d["close"].to_numpy(dtype=float)
+    _pc = np.empty_like(_cl)
+    _pc[0] = _cl[0]
+    _pc[1:] = _cl[:-1]
+    tr = pd.Series(np.maximum(_hi - _lo, np.maximum(np.abs(_hi - _pc), np.abs(_lo - _pc))), index=d.index)
     d["ATR"] = tr.ewm(alpha=1.0 / ATR_PERIOD, adjust=False, min_periods=ATR_PERIOD).mean()
     d["SMA50"] = d["close"].rolling(SMA_PERIOD).mean()
     d["EMA50"] = d["close"].ewm(span=50, adjust=False).mean()
