@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 41
+_DAEMON_VERSION = 42
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -976,9 +976,14 @@ selected_autotrade_mode = st.sidebar.selectbox(
 )
 _active_mode_strats = strategy_registry.autotrade_mode_strategy_ids(selected_autotrade_mode)
 _reg_route_suffix = f" → **{_reg_active_eng}**" if selected_autotrade_mode == "box_plus_ema50_200_regime" else ""
+_intraday_sfx = (
+    f" • 3-Layer 15m: {_live_regime_info.get('intraday_emoji', '🟡')} **{_live_regime_info.get('intraday_label', 'INTRADAY CHOP')}**"
+    if _live_regime_info.get("intraday_valid", 0)
+    else ""
+)
 st.sidebar.caption(
     f"🧭 **Market Trend:** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
-    f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`){_reg_route_suffix}"
+    f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`){_intraday_sfx}{_reg_route_suffix}"
 )
 
 if (

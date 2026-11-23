@@ -370,6 +370,27 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     })
                     continue
 
+                # 3-Layer Intraday Trend Stack Box Guard (protects Box mean-reversion against intraday trends/CHoCH)
+                if s.id == "box_theory":
+                    try:
+                        _mkt_i_m = str((eng.compute_market_regime() or {}).get("intraday_regime", "CHOP_RANGE"))
+                        _p_st_m = eng.compute_pair_intraday_trend_stack(pair) or {}
+                        _coin_i_m = str(_p_st_m.get("regime", "CHOP_RANGE"))
+                        _ch_m = str(_p_st_m.get("s1_choch", "NONE"))
+                        _d_m = "LONG" if str(sig.get("signal", "")).upper() in ("LONG", "BUY") else "SHORT"
+                        if (
+                            (_d_m == "SHORT" and (_mkt_i_m == "CLEAN_UPTREND" or _coin_i_m == "CLEAN_UPTREND" or _ch_m == "BULLISH_CHOCH"))
+                            or (_d_m == "LONG" and (_mkt_i_m == "CLEAN_DOWNTREND" or _coin_i_m == "CLEAN_DOWNTREND" or _ch_m == "BEARISH_CHOCH"))
+                        ):
+                            results.append({
+                                **row,
+                                "signal": None,
+                                "message": f"blocked by 3-Layer Intraday Trend Guard (Mkt15m={_mkt_i_m}, Coin={_coin_i_m}, 1H CHoCH={_ch_m})",
+                            })
+                            continue
+                    except Exception:
+                        pass
+
                 # 1-Crypto-at-a-Time Guard: If any crypto is already active, do not alert/open another crypto
                 if portfolio_occupied and active_Slot_pair and _canon_pair(active_Slot_pair) != pair_base:
                     results.append({

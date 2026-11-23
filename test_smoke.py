@@ -277,6 +277,8 @@ def test_5_daily_bias_enforcement():
             assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
 
         with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
+             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
              patch.object(eng, "place_coindcx_futures_order", return_value=(True, "SIMULATED_RANGE_OK", {"id": "sim_1"})), \
              patch.object(eng, "save_autotrade_config", return_value={}), \
              patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK", {})), \
@@ -1072,6 +1074,8 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
          patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP"}), \
+         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
          patch.object(eng, "place_coindcx_futures_order") as mock_live_order, \
          patch.object(eng, "save_autotrade_config", return_value={}), \
          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
@@ -1200,7 +1204,8 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
              patch.object(eng, "_get_coindcx_credentials", return_value=("k1", "s1")), \
              patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
-             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
+             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.300, "bid": 7.299, "ask": 7.301}), \
              patch.object(eng, "place_coindcx_futures_order", side_effect=_fake_place_limit), \
              patch.object(eng.time, "sleep", return_value=None), \
@@ -1535,7 +1540,8 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
                 assert not ok_box_p and "auto-pausing Box Theory Sweep" in msg_box_p, f"Expected Box paused in STRONG_DOWNTREND, got {ok_box_p} {msg_box_p}"
 
             # Under RANGING_CHOP with 2 EMA trades open -> Box Theory Sweep CAN still take the 3rd slot!
-            with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.4}), \
+            with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP", "median_2d_pct": 0.4}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=two_open):
                 ok_box3, msg_box3, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-INJ_USDT",
@@ -2227,7 +2233,8 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
                     })
                     with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.30, "bid": 7.299, "ask": 7.301}), \
                          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
-                         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
+                         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
+                         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
                          patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
                          patch.object(eng, "get_coindcx_live_usdt_inr_rate", return_value=95.0), \
                          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
@@ -2246,6 +2253,100 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
                             assert 250.0 < used_m <= 4000.0, f"Expected E0 1.5% risk-capped margin <= Rs.4,000, got {used_m}"
 
     print("  -> PASS: Daemon v37/v38/v39 (Concurrent Slots, Auto-Split, 00:00 UTC Reset, Unrealized SL Pause & E0b/E0 Sizing Toggle) verified!")
+
+
+def test_19_v41_3layer_box_guard_and_3_safety_fixes():
+    print("[19/19] Verifying v41 + 3-Layer Intraday Trend Stack Box Guard & 3 Live-Engine Safety Fixes...")
+    import time
+    import tempfile
+    import pandas as pd
+    import numpy as np
+    import coindcx_engine as eng
+    import strategies as strat
+
+    # 1. Wilder ADX + 3-Layer Stack detects CLEAN_UPTREND on HH/HL rally & blocks counter-trend Box SHORT
+    import math
+    n_bars = 160
+    t0 = 1795305600000
+    rows = []
+    px = 100.0
+    for i in range(n_bars):
+        # 1H-scale HH/HL staircase (period ~24 bars = 6h, clear rising swings)
+        target = 100.0 + 0.35 * i + 2.5 * math.sin(2.0 * math.pi * i / 24.0)
+        o = px
+        c = target
+        h = max(o, c) + 0.35
+        l = min(o, c) - 0.35
+        rows.append({"timestamp": t0 + i * 900_000, "open": o, "high": h, "low": l, "close": c, "volume": 1000.0 + i * 5.0})
+        px = c
+    df_up = pd.DataFrame(rows)
+    st_up = eng.compute_intraday_3layer_series(df_up)
+    clean_ups = [x for x in st_up[-24:] if x["regime"] == "CLEAN_UPTREND"]
+    assert clean_ups and clean_ups[-1]["s1_struct"] == "UP" and clean_ups[-1]["vwap_state"] == "BULL_VWAP" and clean_ups[-1]["adx"] > 20.0, st_up[-1]
+
+    # BoxPlusEma50200Strategy blocks Box SHORT during Chop when 3-Layer Intraday is CLEAN_UPTREND (or BULLISH_CHOCH),
+    # while leaving Strategy 4 (15m 50/200 EMA) in STRONG_UPTREND completely untouched!
+    combo = strat.STRATEGY_REGISTRY["box_plus_ema50_200_regime"]
+    fake_box_short = {"signal": "SHORT", "strategy_id": "box_theory", "entry": 100.0, "stop_loss": 101.5, "tp1": 98.5, "tp2": 97.0, "levels": {"daily_close": 95.0, "EMA50": 100.0}}
+    with patch.object(combo.s1, "evaluate_signal", return_value=fake_box_short), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CLEAN_UPTREND"}), \
+         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}):
+        res_blk = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_blk["signal"] == "NEUTRAL" and "3-Layer Intraday Trend Guard" in res_blk["trigger_reason"], res_blk
+
+    fake_s4_long = {"signal": "LONG", "strategy_id": "ema50_200", "entry": 100.0, "stop_loss": 99.0, "tp1": 101.5, "tp2": 103.0}
+    with patch.object(combo.s4, "evaluate_signal", return_value=fake_s4_long), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "intraday_regime": "CHOP_RANGE"}):
+        res_s4 = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_s4["signal"] == "LONG" and res_s4["strategy_id"] == "ema50_200", f"Strategy 4 must remain untouched: {res_s4}"
+
+    # 2. Safety Fix #1: 8h-old active live lock MUST NOT expire while live position is open on CoinDCX (or API unverified)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "_persist_autotrade_state_bg", return_value=None):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            old_lk = {
+                "pair": "B-BTC_USDT", "direction": "SHORT", "entry": 61271.1, "stop_loss": 62928.5,
+                "tp1": 60045.7, "tp2": 58746.1, "opened_ts": time.time() - 9 * 3600,
+                "is_live_exchange": True, "entry1_pending": False, "qty1": 0.001, "leverage": 10,
+                "tp1_order_id": "ORD_TP1_KEEP", "strategy_id": "box_theory",
+            }
+            eng.save_autotrade_config({"active_trade_lock": old_lk, "active_trade_locks": {"B-BTC_USDT": old_lk}})
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{
+                "id": "pos_btc_9h", "pair": "B-BTC_USDT", "direction": "SHORT", "quantity": 0.001,
+                "entry_price": 61271.1, "mark_price": 61300.0, "leverage": 10, "stop_loss": 62928.5, "take_profit": 58746.1,
+            }]), patch.object(eng, "fetch_live_ticker", return_value={"last_price": 61300.0}):
+                eng.get_active_portfolio_trade_status(manage_exchange=True)
+                assert "B-BTC_USDT" in eng._get_active_locks_map(), "9h-old open live position lock must NOT expire!"
+            # API returns None (error): MUST also preserve lock (never wipe on transient error)!
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=None), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 61300.0}):
+                eng.get_active_portfolio_trade_status(manage_exchange=True)
+                assert "B-BTC_USDT" in eng._get_active_locks_map(), "Live lock must NOT expire when API returns None!"
+
+    # 3. Safety Fix #2: _fetch_coindcx_active_positions_sync(return_none_on_error=True) MUST fail closed to None
+    # even when a Sheet bridge snapshot exists!
+    with patch.object(eng, "_send_coindcx_signed_request", return_value=(None, "timeout")), \
+         patch.object(eng, "_try_load_sheet_account_bridge", return_value={"positions": [], "stale": False}):
+        fc_res = eng._fetch_coindcx_active_positions_sync(return_none_on_error=True)
+        assert fc_res is None, f"Expected fail-closed None on return_none_on_error=True, got {fc_res}"
+
+    # 4. Safety Fix #3: _persist_autotrade_state_bg serializes writes monotonically and persists latest snapshot
+    written_states = []
+    def _slow_sheet_save(dep_id, state):
+        time.sleep(0.02)
+        written_states.append(dict(state))
+        return True
+
+    with patch.object(eng, "_get_deployment_id", return_value="test_staging_ser"), \
+         patch("sheets_logger.save_autotrade_state_to_sheet", side_effect=_slow_sheet_save):
+        eng._persist_autotrade_state_bg({"daily_loss_stop_hit": "", "active_trade_locks": {"B-XRP_USDT": {"x": 1}}})
+        eng._persist_autotrade_state_bg({"daily_loss_stop_hit": "2026-11-23", "active_trade_locks": {}})
+        time.sleep(0.15)
+        assert written_states and written_states[-1]["daily_loss_stop_hit"] == "2026-11-23" and written_states[-1]["active_trade_locks"] == {}, written_states
+
+    print("  -> PASS: v41 + 3-Layer Intraday Trend Stack Box Guard & All 3 Live-Engine Safety Fixes verified!")
 
 
 if __name__ == "__main__":
@@ -2267,6 +2368,7 @@ if __name__ == "__main__":
     test_16_three_tier_main_staging_experiment_parity()
     test_17_v36_six_sl_reduction_fixes()
     test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
+    test_19_v41_3layer_box_guard_and_3_safety_fixes()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
