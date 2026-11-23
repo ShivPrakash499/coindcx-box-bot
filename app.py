@@ -2227,7 +2227,7 @@ elif active_section == "🎯 Execute":
                     strategy_registry.setup_tag(_s.id, "SIGNAL"),
                     _s
                 ))
-            if _s.id not in ("box_theory", "ema50_200"):
+            if _s.id not in ("box_theory", "ema50_200", "sixlots_ema9_21_sd"):
                 continue
             _plan = get_cached_strategy_plan(_s.id, selected_pair, float(cur_price), trade_margin_inr, trade_leverage, trade_usd_inr)
             _multi_plan_mode = len(armed_strats) > 1
@@ -3417,7 +3417,7 @@ elif active_section == "🧪 Backtest":
     _bt_mode_keys = [k for k, _ in strategy_registry.AUTOTRADE_MODE_CHOICES]
     _bt_mode_labels = dict(strategy_registry.AUTOTRADE_MODE_CHOICES)
     if st.session_state.get("bt_multi_strat_mode") not in _bt_mode_keys:
-        st.session_state["bt_multi_strat_mode"] = selected_autotrade_mode
+        st.session_state["bt_multi_strat_mode"] = "sixlots_ema9_21_sd"
 
     bc0, bc1, bc2, bc3 = st.columns([1.8, 0.9, 1.1, 1.0])
     bt_strat_mode = bc0.selectbox(
@@ -3426,83 +3426,87 @@ elif active_section == "🧪 Backtest":
         format_func=lambda k: _bt_mode_labels.get(k, k),
         key="bt_multi_strat_mode",
     )
-    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days"], index=0, key="bt_multi_dur")
-    _default_bt_wallet = max(1000.0, round(float(wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
+    _is_yt_bt = (bt_strat_mode == "sixlots_ema9_21_sd")
+    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "90 Days", "180 Days", "365 Days", "730 Days", "1825 Days"], index=5 if _is_yt_bt else 0, key="bt_multi_dur")
+    _default_bt_wallet = 1000000.0 if _is_yt_bt else max(1000.0, round(float(wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
     bt_wallet_inr = bc2.number_input(
         "Starting Funds / Wallet (₹)",
         min_value=1000.0,
-        max_value=10000000.0,
+        max_value=50000000.0,
         value=float(_default_bt_wallet),
-        step=1000.0,
+        step=10000.0,
         format="%.2f",
         key="bt_multi_wallet",
-        help="Mirrors Main's Futures Wallet balance so the 5% Daily Loss Stop (SL Threshold) & Free-Margin Guard behave identically to Main.",
     )
     bt_capital = bc3.number_input(
         "Single-Trade Margin (₹)",
         min_value=1000,
         max_value=5000000,
-        value=max(1000, int(round(margin_inr))),
+        value=100000 if _is_yt_bt else max(1000, int(round(margin_inr))),
         step=1000,
         key="bt_multi_cap",
-        help="Mirrors Main's exact Single-Trade Margin per slot.",
     )
 
-    bg1, bg2, bg3, bg4, bg5 = st.columns([0.9, 1.0, 0.8, 1.3, 1.3])
-    bt_lev = bg1.slider("Leverage (x)", 1, 20, int(leverage), key="bt_multi_lev")
+    bg1, bg2, bg3, bg4, bg5 = st.columns([0.8, 0.9, 0.8, 1.4, 1.3])
+    bt_lev = bg1.slider("Leverage (x)", 1, 20, 10 if _is_yt_bt else int(leverage), key="bt_multi_lev")
     bt_sl_threshold_pct = bg2.number_input(
         "Daily Loss Stop (%)",
         min_value=0.0,
         max_value=25.0,
-        value=float(getattr(strategy_registry, "DAILY_WALLET_LOSS_STOP_PCT", 5.0)),
+        value=0.0 if _is_yt_bt else float(getattr(strategy_registry, "DAILY_WALLET_LOSS_STOP_PCT", 5.0)),
         step=0.5,
         format="%.1f",
         key="bt_daily_loss_stop_pct",
-        help="Locks new trades until the next Crypto Day reset (00:00 UTC / 05:30 AM IST) when realized daily loss reaches this % of day-start wallet (Main = 5.0%; set 0.0 to A/B test without guard).",
     )
     _bt_slot_opts = [1, 2, 3, 4, 5, 6]
-    _bt_slot_def_idx = _bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2
-    bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=_bt_slot_def_idx, key="bt_max_slots")
+    bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=1 if _is_yt_bt else (_bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2), key="bt_max_slots")
     with bg4:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
-        bt_free_margin_guard = st.checkbox(
-            "<90% Free-Margin Guard",
-            value=True,
-            key="bt_free_margin_guard",
-            help="Skips new entries when remaining free wallet equity is below 90% of Single-Trade Margin (identical to Main).",
-        )
+        bt_free_margin_guard = st.checkbox("<90% Free-Margin Guard", value=(not _is_yt_bt), key="bt_free_margin_guard")
     with bg5:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
-        bt_fixed_risk_cap = st.checkbox(
-            "Cap Margin by 1.5% Risk",
-            value=fixed_risk_sizing_on,
-            key="bt_fixed_risk_cap",
-            help="OFF (E0b Default): deploys full Single-Trade Margin per slot. ON (E0): shrinks margin on wide SLs so max SL loss <= 1.5% of wallet.",
-        )
+        bt_fixed_risk_cap = st.checkbox("Cap Margin by 1.5% Risk", value=(False if _is_yt_bt else fixed_risk_sizing_on), key="bt_fixed_risk_cap")
+
+    _yt_tf = "15m"
+    _yt_exit_sel = "smart_hybrid"
+    _yt_pairs = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
+    _yt_btn_lbl = "All 12 High-Vol Movers"
+    if _is_yt_bt:
+        yc1, yc2, yc3 = st.columns([0.9, 1.8, 1.2])
+        _yt_tf = yc1.selectbox("Timeframe", ["15m", "1h", "4h"], index=["15m", "1h", "4h"].index("1h"), key="bt_yt_tf")
+        _yt_exits = {'yt_fixed_2.0': '⭐ Fixed 1:2.0R Maker Limit (Default)', 'yt_half_2.0_trail21': '50% @ 1:2.0R Maker + 50% Trail 21 EMA Close', 'yt_fixed_2.5': 'Fixed 1:2.5R Maker Limit'}
+        _yt_exit_sel = yc2.selectbox("Pure 9/21 Exit Mode", options=list(_yt_exits.keys()), format_func=lambda k: _yt_exits.get(k, k), index=0, key="bt_yt_exit")
+        _yt_u = yc3.selectbox("Pairs", ["SOL & ETH Only", "SOL Only", "ETH Only"], index=0, key="bt_yt_pairs")
+        _yt_pairs = ["B-SOL_USDT"] if _yt_u == "SOL Only" else (["B-ETH_USDT"] if _yt_u == "ETH Only" else ["B-SOL_USDT", "B-ETH_USDT"])
+        _yt_btn_lbl = _yt_u
 
     st.caption(
         f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` • "
-        f"**Sizing:** `{'1.5% Fixed Risk Cap (E0)' if bt_fixed_risk_cap else 'Full Slot Margin (E0b)'}` • "
+        f"**TF:** `{_yt_tf}` • **Pairs:** `{_yt_btn_lbl}` • "
         f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Margin/Trade:** `₹{bt_capital:,.0f}` @ `{bt_lev}x` | "
-        f"**SL Threshold Lock:** `{bt_sl_threshold_pct:.1f}%/day` (`₹{bt_wallet_inr * bt_sl_threshold_pct / 100.0:,.0f}`) | "
-        f"**Slots:** `{bt_max_slots}`. *Backtest results use historical CoinDCX data and are hypothetical.*"
+        f"**Slots:** `{bt_max_slots}`. *Pure standalone 9/21 strategy — zero Box Sweep or 50/200 EMA mixing.*"
     )
 
-    if st.button("🏆 Run Main-Parity Portfolio Backtest (All 12 High-Vol Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
+    if st.button(f"🏆 Run Portfolio Backtest ({_yt_btn_lbl})", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
-        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x, {bt_sl_threshold_pct:.1f}% SL stop)..."):
+        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} [{_yt_tf}] on {_yt_btn_lbl} ({bt_dur_label} @ {bt_lev}x)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
-                pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
+                pairs=_yt_pairs,
                 duration_days=days_p,
                 margin_inr=float(bt_capital),
                 leverage=bt_lev,
                 usd_inr=usd_inr,
                 strategy_id=bt_strat_mode,
                 wallet_inr=float(bt_wallet_inr),
+                exit_mode=_yt_exit_sel,
                 max_concurrent_trades=int(bt_max_slots),
                 daily_loss_stop_pct=float(bt_sl_threshold_pct),
                 enforce_free_margin_guard=bool(bt_free_margin_guard),
+                enforce_same_dir_guard=(not _is_yt_bt),
+                enforce_post_sl_lock=(not _is_yt_bt),
+                enforce_btc_impulse_veto=(not _is_yt_bt),
                 use_fixed_risk_sizing=bool(bt_fixed_risk_cap),
+                interval=_yt_tf,
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 
