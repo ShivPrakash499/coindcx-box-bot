@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 34
+_DAEMON_VERSION = 35
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -812,8 +812,10 @@ _live_regime_info = get_cached_market_regime()
 _active_mode_strats = strategy_registry.autotrade_mode_strategy_ids(selected_autotrade_mode)
 st.sidebar.caption(f"🎯 **Mode:** `{_auto_mode_labels.get(selected_autotrade_mode, selected_autotrade_mode)}`")
 st.sidebar.caption(
-    f"🧭 **Market Trend:** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
-    f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`)"
+    f"🧭 **Macro Trend:** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
+    f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`)  \n"
+    f"⚡ **3-Layer 15m Intraday:** {_live_regime_info.get('intraday_emoji', '🟡')} **{_live_regime_info.get('intraday_label', 'INTRADAY CHOP')}** "
+    f"(`{_live_regime_info.get('intraday_bull_votes', 0)}B/{_live_regime_info.get('intraday_bear_votes', 0)}S` • `1H/VWAP/ADX`)"
 )
 
 if (

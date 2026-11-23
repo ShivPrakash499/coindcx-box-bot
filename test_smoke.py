@@ -276,6 +276,8 @@ def test_5_daily_bias_enforcement():
             assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
 
         with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
+             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE", "vwap": 7.30, "s4_bear_ok": True, "s4_bull_ok": True}), \
              patch.object(eng, "place_coindcx_futures_order", return_value=(True, "SIMULATED_RANGE_OK", {"id": "sim_1"})), \
              patch.object(eng, "save_autotrade_config", return_value={}), \
              patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK", {})), \
@@ -886,7 +888,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         )
 
     # Staging Paper-Only AutoTrade Guard: verify place_coindcx_futures_order is NEVER called on staging
-    with patch.object(eng, "is_staging_environment", return_value=True),          patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}),          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]),          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}),          patch.object(eng, "place_coindcx_futures_order") as mock_live_order,          patch.object(eng, "save_autotrade_config", return_value={}),          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+    with patch.object(eng, "is_staging_environment", return_value=True),          patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}),          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]),          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}),          patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE"}),          patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE", "vwap": 9.0, "s4_bear_ok": True, "s4_bull_ok": True}),          patch.object(eng, "place_coindcx_futures_order") as mock_live_order,          patch.object(eng, "save_autotrade_config", return_value={}),          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
         ok_stg, msg_stg, meta_stg = eng.execute_autotrade_two_entry_signal(
             pair="B-AVAX_USDT",
             sig={
@@ -1010,6 +1012,8 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 60000.0, "available_inr": 60000.0}), \
              patch.object(eng, "_get_coindcx_credentials", return_value=("k1", "s1")), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE", "vwap": 7.30, "s4_bear_ok": True, "s4_bull_ok": True}), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.300, "bid": 7.299, "ask": 7.301}), \
              patch.object(eng, "place_coindcx_futures_order", side_effect=_fake_place_limit), \
              patch.object(eng.time, "sleep", return_value=None), \
@@ -1299,7 +1303,8 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
 
             # In STRONG_DOWNTREND with 2 EMA trades already open -> 3rd EMA trade is capped (reserving 3rd slot for Box)!
             two_open = [{"pair": "B-SUI_USDT"}, {"pair": "B-AVAX_USDT"}]
-            with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.5}), \
+            with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "intraday_regime": "CLEAN_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.5}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CLEAN_DOWNTREND", "s1_choch": "NONE", "vwap": 7.20, "s4_bear_ok": True, "s4_bull_ok": False}), \
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=two_open):
                 ok_cap, msg_cap, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-INJ_USDT",
@@ -1442,7 +1447,8 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
                  patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
                  patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
                  patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
-                 patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
+                 patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "intraday_regime": "CLEAN_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CLEAN_DOWNTREND", "s1_choch": "NONE", "vwap": 1.39, "s4_bear_ok": True, "s4_bull_ok": False}), \
                  patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.4079, "bid": 1.4078, "ask": 1.4080}):
                 ok_dr, msg_dr, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-RENDER_USDT",
@@ -1483,6 +1489,150 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
     print("  -> PASS: All 3 v34 Fixes (Strict 3-Slot/Partial-Fill, Exact Sidebar Margin/No Crumbs, Box-Floor/SL-Drift/4h Lock) verified!")
 
 
+def test_15_three_layer_intraday_trend_stack():
+    """Verifies the 3-Layer Intraday Trend Stack (1H/4H HH-HL/CHoCH, 00:00 UTC Session VWAP, 15m EMA+ADX(14)),
+    Same-Direction 2/2 Guard, 8h active-position lock protection, and AST undefined-name audit across all modules."""
+    print("[15/15] Verifying 3-Layer Intraday Trend Stack (1H/4H+CHoCH, Session VWAP, 15m EMA/ADX14) & Guards...")
+    import ast, builtins, tempfile
+    import numpy as np
+    import pandas as pd
+    from unittest.mock import patch
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+
+    # 1. Synthetic 15m Uptrend -> 1H HH/HL, rising Session VWAP, ADX > 25 -> CLEAN_UPTREND
+    n_bars = 260
+    t0_ms = int(pd.Timestamp("2026-11-20 00:00:00", tz="UTC").timestamp() * 1000)
+    rows = []
+    px = 100.0
+    for i in range(n_bars):
+        # Clear upward impulse + pullbacks on 1H so k=2 fractal pivots form textbook HH/HL,
+        # ending on a rising impulse leg above Session VWAP with ADX > 25
+        if i < 236:
+            wave = 2.8 * np.sin(i * 2 * np.pi / 32.0)
+            c = px + i * 0.12 + wave
+        else:
+            c = (px + 235 * 0.12 + 2.8 * np.sin(235 * 2 * np.pi / 32.0)) + (i - 235) * 0.35
+        o = c - 0.15
+        h = max(o, c) + 0.25
+        l = min(o, c) - 0.15
+        rows.append({"timestamp": t0_ms + i * 900_000, "open": o, "high": h, "low": l, "close": c, "volume": 1000.0 + (i % 5) * 150.0})
+    df_up = pd.DataFrame(rows)
+    st_up = eng.compute_intraday_3layer_series(df_up)
+    assert len(st_up) == n_bars
+    last_up = st_up[-1]
+    assert last_up["s1_struct"] == "UP", f"Expected 1H UP structure (HH/HL), got {last_up['s1_struct']}"
+    assert last_up["s1_choch"] == "NONE", f"Expected no CHoCH in clean uptrend, got {last_up['s1_choch']}"
+    assert last_up["vwap_state"] == "BULL_VWAP", f"Expected BULL_VWAP, got {last_up['vwap_state']}"
+    assert last_up["adx"] > 25.0 and last_up["adx_tier"] == "STRONG", f"Expected ADX > 25, got {last_up['adx']}"
+    assert last_up["regime"] == "CLEAN_UPTREND" and last_up["s4_bull_ok"] is True, f"Expected CLEAN_UPTREND, got {last_up}"
+
+    # 2. Early Reversal Warning (BEARISH_CHOCH): sharp 1H close below last confirmed HL compromises uptrend!
+    rows_choch = list(rows)
+    last_hl = last_up["s1_last_hl"]
+    for k in range(4):  # close 1 full 1H candle strictly below last_hl
+        i = n_bars + k
+        c = last_hl - 1.5 - k * 0.2
+        rows_choch.append({"timestamp": t0_ms + i * 900_000, "open": c + 0.5, "high": c + 0.6, "low": c - 0.3, "close": c, "volume": 2500.0})
+    st_ch = eng.compute_intraday_3layer_series(pd.DataFrame(rows_choch))[-1]
+    assert st_ch["s1_choch"] == "BEARISH_CHOCH", f"Expected BEARISH_CHOCH after 1H close below HL, got {st_ch}"
+    assert st_ch["regime"] != "CLEAN_UPTREND" and st_ch["s4_bull_ok"] is False, f"CHoCH must disable uptrend longs: {st_ch}"
+
+    # 3. Sideways Chop -> slicing flat VWAP & ADX < 20 -> CHOP_RANGE & trend pullbacks disabled!
+    rows_chop = []
+    for i in range(n_bars):
+        osc = 0.25 if (i % 2 == 0) else -0.25
+        c = 100.0 + osc
+        rows_chop.append({"timestamp": t0_ms + i * 900_000, "open": 100.0 - osc * 0.5, "high": 100.35, "low": 99.65, "close": c, "volume": 1000.0})
+    st_cp = eng.compute_intraday_3layer_series(pd.DataFrame(rows_chop))[-1]
+    assert st_cp["vwap_state"] == "CHOP_VWAP", f"Expected CHOP_VWAP on slicing flat VWAP, got {st_cp}"
+    assert st_cp["adx"] < 20.0 and st_cp["adx_tier"] == "CHOP", f"Expected ADX < 20 in flat chop, got {st_cp}"
+    assert st_cp["regime"] == "CHOP_RANGE" and not st_cp["s4_bull_ok"] and not st_cp["s4_bear_ok"], f"Expected CHOP_RANGE disabling trend pullbacks, got {st_cp}"
+
+    # 4. Live Engine Guards: (a) 3-Layer blocks Box SHORT during Market CLEAN_UPTREND (Nov 23 scenario!),
+    #    (b) Max 2 Same-Direction Guard blocks 3rd correlated SHORT, (c) 8h lock expiry does NOT drop open live position!
+    bear_box = {"trend_bias": "BEARISH", "RH": 1.05, "RL": 0.90, "MID": 0.975, "SH": 1.08, "SL": 0.88}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg_file = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", cfg_file), \
+             patch.dict(eng._AUTOTRADE_CFG_MEM_CACHE, {"data": None, "mtime": 0.0}):
+            eng.save_autotrade_config({"autotrade_strategy_mode": "box_plus_ema50_200_regime", "single_trade_margin_inr": 8000.0})
+            with patch.object(eng, "is_staging_environment", return_value=True), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 24000.0, "available_inr": 24000.0}), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+                 patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+                 patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CLEAN_UPTREND", "label": "RANGING / CHOP"}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CLEAN_UPTREND", "s1_choch": "NONE", "vwap": 0.66, "s4_bear_ok": False, "s4_bull_ok": True}):
+                ok_blk, msg_blk, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-SUI_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 0.6679, "tp1": 0.6538, "tp2": 0.6333, "stop_loss": 0.6817, "levels": bear_box},
+                    single_trade_margin_inr=8000.0, leverage=10,
+                )
+                assert not ok_blk and "3-Layer Intraday Trend Guard" in msg_blk, f"Expected 3-Layer Guard to block Box SHORT on CLEAN_UPTREND, got {ok_blk} {msg_blk}"
+                assert not sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime", pair="B-SUI_USDT")
+
+            # (b) Max 2 Same-Direction Guard blocks 3rd SHORT
+            with patch.object(eng, "is_staging_environment", return_value=False), \
+                 patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 24000.0, "available_inr": 20000.0}), \
+                 patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-BTC_USDT", "B-SOL_USDT"]}), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
+                     {"pair": "B-BTC_USDT", "direction": "SHORT", "quantity": 0.001},
+                     {"pair": "B-SOL_USDT", "direction": "SHORT", "quantity": 1.29},
+                 ]), \
+                 patch.object(eng, "get_open_entry_limit_orders", return_value=[]):
+                ok_sd, msg_sd, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-SUI_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 0.6679, "tp1": 0.6538, "tp2": 0.6333, "stop_loss": 0.6817, "levels": bear_box},
+                    single_trade_margin_inr=8000.0, leverage=10,
+                )
+                assert not ok_sd and "Same-Direction Risk Guard" in msg_sd, f"Expected Same-Direction 2/2 block, got {ok_sd} {msg_sd}"
+
+            # (c) 8-hour lock expiry MUST NOT delete lock while live position is still open on CoinDCX!
+            old_lk = {
+                "pair": "B-BTC_USDT", "direction": "SHORT", "entry": 61271.1, "stop_loss": 62928.5,
+                "tp1": 60045.7, "tp2": 58746.1, "opened_ts": time.time() - 9 * 3600,
+                "is_live_exchange": True, "entry1_pending": False, "qty1": 0.001, "leverage": 10,
+                "tp1_order_id": "ORD_TP1_KEEP", "strategy_id": "box_theory",
+            }
+            eng.save_autotrade_config({"active_trade_lock": old_lk, "active_trade_locks": {"B-BTC_USDT": old_lk}})
+            with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{
+                "id": "pos_btc_9h", "pair": "B-BTC_USDT", "direction": "SHORT", "quantity": 0.001,
+                "entry_price": 61271.1, "mark_price": 61300.0, "leverage": 10, "stop_loss": 62928.5, "take_profit": 58746.1,
+            }]), \
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 61300.0}):
+                eng.get_active_portfolio_trade_status(manage_exchange=True)
+                assert "B-BTC_USDT" in eng._get_active_locks_map(), "9h-old open live position lock must NOT expire!"
+
+    # 5. AST undefined-name audit on modified modules
+    bi = set(dir(builtins)) | {"__file__", "__name__"}
+    for fname in ("coindcx_engine.py", "strategies.py", "signal_monitor.py", "app.py"):
+        fpath = os.path.join(os.path.dirname(os.path.abspath(__file__)), fname)
+        tree = ast.parse(open(fpath, encoding="utf-8").read(), filename=fname)
+        defined = set(bi)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Import):
+                for al in node.names: defined.add(al.asname or al.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for al in node.names: defined.add(al.asname or al.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                defined.add(node.id)
+            elif isinstance(node, ast.arg):
+                defined.add(node.arg)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                defined.add(node.name)
+            elif isinstance(node, ast.Global):
+                defined.update(node.names)
+        undef = sorted({n.id for n in ast.walk(tree) if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Load) and n.id not in defined})
+        assert not undef, f"Undefined names in {fname}: {undef}"
+
+    print("  -> PASS: 3-Layer Intraday Trend Stack (1H/4H+CHoCH, VWAP, ADX14), 2-Same-Dir Guard, 8h Live-Lock Fix, & AST Audit verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1498,6 +1648,7 @@ if __name__ == "__main__":
     test_12_sidebar_unlock_autotrade()
     test_13_regime_adaptive_routing_and_structure_tp1()
     test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
+    test_15_three_layer_intraday_trend_stack()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

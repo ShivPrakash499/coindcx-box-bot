@@ -2217,11 +2217,12 @@ class BoxPlusEma50200Strategy(Strategy):
         self.allow_bull_ema = allow_bull_ema
         self.regime_adaptive = regime_adaptive
         if regime_adaptive:
-            self.timeframe = "Regime-Adaptive: Box Sweep (All Regimes) + Auto Bull/Bear 15m 50/200 EMA in Strong Trends"
+            self.timeframe = "v34 + 3-Layer Intraday Trend Stack (1H/4H Structure+CHoCH + Session VWAP + 15m EMA/ADX)"
             self.description = (
-                "2-Year Verified Regime-Adaptive Routing: always runs Strategy 1 (15m Box Theory Sweep L+S); "
-                "automatically activates Bull 15m 50/200 EMA Longs in STRONG UPTREND, Bear 15m 50/200 EMA Shorts "
-                "in STRONG DOWNTREND, and pauses EMA trend entries during RANGING / CHOP markets."
+                "v34 Core (50% TP1 Profit-Lock + Halfway Ratchet) upgraded with the 3-Layer Intraday Trend Stack: "
+                "(1) 1H/4H HH/HL/LH/LL & CHoCH Early Reversal Warning, (2) 00:00 UTC Session VWAP slope & slicing-chop filter, "
+                "(3) 15m EMA separation/slope & Wilder ADX(14) trend-strength gate (>25 strong, 20-25 confirm, <20 chop). "
+                "Blocks Box fades against active intraday trends/CHoCH and gates 15m 50/200 EMA pullbacks by all 3 layers."
             )
         else:
             self.timeframe = (
@@ -2237,23 +2238,62 @@ class BoxPlusEma50200Strategy(Strategy):
         self.s4 = Ema50200PullbackStrategy(allow_bear=True, allow_bull=(allow_bull_ema or regime_adaptive))
 
     def compute_levels(self, pair):
-        return self.s4.compute_levels(pair)
+        lv = self.s4.compute_levels(pair)
+        if lv and self.regime_adaptive:
+            try:
+                st = eng.compute_pair_intraday_trend_stack(pair)
+                if isinstance(st, dict) and float(st.get("vwap", 0.0) or 0.0) > 0:
+                    ref_px = float(lv.get("RH") or lv.get("daily_close") or st["vwap"])
+                    lv["Session_VWAP"] = eng.round_asset_price(st["vwap"], ref_px)
+                    lv["Intraday_Regime"] = st.get("regime", "CHOP_RANGE")
+                    lv["HTF_1H_Struct"] = st.get("s1_struct", "CHOP")
+                    lv["HTF_1H_CHoCH"] = st.get("s1_choch", "NONE")
+                    lv["ADX14_15m"] = float(st.get("adx", 0.0) or 0.0)
+                    lv["Intraday_Summary"] = st.get("summary", "")
+            except Exception:
+                pass
+        return lv
 
     def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
         sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
-            return sig1
         if self.regime_adaptive:
-            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
-            if reg == "RANGING_CHOP":
+            reg_info = eng.compute_market_regime()
+            day_reg = str(reg_info.get("regime", "RANGING_CHOP"))
+            mkt_i_reg = str(reg_info.get("intraday_regime", "CHOP_RANGE"))
+            p_stack = eng.compute_pair_intraday_trend_stack(pair)
+            coin_i_reg = str(p_stack.get("regime", "CHOP_RANGE"))
+            s1_choch = str(p_stack.get("s1_choch", "NONE"))
+            has_stack = float(p_stack.get("vwap", 0.0) or 0.0) > 0
+
+            if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
+                d1 = str(sig1.get("signal", "")).upper()
+                box_blocked = (
+                    (d1 == "SHORT" and (mkt_i_reg == "CLEAN_UPTREND" or coin_i_reg == "CLEAN_UPTREND" or s1_choch == "BULLISH_CHOCH"))
+                    or (d1 == "LONG" and (mkt_i_reg == "CLEAN_DOWNTREND" or coin_i_reg == "CLEAN_DOWNTREND" or s1_choch == "BEARISH_CHOCH"))
+                )
+                if not box_blocked:
+                    return sig1
+                sig1 = dict(sig1)
+                sig1["signal"] = "NEUTRAL"
+                sig1["trigger_reason"] = (
+                    f"3-Layer Intraday Trend Guard: Blocked Box {d1} against active intraday trend/CHoCH "
+                    f"(Mkt15m={mkt_i_reg}, Coin={coin_i_reg}, 1H CHoCH={s1_choch})"
+                )
+
+            if day_reg == "RANGING_CHOP":
                 return sig1
-            sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-            if sig4 and (
-                (reg == "STRONG_DOWNTREND" and sig4.get("signal") == "SHORT")
-                or (reg == "STRONG_UPTREND" and sig4.get("signal") == "LONG")
-            ):
-                return sig4
+            if day_reg == "STRONG_DOWNTREND" and mkt_i_reg != "CLEAN_UPTREND" and ((not has_stack) or bool(p_stack.get("s4_bear_ok", False))):
+                sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+                if sig4 and sig4.get("signal") == "SHORT":
+                    return sig4
+            if day_reg == "STRONG_UPTREND" and mkt_i_reg != "CLEAN_DOWNTREND" and ((not has_stack) or bool(p_stack.get("s4_bull_ok", False))):
+                sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+                if sig4 and sig4.get("signal") == "LONG":
+                    return sig4
+            return sig1
+
+        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
             return sig1
         sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
         if sig4 and sig4.get("signal") in ("LONG", "SHORT"):
@@ -2264,17 +2304,35 @@ class BoxPlusEma50200Strategy(Strategy):
         return self.s1.plan_setups(pair, levels, live_price, margin_inr, leverage, usd_inr)
 
     def chart_lines(self, levels, plan=None):
-        return self.s4.chart_lines(levels, plan)
+        lines = list(self.s4.chart_lines(levels, plan))
+        if levels and levels.get("Session_VWAP"):
+            lines.append({"label": "Session VWAP (00:00 UTC)", "price": levels["Session_VWAP"], "color": "#06b6d4", "dash": "dash"})
+        return lines
 
     def metric_badges(self, levels):
-        return self.s1.metric_badges(levels) + self.s4.metric_badges(levels)
+        badges = self.s1.metric_badges(levels) + self.s4.metric_badges(levels)
+        if levels and levels.get("Session_VWAP"):
+            badges.append({"label": "Session VWAP", "value": levels["Session_VWAP"]})
+        if levels and levels.get("ADX14_15m"):
+            badges.append({"label": "15m ADX(14)", "value": levels["ADX14_15m"]})
+        return badges
 
     def level_rows(self, levels, live_price):
-        return self.s1.level_rows(levels, live_price)
+        rows = list(self.s1.level_rows(levels, live_price))
+        if levels and levels.get("Session_VWAP"):
+            vw = float(levels["Session_VWAP"])
+            rows.append({
+                "Level": f"Session VWAP ({levels.get('HTF_1H_Struct', 'CHOP')} | ADX {levels.get('ADX14_15m', 0):.1f})",
+                "Price": vw,
+                "Distance %": round(((vw - live_price) / live_price) * 100.0, 2) if live_price > 0 else 0.0,
+            })
+        return rows
 
     def prepare_backtest(self, df, df_daily):
         ctx1 = self.s1.prepare_backtest(df, df_daily)
         reg_map = {}
+        intraday_mkt_map = {}
+        stack_by_ts = {}
         if self.regime_adaptive:
             reg_map = dict(eng._PERSIST.get("backtest_regime_map") or {})
             if not reg_map and df_daily is not None and len(df_daily) >= 18:
@@ -2294,36 +2352,65 @@ class BoxPlusEma50200Strategy(Strategy):
                     r5 = (pc / float(closes[i - 6]) - 1.0) * 100.0
                     r2 = (pc / float(closes[i - 3]) - 1.0) * 100.0
                     reg_map[dates[i]] = eng.classify_universe_regime_from_stats(bf, brf, r14, r5, r2)
+            intraday_mkt_map = dict(eng._PERSIST.get("backtest_intraday_regime_map") or {})
+            if df is not None and not df.empty:
+                st_list = eng.compute_intraday_3layer_series(df)
+                stack_by_ts = {int(x["timestamp"]): x for x in st_list}
         return {
             "ctx1": ctx1,
             "ctx4": self.s4.prepare_backtest(df, df_daily),
             "boxes": ctx1["boxes"],
             "regime_map": reg_map,
+            "intraday_mkt_map": intraday_mkt_map,
+            "stack_by_ts": stack_by_ts,
         }
 
     def backtest_has_context(self, candle, ctx):
         return self.s1.backtest_has_context(candle, ctx["ctx1"])
 
     def backtest_entry(self, idx, candle, ctx, records):
-        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
-        if e1:
-            return e1
         if self.regime_adaptive:
+            ts_bar = int(candle.get("timestamp", 0) or 0)
+            pair_name = ctx.get("pair")
+            p_stacks = eng._PERSIST.get("backtest_pair_stacks") or {}
+            st = (p_stacks.get(pair_name) or {}).get(ts_bar) if pair_name else None
+            if st is None:
+                st = (ctx.get("stack_by_ts") or {}).get(ts_bar)
+            mkt_i_reg = (ctx.get("intraday_mkt_map") or {}).get(ts_bar, "CHOP_RANGE")
+            coin_i_reg = str((st or {}).get("regime", "CHOP_RANGE"))
+            s1_choch = str((st or {}).get("s1_choch", "NONE"))
+
+            e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+            if e1:
+                d1 = str(e1.get("direction", "")).upper()
+                if d1 == "SHORT" and (mkt_i_reg == "CLEAN_UPTREND" or coin_i_reg == "CLEAN_UPTREND" or s1_choch == "BULLISH_CHOCH"):
+                    e1 = None
+                elif d1 == "LONG" and (mkt_i_reg == "CLEAN_DOWNTREND" or coin_i_reg == "CLEAN_DOWNTREND" or s1_choch == "BEARISH_CHOCH"):
+                    e1 = None
+            if e1:
+                return e1
+
             day_reg = (ctx.get("regime_map") or {}).get(candle["date_str"], "RANGING_CHOP")
             if day_reg == "RANGING_CHOP":
                 return None
-            e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
-            if e4 and (
-                (day_reg == "STRONG_DOWNTREND" and e4.get("direction") == "SHORT")
-                or (day_reg == "STRONG_UPTREND" and e4.get("direction") == "LONG")
-            ):
-                return e4
+            if day_reg == "STRONG_DOWNTREND" and mkt_i_reg != "CLEAN_UPTREND" and (st is None or bool(st.get("s4_bear_ok", False))):
+                e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
+                if e4 and e4.get("direction") == "SHORT":
+                    return e4
+            if day_reg == "STRONG_UPTREND" and mkt_i_reg != "CLEAN_DOWNTREND" and (st is None or bool(st.get("s4_bull_ok", False))):
+                e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
+                if e4 and e4.get("direction") == "LONG":
+                    return e4
             return None
+
+        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+        if e1:
+            return e1
         return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
 
 
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
-    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Box + Auto Trend EMA] (Recommended)"),
+    ("box_plus_ema50_200_regime", "Combo: v34 + 3-Layer Intraday Stack [1H/VWAP/ADX] (Recommended)"),
     ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA"),
     ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
     ("box_theory", "Box Theory Sweep Only (v27)"),

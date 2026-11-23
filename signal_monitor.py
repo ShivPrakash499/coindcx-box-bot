@@ -87,8 +87,8 @@ def enabled_strategy_ids() -> list:
     return strat_registry.autotrade_mode_strategy_ids(auto_mode)
 
 
-def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str) -> bool:
-    """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
+def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str, pair: str = None) -> bool:
+    """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy & 3-Layer Intraday Trend Stack."""
     m = strat_registry.resolve_autotrade_mode(auto_mode)
     d = str(direction or "").upper()
     if m == "box_theory":
@@ -100,11 +100,25 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str)
     if m == "box_plus_ema50_200_both":
         return strategy_id in ("box_theory", "ema50_200")
     if m == "box_plus_ema50_200_regime":
+        reg_info = eng.compute_market_regime()
+        reg = str(reg_info.get("regime", "RANGING_CHOP"))
+        mkt_i_reg = str(reg_info.get("intraday_regime", "CHOP_RANGE"))
+        p_stack = eng.compute_pair_intraday_trend_stack(pair) if pair else {}
+        coin_i_reg = str(p_stack.get("regime", "CHOP_RANGE"))
+        s1_choch = str(p_stack.get("s1_choch", "NONE"))
+        has_stack = float(p_stack.get("vwap", 0.0) or 0.0) > 0
         if strategy_id == "box_theory":
+            if d == "SHORT" and (mkt_i_reg == "CLEAN_UPTREND" or coin_i_reg == "CLEAN_UPTREND" or s1_choch == "BULLISH_CHOCH"):
+                return False
+            if d == "LONG" and (mkt_i_reg == "CLEAN_DOWNTREND" or coin_i_reg == "CLEAN_DOWNTREND" or s1_choch == "BEARISH_CHOCH"):
+                return False
             return True
         if strategy_id == "ema50_200":
-            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
-            return (reg == "STRONG_DOWNTREND" and d == "SHORT") or (reg == "STRONG_UPTREND" and d == "LONG")
+            if reg == "STRONG_DOWNTREND" and d == "SHORT" and mkt_i_reg != "CLEAN_UPTREND":
+                return (not has_stack) or bool(p_stack.get("s4_bear_ok", False))
+            if reg == "STRONG_UPTREND" and d == "LONG" and mkt_i_reg != "CLEAN_DOWNTREND":
+                return (not has_stack) or bool(p_stack.get("s4_bull_ok", False))
+            return False
         return False
     return strategy_id == strat_registry.DEFAULT_STRATEGY_ID
 
@@ -281,25 +295,25 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if not sig or sig["signal"] == "NEUTRAL":
                     results.append({**row, "message": "no signal"})
                     continue
-                if sid in ("box_theory", "atr_reversal"):
-                    pair_primary_triggered = True
-
-                if auto_mode == "box_plus_ema50_200_regime" and s.id == "ema50_200":
-                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode):
-                        reg_lbl = eng.compute_market_regime().get("label", "RANGING / CHOP")
-                        results.append({**row, "signal": None, "message": f"paused by Regime-Adaptive mode ({reg_lbl})"})
-                        continue
-
-                if float(sig.get("roe_tp1", 0.0)) < 3.0:
-                    results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})
-                    continue
-
                 # Skip sending duplicate setup alerts or opening trades on assets ALREADY in a Live Trade
                 if pair in open_live_pairs or (pair_base and pair_base in open_live_bases):
                     results.append({
                         **row,
                         "message": f"skipped: {pair} is already in an active Live Trade"
                     })
+                    continue
+
+                if auto_mode == "box_plus_ema50_200_regime" and s.id in ("box_theory", "ema50_200"):
+                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode, pair=pair):
+                        reg_now = eng.compute_market_regime()
+                        reg_lbl = f"{reg_now.get('label', 'RANGING / CHOP')} | 15m:{reg_now.get('intraday_label', 'INTRADAY CHOP')}"
+                        results.append({**row, "signal": None, "message": f"blocked by 3-Layer Intraday Trend Stack ({reg_lbl})"})
+                        continue
+                if sid in ("box_theory", "atr_reversal"):
+                    pair_primary_triggered = True
+
+                if float(sig.get("roe_tp1", 0.0)) < 3.0:
+                    results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})
                     continue
 
                 # 1-Crypto-at-a-Time Guard: If any crypto is already active, do not alert/open another crypto
@@ -411,7 +425,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     msg = f"{msg} | 🛑 {daily_stop_msg}"
                 elif (
                     autotrade
-                    and _autotrade_signal_eligible(str(sig.get("strategy_id") or s.id), sig.get("signal"), auto_mode)
+                    and _autotrade_signal_eligible(str(sig.get("strategy_id") or s.id), sig.get("signal"), auto_mode, pair=pair)
                     and not portfolio_occupied
                     and not already_autotraded_candle
                     and not already_autotraded_setup

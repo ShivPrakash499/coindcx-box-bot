@@ -5,6 +5,7 @@ import json
 import hmac
 import hashlib
 import requests
+import numpy as np
 import pandas as pd
 import pytz
 from datetime import datetime, timezone
@@ -442,9 +443,11 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 34
+_REQUIRED_DAEMON_VERSION = 35
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
+MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
+FIXED_RISK_PER_TRADE_PCT = 1.5     # Optional fixed-risk cap (% of wallet per full SL hit)
 
 
 def compute_maker_limit_entry_price(
@@ -2691,6 +2694,8 @@ def run_strategy_backtest(
     df_daily['date_str'] = df_daily['dt_ist'].dt.strftime('%Y-%m-%d')
 
     strat_ctx = strat.prepare_backtest(df, df_daily)
+    if isinstance(strat_ctx, dict):
+        strat_ctx["pair"] = pair
 
     df_records = df.to_dict('records')
     trades = []
@@ -2984,6 +2989,7 @@ def run_strategy_backtest(
                     "entry_price": round_asset_price(entry_p, entry_p),
                     "exit_price": round_asset_price(exit_price, entry_p),
                     "stop_loss": round_asset_price(sl_p, entry_p),
+                    "initial_stop_loss": round_asset_price(float(active_trade.get("initial_stop_loss") or sl_p), entry_p),
                     "target_tp": round_asset_price(tp1_p, entry_p),
                     "exit_reason": exit_reason,
                     "quantity": qty,
@@ -3038,6 +3044,7 @@ def run_strategy_backtest(
                     "entry2_sweep": entry2_p,
                     "entry2_filled": False,
                     "stop_loss": sl_p,
+                    "initial_stop_loss": sl_p,
                     "tp1": tp1_p,
                     "tp2": tp2_p,
                     "quantity": qty,
@@ -3317,6 +3324,419 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
 
 
 _MARKET_REGIME_CACHE = _PERSIST.setdefault("market_regime_cache", {"ts": 0.0, "data": None})
+_PAIR_INTRADAY_STACK_CACHE = _PERSIST.setdefault("pair_intraday_stack_cache", {})
+
+
+def get_crypto_trading_day_str(dt_or_str=None) -> str:
+    """Returns the Crypto Futures trading day (YYYY-MM-DD) aligned to 00:00 UTC / 05:30 AM IST."""
+    try:
+        if dt_or_str is None:
+            dt_utc = datetime.now(timezone.utc)
+            return dt_utc.strftime("%Y-%m-%d")
+        if isinstance(dt_or_str, datetime):
+            dt_utc = dt_or_str.astimezone(timezone.utc) if dt_or_str.tzinfo else IST.localize(dt_or_str).astimezone(timezone.utc)
+            return dt_utc.strftime("%Y-%m-%d")
+        ts = pd.to_datetime(str(dt_or_str).replace(" IST", "").strip())
+        if ts.tzinfo is None:
+            ts = ts.tz_localize(IST)
+        return ts.tz_convert(timezone.utc).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def compute_risk_based_margin_inr(
+    wallet_inr: float,
+    entry_px: float,
+    sl_px: float,
+    leverage: int = 10,
+    max_margin_inr: float = 0.0,
+    risk_pct: float = FIXED_RISK_PER_TRADE_PCT,
+    max_slots: int = 3,
+) -> tuple[float, str]:
+    """Caps trade margin so a full Stop-Loss hit costs <= `risk_pct`% of total wallet equity (incl. fees)."""
+    w = float(wallet_inr or 0.0)
+    e = float(entry_px or 0.0)
+    s = float(sl_px or 0.0)
+    lev = max(1, int(leverage or 10))
+    if w <= 0 or e <= 0 or s <= 0:
+        return round(float(max_margin_inr or 0.0), 2), ""
+    sl_dist_pct = abs(e - s) / e
+    if sl_dist_pct <= 1e-6:
+        return round(float(max_margin_inr or 0.0), 2), ""
+    eff_loss_frac = sl_dist_pct * lev + 0.0118
+    risk_budget_inr = w * (float(risk_pct or FIXED_RISK_PER_TRADE_PCT) / 100.0)
+    raw_m = risk_budget_inr / max(eff_loss_frac, 1e-4)
+    cap_m = float(max_margin_inr) if max_margin_inr and max_margin_inr > 0 else (w / max(1, int(max_slots or 3)))
+    final_m = round(max(0.0, min(raw_m, cap_m)), 2)
+    note = f"{risk_pct:.1f}% Risk Cap (₹{risk_budget_inr:,.0f} max SL -> ₹{final_m:,.0f} margin)" if final_m + 0.01 < cap_m else ""
+    return final_m, note
+
+
+def compute_wilder_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Computes standard Wilder ADX(14), +DI(14), and -DI(14) with zero lookahead."""
+    n = len(close)
+    adx = np.zeros(n, dtype=float)
+    plus_di = np.zeros(n, dtype=float)
+    minus_di = np.zeros(n, dtype=float)
+    if n < period * 2 + 2:
+        return adx, plus_di, minus_di
+    tr = np.zeros(n, dtype=float)
+    pdm = np.zeros(n, dtype=float)
+    mdm = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        up = float(high[i]) - float(high[i - 1])
+        dn = float(low[i - 1]) - float(low[i])
+        pdm[i] = up if (up > dn and up > 0.0) else 0.0
+        mdm[i] = dn if (dn > up and dn > 0.0) else 0.0
+        tr[i] = max(
+            float(high[i]) - float(low[i]),
+            abs(float(high[i]) - float(close[i - 1])),
+            abs(float(low[i]) - float(close[i - 1])),
+        )
+    atr_s = float(np.sum(tr[1 : period + 1]))
+    pdm_s = float(np.sum(pdm[1 : period + 1]))
+    mdm_s = float(np.sum(mdm[1 : period + 1]))
+    dx = np.zeros(n, dtype=float)
+    for i in range(period, n):
+        if i > period:
+            atr_s = atr_s - (atr_s / period) + tr[i]
+            pdm_s = pdm_s - (pdm_s / period) + pdm[i]
+            mdm_s = mdm_s - (mdm_s / period) + mdm[i]
+        pdi = (100.0 * pdm_s / atr_s) if atr_s > 0 else 0.0
+        mdi = (100.0 * mdm_s / atr_s) if atr_s > 0 else 0.0
+        plus_di[i] = pdi
+        minus_di[i] = mdi
+        denom = pdi + mdi
+        dx[i] = (100.0 * abs(pdi - mdi) / denom) if denom > 0 else 0.0
+    s0 = period * 2 - 1
+    adx[s0] = float(np.mean(dx[period : s0 + 1]))
+    for i in range(s0 + 1, n):
+        adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+    return adx, plus_di, minus_di
+
+
+def compute_htf_market_structure_from_15m(
+    ts_ms: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    tf_ms: int = 3_600_000,
+    pivot_k: int = 2,
+) -> list[dict]:
+    """
+    Layer 1 of the 3-Layer Intraday Trend Stack: Higher-Timeframe Market Structure (1H / 4H).
+    Strictly causal (zero lookahead):
+      - Aggregates 15m candles into completed HTF bars (`end_ms <= cur_15m_end_ms`).
+      - Confirms swing highs/lows at `p = j - pivot_k` ONLY once bar `j` closes.
+      - Classifies:
+          * UP   : Clear HH & HL (and latest closed HTF close >= last confirmed HL)
+          * DOWN : Clear LH & LL (and latest closed HTF close <= last confirmed LH)
+          * CHOP : Overlapping swings or active CHoCH reversal warning
+      - Early Reversal Warning (CHoCH):
+          * BEARISH_CHOCH: HTF close breaks & closes below last confirmed HL
+          * BULLISH_CHOCH: HTF close breaks & closes above last confirmed LH
+    """
+    n = len(ts_ms)
+    if n == 0:
+        return []
+    buckets: list[tuple[int, float, float, float]] = []
+    cur_b = -1
+    bh = bl = bc = 0.0
+    for i in range(n):
+        b = int(ts_ms[i] // tf_ms)
+        if b != cur_b:
+            if cur_b >= 0:
+                buckets.append(((cur_b + 1) * tf_ms, bh, bl, bc))
+            cur_b = b
+            bh, bl, bc = float(high[i]), float(low[i]), float(close[i])
+        else:
+            if high[i] > bh:
+                bh = float(high[i])
+            if low[i] < bl:
+                bl = float(low[i])
+            bc = float(close[i])
+    if cur_b >= 0:
+        buckets.append(((cur_b + 1) * tf_ms, bh, bl, bc))
+
+    m = len(buckets)
+    h_a = [x[1] for x in buckets]
+    l_a = [x[2] for x in buckets]
+    c_a = [x[3] for x in buckets]
+    e_a = [x[0] for x in buckets]
+
+    htf_states: list[dict] = []
+    sh: list[float] = []
+    sl: list[float] = []
+    prev_tr = "CHOP"
+    for j in range(m):
+        p = j - pivot_k
+        if p >= pivot_k:
+            if all(h_a[p] > h_a[p - d] for d in range(1, pivot_k + 1)) and all(h_a[p] >= h_a[p + d] for d in range(1, pivot_k + 1)):
+                sh.append(h_a[p])
+            if all(l_a[p] < l_a[p - d] for d in range(1, pivot_k + 1)) and all(l_a[p] <= l_a[p + d] for d in range(1, pivot_k + 1)):
+                sl.append(l_a[p])
+        st = "CHOP"
+        choch = "NONE"
+        cn = c_a[j]
+        last_hl = sl[-1] if sl else 0.0
+        last_lh = sh[-1] if sh else 0.0
+        if len(sh) >= 2 and len(sl) >= 2:
+            hh = sh[-1] > sh[-2]
+            hl = sl[-1] > sl[-2]
+            lh = sh[-1] < sh[-2]
+            ll = sl[-1] < sl[-2]
+            if hh and hl:
+                if cn < sl[-1]:
+                    choch = "BEARISH_CHOCH"
+                    st = "CHOP"
+                else:
+                    st = "UP"
+                    prev_tr = "UP"
+            elif lh and ll:
+                if cn > sh[-1]:
+                    choch = "BULLISH_CHOCH"
+                    st = "CHOP"
+                else:
+                    st = "DOWN"
+                    prev_tr = "DOWN"
+            else:
+                if prev_tr == "UP" and cn < sl[-1]:
+                    choch = "BEARISH_CHOCH"
+                elif prev_tr == "DOWN" and cn > sh[-1]:
+                    choch = "BULLISH_CHOCH"
+        htf_states.append({"struct": st, "choch": choch, "last_hl": last_hl, "last_lh": last_lh})
+
+    out: list[dict] = []
+    ptr = -1
+    for i in range(n):
+        bar_end = int(ts_ms[i]) + 900_000
+        while ptr + 1 < m and e_a[ptr + 1] <= bar_end:
+            ptr += 1
+        out.append(htf_states[ptr] if ptr >= 0 else {"struct": "CHOP", "choch": "NONE", "last_hl": 0.0, "last_lh": 0.0})
+    return out
+
+
+def compute_intraday_3layer_series(df_15m: pd.DataFrame) -> list[dict]:
+    """
+    Computes the complete 3-Layer Intraday Trend Stack across every closed 15m candle (zero lookahead,
+    100% Live <-> Backtest parity):
+      - Layer 1: 1H & 4H Market Structure (HH/HL, LH/LL) + Early Reversal Warning (CHoCH)
+      - Layer 2: Session VWAP (resets daily at 00:00 UTC / 05:30 AM IST) + slope & slicing-chop crosses
+      - Layer 3: 15m EMA(9/21/50/200) Separation & Slope + Wilder ADX(14) Trend-Strength Gate
+                 (ADX > 25 strong, 20-25 moderate requiring candle+vol confirm, < 20 disabled chop)
+    """
+    if df_15m is None or df_15m.empty:
+        return []
+    ts_ms = df_15m["timestamp"].to_numpy(dtype=np.int64)
+    op = df_15m["open"].to_numpy(dtype=float)
+    hi = df_15m["high"].to_numpy(dtype=float)
+    lo = df_15m["low"].to_numpy(dtype=float)
+    cl = df_15m["close"].to_numpy(dtype=float)
+    vol = df_15m["volume"].to_numpy(dtype=float) if "volume" in df_15m.columns else np.ones(len(df_15m), dtype=float)
+    n = len(df_15m)
+
+    # Layer 1: 1H & 4H Market Structure + CHoCH
+    s1h = compute_htf_market_structure_from_15m(ts_ms, hi, lo, cl, tf_ms=3_600_000, pivot_k=2)
+    s4h = compute_htf_market_structure_from_15m(ts_ms, hi, lo, cl, tf_ms=14_400_000, pivot_k=2)
+
+    # Layer 2: Session VWAP (resets every 00:00 UTC session)
+    vwap = np.zeros(n, dtype=float)
+    vwap_state = ["CHOP_VWAP"] * n
+    vwap_slope = np.zeros(n, dtype=float)
+    vwap_x = np.zeros(n, dtype=int)
+    cur_d = -1
+    cpv = 0.0
+    cv = 0.0
+    s0 = 0
+    for i in range(n):
+        d = int(ts_ms[i] // 86_400_000)
+        if d != cur_d:
+            cur_d = d
+            cpv = 0.0
+            cv = 0.0
+            s0 = i
+        tp = (hi[i] + lo[i] + cl[i]) / 3.0
+        vi = max(0.0, vol[i])
+        cpv += tp * vi
+        cv += vi
+        vwap[i] = (cpv / cv) if cv > 0 else tp
+        vr = vwap[max(s0, i - 4)]
+        slp = ((vwap[i] - vr) / vr * 100.0) if vr > 0 else 0.0
+        vwap_slope[i] = slp
+        w0 = max(s0, i - 7)
+        crosses = 0
+        ps = 0
+        for k in range(w0, i + 1):
+            s = 1 if cl[k] > vwap[k] else (-1 if cl[k] < vwap[k] else 0)
+            if s != 0 and ps != 0 and s != ps:
+                crosses += 1
+            if s != 0:
+                ps = s
+        vwap_x[i] = crosses
+        if crosses >= 3 or (crosses >= 2 and abs(slp) < 0.08):
+            vwap_state[i] = "CHOP_VWAP"
+        elif cl[i] > vwap[i] and slp >= 0.02:
+            vwap_state[i] = "BULL_VWAP"
+        elif cl[i] < vwap[i] and slp <= -0.02:
+            vwap_state[i] = "BEAR_VWAP"
+        else:
+            vwap_state[i] = "CHOP_VWAP"
+
+    # Layer 3: 15m EMA Separation & Slope + Wilder ADX(14)
+    sc = pd.Series(cl)
+    e9 = sc.ewm(span=9, adjust=False).mean().to_numpy()
+    e21 = sc.ewm(span=21, adjust=False).mean().to_numpy()
+    e50 = sc.ewm(span=50, adjust=False).mean().to_numpy()
+    e200 = sc.ewm(span=200, adjust=False).mean().to_numpy()
+    adx, plus_di, minus_di = compute_wilder_adx(hi, lo, cl, period=14)
+    vs20 = pd.Series(vol).rolling(20, min_periods=1).mean().to_numpy()
+
+    out: list[dict] = []
+    for i in range(n):
+        ci = float(cl[i])
+        ri = float(hi[i] - lo[i])
+        br = (abs(float(cl[i]) - float(op[i])) / ri) if ri > 0 else 0.0
+        vok = float(vol[i]) >= (1.10 * float(vs20[i])) if vs20[i] > 0 else True
+        sconf = (br >= 0.40) and vok
+        e50p = float(e50[max(0, i - 3)])
+        e21p = float(e21[max(0, i - 3)])
+        e50_bull = (ci > 0) and (e50[i] > e200[i]) and ((e50[i] - e200[i]) / ci >= 0.0015) and (e50[i] >= e50p)
+        e50_bear = (ci > 0) and (e50[i] < e200[i]) and ((e200[i] - e50[i]) / ci >= 0.0015) and (e50[i] <= e50p)
+        e921_bull = (ci > 0) and (e9[i] > e21[i] > e50[i]) and ((e9[i] - e50[i]) / ci >= 0.0025) and (e21[i] > e21p)
+        e921_bear = (ci > 0) and (e9[i] < e21[i] < e50[i]) and ((e50[i] - e9[i]) / ci >= 0.0025) and (e21[i] < e21p)
+        ema_st = "BULL_EMA" if (e50_bull or e921_bull) else ("BEAR_EMA" if (e50_bear or e921_bear) else "CHOP_EMA")
+
+        adxi = float(adx[i])
+        adx_rising = adxi > float(adx[max(0, i - 1)])
+        adx_tier = "STRONG" if adxi > 25.0 else ("MODERATE" if adxi >= 20.0 else "CHOP")
+        adx_pb = float(np.max(adx[max(0, i - 3) : i + 1]))
+        adx_pass = (adxi > 25.0) or (adxi >= 20.0 and sconf)
+        adx_pb_pass = (adx_pb > 25.0) or (adx_pb >= 20.0 and (br >= 0.35 or vok))
+
+        s1 = s1h[i]
+        s4 = s4h[i]
+        htf_up = (s1["struct"] == "UP" or (s1["struct"] == "CHOP" and s4["struct"] == "UP")) and (s1["choch"] != "BEARISH_CHOCH") and (s4["choch"] != "BEARISH_CHOCH")
+        htf_dn = (s1["struct"] == "DOWN" or (s1["struct"] == "CHOP" and s4["struct"] == "DOWN")) and (s1["choch"] != "BULLISH_CHOCH") and (s4["choch"] != "BULLISH_CHOCH")
+
+        if htf_up and vwap_state[i] == "BULL_VWAP" and ema_st == "BULL_EMA" and adx_pass:
+            reg = "CLEAN_UPTREND"
+        elif htf_dn and vwap_state[i] == "BEAR_VWAP" and ema_st == "BEAR_EMA" and adx_pass:
+            reg = "CLEAN_DOWNTREND"
+        else:
+            reg = "CHOP_RANGE"
+
+        # Strategy 4 Pullback Gate: honors all 3 layers without rejecting textbook 50 EMA pullbacks
+        s4_bull_ok = (s1["choch"] != "BEARISH_CHOCH") and (s1["struct"] != "DOWN") and (vwap_x[i] < 3) and (vwap_state[i] != "BEAR_VWAP") and e50_bull and adx_pb_pass
+        s4_bear_ok = (s1["choch"] != "BULLISH_CHOCH") and (s1["struct"] != "UP") and (vwap_x[i] < 3) and (vwap_state[i] != "BULL_VWAP") and e50_bear and adx_pb_pass
+
+        bull_vote = 1 if (reg == "CLEAN_UPTREND" or (s1["struct"] == "UP" and vwap_state[i] == "BULL_VWAP") or s1["choch"] == "BULLISH_CHOCH") else 0
+        bear_vote = 1 if (reg == "CLEAN_DOWNTREND" or (s1["struct"] == "DOWN" and vwap_state[i] == "BEAR_VWAP") or s1["choch"] == "BEARISH_CHOCH") else 0
+
+        out.append({
+            "timestamp": int(ts_ms[i]),
+            "regime": reg,
+            "s4_bull_ok": bool(s4_bull_ok),
+            "s4_bear_ok": bool(s4_bear_ok),
+            "s1_struct": s1["struct"],
+            "s1_choch": s1["choch"],
+            "s1_last_hl": float(s1["last_hl"]),
+            "s1_last_lh": float(s1["last_lh"]),
+            "s4_struct": s4["struct"],
+            "s4_choch": s4["choch"],
+            "vwap": float(vwap[i]),
+            "vwap_state": vwap_state[i],
+            "vwap_slope_pct": round(float(vwap_slope[i]), 3),
+            "vwap_crosses": int(vwap_x[i]),
+            "ema_state": ema_st,
+            "ema9": float(e9[i]),
+            "ema21": float(e21[i]),
+            "ema50": float(e50[i]),
+            "ema200": float(e200[i]),
+            "adx": round(adxi, 1),
+            "adx_pb": round(adx_pb, 1),
+            "adx_rising": bool(adx_rising),
+            "adx_tier": adx_tier,
+            "plus_di": round(float(plus_di[i]), 1),
+            "minus_di": round(float(minus_di[i]), 1),
+            "bull_vote": int(bull_vote),
+            "bear_vote": int(bear_vote),
+        })
+    return out
+
+
+def classify_universe_intraday_regime(
+    bull_votes: int,
+    bear_votes: int,
+    clean_up: int,
+    clean_dn: int,
+    total_valid: int,
+) -> str:
+    """Aggregates the 12-coin 3-Layer Intraday Trend Stack into a live 15m Market-Wide Intraday Regime."""
+    tot = max(1, int(total_valid or 1))
+    bf = bull_votes / tot
+    brf = bear_votes / tot
+    cuf = clean_up / tot
+    cdf = clean_dn / tot
+    if (bf >= 0.40 and bf >= brf * 2.0) or (cuf >= 0.25 and bf > brf):
+        return "CLEAN_UPTREND"
+    if (brf >= 0.40 and brf >= bf * 2.0) or (cdf >= 0.25 and brf > bf):
+        return "CLEAN_DOWNTREND"
+    return "CHOP_RANGE"
+
+
+def compute_pair_intraday_trend_stack(pair: str, df_15m: pd.DataFrame = None, force_refresh: bool = False) -> dict:
+    """
+    Computes the live 3-Layer Intraday Trend Stack for `pair` using strictly closed 15m candles
+    (cached 45s per pair so UI & 24/7 scanner calls stay instant).
+    """
+    now = time.time()
+    if df_15m is None and not force_refresh:
+        ent = _PAIR_INTRADAY_STACK_CACHE.get(pair)
+        if isinstance(ent, dict) and (now - float(ent.get("ts", 0.0))) < 45.0 and isinstance(ent.get("data"), dict):
+            return dict(ent["data"])
+
+    neutral = {
+        "pair": pair, "regime": "CHOP_RANGE", "s4_bull_ok": False, "s4_bear_ok": False,
+        "s1_struct": "CHOP", "s1_choch": "NONE", "s1_last_hl": 0.0, "s1_last_lh": 0.0,
+        "s4_struct": "CHOP", "s4_choch": "NONE", "vwap": 0.0, "vwap_state": "CHOP_VWAP",
+        "vwap_slope_pct": 0.0, "vwap_crosses": 0, "ema_state": "CHOP_EMA",
+        "ema9": 0.0, "ema21": 0.0, "ema50": 0.0, "ema200": 0.0,
+        "adx": 0.0, "adx_pb": 0.0, "adx_rising": False, "adx_tier": "CHOP",
+        "plus_di": 0.0, "minus_di": 0.0, "bull_vote": 0, "bear_vote": 0,
+        "summary": "🟡 CHOP / RANGE (Insufficient 15m data)",
+    }
+    try:
+        df = df_15m
+        if df is None:
+            raw = fetch_coindcx_candles(pair=pair, interval="15m", limit=420, sync_live_price=False)
+            if raw is None or raw.empty or len(raw) < 40:
+                return neutral
+            now_ms = int(now * 1000)
+            df = raw[raw["timestamp"] + 900_000 <= now_ms].reset_index(drop=True)
+            if len(df) < 35:
+                df = raw.iloc[:-1].reset_index(drop=True)
+        if df is None or df.empty or len(df) < 30:
+            return neutral
+        series = compute_intraday_3layer_series(df)
+        if not series:
+            return neutral
+        last = dict(series[-1])
+        last["pair"] = pair
+        reg_lbl = (
+            "🟢 CLEAN UPTREND" if last["regime"] == "CLEAN_UPTREND"
+            else ("🔴 CLEAN DOWNTREND" if last["regime"] == "CLEAN_DOWNTREND" else "🟡 CHOP / RANGE")
+        )
+        choch_tag = f" ⚠️{last['s1_choch']}" if last["s1_choch"] != "NONE" else ""
+        last["summary"] = (
+            f"{reg_lbl} | 1H:{last['s1_struct']}{choch_tag} 4H:{last['s4_struct']} | "
+            f"VWAP:{last['vwap_state']} ({last['vwap_slope_pct']:+.2f}%, x={last['vwap_crosses']}) | "
+            f"15m {last['ema_state']} ADX:{last['adx']:.1f}"
+        )
+        if df_15m is None:
+            _PAIR_INTRADAY_STACK_CACHE[pair] = {"ts": now, "data": dict(last)}
+        return last
+    except Exception:
+        return neutral
 
 
 def classify_universe_regime_from_stats(
@@ -3327,11 +3747,10 @@ def classify_universe_regime_from_stats(
     r2: float,
 ) -> str:
     """
-    Zero-lookahead 2-Year Verified Market Trend Classifier across the 12-coin High-Volatility Universe:
+    Zero-lookahead Macro Market Trend Classifier across the 12-coin High-Volatility Universe:
       - STRONG_UPTREND   : >=50% Bullish Daily Bias AND 14d median >= +2.5% AND 5d >= -1.0% AND 2d >= -1.5%
       - STRONG_DOWNTREND : >=50% Bearish Daily Bias AND 14d median <= -3.5% AND 5d <= +0.5% AND 2d <= +1.0%
-      - RANGING_CHOP     : Mixed breadth, flat 14d momentum, or multi-day post-crash/rally consolidation
-                           (e.g. 2d median bounce > +1.0% in Bear or pullback < -1.5% in Bull).
+      - RANGING_CHOP     : Mixed breadth, flat 14d momentum, or multi-day consolidation.
     """
     if bull_frac >= 0.50 and r14 >= 2.5 and r5 >= -1.0 and r2 >= -1.5:
         return "STRONG_UPTREND"
@@ -3340,21 +3759,48 @@ def classify_universe_regime_from_stats(
     return "RANGING_CHOP"
 
 
-def _format_regime_metadata(regime: str, bull_frac: float, bear_frac: float, r14: float, r5: float, r2: float) -> dict:
+def _format_regime_metadata(
+    regime: str,
+    bull_frac: float,
+    bear_frac: float,
+    r14: float,
+    r5: float,
+    r2: float,
+    intraday_regime: str = "CHOP_RANGE",
+    intraday_bull_votes: int = 0,
+    intraday_bear_votes: int = 0,
+    intraday_clean_up: int = 0,
+    intraday_clean_dn: int = 0,
+    intraday_valid: int = 0,
+) -> dict:
     b_pct = round(bull_frac * 100.0, 0)
     br_pct = round(bear_frac * 100.0, 0)
+    if intraday_regime == "CLEAN_UPTREND":
+        i_emoji, i_label = "🟢", "INTRADAY UPTREND"
+    elif intraday_regime == "CLEAN_DOWNTREND":
+        i_emoji, i_label = "🔴", "INTRADAY DOWNTREND"
+    else:
+        i_emoji, i_label = "🟡", "INTRADAY CHOP"
+
     if regime == "STRONG_UPTREND":
         emoji, label = "🟢", "STRONG UPTREND"
-        routing = "Box Sweep (L+S) + Bull 15m 50/200 EMA (LONG)"
+        routing = "Box Sweep (3-Layer Guarded) + Bull 15m 50/200 EMA (1H/VWAP/ADX Confirmed)"
     elif regime == "STRONG_DOWNTREND":
         emoji, label = "🔴", "STRONG DOWNTREND"
-        routing = "Box Sweep (L+S) + Bear 15m 50/200 EMA (SHORT)"
+        routing = "Box Sweep (3-Layer Guarded) + Bear 15m 50/200 EMA (1H/VWAP/ADX Confirmed)"
     else:
         emoji, label = "🟡", "RANGING / CHOP"
-        routing = "Box Theory Sweep ONLY (15m 50/200 EMA Auto-Paused in Chop)"
+        routing = "Box Theory Sweep (3-Layer Guarded; Trend EMA Paused in Macro Chop)"
+
+    intraday_note = (
+        f" | 3-Layer 15m: {i_emoji} {i_label} ({intraday_bull_votes}B/{intraday_bear_votes}S of {intraday_valid}, "
+        f"Clean {intraday_clean_up}↑/{intraday_clean_dn}↓)"
+        if intraday_valid > 0
+        else ""
+    )
     summary = (
         f"{emoji} {label} — Breadth: {b_pct:.0f}% Bull / {br_pct:.0f}% Bear | "
-        f"14d: {r14:+.1f}% • 5d: {r5:+.1f}% • 2d: {r2:+.1f}% -> {routing}"
+        f"14d: {r14:+.1f}% • 5d: {r5:+.1f}% • 2d: {r2:+.1f}%{intraday_note} -> {routing}"
     )
     return {
         "regime": regime,
@@ -3366,64 +3812,136 @@ def _format_regime_metadata(regime: str, bull_frac: float, bear_frac: float, r14
         "median_14d_pct": round(r14, 2),
         "median_5d_pct": round(r5, 2),
         "median_2d_pct": round(r2, 2),
+        "intraday_regime": intraday_regime,
+        "intraday_emoji": i_emoji,
+        "intraday_label": i_label,
+        "intraday_bull_votes": int(intraday_bull_votes),
+        "intraday_bear_votes": int(intraday_bear_votes),
+        "intraday_clean_up": int(intraday_clean_up),
+        "intraday_clean_dn": int(intraday_clean_dn),
+        "intraday_valid": int(intraday_valid),
         "summary": summary,
     }
 
 
 def compute_market_regime(pairs: list[str] = None, force_refresh: bool = False) -> dict:
     """
-    Computes the live zero-lookahead Market Trend Regime across HIGH_VOL_FUTURES_UNIVERSE
-    using completed daily candles (cached 5 minutes so UI & 24/7 scanner calls take 0ms when warm).
+    Computes BOTH the Macro Daily Regime AND the Live 12-Coin 3-Layer Intraday Trend Stack
+    Consensus (1H/4H Structure & CHoCH + 00:00 UTC Session VWAP + 15m EMA Slope & ADX(14)),
+    cached 90 seconds so UI & 24/7 daemon respond immediately while tracking intraday reversals!
     """
     now = time.time()
     cached = _MARKET_REGIME_CACHE.get("data")
-    if not force_refresh and isinstance(cached, dict) and (now - float(_MARKET_REGIME_CACHE.get("ts", 0.0))) < 300.0:
+    if not force_refresh and isinstance(cached, dict) and (now - float(_MARKET_REGIME_CACHE.get("ts", 0.0))) < 90.0:
         return dict(cached)
 
     pool = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
     now_ms = int(now * 1000)
     bull_cnt, bear_cnt, valid_cnt = 0, 0, 0
     r14_list, r5_list, r2_list = [], [], []
+    i_bv, i_brv, i_cu, i_cd, i_val = 0, 0, 0, 0, 0
 
     for p in pool:
         try:
             df_d = fetch_coindcx_candles(pair=p, interval="1d", limit=260, sync_live_price=False)
-            if df_d is None or df_d.empty or len(df_d) < 20:
-                continue
-            closed_d = df_d[df_d["timestamp"] + 86400000 <= now_ms].reset_index(drop=True)
-            if len(closed_d) < 16:
-                closed_d = df_d.iloc[:-1].reset_index(drop=True)
-            if len(closed_d) < 16:
-                continue
-            closes = closed_d["close"]
-            e50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
-            e200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
-            c_last = float(closes.iloc[-1])
-            valid_cnt += 1
-            if c_last > e50 and c_last > e200:
-                bull_cnt += 1
-            elif c_last < e50 and c_last < e200:
-                bear_cnt += 1
-            r14_list.append((c_last / float(closes.iloc[-15]) - 1.0) * 100.0)
-            r5_list.append((c_last / float(closes.iloc[-6]) - 1.0) * 100.0)
-            r2_list.append((c_last / float(closes.iloc[-3]) - 1.0) * 100.0)
+            if df_d is not None and not df_d.empty and len(df_d) >= 20:
+                closed_d = df_d[df_d["timestamp"] + 86400000 <= now_ms].reset_index(drop=True)
+                if len(closed_d) < 16:
+                    closed_d = df_d.iloc[:-1].reset_index(drop=True)
+                if len(closed_d) >= 16:
+                    closes = closed_d["close"]
+                    e50 = float(closes.ewm(span=50, adjust=False).mean().iloc[-1])
+                    e200 = float(closes.ewm(span=200, adjust=False).mean().iloc[-1])
+                    c_last = float(closes.iloc[-1])
+                    valid_cnt += 1
+                    if c_last > e50 and c_last > e200:
+                        bull_cnt += 1
+                    elif c_last < e50 and c_last < e200:
+                        bear_cnt += 1
+                    r14_list.append((c_last / float(closes.iloc[-15]) - 1.0) * 100.0)
+                    r5_list.append((c_last / float(closes.iloc[-6]) - 1.0) * 100.0)
+                    r2_list.append((c_last / float(closes.iloc[-3]) - 1.0) * 100.0)
         except Exception:
-            continue
+            pass
+        try:
+            st_i = compute_pair_intraday_trend_stack(p, force_refresh=force_refresh)
+            if st_i and float(st_i.get("vwap", 0.0) or 0.0) > 0:
+                i_val += 1
+                i_bv += int(st_i.get("bull_vote", 0) or 0)
+                i_brv += int(st_i.get("bear_vote", 0) or 0)
+                if st_i.get("regime") == "CLEAN_UPTREND":
+                    i_cu += 1
+                elif st_i.get("regime") == "CLEAN_DOWNTREND":
+                    i_cd += 1
+        except Exception:
+            pass
 
-    if valid_cnt == 0:
-        fallback = _format_regime_metadata("RANGING_CHOP", 0.0, 0.0, 0.0, 0.0, 0.0)
-        return fallback
+    if valid_cnt == 0 and i_val == 0:
+        return _format_regime_metadata("RANGING_CHOP", 0.0, 0.0, 0.0, 0.0, 0.0)
 
     r14_med = float(pd.Series(r14_list).median()) if r14_list else 0.0
     r5_med = float(pd.Series(r5_list).median()) if r5_list else 0.0
     r2_med = float(pd.Series(r2_list).median()) if r2_list else 0.0
-    bull_f = bull_cnt / valid_cnt
-    bear_f = bear_cnt / valid_cnt
-    reg = classify_universe_regime_from_stats(bull_f, bear_f, r14_med, r5_med, r2_med)
-    out = _format_regime_metadata(reg, bull_f, bear_f, r14_med, r5_med, r2_med)
+    bull_f = (bull_cnt / valid_cnt) if valid_cnt > 0 else 0.0
+    bear_f = (bear_cnt / valid_cnt) if valid_cnt > 0 else 0.0
+    reg = classify_universe_regime_from_stats(bull_f, bear_f, r14_med, r5_med, r2_med) if valid_cnt > 0 else "RANGING_CHOP"
+    i_reg = classify_universe_intraday_regime(i_bv, i_brv, i_cu, i_cd, i_val) if i_val > 0 else "CHOP_RANGE"
+    out = _format_regime_metadata(
+        reg, bull_f, bear_f, r14_med, r5_med, r2_med,
+        intraday_regime=i_reg,
+        intraday_bull_votes=i_bv,
+        intraday_bear_votes=i_brv,
+        intraday_clean_up=i_cu,
+        intraday_clean_dn=i_cd,
+        intraday_valid=i_val,
+    )
     _MARKET_REGIME_CACHE["data"] = dict(out)
     _MARKET_REGIME_CACHE["ts"] = now
     return out
+
+
+def build_historical_intraday_regime_map(pairs: list[str] = None, duration_days: int = 30) -> dict[int, str]:
+    """
+    Builds a strictly zero-lookahead 15m timestamp_ms -> ('CLEAN_UPTREND' | 'CLEAN_DOWNTREND' | 'CHOP_RANGE')
+    Market-Wide 3-Layer Intraday Consensus map across `pairs`, AND caches per-pair 3-Layer series in
+    `_PERSIST["backtest_pair_stacks"]` so backtests achieve 100% live <-> backtest parity!
+    """
+    pool = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
+    votes_by_ts: dict[int, list[int]] = {}
+    pair_stacks: dict[str, dict[int, dict]] = {}
+
+    for p in pool:
+        try:
+            df_15 = fetch_historical_candles_paginated(pair=p, interval="15m", duration_days=duration_days + 7)
+            if df_15 is None or df_15.empty or len(df_15) < 40:
+                continue
+            series = compute_intraday_3layer_series(df_15)
+            p_map: dict[int, dict] = {}
+            for st in series:
+                ts = int(st["timestamp"])
+                p_map[ts] = st
+                v = votes_by_ts.get(ts)
+                if v is None:
+                    v = [0, 0, 0, 0, 0]
+                    votes_by_ts[ts] = v
+                v[0] += int(st["bull_vote"])
+                v[1] += int(st["bear_vote"])
+                if st["regime"] == "CLEAN_UPTREND":
+                    v[2] += 1
+                elif st["regime"] == "CLEAN_DOWNTREND":
+                    v[3] += 1
+                v[4] += 1
+            pair_stacks[p] = p_map
+        except Exception:
+            continue
+
+    intraday_map: dict[int, str] = {}
+    for ts, (bv, brv, cu, cd, tot) in votes_by_ts.items():
+        intraday_map[ts] = classify_universe_intraday_regime(bv, brv, cu, cd, tot)
+
+    _PERSIST["backtest_intraday_regime_map"] = intraday_map
+    _PERSIST["backtest_pair_stacks"] = pair_stacks
+    return intraday_map
 
 
 def build_historical_regime_map(pairs: list[str] = None, duration_days: int = 30, warmup_days: int = 1000) -> dict[str, str]:
@@ -4683,12 +5201,6 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
             }
 
         try:
-            if l_ts > 0 and (time.time() - l_ts) > 8 * 3600:
-                if is_live_ex:
-                    cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
-                clear_autotrade_active_lock(l_pair)
-                return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
-
             matched_live_pos = None
             live_positions = None
             if is_live_ex or any(bool(v.get("is_live_exchange")) for v in locks_map.values()):
@@ -4696,6 +5208,21 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                 # NEVER the UI's non-blocking cold-cache fetch_coindcx_active_positions(force_refresh=False),
                 # which returns [] when cold and previously caused active_trade_lock to be falsely cleared!
                 live_positions = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
+
+            # Only expire a lock after 8h if it is NOT an active live position on CoinDCX!
+            _has_open_live_match = bool(
+                is_live_ex
+                and isinstance(live_positions, list)
+                and any(p.get("pair") == l_pair for p in live_positions)
+            )
+            if l_ts > 0 and (time.time() - l_ts) > 8 * 3600 and not _has_open_live_match:
+                if is_live_ex and live_positions is not None:
+                    cancel_coindcx_open_entry_orders(l_pair, cancel_all_for_pair=True)
+                if (not is_live_ex) or (live_positions is not None):
+                    clear_autotrade_active_lock(l_pair)
+                    return {"is_occupied": False, "active_pair": None, "source": "Slot Free (Previous App Trade Expired)"}
+
+            if is_live_ex or any(bool(v.get("is_live_exchange")) for v in locks_map.values()):
                 if live_positions is not None:
                     # Sync any other pending Maker Limit locks in `locks_map` (multi-slot concurrency support)
                     for _o_lp, _o_lk in list(locks_map.items()):
@@ -5426,6 +5953,39 @@ def execute_autotrade_two_entry_signal(
 
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     norm_dir = "LONG" if direction in ("LONG", "BUY") else "SHORT"
+    allow_mode_override = bool(sig.get("manual_override", False))
+
+    # Max 2 Same-Direction Portfolio Guard (prevents 3 correlated altcoins getting swept together)
+    if not allow_mode_override:
+        def _extract_dir_tag(val: str) -> str:
+            s_v = str(val or "").upper().strip()
+            if s_v in ("LONG", "BUY"):
+                return "LONG"
+            if s_v in ("SHORT", "SELL"):
+                return "SHORT"
+            return ""
+
+        same_dir_pairs: list[str] = []
+        for _lp in (live_ex_pos or []):
+            if isinstance(_lp, dict) and _lp.get("pair") and _extract_dir_tag(_lp.get("direction") or _lp.get("side")) == norm_dir:
+                _pn = str(_lp["pair"])
+                if _pn not in same_dir_pairs:
+                    same_dir_pairs.append(_pn)
+        for _eo in (open_entry_orders or []):
+            if isinstance(_eo, dict) and _eo.get("pair") and _extract_dir_tag(_eo.get("side") or _eo.get("direction")) == norm_dir:
+                _ep = str(_eo["pair"])
+                if _ep not in same_dir_pairs:
+                    same_dir_pairs.append(_ep)
+        for _lkp, _lkv in _get_active_locks_map(cfg).items():
+            if bool(_lkv.get("is_live_exchange")) == (not staging_paper_only):
+                if (not bool(_lkv.get("entry1_pending"))) or (_now_chk - float(_lkv.get("opened_ts", 0.0) or 0.0)) < ENTRY1_LIMIT_EXPIRY_SEC:
+                    if _extract_dir_tag(_lkv.get("direction")) == norm_dir and str(_lkp) not in same_dir_pairs:
+                        same_dir_pairs.append(str(_lkp))
+        if len(same_dir_pairs) >= MAX_SAME_DIRECTION_TRADES:
+            return False, (
+                f"Same-Direction Risk Guard ({len(same_dir_pairs)}/{MAX_SAME_DIRECTION_TRADES} {norm_dir} trades active: "
+                f"{', '.join(same_dir_pairs[:MAX_SAME_DIRECTION_TRADES])}): Blocking correlated {norm_dir} on {pair}."
+            ), {"same_direction_pairs": same_dir_pairs, "direction": norm_dir}
 
     # Hard Daily 50 & 200 EMA Bias Guard before placing any AutoTrade order
     # Always verify against fresh compute_market_bias(pair) if sig_levels is missing or to prevent stale signals
@@ -5446,12 +6006,16 @@ def execute_autotrade_two_entry_signal(
     else:
         daily_bias = "NEUTRAL"
 
+    if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
+        return False, (
+            f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
+        ), {"daily_bias": daily_bias, "direction": norm_dir}
+
     # AutoTrade Strategy Enforcement: supports `box_theory` (Strategy 1) and `ema50_200` (Strategy 4)
-    # per the configured `autotrade_strategy_mode` (default: `box_plus_ema50_200_bear`)
+    # per the configured `autotrade_strategy_mode` (default: `box_plus_ema50_200_regime`)
     import strategies as _strat_mod
     auto_mode = _strat_mod.resolve_autotrade_mode(cfg.get("autotrade_strategy_mode"))
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
-    allow_mode_override = bool(sig.get("manual_override", False))
     if sig_strat_id not in ("box_theory", "ema50_200"):
         return False, (
             f"AutoTrade Strategy Guard: AutoTrade only executes Box Theory Sweep or 15m 50/200 EMA Pullback; "
@@ -5471,14 +6035,31 @@ def execute_autotrade_two_entry_signal(
                 f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
                 f"(switch to Combo: Regime-Adaptive or Bull & Bear EMA to enable Bullish EMA Longs)."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
+        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "box_theory":
+            reg_info = compute_market_regime()
+            mkt_i_reg = str(reg_info.get("intraday_regime", "CHOP_RANGE"))
+            p_stack = compute_pair_intraday_trend_stack(pair)
+            coin_i_reg = str(p_stack.get("regime", "CHOP_RANGE"))
+            s1_choch = str(p_stack.get("s1_choch", "NONE"))
+            if norm_dir == "SHORT" and (mkt_i_reg == "CLEAN_UPTREND" or coin_i_reg == "CLEAN_UPTREND" or s1_choch == "BULLISH_CHOCH"):
+                return False, (
+                    f"3-Layer Intraday Trend Guard: Blocking Box SHORT on {pair} against active intraday uptrend/CHoCH "
+                    f"(Market 15m={mkt_i_reg}, Coin={coin_i_reg}, 1H CHoCH={s1_choch})."
+                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "intraday_regime": mkt_i_reg, "pair_stack": p_stack}
+            if norm_dir == "LONG" and (mkt_i_reg == "CLEAN_DOWNTREND" or coin_i_reg == "CLEAN_DOWNTREND" or s1_choch == "BEARISH_CHOCH"):
+                return False, (
+                    f"3-Layer Intraday Trend Guard: Blocking Box LONG on {pair} against active intraday downtrend/CHoCH "
+                    f"(Market 15m={mkt_i_reg}, Coin={coin_i_reg}, 1H CHoCH={s1_choch})."
+                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "intraday_regime": mkt_i_reg, "pair_stack": p_stack}
         if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "ema50_200":
             reg_info = compute_market_regime()
             cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
+            mkt_i_reg = str(reg_info.get("intraday_regime", "CHOP_RANGE"))
             if cur_reg == "RANGING_CHOP":
                 return False, (
-                    f"Market Regime Guard ({reg_info.get('label', 'RANGING / CHOP')}): Market is ranging "
+                    f"Market Regime Guard ({reg_info.get('label', 'RANGING / CHOP')}): Macro market is ranging "
                     f"(2d median {reg_info.get('median_2d_pct', 0.0):+.2f}%), auto-pausing 15m 50/200 EMA on {pair} "
-                    f"and trading Box Theory Sweep only."
+                    f"and trading 3-Layer-guarded Box Theory Sweep only."
                 ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
             if cur_reg == "STRONG_DOWNTREND" and norm_dir != "SHORT":
                 return False, (
@@ -5488,6 +6069,22 @@ def execute_autotrade_two_entry_signal(
                 return False, (
                     f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
                 ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+            if (norm_dir == "SHORT" and mkt_i_reg == "CLEAN_UPTREND") or (norm_dir == "LONG" and mkt_i_reg == "CLEAN_DOWNTREND"):
+                return False, (
+                    f"3-Layer Intraday Trend Guard: Blocking {norm_dir} EMA on {pair} against Market 15m {mkt_i_reg}."
+                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "intraday_regime": mkt_i_reg}
+            p_stack = compute_pair_intraday_trend_stack(pair)
+            if float(p_stack.get("vwap", 0.0) or 0.0) > 0:
+                if norm_dir == "SHORT" and not bool(p_stack.get("s4_bear_ok", False)):
+                    return False, (
+                        f"3-Layer Intraday Trend Guard: {pair} failed 1H/VWAP/ADX(14) gate for SHORT EMA "
+                        f"({p_stack.get('summary', '')})."
+                    ), {"strategy_id": sig_strat_id, "mode": auto_mode, "pair_stack": p_stack}
+                if norm_dir == "LONG" and not bool(p_stack.get("s4_bull_ok", False)):
+                    return False, (
+                        f"3-Layer Intraday Trend Guard: {pair} failed 1H/VWAP/ADX(14) gate for LONG EMA "
+                        f"({p_stack.get('summary', '')})."
+                    ), {"strategy_id": sig_strat_id, "mode": auto_mode, "pair_stack": p_stack}
         if sig_strat_id == "ema50_200":
             open_ema_cnt = count_open_ema50_200_slots(
                 live_positions=live_ex_pos if live_ex_pos is not None else [],
@@ -5499,10 +6096,6 @@ def execute_autotrade_two_entry_signal(
                     f"EMA Slot Cap ({open_ema_cnt}/{MAX_EMA_CONCURRENT_TRADES} EMA slots active): "
                     f"Reserving final portfolio slot for Box Theory Sweep; skipping correlated EMA trade on {pair}."
                 ), {"strategy_id": sig_strat_id, "open_ema_slots": open_ema_cnt}
-    if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
-        return False, (
-            f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
-        ), {"daily_bias": daily_bias, "direction": norm_dir}
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
@@ -5754,21 +6347,33 @@ def run_portfolio_single_slot_backtest(
     wallet_inr: float = None,
     exit_mode: str = "smart_hybrid",
     max_concurrent_trades: int = MAX_CONCURRENT_TRADES,
+    daily_loss_stop_pct: float = None,
+    enforce_free_margin_guard: bool = True,
+    enforce_same_dir_guard: bool = True,
+    use_fixed_risk_sizing: bool = False,
+    risk_per_trade_pct: float = FIXED_RISK_PER_TRADE_PCT,
 ) -> dict:
     """
-    Simulates the exact '1 Crypto at a Time @ 10x Leverage' Portfolio across the High-Volatility
-    Futures Universe:
-      - Scans all pairs in `pairs` (defaults to HIGH_VOL_FUTURES_UNIVERSE).
-      - Strictly allows ONLY 1 active trade across the entire portfolio at any time.
-      - Enforces the 5% Total Futures Wallet Daily Loss Stop (including fees).
+    Simulates the v34 + 3-Layer Intraday Trend Stack Portfolio across the High-Volatility
+    Futures Universe with full realistic Main-parity guards:
+      - Precomputes BOTH Macro Daily Regime AND 12-coin 15m 3-Layer Intraday Trend Stack Consensus
+        (1H/4H Structure & CHoCH + 00:00 UTC Session VWAP + 15m EMA Slope & Wilder ADX(14)).
+      - Enforces Max Concurrent Slots (3), Max 2 Same-Direction Positions, Max 2 EMA Slots.
+      - Enforces 5% Crypto-Day (00:00 UTC) Wallet Daily Loss Stop & <90% Free-Margin Anti-Crumb Guard.
+      - Supports both E0b Full-Slot Margin (default) and optional E0 1.5% Fixed Wallet Risk Cap.
     """
     import strategies as _strategies
     eff_wallet_inr = float(wallet_inr) if (wallet_inr and wallet_inr > 0) else (margin_inr / TRADE_ALLOCATION_FRACTION)
-    max_daily_loss_inr = eff_wallet_inr * (_strategies.DAILY_WALLET_LOSS_STOP_PCT / 100.0)
+    dl_stop_pct = (
+        float(_strategies.DAILY_WALLET_LOSS_STOP_PCT)
+        if daily_loss_stop_pct is None
+        else max(0.0, float(daily_loss_stop_pct))
+    )
 
     universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
     if strategy_id == "box_plus_ema50_200_regime":
         build_historical_regime_map(pairs=universe, duration_days=duration_days)
+        build_historical_intraday_regime_map(pairs=universe, duration_days=duration_days)
     all_candidates = []
     standalone_rows = []
     for rank, p in enumerate(universe):
@@ -5805,6 +6410,20 @@ def run_portfolio_single_slot_backtest(
     if not standalone_df.empty:
         standalone_df = standalone_df.sort_values(by="Net_Profit_INR", ascending=False).reset_index(drop=True)
 
+    empty_guards = {
+        "starting_wallet_inr": round(eff_wallet_inr, 2),
+        "ending_wallet_inr": round(eff_wallet_inr, 2),
+        "wallet_roi_pct": 0.0,
+        "max_drawdown_pct": 0.0,
+        "daily_loss_stop_pct": dl_stop_pct,
+        "days_locked_by_sl_threshold": 0,
+        "blocked_by_sl_threshold": 0,
+        "blocked_by_slot_cap": 0,
+        "blocked_by_same_dir": 0,
+        "blocked_by_free_margin": 0,
+        "use_fixed_risk_sizing": bool(use_fixed_risk_sizing),
+    }
+
     if not all_candidates:
         return {
             "total_trades": 0, "win_count": 0, "loss_count": 0, "win_rate_pct": 0.0,
@@ -5812,51 +6431,99 @@ def run_portfolio_single_slot_backtest(
             "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(),
             "coin_summary_df": pd.DataFrame(), "standalone_summary_df": standalone_df,
             "strategy_id": strategy_id, "strategy_breakdown": {},
+            "ending_wallet_inr": round(eff_wallet_inr, 2), "max_drawdown_pct": 0.0,
+            "guards_audit": empty_guards,
         }
 
     df_all = pd.DataFrame(all_candidates).sort_values(by=["entry_time", "vol_rank"]).reset_index(drop=True)
     accepted = []
     active_open_trades = []
     max_slots = max(1, int(max_concurrent_trades or MAX_CONCURRENT_TRADES))
-    day_counts = {}
-    day_pnl = {}
-    locked_days = set()
+    current_wallet_inr = float(eff_wallet_inr)
+    peak_wallet_inr = float(eff_wallet_inr)
+    max_drawdown_pct = 0.0
+    day_start_wallet: dict[str, float] = {}
+    day_counts: dict[str, int] = {}
+    day_pnl: dict[str, float] = {}
+    locked_days: set[str] = set()
+    blocked_sl = blocked_slot = blocked_same_dir = blocked_margin = 0
 
     def _settle_closed_trades(up_to_time: str):
-        nonlocal active_open_trades
+        nonlocal active_open_trades, current_wallet_inr, peak_wallet_inr, max_drawdown_pct
         still_open = []
-        # Sort closing trades chronologically by exit_time so daily 5% wallet loss stop triggers at exact close time
         closing = [t for t in active_open_trades if str(t["exit_time"]) <= up_to_time]
         for t in active_open_trades:
             if str(t["exit_time"]) > up_to_time:
                 still_open.append(t)
         closing.sort(key=lambda x: str(x["exit_time"]))
         for t in closing:
-            t_ent_day = str(t["entry_time"])[:10]
-            t_ext_day = str(t["exit_time"])[:10]
+            t_ent_day = get_crypto_trading_day_str(str(t["entry_time"]))
+            t_ext_day = get_crypto_trading_day_str(str(t["exit_time"]))
+            day_start_wallet.setdefault(t_ext_day, max(1.0, current_wallet_inr))
+            day_start_wallet.setdefault(t_ent_day, max(1.0, current_wallet_inr))
             pnl_v = float(t["net_pnl_inr"])
+            current_wallet_inr = round(max(0.0, current_wallet_inr + pnl_v), 2)
+            if current_wallet_inr > peak_wallet_inr:
+                peak_wallet_inr = current_wallet_inr
+            if peak_wallet_inr > 0:
+                dd_p = ((peak_wallet_inr - current_wallet_inr) / peak_wallet_inr) * 100.0
+                if dd_p > max_drawdown_pct:
+                    max_drawdown_pct = dd_p
             day_pnl[t_ext_day] = day_pnl.get(t_ext_day, 0.0) + pnl_v
             if t_ent_day != t_ext_day:
                 day_pnl[t_ent_day] = day_pnl.get(t_ent_day, 0.0) + pnl_v
-            if day_pnl.get(t_ext_day, 0.0) <= -max_daily_loss_inr:
-                locked_days.add(t_ext_day)
-            if day_pnl.get(t_ent_day, 0.0) <= -max_daily_loss_inr:
-                locked_days.add(t_ent_day)
+            if dl_stop_pct > 0:
+                if day_pnl.get(t_ext_day, 0.0) <= -(day_start_wallet[t_ext_day] * (dl_stop_pct / 100.0)):
+                    locked_days.add(t_ext_day)
+                if day_pnl.get(t_ent_day, 0.0) <= -(day_start_wallet[t_ent_day] * (dl_stop_pct / 100.0)):
+                    locked_days.add(t_ent_day)
         active_open_trades = still_open
 
     last_ema_zone_by_pair: dict[str, tuple] = {}
     for _, tr in df_all.iterrows():
         ent_t = str(tr["entry_time"])
-        ext_t = str(tr["exit_time"])
-        day_str = ent_t[:10]
+        day_str = get_crypto_trading_day_str(ent_t)
+        tr_dir = str(tr.get("direction", "")).upper()
         _settle_closed_trades(ent_t)
+        day_start_wallet.setdefault(day_str, max(1.0, current_wallet_inr))
         if day_str in locked_days:
+            blocked_sl += 1
             continue
-        # Only 1 active trade per coin at a time, and at most `max_slots` (3) concurrent trades across the wallet
         if any(t.get("pair") == tr["pair"] for t in active_open_trades):
             continue
         if len(active_open_trades) >= max_slots:
+            blocked_slot += 1
             continue
+        if enforce_same_dir_guard:
+            same_dir_open = sum(1 for t in active_open_trades if str(t.get("direction", "")).upper() == tr_dir)
+            if same_dir_open >= MAX_SAME_DIRECTION_TRADES:
+                blocked_same_dir += 1
+                continue
+
+        tr_dict = tr.to_dict()
+        eff_trade_margin = float(margin_inr)
+        init_sl_bt = float(tr_dict.get("initial_stop_loss") or tr_dict.get("stop_loss") or 0.0)
+        ent_px_bt = float(tr_dict.get("entry_price", 0.0) or 0.0)
+        if use_fixed_risk_sizing and init_sl_bt > 0 and ent_px_bt > 0 and current_wallet_inr > 0:
+            r_m_bt, _ = compute_risk_based_margin_inr(
+                wallet_inr=current_wallet_inr,
+                entry_px=ent_px_bt,
+                sl_px=init_sl_bt,
+                leverage=leverage,
+                max_margin_inr=float(margin_inr),
+                risk_pct=float(risk_per_trade_pct),
+                max_slots=max_slots,
+            )
+            if r_m_bt > 0 and (r_m_bt * leverage) >= 2448.0:
+                eff_trade_margin = min(float(margin_inr), float(r_m_bt))
+
+        if enforce_free_margin_guard and eff_trade_margin >= 2500.0:
+            locked_m = sum(float(t.get("_bt_margin_inr", margin_inr) or margin_inr) for t in active_open_trades)
+            avail_m = max(0.0, current_wallet_inr - locked_m)
+            if (avail_m * 0.98) < (eff_trade_margin * 0.90):
+                blocked_margin += 1
+                continue
+
         is_ema_tr = "50/200 EMA" in str(tr.get("strategy", ""))
         if is_ema_tr:
             open_ema_bt = sum(1 for t in active_open_trades if "50/200 EMA" in str(t.get("strategy", "")))
@@ -5874,7 +6541,16 @@ def run_portfolio_single_slot_backtest(
                     and abs(cur_ep - prev_ep) / cur_ep < 0.008
                 ):
                     continue
-        tr_dict = tr.to_dict()
+
+        if margin_inr > 0 and abs(eff_trade_margin - float(margin_inr)) > 0.01:
+            scale_f = eff_trade_margin / float(margin_inr)
+            tr_dict["net_pnl_inr"] = round(float(tr_dict.get("net_pnl_inr", 0.0) or 0.0) * scale_f, 2)
+            if "gross_pnl_inr" in tr_dict:
+                tr_dict["gross_pnl_inr"] = round(float(tr_dict.get("gross_pnl_inr", 0.0) or 0.0) * scale_f, 2)
+            if "fees_inr" in tr_dict:
+                tr_dict["fees_inr"] = round(float(tr_dict.get("fees_inr", 0.0) or 0.0) * scale_f, 2)
+        tr_dict["_bt_margin_inr"] = float(eff_trade_margin)
+
         if is_ema_tr:
             last_ema_zone_by_pair[str(tr["pair"])] = (
                 pd.to_datetime(ent_t),
@@ -5885,6 +6561,19 @@ def run_portfolio_single_slot_backtest(
         accepted.append(tr_dict)
         active_open_trades.append(tr_dict)
         day_counts[day_str] = day_counts.get(day_str, 0) + 1
+
+    _settle_closed_trades("9999-12-31 23:59")
+
+    if not accepted:
+        return {
+            "total_trades": 0, "win_count": 0, "loss_count": 0, "win_rate_pct": 0.0,
+            "net_profit_inr": 0.0, "total_roi_pct": 0.0, "profit_factor": 0.0,
+            "total_fees_paid_inr": 0.0, "trades_df": pd.DataFrame(),
+            "coin_summary_df": pd.DataFrame(), "standalone_summary_df": standalone_df,
+            "strategy_id": strategy_id, "strategy_breakdown": {},
+            "ending_wallet_inr": round(current_wallet_inr, 2), "max_drawdown_pct": round(max_drawdown_pct, 2),
+            "guards_audit": empty_guards,
+        }
 
     pdf = pd.DataFrame(accepted)
     wins = pdf[pdf["is_win"] == True]
@@ -5906,7 +6595,6 @@ def run_portfolio_single_slot_backtest(
             Avg_ROE_Pct=("roe_pct", lambda s: round(float(s.mean()), 2)),
         )
     )
-    # Ensure all pairs in universe are represented so no coin is silently omitted
     existing_pairs = set(coin_grp["pair"].tolist()) if not coin_grp.empty else set()
     missing_rows = [
         {"pair": p, "Trades": 0, "Wins": 0, "Net_Profit_INR": 0.0, "Avg_ROE_Pct": 0.0}
@@ -5939,6 +6627,21 @@ def run_portfolio_single_slot_backtest(
                 "win_rate_pct": s_wr, "net_pnl_inr": s_net,
             }
 
+    guards_audit = {
+        "starting_wallet_inr": round(eff_wallet_inr, 2),
+        "ending_wallet_inr": round(current_wallet_inr, 2),
+        "wallet_roi_pct": round((net_pnl / eff_wallet_inr) * 100.0, 2) if eff_wallet_inr > 0 else 0.0,
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "daily_loss_stop_pct": dl_stop_pct,
+        "days_locked_by_sl_threshold": len(locked_days),
+        "locked_dates": sorted(locked_days),
+        "blocked_by_sl_threshold": blocked_sl,
+        "blocked_by_slot_cap": blocked_slot,
+        "blocked_by_same_dir": blocked_same_dir,
+        "blocked_by_free_margin": blocked_margin,
+        "use_fixed_risk_sizing": bool(use_fixed_risk_sizing),
+    }
+
     return {
         "total_trades": tot,
         "win_count": int(len(wins)),
@@ -5949,6 +6652,9 @@ def run_portfolio_single_slot_backtest(
         "profit_factor": pf,
         "total_fees_paid_inr": fees,
         "total_gross_profit": round(gp, 2),
+        "ending_wallet_inr": round(current_wallet_inr, 2),
+        "max_drawdown_pct": round(max_drawdown_pct, 2),
+        "guards_audit": guards_audit,
         "total_gross_loss": round(gl, 2),
         "trades_df": pdf,
         "coin_summary_df": coin_grp,
@@ -6342,6 +7048,15 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "classify_universe_regime_from_stats": classify_universe_regime_from_stats,
             "compute_market_regime": compute_market_regime,
             "build_historical_regime_map": build_historical_regime_map,
+            "compute_wilder_adx": compute_wilder_adx,
+            "compute_htf_market_structure_from_15m": compute_htf_market_structure_from_15m,
+            "compute_intraday_3layer_series": compute_intraday_3layer_series,
+            "classify_universe_intraday_regime": classify_universe_intraday_regime,
+            "compute_pair_intraday_trend_stack": compute_pair_intraday_trend_stack,
+            "build_historical_intraday_regime_map": build_historical_intraday_regime_map,
+            "get_crypto_trading_day_str": get_crypto_trading_day_str,
+            "compute_risk_based_margin_inr": compute_risk_based_margin_inr,
+            "run_portfolio_single_slot_backtest": run_portfolio_single_slot_backtest,
             "count_open_ema50_200_slots": count_open_ema50_200_slots,
             "_get_active_locks_map": _get_active_locks_map,
             "get_open_entry_limit_orders": get_open_entry_limit_orders,
