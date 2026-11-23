@@ -2227,10 +2227,10 @@ elif active_section == "🎯 Execute":
                     strategy_registry.setup_tag(_s.id, "SIGNAL"),
                     _s
                 ))
-            if exec_strategy_mode in (_all_label, _combo_bear_lbl, _combo_both_lbl) and _s.id not in ("box_theory", "ema50_200"):
+            if _s.id not in ("box_theory", "ema50_200"):
                 continue
             _plan = get_cached_strategy_plan(_s.id, selected_pair, float(cur_price), trade_margin_inr, trade_leverage, trade_usd_inr)
-            _multi_plan_mode = exec_strategy_mode in (_all_label, _combo_bear_lbl, _combo_both_lbl)
+            _multi_plan_mode = len(armed_strats) > 1
             _plan_sfx = (" [Box]" if _s.id == "box_theory" else " [50/200 EMA]") if _multi_plan_mode else ""
             for _d, _ico in (("BUY", "🟢"), ("SELL", "🔴")):
                 _st = _plan.get(_d)

@@ -510,10 +510,101 @@ def test_7_ui_render_and_navigation_tabs_integrity():
         assert stale_ui_label not in app_src, f"Stale UI label '{stale_ui_label}' found in app.py!"
     assert "#### 🎫 Trade Execution Ticket" in app_src
 
-    # 7. Parse AST of app.py to ensure clean top-level structure
+    # 7. Full scope-aware AST undefined-name (NameError) audit across all 7 core modules (catches deleted-var UI crashes like Execute tab!)
+    import builtins as _builtins
+    _bi_names = set(dir(_builtins)) | {"__file__", "__name__", "__doc__", "__package__", "__spec__", "__cached__", "__annotations__"}
+
+    def _scan_undefined_names(src_txt: str, fname: str) -> list[tuple[int, str]]:
+        _tr = ast.parse(src_txt, filename=fname)
+        _bad: list[tuple[int, str]] = []
+
+        def _walk_scope(node, parent_defs):
+            local_defs = set(parent_defs)
+
+            def _collect(n):
+                for ch in ast.iter_child_nodes(n):
+                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        local_defs.add(ch.name)
+                    elif isinstance(ch, (ast.Import, ast.ImportFrom)):
+                        for al in ch.names:
+                            local_defs.add(al.asname or al.name.split(".")[0])
+                    elif isinstance(ch, ast.Name) and isinstance(ch.ctx, (ast.Store, ast.Del)):
+                        local_defs.add(ch.id)
+                    elif isinstance(ch, ast.ExceptHandler):
+                        if ch.name:
+                            local_defs.add(ch.name)
+                        _collect(ch)
+                    elif isinstance(ch, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)):
+                        continue
+                    else:
+                        _collect(ch)
+
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for ag in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                    local_defs.add(ag.arg)
+                if node.args.vararg:
+                    local_defs.add(node.args.vararg.arg)
+                if node.args.kwarg:
+                    local_defs.add(node.args.kwarg.arg)
+            _collect(node)
+
+            def _check(n, defs):
+                for ch in ast.iter_child_nodes(n):
+                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for d_node in ch.decorator_list + ch.args.defaults + [x for x in ch.args.kw_defaults if x]:
+                            _check(d_node, defs)
+                        _walk_scope(ch, defs)
+                    elif isinstance(ch, ast.ClassDef):
+                        for b_node in ch.bases + ch.decorator_list:
+                            _check(b_node, defs)
+                        _walk_scope(ch, defs)
+                    elif isinstance(ch, ast.Lambda):
+                        l_defs = set(defs) | {ag.arg for ag in ch.args.args + ch.args.posonlyargs + ch.args.kwonlyargs}
+                        if ch.args.vararg:
+                            l_defs.add(ch.args.vararg.arg)
+                        if ch.args.kwarg:
+                            l_defs.add(ch.args.kwarg.arg)
+                        _check(ch.body, l_defs)
+                    elif isinstance(ch, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                        c_defs = set(defs)
+                        for gen in ch.generators:
+                            _check(gen.iter, c_defs)
+                            for tgt in ast.walk(gen.target):
+                                if isinstance(tgt, ast.Name):
+                                    c_defs.add(tgt.id)
+                            for iff in gen.ifs:
+                                _check(iff, c_defs)
+                        if isinstance(ch, ast.DictComp):
+                            _check(ch.key, c_defs)
+                            _check(ch.value, c_defs)
+                        else:
+                            _check(ch.elt, c_defs)
+                    elif isinstance(ch, ast.NamedExpr):
+                        _check(ch.value, defs)
+                        if isinstance(ch.target, ast.Name):
+                            defs.add(ch.target.id)
+                    elif isinstance(ch, ast.Name) and isinstance(ch.ctx, ast.Load):
+                        if ch.id not in defs and ch.id not in _bi_names:
+                            _bad.append((ch.lineno, ch.id))
+                    else:
+                        _check(ch, defs)
+
+            _check(node, local_defs)
+
+        _walk_scope(_tr, set())
+        return _bad
+
     tree = ast.parse(app_src, filename="app.py")
     assert len(tree.body) > 20
-    print(f"  -> PASS: All 7 UI tabs ({', '.join(expected_tabs)}) & fragment non-loop invariants verified.")
+    for _mod_fn in ("app.py", "coindcx_engine.py", "strategies.py", "signal_monitor.py", "sheets_logger.py", "gemini_advisor.py", "email_notifier.py"):
+        _mod_p = os.path.join(ROOT_DIR, _mod_fn)
+        if os.path.exists(_mod_p):
+            with open(_mod_p, "r", encoding="utf-8") as _mf:
+                _undef = _scan_undefined_names(_mf.read(), _mod_fn)
+            assert not _undef, f"CRITICAL NameError risk in {_mod_fn}: undefined names {_undef[:10]}"
+    for _dead_exec_var in ("_all_label", "_combo_bear_lbl", "_combo_both_lbl"):
+        assert _dead_exec_var not in app_src, f"Dead Execute-tab variable '{_dead_exec_var}' still referenced in app.py!"
+    print(f"  -> PASS: All 7 UI tabs ({', '.join(expected_tabs)}), fragment guards & 0-NameError AST audit across all 7 modules verified.")
 
 
 def test_8_stale_cache_expiry_and_nat_pinner():
