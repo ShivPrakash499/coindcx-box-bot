@@ -3380,6 +3380,7 @@ def run_strategy_backtest(
         df_exec_raw = df_exec_raw.copy()
         df_exec_raw["EMA9_15m"] = df_exec_raw["close"].astype(float).ewm(span=9, adjust=False).mean()
         df_exec_raw["EMA21_15m"] = df_exec_raw["close"].astype(float).ewm(span=21, adjust=False).mean()
+        df_exec_raw["EMA31_15m"] = df_exec_raw["close"].astype(float).ewm(span=31, adjust=False).mean()
         cutoff_ms = int(df_exec_raw["timestamp"].iloc[-1]) - int(duration_days * 86400 * 1000)
         df_sub = df_exec_raw[df_exec_raw["timestamp"] >= cutoff_ms].copy().reset_index(drop=True)
         df = df_sub if len(df_sub) >= 20 else df_exec_raw.copy().reset_index(drop=True)
@@ -3388,6 +3389,7 @@ def run_strategy_backtest(
         df = df_exec_raw.copy()
         df["EMA9_15m"] = df["close"].astype(float).ewm(span=9, adjust=False).mean()
         df["EMA21_15m"] = df["close"].astype(float).ewm(span=21, adjust=False).mean()
+        df["EMA31_15m"] = df["close"].astype(float).ewm(span=31, adjust=False).mean()
 
     # 2. Fetch daily candles for daily box & ATR establishment
     df_daily = fetch_historical_candles_paginated(
@@ -3424,6 +3426,7 @@ def run_strategy_backtest(
     df_records = df.to_dict('records')
     trades = []
     active_trade = None
+    reentry_watch = None
     last_exit_idx = -999
     initial_capital = margin_inr
     current_equity = initial_capital
@@ -3435,6 +3438,15 @@ def run_strategy_backtest(
     day_trade_count = {}
     day_realized_pnl = {}
     day_locked = set()
+
+    _EXP_REENTRY_MODES = {
+        "box_ema31_1to3_reentry": {"box_only": True, "ema_span": 31, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
+        "ema31_1to3_reentry_all": {"box_only": False, "ema_span": 31, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
+        "ema21_1to3_reentry_all": {"box_only": False, "ema_span": 21, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
+        "ema21_v36tp_reentry_all": {"box_only": False, "ema_span": 21, "use_3r": False, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
+    }
+    _exp_re_cfg = _EXP_REENTRY_MODES.get(exit_mode)
+    _pair_tick_sz = float(get_pair_lot_spec(pair).get("tick_size", 0.01) or 0.01)
 
     for idx, candle in enumerate(df_records):
         c_date = candle['date_str']
@@ -3468,11 +3480,11 @@ def run_strategy_backtest(
             deployed_margin_inr = active_trade["deployed_margin_inr"]
 
             is_s3_active = (
-                "Strategy 3" in str(active_trade.get("strategy", ""))
+                "Strategy 3" in str(active_trade.get("strategy_tag", active_trade.get("strategy", "")))
                 or strategy_id == "ema9_retest"
             )
-            is_ema9_21_mode = exit_mode in ("ema9_21_1to3_full", "ema9_21_1to3_hybrid")
-            is_ema9_21_full = (exit_mode == "ema9_21_1to3_full")
+            _tr_is_ema50_200 = "50/200 EMA" in str(active_trade.get("strategy_tag", active_trade.get("strategy", "")))
+            is_exp_trail_active = bool(_exp_re_cfg) and (not _exp_re_cfg["box_only"] or not _tr_is_ema50_200)
             use_full_s3_mode = (exit_mode == "strategy3_full") or (exit_mode == "smart_hybrid" and is_s3_active)
 
             # Trailing 15m Candle High/Low Stop Loss is used only in Strategy 3 full-runner mode;
@@ -3614,63 +3626,31 @@ def run_strategy_backtest(
                                     exit_reason = f"100% Exit: Confirmed 5m 9 EMA Cross{scale_tag}"
                                     break
 
-                elif is_ema9_21_mode:
-                    # Experiment Mode: Uncapped 1:3 R:R TP + 15m 9/21 EMA Cross/Touch/Prev-Candle Exit + 21 EMA Trailing SL (8 ticks)
-                    tp_3r = float(active_trade.get("tp_3r", tp2_p) or tp2_p)
-                    if is_ema9_21_full:
-                        if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
-                            exit_triggered = True
-                            exit_price = sl_p
-                            exit_reason = (
-                                f"Trailing 21 EMA SL (8t){scale_tag}"
-                                if active_trade.get("ema21_trailed")
-                                else f"Catastrophe Stop Loss{scale_tag}"
-                            )
-                            break
-                        if (pos_dir == "LONG" and tp_3r > 0 and s5_high >= tp_3r) or (pos_dir == "SHORT" and tp_3r > 0 and s5_low <= tp_3r):
-                            exit_triggered = True
-                            exit_price = tp_3r
-                            active_trade["tp2_hit"] = True
-                            exit_reason = f"100% 1:3 TP Target Hit{scale_tag}"
-                            break
-                    else:
-                        # 50/50 Hybrid: 50% Book at TP1 -> remaining 50% rides uncapped to 1:3 TP with 15m 9/21 EMA Exit + 21 EMA Trail
-                        if not active_trade.get("tp1_hit", False):
-                            if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
-                                exit_triggered = True
-                                exit_price = sl_p
-                                exit_reason = (
-                                    f"Trailing 21 EMA SL (8t){scale_tag}"
-                                    if active_trade.get("ema21_trailed")
-                                    else f"Catastrophe Stop Loss{scale_tag}"
-                                )
-                                break
-                            if (pos_dir == "LONG" and s5_high >= tp1_p) or (pos_dir == "SHORT" and s5_low <= tp1_p):
-                                active_trade["tp1_hit"] = True
-                                new_be_sl = compute_tp1_profit_lock_sl(pair, pos_dir, entry_p, tp1_p)
-                                if (pos_dir == "LONG" and new_be_sl > sl_p) or (pos_dir == "SHORT" and new_be_sl < sl_p):
-                                    sl_p = new_be_sl
-                                    active_trade["stop_loss"] = sl_p
-                                if (pos_dir == "LONG" and tp_3r > 0 and s5_high >= tp_3r) or (pos_dir == "SHORT" and tp_3r > 0 and s5_low <= tp_3r):
-                                    exit_triggered = True
-                                    exit_price = 0.5 * tp1_p + 0.5 * tp_3r
-                                    active_trade["tp2_hit"] = True
-                                    exit_reason = f"TP1 (50% Booked) + 50% 1:3 TP Target Hit{scale_tag}"
-                                    break
-                                continue
-                        else:
-                            if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
-                                exit_triggered = True
-                                exit_price = 0.5 * tp1_p + 0.5 * sl_p
-                                r_lbl = "Trailing 21 EMA SL (8t)" if active_trade.get("ema21_trailed") else "Runner Fee-BE SL"
-                                exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
-                                break
-                            if (pos_dir == "LONG" and tp_3r > 0 and s5_high >= tp_3r) or (pos_dir == "SHORT" and tp_3r > 0 and s5_low <= tp_3r):
-                                exit_triggered = True
-                                exit_price = 0.5 * tp1_p + 0.5 * tp_3r
-                                active_trade["tp2_hit"] = True
-                                exit_reason = f"TP1 (50% Booked) + 50% 1:3 TP Target Hit{scale_tag}"
-                                break
+                elif is_exp_trail_active:
+                    # Experiment Trailing EMA SL (+1.5% ROE arm -> 21/31 EMA +-8t) + Structural/1:3 TP + 21 EMA 2c Re-Entry
+                    _exp_tgt_tp = float(active_trade.get("exp_target_tp", tp2_p) or tp2_p)
+                    if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
+                        exit_triggered = True
+                        exit_price = sl_p
+                        _tr_sp = int(_exp_re_cfg["ema_span"])
+                        _tr_tk = int(_exp_re_cfg["ticks"])
+                        exit_reason = (
+                            f"Trailing {_tr_sp} EMA SL ({_tr_tk}t){scale_tag}"
+                            if active_trade.get("ema_trailed")
+                            else f"Catastrophe Stop Loss{scale_tag}"
+                        )
+                        active_trade["_was_trailing_sl_exit"] = bool(active_trade.get("ema_trailed"))
+                        break
+                    if (pos_dir == "LONG" and _exp_tgt_tp > 0 and s5_high >= _exp_tgt_tp) or (
+                        pos_dir == "SHORT" and _exp_tgt_tp > 0 and s5_low <= _exp_tgt_tp
+                    ):
+                        exit_triggered = True
+                        exit_price = _exp_tgt_tp
+                        active_trade["tp2_hit"] = True
+                        active_trade["_was_trailing_sl_exit"] = False
+                        _tp_lbl = "100% 1:3 TP Target Hit" if _exp_re_cfg["use_3r"] else "100% Structural TP2 Target Hit"
+                        exit_reason = f"{_tp_lbl}{scale_tag}"
+                        break
 
                 else:
                     # Variant 2 (Default Structural Runner): Book 50% at TP1, lock runner SL in profit
@@ -3733,83 +3713,33 @@ def run_strategy_backtest(
                                 active_trade["stop_loss"] = sl_p
                                 active_trade["halfway_ratcheted"] = True
 
-            # Closed 15m candle management for `ema9_21_1to3_*` exit modes:
-            #   - In `ema9_21_1to3_hybrid` (50/50), arm 9/21 EMA + 21 EMA trailing SL strictly AFTER TP1 is booked
-            #     so trades never get choked on Bar 1 while 21 EMA sits near entry!
-            #   - In `ema9_21_1to3_full` (100%), arm as soon as price establishes on the trend side of 9 & 21 EMA.
-            if (not exit_triggered) and is_ema9_21_mode and (is_ema9_21_full or active_trade.get("tp1_hit", False)):
-                e9_15 = float(candle.get("EMA9_15m", 0.0) or 0.0)
-                e21_15 = float(candle.get("EMA21_15m", 0.0) or 0.0)
-                prev_15 = df_records[idx - 1] if idx > 0 else candle
-                pair_tick = float(get_pair_lot_spec(pair).get("tick_size", 0.01) or 0.01)
-                tick_buf = 8.0 * pair_tick
-                if e9_15 > 0 and e21_15 > 0:
+            # Closed 15m candle Trailing EMA SL management (+1.5% ROE positive close -> trail 21/31 EMA +-8 ticks):
+            if (not exit_triggered) and is_exp_trail_active:
+                _ema_col_tr = "EMA31_15m" if int(_exp_re_cfg["ema_span"]) == 31 else "EMA21_15m"
+                _ema_tr_val = float(candle.get(_ema_col_tr, 0.0) or 0.0)
+                if _ema_tr_val > 0 and entry_p > 0:
                     if pos_dir == "LONG":
-                        if c_close > e9_15 and c_close > e21_15:
-                            active_trade["ema9_21_armed"] = True
-                        if active_trade.get("ema9_21_armed", False):
-                            if c_close > e9_15 and c_low > e21_15:
-                                active_trade["ema9_crossed"] = False
-                                active_trade["ema21_touched"] = False
-                            if c_close < e9_15 or c_low <= e9_15:
-                                active_trade["ema9_crossed"] = True
-                            if active_trade.get("ema9_crossed", False) and c_low <= e21_15:
-                                active_trade["ema21_touched"] = True
-                            if (
-                                active_trade.get("ema9_crossed", False)
-                                and active_trade.get("ema21_touched", False)
-                                and c_close < float(prev_15["low"])
-                            ):
-                                exit_triggered = True
-                                exit_price = (
-                                    (0.5 * tp1_p + 0.5 * c_close)
-                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
-                                    else c_close
-                                )
-                                exit_reason = (
-                                    f"TP1 (50% Booked) + 50% 15m 9/21 EMA Prev-Low Exit{scale_tag}"
-                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
-                                    else f"15m 9/21 EMA Cross + Prev-Low Exit{scale_tag}"
-                                )
-                            else:
-                                cand_tr = format_order_price(pair, e21_15 - tick_buf)
-                                if cand_tr > sl_p and cand_tr < c_close:
-                                    sl_p = cand_tr
-                                    active_trade["stop_loss"] = sl_p
-                                    active_trade["ema21_trailed"] = True
+                        _roe_c = ((c_close - entry_p) / entry_p) * leverage * 100.0
+                        if (c_close > c_open) and (c_close > entry_p) and (_roe_c >= float(_exp_re_cfg["roe_arm"])):
+                            active_trade["roe_trail_armed"] = True
                     else:
-                        if c_close < e9_15 and c_close < e21_15:
-                            active_trade["ema9_21_armed"] = True
-                        if active_trade.get("ema9_21_armed", False):
-                            if c_close < e9_15 and c_high < e21_15:
-                                active_trade["ema9_crossed"] = False
-                                active_trade["ema21_touched"] = False
-                            if c_close > e9_15 or c_high >= e9_15:
-                                active_trade["ema9_crossed"] = True
-                            if active_trade.get("ema9_crossed", False) and c_high >= e21_15:
-                                active_trade["ema21_touched"] = True
-                            if (
-                                active_trade.get("ema9_crossed", False)
-                                and active_trade.get("ema21_touched", False)
-                                and c_close > float(prev_15["high"])
-                            ):
-                                exit_triggered = True
-                                exit_price = (
-                                    (0.5 * tp1_p + 0.5 * c_close)
-                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
-                                    else c_close
-                                )
-                                exit_reason = (
-                                    f"TP1 (50% Booked) + 50% 15m 9/21 EMA Prev-High Exit{scale_tag}"
-                                    if (not is_ema9_21_full and active_trade.get("tp1_hit", False))
-                                    else f"15m 9/21 EMA Cross + Prev-High Exit{scale_tag}"
-                                )
-                            else:
-                                cand_tr = format_order_price(pair, e21_15 + tick_buf)
-                                if cand_tr < sl_p and cand_tr > c_close:
-                                    sl_p = cand_tr
-                                    active_trade["stop_loss"] = sl_p
-                                    active_trade["ema21_trailed"] = True
+                        _roe_c = ((entry_p - c_close) / entry_p) * leverage * 100.0
+                        if (c_close < c_open) and (c_close < entry_p) and (_roe_c >= float(_exp_re_cfg["roe_arm"])):
+                            active_trade["roe_trail_armed"] = True
+                    if active_trade.get("roe_trail_armed", False):
+                        _tk_buf = float(_exp_re_cfg["ticks"]) * _pair_tick_sz
+                        if pos_dir == "LONG":
+                            _cand_sl = format_order_price(pair, _ema_tr_val - _tk_buf)
+                            if _cand_sl < c_close and _cand_sl > sl_p:
+                                sl_p = _cand_sl
+                                active_trade["stop_loss"] = sl_p
+                                active_trade["ema_trailed"] = True
+                        else:
+                            _cand_sl = format_order_price(pair, _ema_tr_val + _tk_buf)
+                            if _cand_sl > c_close and _cand_sl < sl_p:
+                                sl_p = _cand_sl
+                                active_trade["stop_loss"] = sl_p
+                                active_trade["ema_trailed"] = True
 
             if exit_triggered:
                 if pos_dir == "LONG":
@@ -3818,9 +3748,10 @@ def run_strategy_backtest(
                     gross_pnl_usd = (entry_p - exit_price) * qty
 
                 gross_pnl_inr = gross_pnl_usd * usd_inr
-                entry_fee_inr = notional_inr * maker_fee_rate
+                _ent_fee_r = taker_fee_rate if active_trade.get("is_reentry") else maker_fee_rate
+                entry_fee_inr = notional_inr * _ent_fee_r
                 exit_notional_inr = (qty * exit_price) * usd_inr
-                if active_trade.get("tp1_hit", False) and not use_full_s3_mode and not is_ema9_21_full:
+                if active_trade.get("tp1_hit", False) and not use_full_s3_mode and not is_exp_trail_active:
                     tp1_notional_inr = (0.5 * qty * tp1_p) * usd_inr
                     exit_fee_inr = (tp1_notional_inr * maker_fee_rate) + (max(0.0, exit_notional_inr - tp1_notional_inr) * taker_fee_rate)
                 else:
@@ -3842,6 +3773,7 @@ def run_strategy_backtest(
                 if day_realized_pnl.get(c_crypto_day, 0.0) <= -max_daily_loss_inr:
                     day_locked.add(c_crypto_day)
 
+                _was_tr_sl = bool(active_trade.get("_was_trailing_sl_exit", False))
                 trades.append({
                     "trade_id": len(trades) + 1,
                     "entry_time": active_trade["entry_time"],
@@ -3853,7 +3785,7 @@ def run_strategy_backtest(
                     "exit_price": round_asset_price(exit_price, entry_p),
                     "stop_loss": round_asset_price(sl_p, entry_p),
                     "initial_stop_loss": round_asset_price(float(active_trade.get("initial_stop_loss", sl_p) or sl_p), entry_p),
-                    "target_tp": round_asset_price(tp1_p, entry_p),
+                    "target_tp": round_asset_price(float(active_trade.get("exp_target_tp", tp1_p) if is_exp_trail_active else tp1_p), entry_p),
                     "exit_reason": exit_reason,
                     "quantity": qty,
                     "gross_pnl_inr": round(gross_pnl_inr, 2),
@@ -3861,6 +3793,8 @@ def run_strategy_backtest(
                     "net_pnl_inr": round(net_pnl_inr, 2),
                     "roe_pct": round(roe_pct, 2),
                     "is_win": net_pnl_inr > 0,
+                    "is_reentry": bool(active_trade.get("is_reentry", False)),
+                    "was_trailing_sl": _was_tr_sl,
                     "duration_candles": idx - active_trade["entry_idx"],
                     "strategy": active_trade.get("strategy_tag") or strat.name,
                     "trigger": active_trade.get("reason", "")
@@ -3872,17 +3806,212 @@ def run_strategy_backtest(
                     "pnl_inr": round(net_pnl_inr, 2)
                 })
 
+                # Step 4-5 Re-Entry Arm: if Trailing EMA SL was HIT before TP, watch for 21 EMA touch + 2c confirmation
+                if (
+                    is_exp_trail_active
+                    and _was_tr_sl
+                    and int(active_trade.get("reentry_num", 0)) < int(_exp_re_cfg["max_re"])
+                ):
+                    reentry_watch = {
+                        "direction": pos_dir,
+                        "orig_init_sl": float(active_trade.get("orig_step1_sl", active_trade.get("initial_stop_loss", sl_p))),
+                        "orig_tp1": float(active_trade.get("orig_step1_tp1", tp1_p)),
+                        "orig_tp2": float(active_trade.get("orig_step1_tp2", tp2_p)),
+                        "orig_target_tp": float(active_trade.get("orig_step1_target_tp", active_trade.get("exp_target_tp", tp2_p))),
+                        "orig_strategy_tag": active_trade.get("strategy_tag") or strat.name,
+                        "orig_reason": active_trade.get("reason", ""),
+                        "armed_idx": idx,
+                        "reentry_num": int(active_trade.get("reentry_num", 0)) + 1,
+                        "stage": "WAIT_TRIGGER",
+                        "trigger_high": 0.0,
+                        "trigger_low": 0.0,
+                        "trigger_idx": -1,
+                        "confirm_streak": 0,
+                        "confirm_entry_px": 0.0,
+                        "confirm_idx": -1,
+                    }
+                else:
+                    reentry_watch = None
+
                 active_trade = None
                 last_exit_idx = idx
 
         # Daily Discipline Gate: STOP trading until next Crypto Day (00:00 UTC / 05:30 AM IST) if 5% wallet lost
         if c_crypto_day in day_locked:
+            reentry_watch = None
             continue
 
+        # Step 4-5 Re-Entry State Machine (after a Trailing EMA SL hit in Experiment modes)
+        _reentry_opened_bar = False
+        if _exp_re_cfg and (not active_trade) and reentry_watch is not None and idx > reentry_watch["armed_idx"]:
+            _rw = reentry_watch
+            _r_dir = _rw["direction"]
+            _o_sl = _rw["orig_init_sl"]
+            _o_tp = _rw["orig_target_tp"]
+            if (
+                (idx - _rw["armed_idx"]) > 24
+                or (_r_dir == "LONG" and (c_low <= _o_sl or c_high >= _o_tp))
+                or (_r_dir == "SHORT" and (c_high >= _o_sl or c_low <= _o_tp))
+            ):
+                reentry_watch = None
+            else:
+                if _rw["stage"] == "WAIT_ENTRY_FILL":
+                    if (idx - _rw["confirm_idx"]) > 6:
+                        _rw["stage"] = "WAIT_TRIGGER"
+                        _rw["confirm_streak"] = 0
+                    else:
+                        _sub5_re = sub5_by_15m_ts.get((c_ts // 900000) * 900000) or [
+                            {"open": c_open, "high": c_high, "low": c_low, "close": c_close}
+                        ]
+                        _c_px = _rw["confirm_entry_px"]
+                        for _si, _s5 in enumerate(_sub5_re):
+                            _s5_o = float(_s5.get("open", c_open))
+                            _s5_h = float(_s5["high"])
+                            _s5_l = float(_s5["low"])
+                            if (_r_dir == "LONG" and (_s5_l <= _o_sl or _s5_h >= _o_tp)) or (
+                                _r_dir == "SHORT" and (_s5_h >= _o_sl or _s5_l <= _o_tp)
+                            ):
+                                reentry_watch = None
+                                break
+                            _filled = (_r_dir == "LONG" and _s5_h >= _c_px) or (_r_dir == "SHORT" and _s5_l <= _c_px)
+                            if _filled:
+                                _fill_px = format_order_price(pair, max(_s5_o, _c_px) if _r_dir == "LONG" else min(_s5_o, _c_px))
+                                _valid_rr = (
+                                    (_o_sl < _fill_px < _o_tp and (_fill_px - _o_sl) / _fill_px >= 0.003)
+                                    if _r_dir == "LONG"
+                                    else (_o_tp < _fill_px < _o_sl and (_o_sl - _fill_px) / _fill_px >= 0.003)
+                                )
+                                if _valid_rr:
+                                    _re_qty = format_order_quantity(pair, ((margin_inr / usd_inr) * leverage) / _fill_px)
+                                    active_trade = {
+                                        "direction": _r_dir,
+                                        "entry_time": c_time.strftime("%Y-%m-%d %H:%M"),
+                                        "entry_date": c_date,
+                                        "entry_crypto_day": c_crypto_day,
+                                        "entry_idx": idx,
+                                        "entry_price": _fill_px,
+                                        "entry2_sweep": 0.0,
+                                        "entry2_filled": False,
+                                        "stop_loss": _o_sl,
+                                        "initial_stop_loss": _o_sl,
+                                        "orig_step1_sl": _o_sl,
+                                        "orig_step1_tp1": _rw["orig_tp1"],
+                                        "orig_step1_tp2": _rw["orig_tp2"],
+                                        "orig_step1_target_tp": _o_tp,
+                                        "tp1": _rw["orig_tp1"],
+                                        "tp2": _rw["orig_tp2"],
+                                        "exp_target_tp": _o_tp,
+                                        "roe_trail_armed": False,
+                                        "ema_trailed": False,
+                                        "is_reentry": True,
+                                        "reentry_num": _rw["reentry_num"],
+                                        "quantity": _re_qty,
+                                        "notional_inr": margin_inr * leverage,
+                                        "deployed_margin_inr": margin_inr,
+                                        "session": _strategies.backtest_session_name(c_time),
+                                        "tp1_hit": False,
+                                        "ema9_armed": False,
+                                        "wrong_ema9_streak": 0,
+                                        "atr20_pb_armed": False,
+                                        "tp1_label": "100% Trail",
+                                        "tp2_label": "Re-Entry Target",
+                                        "reason": f"{_rw['orig_reason']} [21-EMA Re-Entry #{_rw['reentry_num']}]",
+                                        "strategy_tag": _rw["orig_strategy_tag"],
+                                    }
+                                    reentry_watch = None
+                                    _reentry_opened_bar = True
+                                    # Evaluate any remaining 5m bars after fill on this same 15m candle (zero lookahead)
+                                    _rem_ex = False
+                                    _rem_px = None
+                                    _rem_rsn = None
+                                    for _s5r in _sub5_re[_si + 1:]:
+                                        _rh, _rl = float(_s5r["high"]), float(_s5r["low"])
+                                        if (_r_dir == "LONG" and _rl <= _o_sl) or (_r_dir == "SHORT" and _rh >= _o_sl):
+                                            _rem_ex, _rem_px, _rem_rsn = True, _o_sl, "Catastrophe Stop Loss [Single Entry]"
+                                            break
+                                        if (_r_dir == "LONG" and _rh >= _o_tp) or (_r_dir == "SHORT" and _rl <= _o_tp):
+                                            _rem_ex, _rem_px = True, _o_tp
+                                            _rem_rsn = ("100% 1:3 TP Target Hit [Single Entry]" if _exp_re_cfg["use_3r"] else "100% Structural TP2 Target Hit [Single Entry]")
+                                            break
+                                    if _rem_ex:
+                                        _gp_u = (_rem_px - _fill_px) * _re_qty if _r_dir == "LONG" else (_fill_px - _rem_px) * _re_qty
+                                        _gp_i = _gp_u * usd_inr
+                                        _tf_i = (margin_inr * leverage * taker_fee_rate) + ((_re_qty * _rem_px * usd_inr) * taker_fee_rate)
+                                        _np_i = _gp_i - _tf_i
+                                        current_equity += _np_i
+                                        day_realized_pnl[c_crypto_day] = day_realized_pnl.get(c_crypto_day, 0.0) + _np_i
+                                        if day_realized_pnl.get(c_crypto_day, 0.0) <= -max_daily_loss_inr:
+                                            day_locked.add(c_crypto_day)
+                                        trades.append({
+                                            "trade_id": len(trades) + 1, "entry_time": active_trade["entry_time"], "exit_time": c_time.strftime("%Y-%m-%d %H:%M"),
+                                            "pair": pair, "direction": _r_dir, "session": active_trade["session"],
+                                            "entry_price": round_asset_price(_fill_px, _fill_px), "exit_price": round_asset_price(_rem_px, _fill_px),
+                                            "stop_loss": round_asset_price(_o_sl, _fill_px), "initial_stop_loss": round_asset_price(_o_sl, _fill_px),
+                                            "target_tp": round_asset_price(_o_tp, _fill_px), "exit_reason": _rem_rsn, "quantity": _re_qty,
+                                            "gross_pnl_inr": round(_gp_i, 2), "fees_inr": round(_tf_i, 2), "net_pnl_inr": round(_np_i, 2),
+                                            "roe_pct": round((_np_i / margin_inr) * 100.0, 2) if margin_inr > 0 else 0.0,
+                                            "is_win": _np_i > 0, "is_reentry": True, "was_trailing_sl": False,
+                                            "duration_candles": 0, "strategy": active_trade["strategy_tag"], "trigger": active_trade["reason"],
+                                        })
+                                        equity_curve.append({"timestamp": c_time.strftime("%Y-%m-%d %H:%M"), "equity_inr": round(current_equity, 2), "pnl_inr": round(_np_i, 2)})
+                                        active_trade = None
+                                        last_exit_idx = idx
+                                    elif active_trade:
+                                        _ema_c_r = "EMA31_15m" if int(_exp_re_cfg["ema_span"]) == 31 else "EMA21_15m"
+                                        _ema_v_r = float(candle.get(_ema_c_r, 0.0) or 0.0)
+                                        if _ema_v_r > 0:
+                                            _rc_r = (((c_close - _fill_px) / _fill_px) if _r_dir == "LONG" else ((_fill_px - c_close) / _fill_px)) * leverage * 100.0
+                                            if ((_r_dir == "LONG" and c_close > c_open and c_close > _fill_px) or (_r_dir == "SHORT" and c_close < c_open and c_close < _fill_px)) and _rc_r >= float(_exp_re_cfg["roe_arm"]):
+                                                active_trade["roe_trail_armed"] = True
+                                            if active_trade.get("roe_trail_armed"):
+                                                _tb_r = float(_exp_re_cfg["ticks"]) * _pair_tick_sz
+                                                _cs_r = format_order_price(pair, (_ema_v_r - _tb_r) if _r_dir == "LONG" else (_ema_v_r + _tb_r))
+                                                if (_r_dir == "LONG" and _cs_r < c_close and _cs_r > _o_sl) or (_r_dir == "SHORT" and _cs_r > c_close and _cs_r < _o_sl):
+                                                    active_trade["stop_loss"] = _cs_r
+                                                    active_trade["ema_trailed"] = True
+                                else:
+                                    reentry_watch = None
+                                break
+
+                if (not active_trade) and reentry_watch is not None and _rw["stage"] in ("WAIT_TRIGGER", "WAIT_CONFIRM"):
+                    _e21_re = float(candle.get("EMA21_15m", 0.0) or 0.0)
+                    _prev_re = df_records[idx - 1] if idx > 0 else candle
+                    _pe21_re = float(_prev_re.get("EMA21_15m", _e21_re) or _e21_re)
+                    _touched_21 = (
+                        (_e21_re > 0 and c_low <= _e21_re <= c_high)
+                        or (_r_dir == "LONG" and float(_prev_re["close"]) < _pe21_re and c_close >= _e21_re)
+                        or (_r_dir == "SHORT" and float(_prev_re["close"]) > _pe21_re and c_close <= _e21_re)
+                    )
+                    if _rw["stage"] == "WAIT_TRIGGER":
+                        if _touched_21:
+                            _rw["stage"] = "WAIT_CONFIRM"
+                            _rw["trigger_high"] = c_high
+                            _rw["trigger_low"] = c_low
+                            _rw["trigger_idx"] = idx
+                            _rw["confirm_streak"] = 0
+                    elif _rw["stage"] == "WAIT_CONFIRM":
+                        _is_c = (c_close > _rw["trigger_high"]) if _r_dir == "LONG" else (c_close < _rw["trigger_low"])
+                        if _is_c:
+                            _rw["confirm_streak"] += 1
+                            if _rw["confirm_streak"] >= int(_exp_re_cfg["confirm_c"]):
+                                _rw["stage"] = "WAIT_ENTRY_FILL"
+                                _rw["confirm_entry_px"] = format_order_price(pair, c_high if _r_dir == "LONG" else c_low)
+                                _rw["confirm_idx"] = idx
+                        else:
+                            if _touched_21:
+                                _rw["trigger_high"] = c_high
+                                _rw["trigger_low"] = c_low
+                                _rw["trigger_idx"] = idx
+                                _rw["confirm_streak"] = 0
+                            elif (idx - _rw["trigger_idx"]) > 4:
+                                _rw["stage"] = "WAIT_TRIGGER"
+                                _rw["confirm_streak"] = 0
+
         # If no active trade, ask the strategy whether this closed candle is an entry
-        if not active_trade and (idx - last_exit_idx >= 1):
+        if (not active_trade) and (not _reentry_opened_bar) and (idx - last_exit_idx >= 1):
             entry_sig = strat.backtest_entry(idx, candle, strat_ctx, df_records)
             if entry_sig:
+                reentry_watch = None
                 trade_dir = entry_sig["direction"]
                 entry_p = entry_sig["entry"]
                 entry2_p = float(entry_sig.get("entry2_sweep", 0.0) or 0.0)
@@ -3904,6 +4033,9 @@ def run_strategy_backtest(
                     if trade_dir == "LONG"
                     else format_order_price(pair, max(entry_p * 0.05, entry_p - 3.0 * sl_dist_init))
                 )
+                _sig_tag = entry_sig.get("strategy_tag", strat.name)
+                _use_exp_for_sig = bool(_exp_re_cfg) and (not _exp_re_cfg["box_only"] or "50/200 EMA" not in str(_sig_tag))
+                _exp_tgt_init = (tp_3r_px if (_use_exp_for_sig and _exp_re_cfg["use_3r"]) else tp2_p)
 
                 active_trade = {
                     "direction": trade_dir,
@@ -3916,13 +4048,17 @@ def run_strategy_backtest(
                     "entry2_filled": False,
                     "stop_loss": sl_p,
                     "initial_stop_loss": sl_p,
+                    "orig_step1_sl": sl_p,
+                    "orig_step1_tp1": tp1_p,
+                    "orig_step1_tp2": tp2_p,
+                    "orig_step1_target_tp": _exp_tgt_init,
                     "tp1": tp1_p,
                     "tp2": tp2_p,
-                    "tp_3r": tp_3r_px,
-                    "ema9_21_armed": False,
-                    "ema9_crossed": False,
-                    "ema21_touched": False,
-                    "ema21_trailed": False,
+                    "exp_target_tp": _exp_tgt_init,
+                    "roe_trail_armed": False,
+                    "ema_trailed": False,
+                    "is_reentry": False,
+                    "reentry_num": 0,
                     "quantity": qty,
                     "notional_inr": notional_inr,
                     "deployed_margin_inr": margin_inr,
@@ -3934,7 +4070,7 @@ def run_strategy_backtest(
                     "tp1_label": entry_sig.get("tp1_label", "50% Book"),
                     "tp2_label": entry_sig.get("tp2_label", "50% Runner"),
                     "reason": entry_sig.get("reason", ""),
-                    "strategy_tag": entry_sig.get("strategy_tag", strat.name),
+                    "strategy_tag": _sig_tag,
                 }
                 day_trade_count[c_date] = day_trade_count.get(c_date, 0) + 1
 
@@ -7288,6 +7424,13 @@ def run_portfolio_single_slot_backtest(
     blocked_post_sl = 0
     blocked_btc_veto = 0
 
+    _allow_reentry_exempt = exit_mode in (
+        "box_ema31_1to3_reentry",
+        "ema31_1to3_reentry_all",
+        "ema21_1to3_reentry_all",
+        "ema21_v36tp_reentry_all",
+    )
+
     def _settle_closed_trades(up_to_time: str):
         nonlocal active_open_trades, current_wallet_inr, peak_wallet_inr, max_drawdown_pct
         still_open = []
@@ -7312,7 +7455,8 @@ def run_portfolio_single_slot_backtest(
                 dd_pct = ((peak_wallet_inr - current_wallet_inr) / peak_wallet_inr) * 100.0
                 if dd_pct > max_drawdown_pct:
                     max_drawdown_pct = dd_pct
-            if not bool(t.get("is_win", False)):
+            _is_tr_sl_exit = bool(t.get("was_trailing_sl", False))
+            if (not bool(t.get("is_win", False))) and not (_allow_reentry_exempt and _is_tr_sl_exit):
                 try:
                     t_p = str(t.get("pair", ""))
                     t_d = str(t.get("direction", "")).upper()
@@ -7352,7 +7496,8 @@ def run_portfolio_single_slot_backtest(
             blocked_sl += 1
             continue
         # Unified Cross-Strategy 4h Post-SL Lock (blocks both Box & EMA on same pair+dir for 4h after an SL loss)
-        if enforce_post_sl_lock:
+        _tr_is_reentry = bool(tr.get("is_reentry", False))
+        if enforce_post_sl_lock and not (_allow_reentry_exempt and _tr_is_reentry):
             lk_until = post_sl_lock_until.get((tr_pair, tr_dir))
             if lk_until is not None and cur_dt < lk_until:
                 blocked_post_sl += 1
@@ -7415,7 +7560,7 @@ def run_portfolio_single_slot_backtest(
                 continue
             prev_z = last_ema_zone_by_pair.get(tr_pair)
             cur_ep = float(tr.get("entry_price", 0.0) or 0.0)
-            if prev_z and cur_ep > 0:
+            if prev_z and cur_ep > 0 and not (_allow_reentry_exempt and _tr_is_reentry):
                 prev_dt, prev_dir, prev_ep, prev_win = prev_z
                 zone_lock_sec = 3600 if prev_win else (4 * 3600)
                 if (
@@ -7449,6 +7594,7 @@ def run_portfolio_single_slot_backtest(
     _settle_closed_trades("9999-12-31 23:59:59")
 
     wallet_roi_pct = round(((current_wallet_inr - eff_wallet_inr) / eff_wallet_inr) * 100.0, 2) if eff_wallet_inr > 0 else 0.0
+    _re_acc = [t for t in accepted if bool(t.get("is_reentry", False))]
     guards_audit = {
         "starting_wallet_inr": round(eff_wallet_inr, 2),
         "ending_wallet_inr": round(current_wallet_inr, 2),
@@ -7467,6 +7613,8 @@ def run_portfolio_single_slot_backtest(
         "blocked_by_post_sl_lock": blocked_post_sl,
         "blocked_by_btc_veto": blocked_btc_veto,
         "use_fixed_risk_sizing": bool(use_fixed_risk_sizing),
+        "reentry_trades": len(_re_acc),
+        "reentry_net_pnl_inr": round(sum(float(t.get("net_pnl_inr", 0.0) or 0.0) for t in _re_acc), 2),
     }
 
     if not accepted:

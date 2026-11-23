@@ -3405,7 +3405,7 @@ elif active_section == "🧪 Backtest":
         help="Mirrors Main's exact Single-Trade Margin per slot.",
     )
 
-    bg1, bg2, bg3, bg4, bg5 = st.columns([0.9, 1.0, 0.7, 1.8, 1.2])
+    bg1, bg2, bg3, bg4, bg5, bg6 = st.columns([0.8, 0.9, 0.7, 1.9, 1.1, 1.1])
     bt_lev = bg1.slider("Leverage (x)", 1, 20, int(leverage), key="bt_multi_lev")
     bt_sl_threshold_pct = bg2.number_input(
         "Daily Loss Stop (%)",
@@ -3421,9 +3421,11 @@ elif active_section == "🧪 Backtest":
     _bt_slot_def_idx = _bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2
     bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=_bt_slot_def_idx, key="bt_max_slots")
     _bt_exit_modes = {
-        "smart_hybrid": "Structural Runner (50% TP1 + Fee-BE -> TP2)",
-        "ema9_21_1to3_full": "15m 9/21 EMA Exit + 1:3 TP (100% Full + 21 EMA Trail 8t)",
-        "ema9_21_1to3_hybrid": "15m 9/21 EMA Exit + 1:3 TP (50% TP1 + Uncapped 1:3 Runner)",
+        "smart_hybrid": "Baseline: v36/v38 Structural Runner (50% TP1 + Fee-BE -> TP2)",
+        "box_ema31_1to3_reentry": "⭐ Hybrid (HYB-A): Box=31 EMA(8t)+1:3+21EMA ReEntry(2c) | EMA=v36",
+        "ema31_1to3_reentry_all": "Uniform V10: All=31 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
+        "ema21_1to3_reentry_all": "Uniform V4: All=21 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
+        "ema21_v36tp_reentry_all": "Uniform V1: All=21 EMA(8t) Trail + v36 TP2 + 21EMA ReEntry(2c)",
     }
     bt_exit_mode = bg4.selectbox(
         "Exit Mode",
@@ -3431,19 +3433,28 @@ elif active_section == "🧪 Backtest":
         format_func=lambda k: _bt_exit_modes.get(k, k),
         index=1 if _is_experiment_env else 0,
         key="bt_exit_mode_sel",
-        help="Compare v38 Structural Runner against the Experiment 15m 9/21 EMA Crossover + 21 EMA Trailing SL (8 ticks) + Uncapped 1:3 TP exit.",
+        help="Compare Baseline v36/v38 Structural Runner against the +1.5% ROE Trailing 31/21 EMA (8t) SL + 1:3/v36 TP + 21 EMA Touch & 2-Candle Confirmation Re-Entry modes.",
     )
     with bg5:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
         bt_free_margin_guard = st.checkbox(
-            "<90% Free-Margin Guard",
+            "<90% Free-Margin",
             value=True,
             key="bt_free_margin_guard",
             help="Skips new entries when remaining free wallet equity is below 90% of Single-Trade Margin (identical to Main).",
         )
+    with bg6:
+        st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
+        bt_fixed_risk_cap = st.checkbox(
+            "1.5% Risk Cap (E0)",
+            value=False,
+            key="bt_fixed_risk_cap",
+            help="OFF = E0b (Full Slot Margin). ON = E0 (1.5% Fixed Wallet Risk Cap).",
+        )
 
     st.caption(
         f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` • "
+        f"**Sizing:** `{'E0 (1.5% Risk Cap)' if bt_fixed_risk_cap else 'E0b (Full Slot Margin)'}` • "
         f"**Exit:** `{_bt_exit_modes.get(bt_exit_mode, bt_exit_mode)}` • "
         f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Margin/Trade:** `₹{bt_capital:,.0f}` @ `{bt_lev}x` | "
         f"**SL Threshold Lock:** `{bt_sl_threshold_pct:.1f}%/day` (`₹{bt_wallet_inr * bt_sl_threshold_pct / 100.0:,.0f}`) | "
@@ -3465,6 +3476,7 @@ elif active_section == "🧪 Backtest":
                 max_concurrent_trades=int(bt_max_slots),
                 daily_loss_stop_pct=float(bt_sl_threshold_pct),
                 enforce_free_margin_guard=bool(bt_free_margin_guard),
+                use_fixed_risk_sizing=bool(bt_fixed_risk_cap),
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 
@@ -3505,11 +3517,15 @@ elif active_section == "🧪 Backtest":
             _blk_psl = int(_ga.get("blocked_by_post_sl_lock", 0) or 0)
             _blk_btc = int(_ga.get("blocked_by_btc_veto", 0) or 0)
             _lk_dates_s = ", ".join((_ga.get("locked_dates") or [])[:8])
+            _sz_lbl_ga = "1.5% Fixed Risk Sizing (E0)" if _ga.get("use_fixed_risk_sizing") else "Full Slot Margin (E0b)"
+            _re_t_ga = int(_ga.get("reentry_trades", 0) or 0)
+            _re_pnl_ga = float(_ga.get("reentry_net_pnl_inr", 0.0) or 0.0)
+            _re_str_ga = f" • Re-Entries: `{_re_t_ga}` (`{'+' if _re_pnl_ga >= 0 else ''}₹{_re_pnl_ga:,.0f}`)" if _re_t_ga > 0 else ""
             st.info(
-                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold | 1.5% Fixed Risk Sizing):** "
+                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold | {_sz_lbl_ga}):** "
                 f"**{_lk_days} day(s)** hit Daily Loss Stop (`{_blk_sl}` trades blocked{f': {_lk_dates_s}' if _lk_dates_s else ''}) • "
                 f"Same-Dir (>2) Blocked: `{_blk_sd}` • Post-SL 4h Lock: `{_blk_psl}` • BTC Impulse Veto: `{_blk_btc}` • "
-                f"Slot Cap: `{_blk_slot}` • Max 2 EMA: `{_blk_ema}` • <90% Free-Margin: `{_blk_fm}` • 4h Zone: `{_blk_z4}`"
+                f"Slot Cap: `{_blk_slot}` • Max 2 EMA: `{_blk_ema}` • <90% Free-Margin: `{_blk_fm}` • 4h Zone: `{_blk_z4}`{_re_str_ga}"
             )
 
         _eq_curve = port_out.get("equity_curve") or []
