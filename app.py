@@ -3422,7 +3422,8 @@ elif active_section == "🧪 Backtest":
     bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=_bt_slot_def_idx, key="bt_max_slots")
     _bt_exit_modes = {
         "smart_hybrid": "Baseline: v36/v38 Structural Runner (50% TP1 + Fee-BE -> TP2)",
-        "box_ema31_1to3_reentry": "⭐ Hybrid (HYB-A): Box=31 EMA(8t)+1:3+21EMA ReEntry(2c) | EMA=v36",
+        "box_ema31_1to3_no_reentry": "⭐ HYB-A (NO Re-Entry): Box=31 EMA(8t)+1:3 | EMA=v36 (OOS Verified)",
+        "box_ema31_1to3_reentry": "HYB-A (+Re-Entry 2c): Box=31 EMA(8t)+1:3+21EMA ReEntry | EMA=v36",
         "ema31_1to3_reentry_all": "Uniform V10: All=31 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
         "ema21_1to3_reentry_all": "Uniform V4: All=21 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
         "ema21_v36tp_reentry_all": "Uniform V1: All=21 EMA(8t) Trail + v36 TP2 + 21EMA ReEntry(2c)",

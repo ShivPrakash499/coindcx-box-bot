@@ -3440,6 +3440,7 @@ def run_strategy_backtest(
     day_locked = set()
 
     _EXP_REENTRY_MODES = {
+        "box_ema31_1to3_no_reentry": {"box_only": True, "ema_span": 31, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 0},
         "box_ema31_1to3_reentry": {"box_only": True, "ema_span": 31, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
         "ema31_1to3_reentry_all": {"box_only": False, "ema_span": 31, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
         "ema21_1to3_reentry_all": {"box_only": False, "ema_span": 21, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
@@ -7425,6 +7426,7 @@ def run_portfolio_single_slot_backtest(
     blocked_btc_veto = 0
 
     _allow_reentry_exempt = exit_mode in (
+        "box_ema31_1to3_no_reentry",
         "box_ema31_1to3_reentry",
         "ema31_1to3_reentry_all",
         "ema21_1to3_reentry_all",
