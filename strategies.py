@@ -2360,7 +2360,377 @@ class BoxPlusEma50200Strategy(Strategy):
         return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
 
 
+
+# ----------------------------------------------------------------------------------------------
+# Pure Standalone YouTube 9/21 EMA Strategy Module (ZERO Box Sweep / ZERO 50-200 EMA!)
+# ----------------------------------------------------------------------------------------------
+def _yt_calc_atr14(highs: list[float], lows: list[float], closes: list[float]) -> list[float]:
+    if not closes:
+        return []
+    trs = [float(highs[0]) - float(lows[0])]
+    for i in range(1, len(closes)):
+        hi, lo, pc = float(highs[i]), float(lows[i]), float(closes[i - 1])
+        trs.append(max(hi - lo, abs(hi - pc), abs(lo - pc)))
+    return pd.Series(trs).ewm(span=14, adjust=False).mean().tolist()
+
+
+def _yt_resample_htf(df: pd.DataFrame, bar_ms: int) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    d = df.copy()
+    d["_b"] = (d["timestamp"].astype("int64") // bar_ms) * bar_ms
+    return (
+        d.groupby("_b", as_index=False)
+        .agg(open=("open", "first"), high=("high", "max"), low=("low", "min"), close=("close", "last"), volume=("volume", "sum"))
+        .rename(columns={"_b": "timestamp"})
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+
+
+def _yt_build_indicators(df: pd.DataFrame, tf_name: str = "1h", df_htf: pd.DataFrame | None = None) -> dict:
+    """Computes pure 9 & 21 EMA, volume, ATR, Last-2-Crossovers, S/R pivots, S/D zones & HTF 9/21 structure (ZERO 50/200 EMA)."""
+    import bisect
+    df_full = df.attrs.get("df_full_exec") if hasattr(df, "attrs") else None
+    src = df_full if (df_full is not None and not df_full.empty and len(df_full) >= len(df)) else df
+    tail_n = len(df)
+
+    o = src["open"].astype(float).tolist()
+    h = src["high"].astype(float).tolist()
+    l = src["low"].astype(float).tolist()
+    c = src["close"].astype(float).tolist()
+    v = (src["volume"].astype(float) if "volume" in src.columns else pd.Series([1.0] * len(src))).tolist()
+    n = len(c)
+
+    sc = pd.Series(c)
+    e9 = sc.ewm(span=9, adjust=False).mean().tolist()
+    e21 = sc.ewm(span=21, adjust=False).mean().tolist()
+    atr = _yt_calc_atr14(h, l, c)
+    vsma = pd.Series(v).rolling(20, min_periods=10).mean().fillna(0.0).tolist()
+
+    mfe_thresh = {"15m": 0.005, "1h": 0.010, "4h": 0.020}.get(tf_name, 0.010)
+    tf_ms = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}.get(tf_name, 3_600_000)
+    htf_ms = {"15m": 3_600_000, "1h": 14_400_000, "4h": 86_400_000}.get(tf_name, 14_400_000)
+
+    bars_since = [0] * n
+    last2_ok = [False] * n
+    cross_up = [False] * n
+    cross_dn = [False] * n
+    is_cross = [0] * n
+    c_dir = 0
+    c_idx = -999
+    c_px = 0.0
+    bh = bl = 0.0
+    prev_ok = False
+    for i in range(1, n):
+        dp = 1 if e9[i - 1] > e21[i - 1] else (-1 if e9[i - 1] < e21[i - 1] else 0)
+        dn = 1 if e9[i] > e21[i] else (-1 if e9[i] < e21[i] else 0)
+        if dn != 0 and dp != 0 and dn != dp:
+            is_cross[i] = 1
+            if dn == 1:
+                cross_up[i] = True
+            else:
+                cross_dn[i] = True
+            if c_dir != 0 and c_px > 0:
+                lived = i - c_idx
+                mfe = ((bh - c_px) / c_px) if c_dir == 1 else ((c_px - bl) / c_px)
+                prev_ok = (lived > 5) and (mfe >= mfe_thresh)
+            else:
+                prev_ok = False
+            c_dir, c_idx, c_px, bh, bl = dn, i, c[i], h[i], l[i]
+        elif c_dir != 0:
+            if h[i] > bh:
+                bh = h[i]
+            if l[i] < bl:
+                bl = l[i]
+        if c_dir != 0 and c_px > 0:
+            bars_since[i] = i - c_idx
+            mfe_now = ((bh - c_px) / c_px) if c_dir == 1 else ((c_px - bl) / c_px)
+            last2_ok[i] = prev_ok and (mfe_now >= mfe_thresh)
+    cross10 = pd.Series(is_cross).rolling(10, min_periods=1).sum().astype(int).tolist()
+
+    # Causal rolling Swing S/R (ZERO Daily Box!)
+    res50 = pd.Series(h).shift(2).rolling(48, min_periods=20).max().fillna(0.0).tolist()
+    sup50 = pd.Series(l).shift(2).rolling(48, min_periods=20).min().fillna(0.0).tolist()
+    res20 = pd.Series(h).shift(2).rolling(18, min_periods=10).max().fillna(0.0).tolist()
+    sup20 = pd.Series(l).shift(2).rolling(18, min_periods=10).min().fillna(0.0).tolist()
+
+    # Causal Supply & Demand Zones (impulsive >=1.8xATR breakout base)
+    dem_low = [0.0] * n
+    dem_high = [0.0] * n
+    sup_low = [0.0] * n
+    sup_high = [0.0] * n
+    cur_dl = cur_dh = cur_sl = cur_sh = 0.0
+    for i in range(3, n):
+        if atr[i - 1] > 0 and (c[i - 1] - o[i - 1]) >= 1.8 * atr[i - 1] and c[i - 1] > h[i - 2]:
+            cur_dl = min(l[i - 2], l[i - 1])
+            cur_dh = max(o[i - 2], c[i - 2])
+        if atr[i - 1] > 0 and (o[i - 1] - c[i - 1]) >= 1.8 * atr[i - 1] and c[i - 1] < l[i - 2]:
+            cur_sh = max(h[i - 2], h[i - 1])
+            cur_sl = min(o[i - 2], c[i - 2])
+        if cur_dl > 0 and c[i - 1] < cur_dl:
+            cur_dl = cur_dh = 0.0
+        if cur_sh > 0 and c[i - 1] > cur_sh:
+            cur_sl = cur_sh = 0.0
+        dem_low[i], dem_high[i] = cur_dl, cur_dh
+        sup_low[i], sup_high[i] = cur_sl, cur_sh
+
+    # Zero-lookahead HTF 9/21 & swing midpoint structure (ZERO 50/200 EMA!)
+    ts_tail = [int(t) for t in df["timestamp"].tolist()]
+    if df_htf is None or df_htf.empty:
+        df_htf = _yt_resample_htf(src, htf_ms)
+    htf_bias = [0] * tail_n
+    htf_struct = [0] * tail_n
+    if df_htf is not None and len(df_htf) >= 25:
+        ch_l = df_htf["close"].astype(float).tolist()
+        hh_l = df_htf["high"].astype(float).tolist()
+        ll_l = df_htf["low"].astype(float).tolist()
+        e9_h = pd.Series(ch_l).ewm(span=9, adjust=False).mean().tolist()
+        e21_h = pd.Series(ch_l).ewm(span=21, adjust=False).mean().tolist()
+        hh20 = pd.Series(hh_l).rolling(20, min_periods=10).max().fillna(0.0).tolist()
+        ll20 = pd.Series(ll_l).rolling(20, min_periods=10).min().fillna(0.0).tolist()
+        close_ts_h = [int(t) + htf_ms for t in df_htf["timestamp"].tolist()]
+        for i, t_cur in enumerate(ts_tail):
+            j = bisect.bisect_right(close_ts_h, t_cur + tf_ms) - 1
+            if j < 25:
+                continue
+            chv, e9v, e21v = ch_l[j], e9_h[j], e21_h[j]
+            midv = 0.5 * (hh20[j] + ll20[j])
+            if e9v > e21v and chv > e21v:
+                htf_bias[i] = 1
+            elif e9v < e21v and chv < e21v:
+                htf_bias[i] = -1
+            if e9v > e21v and chv > midv:
+                htf_struct[i] = 1
+            elif e9v < e21v and chv < midv:
+                htf_struct[i] = -1
+
+    return {
+        "ema9": e9[-tail_n:], "ema21": e21[-tail_n:], "atr14": atr[-tail_n:], "vol_sma20": vsma[-tail_n:],
+        "bars_since_cross": bars_since[-tail_n:], "last2_clean": last2_ok[-tail_n:],
+        "cross_up": cross_up[-tail_n:], "cross_dn": cross_dn[-tail_n:], "cross10": cross10[-tail_n:],
+        "res50": res50[-tail_n:], "sup50": sup50[-tail_n:], "res20": res20[-tail_n:], "sup20": sup20[-tail_n:],
+        "dem_low": dem_low[-tail_n:], "dem_high": dem_high[-tail_n:],
+        "sup_low": sup_low[-tail_n:], "sup_high": sup_high[-tail_n:],
+        "htf_bias": htf_bias, "htf_struct": htf_struct,
+    }
+
+def _detect_yt_ema9_21_setup(recs: list[dict], idx: int, ind: dict, tf_name: str = "1h") -> dict | None:
+    """Trading Data (S15vYdGEm7o): Pure 9/21 Last-2-Crossovers Chop Filter + 3-Step Pullback & Confirmation Close."""
+    if idx < 25 or idx >= len(recs):
+        return None
+    if not bool(ind["last2_clean"][idx]) or int(ind["bars_since_cross"][idx]) < 4:
+        return None
+
+    cur, prev = recs[idx], recs[idx - 1]
+    co, ch, cl, cc = float(cur.get("open", cur["close"])), float(cur["high"]), float(cur["low"]), float(cur["close"])
+    po, ph, pl, pc = float(prev.get("open", prev["close"])), float(prev["high"]), float(prev["low"]), float(prev["close"])
+    rng = ch - cl
+    if cc <= 0 or rng <= 1e-12:
+        return None
+    body = abs(cc - co)
+    br = body / rng
+    uw = ch - max(co, cc)
+    lw = min(co, cc) - cl
+
+    e9, e21 = float(ind["ema9"][idx]), float(ind["ema21"][idx])
+    e9_3, e21_3 = float(ind["ema9"][idx - 3]), float(ind["ema21"][idx - 3])
+    pe9, pe21 = float(ind["ema9"][idx - 1]), float(ind["ema21"][idx - 1])
+    atr = float(ind["atr14"][idx])
+    htf_b = int(ind["htf_bias"][idx])
+
+    max_sl = {"15m": 0.025, "1h": 0.045, "4h": 0.075}.get(tf_name, 0.045)
+    min_sl = {"15m": 0.0025, "1h": 0.0040, "4h": 0.0070}.get(tf_name, 0.0040)
+
+    strong_g = (cc > co) and (br >= 0.45 or (lw >= 1.8 * body and uw <= 0.25 * rng and br >= 0.20))
+    strong_r = (cc < co) and (br >= 0.45 or (uw >= 1.8 * body and lw <= 0.25 * rng and br >= 0.20))
+    htf_ok_l = True if tf_name == "4h" else (htf_b == 1)
+    htf_ok_s = True if tf_name == "4h" else (htf_b == -1)
+
+    if htf_ok_l and e9 > e21 and e9 > e9_3 and e21 > e21_3:
+        if (pc < po) and (min(pl, cl) <= pe9 * 1.0015) and (pc >= pe21 * 0.996):
+            if strong_g and cc > e9 and cc > ph:
+                pb_low = min(float(recs[k]["low"]) for k in range(idx - 3, idx + 1))
+                sl_px = pb_low - 0.15 * atr
+                sl_dist = (cc - sl_px) / cc
+                if min_sl <= sl_dist <= max_sl:
+                    risk = cc - sl_px
+                    return {
+                        "direction": "LONG", "entry": cc, "entry2_sweep": 0.0,
+                        "stop": sl_px, "tp1": cc + 2.0 * risk, "tp2": cc + 2.0 * risk,
+                        "tp1_label": "Fixed 1:2.0R Maker TP", "tp2_label": "Pure 9/21 Pullback Target",
+                        "reason": f"Trading Data LONG ({tf_name} Last-2-Cross Clean + 9/21 Pullback Confirm, SL {sl_dist*100:.2f}%)",
+                        "trigger_zone": f"{tf_name} 9/21 EMA PULLBACK",
+                        "strategy_tag": "Trading Data (9/21 Pullback)",
+                    }
+    elif htf_ok_s and e9 < e21 and e9 < e9_3 and e21 < e21_3:
+        if (pc > po) and (max(ph, ch) >= pe9 * 0.9985) and (pc <= pe21 * 1.004):
+            if strong_r and cc < e9 and cc < pl:
+                pb_high = max(float(recs[k]["high"]) for k in range(idx - 3, idx + 1))
+                sl_px = pb_high + 0.15 * atr
+                sl_dist = (sl_px - cc) / cc
+                if min_sl <= sl_dist <= max_sl:
+                    risk = sl_px - cc
+                    return {
+                        "direction": "SHORT", "entry": cc, "entry2_sweep": 0.0,
+                        "stop": sl_px, "tp1": cc - 2.0 * risk, "tp2": cc - 2.0 * risk,
+                        "tp1_label": "Fixed 1:2.0R Maker TP", "tp2_label": "Pure 9/21 Pullback Target",
+                        "reason": f"Trading Data SHORT ({tf_name} Last-2-Cross Clean + 9/21 Pullback Confirm, SL {sl_dist*100:.2f}%)",
+                        "trigger_zone": f"{tf_name} 9/21 EMA PULLBACK",
+                        "strategy_tag": "Trading Data (9/21 Pullback)",
+                    }
+    return None
+
+
+class TradingDataEma921Strategy(Strategy):
+    id = "td_ema9_21_pullback"
+    name = "Trading Data: 9/21 Pullback (Last-2-Cross)"
+    short = "TD 9/21 Pullback"
+    timeframe = "1H Execution (15m / 1H / 4H) — Pure 9/21 EMA Standalone"
+    description = "Pure 9 & 21 EMA Pullback strategy from Trading Data (S15vYdGEm7o) — ZERO Box Sweep, ZERO 50/200 EMA: Step 1 'Last 2 Crossovers' chop filter + HTF 9/21 alignment; Step 2 skip initial cross (>=4 bars) and wait for pullback into 9/21 EMA zone; Step 3 strong confirmation candle close back across 9 EMA & prior pullback H/L; pullback swing SL + 0.15xATR buffer; pure R:R / 21 EMA exit."
+    daily_warmup_days = 15
+    tp1_name = "Pure 9/21 Target / BE Arm"
+    tp2_name = "Pure 9/21 Runner / Target"
+    uses_live_price = True
+    default_interval = "1h"
+    default_exit_mode = "yt_fixed_2.0"
+
+    def compute_levels(self, pair):
+        tf = self.default_interval
+        tf_ms = {"15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}.get(tf, 3_600_000)
+        htf_tf = {"15m": "1h", "1h": "4h", "4h": "1d"}.get(tf, "4h")
+        df = eng.fetch_coindcx_candles(pair=pair, interval=tf, limit=260, sync_live_price=False)
+        if df.empty or len(df) < 40:
+            return None
+        now_ms = int(time.time() * 1000)
+        closed = df[df["timestamp"] + tf_ms <= now_ms].reset_index(drop=True)
+        if len(closed) < 40:
+            closed = df.iloc[:-1].reset_index(drop=True)
+        df_htf = eng.fetch_coindcx_candles(pair=pair, interval=htf_tf, limit=120, sync_live_price=False)
+        ind = _yt_build_indicators(closed, tf_name=tf, df_htf=df_htf)
+        i = len(closed) - 1
+        px = float(closed["close"].iloc[i])
+        e9, e21 = float(ind["ema9"][i]), float(ind["ema21"][i])
+        bias = "BULLISH" if e9 > e21 else ("BEARISH" if e9 < e21 else "RANGE")
+        return {
+            "EMA9": eng.round_asset_price(e9, px),
+            "EMA21": eng.round_asset_price(e21, px),
+            "ATR14": eng.round_asset_price(ind["atr14"][i], px),
+            "trend_bias": bias, "bias": bias,
+            "MID": eng.round_asset_price(e21, px),
+            "RH": eng.round_asset_price(float(ind["res20"][i] or px * 1.02), px),
+            "RL": eng.round_asset_price(float(ind["sup20"][i] or px * 0.98), px),
+            "SH": eng.round_asset_price(float(ind["res50"][i] or px * 1.04), px),
+            "SL": eng.round_asset_price(float(ind["sup50"][i] or px * 0.96), px),
+            "_df_exec": closed, "_ind": ind, "_tf": tf,
+        }
+
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+        levels = levels or self.compute_levels(pair)
+        if not levels:
+            return None
+        df_ex, ind, tf = levels.get("_df_exec"), levels.get("_ind"), levels.get("_tf", self.default_interval)
+        if df_ex is None or df_ex.empty or ind is None:
+            fresh = self.compute_levels(pair)
+            if not fresh:
+                return None
+            levels = fresh
+            df_ex, ind, tf = fresh["_df_exec"], fresh["_ind"], fresh["_tf"]
+        recs = df_ex.to_dict("records")
+        idx = len(recs) - 1
+        cur = recs[idx]
+        px = float(cur["close"])
+        session = eng.get_current_session_info(datetime.now(IST))
+        ct = datetime.fromtimestamp(cur["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
+        clean_lvl = {k: v for k, v in levels.items() if not str(k).startswith("_")}
+        out = {
+            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+            "candle_evaluated": f"{tf} ({ct}) [{session['emoji']} {session['name']}]",
+            "session": session, "session_name": f"{session['emoji']} {session['name']}",
+            "is_prime_session": session["is_prime"], "is_us_open_candle": session["session_id"] == "NEW_YORK",
+            "pair": pair, "levels": clean_lvl, "candle_ts": int(cur["timestamp"]),
+            "signal": "NEUTRAL", "signal_kind": None, "trigger_zone": None, "trigger_reason": "",
+            "setup": f"WAIT / NO TRADE (Pure 9/21 EMA {tf}: 9=${clean_lvl.get('EMA9')} | 21=${clean_lvl.get('EMA21')})",
+            "entry": px, "entry2_sweep": 0.0, "stop_loss": 0.0, "tp1": 0.0, "tp2": 0.0,
+        }
+        out.update(position_metrics(pair, px, 0.0, px, px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+        sig = _detect_yt_ema9_21_setup(recs, idx, ind, tf_name=tf)
+        if sig:
+            ep = eng.round_asset_price(sig["entry"], px)
+            sp = eng.round_asset_price(sig["stop"], px)
+            t1 = eng.round_asset_price(sig["tp1"], px)
+            t2 = eng.round_asset_price(sig["tp2"], px)
+            out.update({
+                "signal": sig["direction"], "signal_kind": "YT_EMA9_21",
+                "trigger_zone": sig["trigger_zone"], "trigger_reason": sig["reason"],
+                "setup": f"{sig['direction']} TD 9/21 Pullback",
+                "entry": ep, "entry2_sweep": 0.0, "stop_loss": sp, "tp1": t1, "tp2": t2,
+                "tp1_label": sig["tp1_label"], "tp2_label": sig["tp2_label"],
+            })
+            out.update(position_metrics(pair, ep, sp, t1, t2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+        return self._stamp(out)
+
+    def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
+        if not levels:
+            return {"BUY": None, "SELL": None, "note": ""}
+        px = float(live_price or levels.get("EMA9") or 0.0)
+        e9 = float(levels.get("EMA9") or px)
+        e21 = float(levels.get("EMA21") or px)
+        atr = float(levels.get("ATR14") or (px * 0.01))
+        if px <= 0:
+            return {"BUY": None, "SELL": None, "note": ""}
+        b_ent = eng.round_asset_price(e9, px)
+        b_sl = eng.round_asset_price(min(e21, b_ent) - 0.5 * atr, px)
+        b_rk = max(b_ent - b_sl, px * 0.005)
+        b_t1, b_t2 = eng.round_asset_price(b_ent + 1.5 * b_rk, px), eng.round_asset_price(b_ent + 2.0 * b_rk, px)
+        s_ent = eng.round_asset_price(e9, px)
+        s_sl = eng.round_asset_price(max(e21, s_ent) + 0.5 * atr, px)
+        s_rk = max(s_sl - s_ent, px * 0.005)
+        s_t1, s_t2 = eng.round_asset_price(s_ent - 1.5 * s_rk, px), eng.round_asset_price(s_ent - 2.0 * s_rk, px)
+        buy_s = {"direction": "BUY", "setup": "LONG TD 9/21 Pullback", "entry": b_ent, "entry2_sweep": 0.0, "stop_loss": b_sl, "tp1": b_t1, "tp2": b_t2, **position_metrics(pair, b_ent, b_sl, b_t1, b_t2, margin_inr, leverage, usd_inr, entry2_sweep=0.0)}
+        sell_s = {"direction": "SELL", "setup": "SHORT TD 9/21 Pullback", "entry": s_ent, "entry2_sweep": 0.0, "stop_loss": s_sl, "tp1": s_t1, "tp2": s_t2, **position_metrics(pair, s_ent, s_sl, s_t1, s_t2, margin_inr, leverage, usd_inr, entry2_sweep=0.0)}
+        return {"BUY": self._stamp(buy_s), "SELL": self._stamp(sell_s), "note": f"Pure 9/21 EMA: 9=${levels.get('EMA9')} | 21=${levels.get('EMA21')}"}
+
+    def chart_lines(self, levels, plan=None):
+        if not levels:
+            return []
+        out = []
+        if levels.get("EMA9"):
+            out.append({"label": "9 EMA (Fast)", "price": levels["EMA9"], "color": "#22c55e", "dash": "solid"})
+        if levels.get("EMA21"):
+            out.append({"label": "21 EMA (Slow)", "price": levels["EMA21"], "color": "#38bdf8", "dash": "solid"})
+        return out
+
+    def metric_badges(self, levels):
+        if not levels:
+            return []
+        return [{"label": lbl, "value": levels[k]} for k, lbl in (("EMA9", "9 EMA"), ("EMA21", "21 EMA")) if levels.get(k)]
+
+    def level_rows(self, levels, live_price):
+        if not levels:
+            return []
+        rows = []
+        for k, lbl in (("EMA9", "9 EMA (Fast)"), ("EMA21", "21 EMA (Slow)")):
+            v = float(levels.get(k, 0.0) or 0.0)
+            if v > 0:
+                rows.append({"Level": lbl, "Price": v, "Distance %": round(((v - live_price) / live_price) * 100.0, 2) if live_price > 0 else 0.0})
+        return rows
+
+    def prepare_backtest(self, df, df_daily):
+        tf = str(df.attrs.get("exec_interval") or self.default_interval) if hasattr(df, "attrs") else self.default_interval
+        df_htf = df.attrs.get("df_htf") if hasattr(df, "attrs") else None
+        ind = _yt_build_indicators(df, tf_name=tf, df_htf=df_htf)
+        return {"ind": ind, "tf": tf, "boxes": {}, "daily": {}}
+
+    def backtest_has_context(self, candle, ctx):
+        return bool(ctx and ctx.get("ind"))
+
+    def backtest_entry(self, idx, candle, ctx, records):
+        return _detect_yt_ema9_21_setup(records, idx, ctx["ind"], tf_name=ctx.get("tf", self.default_interval))
+
+
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
+    ("td_ema9_21_pullback", "📺 Trading Data: 9/21 Last-2-Cross Pullback (Standalone)"),
     ("box_plus_ema50_200_regime", "🤖 Auto (Market-Trend Adaptive)"),
     ("box_theory", "📦 Box Theory Sweep (Chop)"),
     ("ema50_200", "📈 15m 50/200 EMA Pullback (Trend)"),
@@ -2391,6 +2761,8 @@ def autotrade_mode_label(mode: str | None) -> str:
 def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
     """Ordered component strategies for live scanning under a given AutoTrade/Backtest mode."""
     m = resolve_autotrade_mode(mode)
+    if m == "td_ema9_21_pullback":
+        return ["td_ema9_21_pullback"]
     if m == "box_theory":
         return ["box_theory"]
     if m == "ema50_200":
@@ -2416,6 +2788,7 @@ STRATEGY_REGISTRY: dict[str, Strategy] = {
     AtrReversal.id: AtrReversal(),
     Ema9RetestStrategy.id: Ema9RetestStrategy(),
     Ema50200PullbackStrategy.id: Ema50200PullbackStrategy(allow_bear=True, allow_bull=True),
+    TradingDataEma921Strategy.id: TradingDataEma921Strategy(),
     "box_plus_ema50_200_regime": BoxPlusEma50200Strategy(
         sid="box_plus_ema50_200_regime",
         name="Combo: Regime-Adaptive [Box + Auto Trend EMA]",
@@ -2447,6 +2820,7 @@ def get_strategy(strategy_id: str | None) -> Strategy:
 def list_strategies() -> list[Strategy]:
     """User-facing active strategies (legacy ATR Reversal & 5m 9 EMA Retest stay in STRATEGY_REGISTRY only)."""
     return [
+        STRATEGY_REGISTRY[TradingDataEma921Strategy.id],
         STRATEGY_REGISTRY[BoxTheorySweep.id],
         STRATEGY_REGISTRY[Ema50200PullbackStrategy.id],
     ]
