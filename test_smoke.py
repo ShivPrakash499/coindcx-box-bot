@@ -2416,6 +2416,14 @@ def test_20_box_sweep_v2_upgrades():
     recs_reset[3]["high"] = 102.2
     assert strat._detect_box_sweep_reclaim_setup(recs_reset, 5, rh=104.0, rl=100.0, sh=105.5, sl=98.5, mid=102.0, bias="NEUTRAL", ema50_15m=101.8, atr14_15m=0.6, vol_sma20=100.0) is not None
 
+    # Regression guard: DataFrame with DataFrame values inside df.attrs (df_5m / df_full_15m) MUST NOT crash prepare_backtest()
+    df_15m_attrs = pd.DataFrame(recs_3rd)
+    df_15m_attrs.attrs["df_5m"] = pd.DataFrame(recs)
+    df_d_attrs = df_up.copy()
+    df_d_attrs["date_str"] = pd.to_datetime(df_d_attrs["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(eng.IST).dt.strftime("%Y-%m-%d")
+    ctx_attrs = strat.BoxTheorySweep().prepare_backtest(df_15m_attrs, df_d_attrs)
+    assert len(ctx_attrs["atr14_15m"]) == len(df_15m_attrs) and len(ctx_attrs["vol_sma20"]) == len(df_15m_attrs)
+
     print("  -> PASS: Box Sweep v2 (5-10d Regime Levels, Waterfall/Huge-Green 4H Anchors, Blackout, >=1.15x Vol, 2-Touch Limit, Wick SL <=2%, +/-0.20% Fee-BE) verified!")
 
 
