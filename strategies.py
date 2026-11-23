@@ -809,7 +809,8 @@ def _detect_box_sweep_reclaim_setup(
                     "plan": plan,
                 }
 
-        if bias == "BEARISH":
+        # 1B: Broken-RL retest disabled after 5-horizon ablation (90d: 97T, 34.0% WR, -Rs.24,418 vs Pure Sweep +Rs.32,097)
+        if False and bias == "BEARISH":
             closes_below_rl = sum(1 for r in prior16 if float(r["close"]) < rl * 0.998)
             retest_rl = (
                 (lower_box_broken or closes_below_rl >= 2)
@@ -857,7 +858,8 @@ def _detect_box_sweep_reclaim_setup(
                     "plan": plan,
                 }
 
-        if bias == "BULLISH":
+        # 2B: Broken-RH retest disabled after 5-horizon ablation (90d: 97T, 34.0% WR, -Rs.24,418 vs Pure Sweep +Rs.32,097)
+        if False and bias == "BULLISH":
             closes_above_rh = sum(1 for r in prior16 if float(r["close"]) > rh * 1.002)
             retest_rh = (
                 (upper_box_broken or closes_above_rh >= 2)
