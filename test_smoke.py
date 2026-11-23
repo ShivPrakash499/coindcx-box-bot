@@ -1633,6 +1633,116 @@ def test_15_three_layer_intraday_trend_stack():
     print("  -> PASS: 3-Layer Intraday Trend Stack (1H/4H+CHoCH, VWAP, ADX14), 2-Same-Dir Guard, 8h Live-Lock Fix, & AST Audit verified!")
 
 
+def test_16_box_sweep_v2_upgrades():
+    print("[16/16] Verifying Box Sweep v2 (5-10d Regime Levels, Session-Open Blackout, >=1.15x Vol, 2-Touch Limit, Wick+0.35ATR <=2% SL, 0.85% TP1, +/-0.20% Fee-BE)...")
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+    from datetime import datetime, timezone
+
+    # 1. Regime-Aware 5-10d Lookback: stale 20-day-old high MUST be ignored; fresh highs use RH + 0.35 * Daily ATR
+    base_ts = int(datetime(2026, 10, 1, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    rows = []
+    for i in range(25):
+        # Day 2 (23 days ago) had a stale spike to 102.0; last 10 days are strictly <= 100.0
+        hi = 102.0 if i == 2 else (100.0 if i == 24 else 98.5)
+        lo = 95.0 if i == 24 else 95.5
+        rows.append({"timestamp": base_ts + i * 86400000, "open": 97.0, "high": hi, "low": lo, "close": 99.5, "volume": 1000.0})
+    df_up = pd.DataFrame(rows)
+    lv_up = eng.compute_box_swing_levels(df_up, bias="BULLISH", daily_atr=4.0, h4_swings=None)
+    assert abs(lv_up["RH"] - 100.0) < 1e-6
+    # Fresh highs -> SH = RH + 0.35 * 4.0 = 101.40 (NOT stale 102.0 from 23 days ago!)
+    assert abs(lv_up["SH"] - 101.40) < 1e-6, f"Expected fresh-high SH=101.40 (RH + 0.35*ATR), got {lv_up['SH']}"
+
+    # 2. Waterfall Day Nuance (Downtrend): >5% red drop uses causal 4H LH as active RH while preserving macro_RH = PDH
+    df_down = df_up.copy()
+    df_down.loc[24, "high"] = 108.0
+    df_down.loc[24, "low"] = 99.0
+    df_down.loc[24, "close"] = 100.0  # PDH is 8% above close (>5%)
+    lv_wf = eng.compute_box_swing_levels(
+        df_down, bias="BEARISH", daily_atr=4.0,
+        h4_swings={"highs": [103.5, 105.0], "lows": [98.0], "latest_lh": 103.5, "latest_hl": None},
+    )
+    assert abs(lv_wf["RH"] - 103.5) < 1e-6 and abs(lv_wf["macro_RH"] - 108.0) < 1e-6, f"Waterfall 4H LH failed: {lv_wf}"
+    assert abs(lv_wf["SH"] - 105.0) < 1e-6, f"Expected 4H SH=105.0 within 1%-2% above 103.5, got {lv_wf['SH']}"
+
+    # 3. Huge Green Bar Nuance (Uptrend): >5% green rally uses causal 4H HL as active RL
+    df_green = df_up.copy()
+    df_green.loc[24, "high"] = 110.0
+    df_green.loc[24, "low"] = 98.0
+    df_green.loc[24, "close"] = 108.0  # PDL is 9.2% below close (>5%)
+    lv_hg = eng.compute_box_swing_levels(
+        df_green, bias="BULLISH", daily_atr=4.0,
+        h4_swings={"highs": [], "lows": [103.0, 105.0], "latest_hl": 105.0, "latest_lh": None},
+    )
+    assert abs(lv_hg["RL"] - 105.0) < 1e-6 and abs(lv_hg["SL"] - 103.0) < 1e-6, f"Huge-green 4H HL failed: {lv_hg}"
+
+    # 4. Session-Open Blackout Windows (Tokyo 07:00-08:30, London 13:00-14:30, NY 18:45-20:15 IST)
+    from datetime import timedelta as _td
+    _ist_fixed = timezone(_td(hours=5, minutes=30))
+    def _ist_ms(h, m):
+        return int(datetime(2026, 11, 23, h, m, tzinfo=_ist_fixed).timestamp() * 1000)
+
+    assert strat._is_box_session_open_blackout(_ist_ms(7, 15)) is True
+    assert strat._is_box_session_open_blackout(_ist_ms(8, 30)) is False
+    assert strat._is_box_session_open_blackout(_ist_ms(13, 45)) is True
+    assert strat._is_box_session_open_blackout(_ist_ms(14, 30)) is False
+    assert strat._is_box_session_open_blackout(_ist_ms(19, 0)) is True
+    assert strat._is_box_session_open_blackout(_ist_ms(20, 15)) is False
+    assert strat._is_box_session_open_blackout(_ist_ms(11, 0)) is False
+
+    # 5. 3-Step Sweep-Reclaim: Volume >= 1.15x, Tight Wick + 0.35*ATR <= 2.0% SL, TP1 >= 0.85%, Blackout, & 2-Touch Limit
+    ok_ts = _ist_ms(11, 0)
+    ny_ts = _ist_ms(19, 0)
+    # Clean bullish sweep below RL=100.0 with >=30% lower wick, vol=130 (>=1.15*100), MID=102.0, RH=104.0
+    recs = [
+        {"timestamp": ok_ts - 900000, "date_str": "2026-11-23", "open": 100.6, "high": 100.8, "low": 100.2, "close": 100.3, "volume": 100.0, "EMA9": 100.5, "EMA50": 101.8},
+        {"timestamp": ok_ts, "date_str": "2026-11-23", "open": 100.3, "high": 100.9, "low": 99.6, "close": 100.6, "volume": 130.0, "EMA9": 100.5, "EMA50": 101.8},
+    ]
+    hit_ok = strat._detect_box_sweep_reclaim_setup(recs, 1, rh=104.0, rl=100.0, sh=105.5, sl=98.5, mid=102.0, bias="NEUTRAL", ema50_15m=101.8, atr14_15m=0.6, vol_sma20=100.0)
+    assert hit_ok is not None and hit_ok["direction"] == "LONG", f"Expected clean LONG sweep-reclaim, got {hit_ok}"
+    # Wick=99.6, SL = 99.6 - 0.35*0.6 = 99.39 -> distance = (100.6 - 99.39)/100.6 = 1.20% (<=2.0%, NOT blindly past SL=98.5!)
+    assert abs(hit_ok["plan"]["stop"] - 99.39) < 1e-4, f"Expected Wick-0.35*ATR SL=99.39, got {hit_ok['plan']['stop']}"
+    assert abs(hit_ok["plan"]["tp1"] - 101.8) < 1e-4, f"Expected nearer TP1=15m 50 EMA (101.8), got {hit_ok['plan']['tp1']}"
+    assert abs(hit_ok["plan"]["tp2"] - 104.0) < 1e-4, f"Expected TP2=RH (104.0), got {hit_ok['plan']['tp2']}"
+
+    # Low volume (<1.15x) MUST be rejected
+    recs_lowvol = [recs[0], {**recs[1], "volume": 105.0}]
+    assert strat._detect_box_sweep_reclaim_setup(recs_lowvol, 1, rh=104.0, rl=100.0, sh=105.5, sl=98.5, mid=102.0, bias="NEUTRAL", ema50_15m=101.8, atr14_15m=0.6, vol_sma20=100.0) is None
+
+    # NY Open blackout window MUST be rejected
+    recs_ny = [recs[0], {**recs[1], "timestamp": ny_ts}]
+    assert strat._detect_box_sweep_reclaim_setup(recs_ny, 1, rh=104.0, rl=100.0, sh=105.5, sl=98.5, mid=102.0, bias="NEUTRAL", ema50_15m=101.8, atr14_15m=0.6, vol_sma20=100.0) is None
+
+    # Oversized sweep wick (>2.0% from entry) MUST be rejected
+    recs_hugewick = [recs[0], {**recs[1], "low": 98.2}]  # (100.6 - 98.2)/100.6 = 2.38% > 2.0%
+    assert strat._detect_box_sweep_reclaim_setup(recs_hugewick, 1, rh=104.0, rl=100.0, sh=105.5, sl=98.0, mid=102.0, bias="NEUTRAL", ema50_15m=101.8, atr14_15m=0.6, vol_sma20=100.0) is None
+
+    # 2-Touch Limit: 2 prior unbounced touches of RL (without touching MID=102.0) MUST block 3rd test; touching MID resets count!
+    recs_3rd = [
+        {"timestamp": ok_ts - 6 * 900000, "date_str": "2026-11-23", "open": 100.5, "high": 101.0, "low": 100.05, "close": 100.8, "volume": 100.0, "EMA9": 100.5, "EMA50": 101.8},  # touch 1
+        {"timestamp": ok_ts - 5 * 900000, "date_str": "2026-11-23", "open": 100.8, "high": 101.4, "low": 100.6, "close": 101.0, "volume": 100.0, "EMA9": 100.6, "EMA50": 101.8},   # bounced < MID
+        {"timestamp": ok_ts - 4 * 900000, "date_str": "2026-11-23", "open": 101.0, "high": 101.1, "low": 100.08, "close": 100.7, "volume": 100.0, "EMA9": 100.5, "EMA50": 101.8},  # touch 2
+        {"timestamp": ok_ts - 3 * 900000, "date_str": "2026-11-23", "open": 100.7, "high": 101.2, "low": 100.5, "close": 100.9, "volume": 100.0, "EMA9": 100.5, "EMA50": 101.8},   # bounced < MID
+        recs[0],
+        recs[1],  # 3rd unbounced test -> MUST SKIP
+    ]
+    assert strat._count_unbounced_edge_touches(recs_3rd, 5, edge_px=100.0, mid_px=102.0, direction="LONG") == 2
+    assert strat._detect_box_sweep_reclaim_setup(recs_3rd, 5, rh=104.0, rl=100.0, sh=105.5, sl=98.5, mid=102.0, bias="NEUTRAL", ema50_15m=101.8, atr14_15m=0.6, vol_sma20=100.0) is None
+    # Bounce to MID (102.2) resets touch count -> allowed!
+    recs_reset = [dict(r) for r in recs_3rd]
+    recs_reset[3]["high"] = 102.2
+    assert strat._count_unbounced_edge_touches(recs_reset, 5, edge_px=100.0, mid_px=102.0, direction="LONG") == 0
+    assert strat._detect_box_sweep_reclaim_setup(recs_reset, 5, rh=104.0, rl=100.0, sh=105.5, sl=98.5, mid=102.0, bias="NEUTRAL", ema50_15m=101.8, atr14_15m=0.6, vol_sma20=100.0) is not None
+
+    # 6. Post-TP1 Fee-Covered Breakeven (+/-0.20%) for Box trades
+    be_l = eng.compute_tp1_profit_lock_sl("B-ETH_USDT", "LONG", entry_px=2000.0, tp1_px=2050.0, use_fee_be=True)
+    be_s = eng.compute_tp1_profit_lock_sl("B-ETH_USDT", "SHORT", entry_px=2000.0, tp1_px=1950.0, use_fee_be=True)
+    assert abs(be_l - 2004.0) < 0.05 and abs(be_s - 1996.0) < 0.05, f"Expected +/-0.20% Fee-BE (2004/1996), got {be_l}/{be_s}"
+
+    print("  -> PASS: Box Sweep v2 (5-10d Regime Levels, Waterfall/Huge-Green 4H Anchors, Blackout, >=1.15x Vol, 2-Touch Limit, Wick SL <=2%, +/-0.20% Fee-BE) verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1649,6 +1759,7 @@ if __name__ == "__main__":
     test_13_regime_adaptive_routing_and_structure_tp1()
     test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
     test_15_three_layer_intraday_trend_stack()
+    test_16_box_sweep_v2_upgrades()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

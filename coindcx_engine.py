@@ -2133,59 +2133,306 @@ def fetch_historical_candles_paginated(
     _HISTORICAL_CANDLES_CACHE[cache_key] = {"df": df, "timestamp": now_ts}
     return df
 
-def compute_box_swing_levels(df_completed: pd.DataFrame) -> dict:
-    """
-    Single source of truth for Box RH / RL / SH / SL used by BOTH live trading (calculate_daily_box_levels)
-    and backtesting (BoxTheorySweep.prepare_backtest), so both always produce identical levels.
+def _is_intraday_15m_frame(df_15m: pd.DataFrame | None) -> bool:
+    """Returns True only when `df_15m` is genuinely intraday (median bar spacing <= 30 min, >= 32 bars)."""
+    if df_15m is None or len(df_15m) < 32:
+        return False
+    if not {"timestamp", "high", "low", "close"}.issubset(df_15m.columns):
+        return False
+    try:
+        diffs = df_15m["timestamp"].astype("int64").diff().dropna()
+        if diffs.empty:
+            return False
+        med_dt = float(diffs.median())
+        return 0 < med_dt <= 1_800_000.0
+    except Exception:
+        return False
 
-    `df_completed` = completed daily candles in ascending order whose LAST row is the previous day (RH/RL day).
-    Only the last 30 completed candles are used.
-      - SH = nearest prior high at least 0.8% above RH, if within 3.5% of RH; otherwise RH + 1.5%.
-      - SL = nearest prior low at least 0.8% below RL, if within 3.5% of RL; otherwise RL - 1.5%.
+
+def _build_4h_bars_and_pivots_from_15m(df_15m: pd.DataFrame) -> list[dict]:
     """
-    dfc = df_completed.tail(30)
+    Aggregates 15m candles into UTC 4-hour candles (`ts_4h = (ts // 14400000) * 14400000`)
+    and finds strictly causal `k=2` pivot highs/lows (`confirm_ts = ts_4h[j+2] + 14400000`).
+    Returns a list of pivot dicts sorted by `confirm_ts`.
+    """
+    if not _is_intraday_15m_frame(df_15m):
+        return []
+    ts_arr = df_15m["timestamp"].astype("int64").to_numpy()
+    hi_arr = df_15m["high"].astype("float64").to_numpy()
+    lo_arr = df_15m["low"].astype("float64").to_numpy()
+
+    b4_ts: list[int] = []
+    b4_hi: list[float] = []
+    b4_lo: list[float] = []
+    cur_bucket = -1
+    cur_h = -1.0
+    cur_l = 1e18
+    for i in range(len(ts_arr)):
+        b = int(ts_arr[i] // 14_400_000) * 14_400_000
+        h = float(hi_arr[i])
+        l = float(lo_arr[i])
+        if b != cur_bucket:
+            if cur_bucket >= 0:
+                b4_ts.append(cur_bucket)
+                b4_hi.append(cur_h)
+                b4_lo.append(cur_l)
+            cur_bucket = b
+            cur_h = h
+            cur_l = l
+        else:
+            if h > cur_h:
+                cur_h = h
+            if l < cur_l:
+                cur_l = l
+    if cur_bucket >= 0:
+        b4_ts.append(cur_bucket)
+        b4_hi.append(cur_h)
+        b4_lo.append(cur_l)
+
+    n4 = len(b4_ts)
+    if n4 < 5:
+        return []
+
+    pivots: list[dict] = []
+    k = 2
+    for j in range(k, n4 - k):
+        win_h = max(b4_hi[j - k : j + k + 1])
+        win_l = min(b4_lo[j - k : j + k + 1])
+        confirm_ts = b4_ts[j + k] + 14_400_000
+        if b4_hi[j] >= win_h:
+            pivots.append({"kind": "H", "price": b4_hi[j], "bar_ts": b4_ts[j], "confirm_ts": confirm_ts})
+        if b4_lo[j] <= win_l:
+            pivots.append({"kind": "L", "price": b4_lo[j], "bar_ts": b4_ts[j], "confirm_ts": confirm_ts})
+    pivots.sort(key=lambda x: x["confirm_ts"])
+    return pivots
+
+
+def _summarize_4h_pivots_at_cutoff(pivots: list[dict], cutoff_ts_ms: int, lookback_days: int = 10) -> dict | None:
+    if not pivots or cutoff_ts_ms <= 0:
+        return None
+    min_bar_ts = cutoff_ts_ms - int(lookback_days) * 86_400_000
+    recent_bar_ts = cutoff_ts_ms - 4 * 86_400_000
+    highs: list[float] = []
+    lows: list[float] = []
+    recent_highs: list[float] = []
+    recent_lows: list[float] = []
+    for p in pivots:
+        if p["confirm_ts"] > cutoff_ts_ms:
+            break
+        if p["bar_ts"] < min_bar_ts:
+            continue
+        px = float(p["price"])
+        if p["kind"] == "H":
+            highs.append(px)
+            if p["bar_ts"] >= recent_bar_ts:
+                recent_highs.append(px)
+        else:
+            lows.append(px)
+            if p["bar_ts"] >= recent_bar_ts:
+                recent_lows.append(px)
+    if not highs and not lows:
+        return None
+
+    latest_hl = None
+    if len(recent_lows) >= 2 and recent_lows[-1] > recent_lows[-2]:
+        latest_hl = recent_lows[-1]
+    elif recent_lows:
+        latest_hl = recent_lows[-1]
+
+    latest_lh = None
+    if len(recent_highs) >= 2 and recent_highs[-1] < recent_highs[-2]:
+        latest_lh = recent_highs[-1]
+    elif recent_highs:
+        latest_lh = recent_highs[-1]
+
+    return {
+        "highs": highs,
+        "lows": lows,
+        "latest_hl": latest_hl,
+        "latest_lh": latest_lh,
+    }
+
+
+def extract_causal_4h_swings_for_cutoff(df_15m: pd.DataFrame | None, cutoff_ts_ms: int, lookback_days: int = 10) -> dict | None:
+    """Extracts strictly causal 4H swing highs/lows confirmed at or before `cutoff_ts_ms` over the last `lookback_days`."""
+    pivots = _build_4h_bars_and_pivots_from_15m(df_15m)
+    return _summarize_4h_pivots_at_cutoff(pivots, cutoff_ts_ms, lookback_days=lookback_days)
+
+
+def extract_causal_4h_swings_by_day(df_15m: pd.DataFrame | None, day_cutoffs: dict[str, int], lookback_days: int = 10) -> dict[str, dict | None]:
+    """Batch-extracts strictly causal 4H swing pools for every `{date_str: cutoff_ts_ms}` in one O(N) pass."""
+    pivots = _build_4h_bars_and_pivots_from_15m(df_15m)
+    if not pivots:
+        return {}
+    out: dict[str, dict | None] = {}
+    for d_str, cutoff_ts in day_cutoffs.items():
+        out[d_str] = _summarize_4h_pivots_at_cutoff(pivots, int(cutoff_ts), lookback_days=lookback_days)
+    return out
+
+
+def compute_box_swing_levels(
+    df_completed: pd.DataFrame,
+    bias: str = "NEUTRAL",
+    daily_atr: float | None = None,
+    h4_swings: dict | None = None,
+) -> dict:
+    """
+    Single source of truth for Regime-Aware Box RH / RL / SH / SL (Box Sweep v2) used by BOTH live trading
+    (`calculate_daily_box_levels`) and backtesting (`BoxTheorySweep.prepare_backtest`) for exact parity.
+
+    `df_completed` = completed daily candles in ascending order whose LAST row is yesterday (PDH/PDL day).
+    Uses strictly a **5–10 day lookback** (never stale 30-day levels) plus optional causal 4H swings:
+      - BULLISH (Uptrend): RH = PDH; SH = nearest 4H/Daily swing high above RH in 5–10d (or RH + 0.35 * Daily ATR at fresh highs);
+        RL = PDL (or latest causal 4H Higher Low if yesterday was a >5% huge green trend bar);
+        SL = nearest 4H/5–10d low below RL within 1%–2% (fallback RL - min(0.35 * ATR, 1.8%)).
+      - BEARISH (Downtrend): RL = PDL; SL = nearest 4H/Daily swing low below RL in 5–10d (or RL - 0.35 * Daily ATR at fresh lows);
+        RH = PDH (keeps macro_RH = PDH; uses latest causal 4H Lower High if yesterday was a >5% waterfall dump day);
+        SH = nearest 4H/5–10d high above RH within 1%–2% (fallback RH + min(0.35 * ATR, 1.8%)).
+      - NEUTRAL (Ranging/Sideways): Inside day -> RH = PDH, RL = PDL; else compact 5-day ceiling/floor;
+        SH = highest external liquidity wick above RH from last 5–10 days (capped <= +3.5%);
+        SL = lowest external liquidity wick below RL from last 5–10 days (floored >= -3.5%).
+    """
+    b_mode = str(bias or "NEUTRAL").upper()
+    dfc_atr = df_completed.tail(20)
+    dfc = df_completed.tail(10)
     prev_day = dfc.iloc[-1]
-    rh = float(prev_day["high"])
-    rl = float(prev_day["low"])
+    pdh = float(prev_day["high"])
+    pdl = float(prev_day["low"])
+    prev_close = float(prev_day["close"])
     df_hist = dfc.iloc[:-1]
 
     up_days = dfc[dfc["close"] >= dfc["open"]]
     down_days = dfc[dfc["close"] < dfc["open"]]
-    avg_daily_rise = float((up_days["close"] - up_days["open"]).mean()) if len(up_days) > 0 else (rh - rl) * 0.25
-    avg_daily_drop = float((down_days["open"] - down_days["close"]).mean()) if len(down_days) > 0 else (rh - rl) * 0.25
+    avg_daily_rise = float((up_days["close"] - up_days["open"]).mean()) if len(up_days) > 0 else (pdh - pdl) * 0.25
+    avg_daily_drop = float((down_days["open"] - down_days["close"]).mean()) if len(down_days) > 0 else (pdh - pdl) * 0.25
     if not avg_daily_rise or avg_daily_rise <= 0 or avg_daily_rise != avg_daily_rise:
-        avg_daily_rise = (rh - rl) * 0.25
+        avg_daily_rise = (pdh - pdl) * 0.25
     if not avg_daily_drop or avg_daily_drop <= 0 or avg_daily_drop != avg_daily_drop:
-        avg_daily_drop = (rh - rl) * 0.25
+        avg_daily_drop = (pdh - pdl) * 0.25
 
-    # Formula B (selected for both live & backtest):
-    #   SH = nearest prior high >= RH * 1.008, if it is <= RH * 1.035; otherwise RH * 1.015
-    #   SL = nearest prior low  <= RL * 0.992, if it is >= RL * 0.965; otherwise RL * 0.985
-    # (avg_daily_rise / avg_daily_drop above are kept for UI display only)
-    sh_candidates = [float(h) for h in df_hist["high"].tolist() if float(h) >= rh * 1.008]
-    if sh_candidates and min(sh_candidates) <= rh * 1.035:
-        sh = min(sh_candidates)
-    else:
-        sh = rh * 1.015
+    atr_d = 0.0
+    if daily_atr is not None:
+        try:
+            _v = float(daily_atr)
+            if _v > 0 and _v == _v:
+                atr_d = _v
+        except Exception:
+            atr_d = 0.0
+    if atr_d <= 0:
+        try:
+            if len(dfc_atr) >= 2:
+                _pc = dfc_atr["close"].shift(1)
+                _tr = pd.concat(
+                    [dfc_atr["high"] - dfc_atr["low"], (dfc_atr["high"] - _pc).abs(), (dfc_atr["low"] - _pc).abs()],
+                    axis=1,
+                ).max(axis=1)
+                atr_d = float(_tr.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=1).mean().iloc[-1])
+            else:
+                atr_d = max(pdh - pdl, prev_close * 0.03)
+        except Exception:
+            atr_d = max(pdh - pdl, prev_close * 0.03)
+    if atr_d <= 0 or atr_d != atr_d:
+        atr_d = max(pdh - pdl, prev_close * 0.03)
 
-    sl_candidates = [float(l) for l in df_hist["low"].tolist() if float(l) <= rl * 0.992]
-    if sl_candidates and max(sl_candidates) >= rl * 0.965:
-        sl = max(sl_candidates)
+    h4_highs = [float(x) for x in ((h4_swings or {}).get("highs") or []) if float(x) > 0]
+    h4_lows = [float(x) for x in ((h4_swings or {}).get("lows") or []) if float(x) > 0]
+    h4_latest_hl = (h4_swings or {}).get("latest_hl")
+    h4_latest_lh = (h4_swings or {}).get("latest_lh")
+
+    hist_highs = [float(h) for h in df_hist["high"].tolist()] + h4_highs
+    hist_lows = [float(l) for l in df_hist["low"].tolist()] + h4_lows
+
+    rh = pdh
+    rl = pdl
+
+    if b_mode == "BULLISH":
+        # Huge Green Bar Nuance: if PDL is > 5% below prev_close, anchor intraday RL to latest causal 4H Higher Low
+        if prev_close > 0 and (prev_close - pdl) / prev_close > 0.05 and h4_latest_hl is not None:
+            _hl_px = float(h4_latest_hl)
+            if pdl < _hl_px < prev_close * 0.992 and _hl_px < rh * 0.990:
+                rl = _hl_px
+
+        # SH = nearest prior 4H/Daily swing high above RH (5–10d), or RH + 0.35 * Daily ATR at fresh highs
+        sh_cands = [h for h in hist_highs if rh * 1.005 <= h <= rh * 1.035]
+        if sh_cands:
+            sh = min(sh_cands)
+        else:
+            sh = rh + min(0.35 * atr_d, rh * 0.025)
+
+        # SL = nearest 4H Higher Low / 5–10d low below RL within 1%–2% (fallback 0.5%–2.5%, else 0.35 * ATR capped 1.8%)
+        sl_tight = [l for l in hist_lows if rl * 0.980 <= l <= rl * 0.990]
+        if sl_tight:
+            sl = max(sl_tight)
+        else:
+            sl_near = [l for l in hist_lows if rl * 0.975 <= l <= rl * 0.995]
+            sl = max(sl_near) if sl_near else (rl - min(0.35 * atr_d, rl * 0.018))
+
+    elif b_mode == "BEARISH":
+        # Waterfall Day Nuance: if PDH is > 5% above prev_close, keep PDH as macro_RH and anchor active RH to latest causal 4H LH
+        if prev_close > 0 and (pdh - prev_close) / prev_close > 0.05 and h4_latest_lh is not None:
+            _lh_px = float(h4_latest_lh)
+            if prev_close * 1.008 < _lh_px < pdh and _lh_px > rl * 1.010:
+                rh = _lh_px
+
+        # SH = nearest 4H Lower High / 5–10d high above RH within 1%–2% (fallback 0.5%–2.5%, else 0.35 * ATR capped 1.8%)
+        sh_tight = [h for h in hist_highs if rh * 1.010 <= h <= rh * 1.020]
+        if sh_tight:
+            sh = min(sh_tight)
+        else:
+            sh_near = [h for h in hist_highs if rh * 1.005 <= h <= rh * 1.025]
+            sh = min(sh_near) if sh_near else (rh + min(0.35 * atr_d, rh * 0.018))
+
+        # SL = nearest prior 4H/Daily swing low below RL (5–10d), or RL - 0.35 * Daily ATR at fresh lows
+        sl_cands = [l for l in hist_lows if rl * 0.965 <= l <= rl * 0.995]
+        if sl_cands:
+            sl = max(sl_cands)
+        else:
+            sl = rl - min(0.35 * atr_d, rl * 0.025)
+
     else:
-        sl = rl * 0.985
+        # Ranging / Sideways: Inside day uses PDH/PDL; otherwise compact 5-day ceiling/floor
+        is_inside_day = (
+            len(dfc) >= 2
+            and pdh <= float(dfc.iloc[-2]["high"])
+            and pdl >= float(dfc.iloc[-2]["low"])
+        )
+        if not is_inside_day and len(dfc) >= 5:
+            r5 = dfc.tail(5)
+            r5_hi = float(r5["high"].max())
+            r5_lo = float(r5["low"].min())
+            if r5_hi <= pdh * 1.030:
+                rh = r5_hi
+            if r5_lo >= pdl * 0.970:
+                rl = r5_lo
+
+        # SH / SL = highest / lowest external liquidity wicks from last 5–10 days (capped within 3.5%)
+        sh_cands = [h for h in hist_highs if rh * 1.004 <= h <= rh * 1.035]
+        sh = max(sh_cands) if sh_cands else (rh + min(0.35 * atr_d, rh * 0.020))
+
+        sl_cands = [l for l in hist_lows if rl * 0.965 <= l <= rl * 0.996]
+        sl = min(sl_cands) if sl_cands else (rl - min(0.35 * atr_d, rl * 0.020))
+
+    # Safety structural ordering guarantees
+    if rl >= rh:
+        rh, rl = pdh, pdl
+    if sh <= rh * 1.002:
+        sh = rh + max(min(0.35 * atr_d, rh * 0.020), rh * 0.006)
+    if sl >= rl * 0.998 or sl <= 0:
+        sl = max(rl * 0.95, rl - max(min(0.35 * atr_d, rl * 0.020), rl * 0.006))
 
     return {
         "RH": rh, "RL": rl, "SH": sh, "SL": sl,
+        "macro_RH": pdh, "macro_RL": pdl,
+        "daily_atr": atr_d,
         "avg_daily_rise": avg_daily_rise, "avg_daily_drop": avg_daily_drop,
     }
 
 
 def calculate_daily_box_levels(pair="B-ETH_USDT"):
     """
-    Calculates Previous Day High (RH), Low (RL), Swing High (SH), Swing Low (SL),
-    Equilibrium Midpoint (MID), and Daily 50 EMA & 200 EMA Trend Bias.
-    Strictly caps SH/SL lookback to 30 completed daily candles, while using 1000 daily candles
-    so the 200-day EMA matches TradingView / CoinDCX exactly.
+    Calculates Regime-Aware Box levels (RH, RL, SH, SL, MID) using strictly a 5–10 day lookback
+    + causal 4H swings, along with Daily 50 EMA, 200 EMA, Wilder ATR(14), and Trend Bias.
+    Uses 1000 daily candles so the 200-day EMA matches TradingView / CoinDCX exactly.
     """
     df_daily = fetch_coindcx_candles(pair=pair, interval="1d", limit=1000, sync_live_price=False)
     if df_daily.empty or len(df_daily) < 2:
@@ -2195,18 +2442,21 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
     if df_all_completed.empty:
         return None
 
-    # Lock Daily 50 EMA, 200 EMA, and Trend Bias to the previous completed daily candle close
+    # Lock Daily 50 EMA, 200 EMA, Wilder ATR(14), and Trend Bias to the previous completed daily candle close
     # so Daily Bias stays fixed for the entire 24h day (matching prepare_backtest() and never flickering intrabar)
     ema50_val = float(df_all_completed['close'].ewm(span=50, adjust=False).mean().iloc[-1])
     ema200_val = float(df_all_completed['close'].ewm(span=200, adjust=False).mean().iloc[-1])
+    _pc_d = df_all_completed['close'].shift(1)
+    _tr_d = pd.concat(
+        [df_all_completed['high'] - df_all_completed['low'], (df_all_completed['high'] - _pc_d).abs(), (df_all_completed['low'] - _pc_d).abs()],
+        axis=1,
+    ).max(axis=1)
+    _atr_s = _tr_d.ewm(alpha=1.0 / 14.0, adjust=False, min_periods=14).mean()
+    _atr_last = float(_atr_s.iloc[-1]) if len(_atr_s) > 0 and pd.notna(_atr_s.iloc[-1]) else None
 
-    # Limit search strictly to maximum 30 completed daily candles (never go beyond 30 days)
-    df_completed = df_all_completed.tail(30)
+    df_completed = df_all_completed.tail(20)
     prev_day = df_completed.iloc[-1]
-    rh = float(prev_day['high'])
-    rl = float(prev_day['low'])
     daily_close = float(prev_day['close'])
-    mid = (rh + rl) / 2.0
 
     if daily_close < ema50_val and daily_close < ema200_val:
         trend_bias = "BEARISH"
@@ -2215,9 +2465,26 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
     else:
         trend_bias = "NEUTRAL"
 
-    # Shared SH/SL formula (identical in live and backtest — see compute_box_swing_levels)
-    swing = compute_box_swing_levels(df_completed)
+    # Extract causal 4H swings strictly prior to today's open (skipped automatically if mocked with daily candles)
+    h4_swings = None
+    try:
+        df_15m_sw = fetch_coindcx_candles(pair=pair, interval="15m", limit=1000, sync_live_price=False)
+        if _is_intraday_15m_frame(df_15m_sw):
+            cutoff_ts = int(prev_day['timestamp']) + 86_400_000
+            h4_swings = extract_causal_4h_swings_for_cutoff(df_15m_sw, cutoff_ts, lookback_days=10)
+    except Exception:
+        h4_swings = None
+
+    # Shared Regime-Aware 5–10d Box formula (identical in live and backtest — see compute_box_swing_levels)
+    swing = compute_box_swing_levels(
+        df_completed,
+        bias=trend_bias,
+        daily_atr=_atr_last,
+        h4_swings=h4_swings,
+    )
+    rh, rl = swing["RH"], swing["RL"]
     sh, sl = swing["SH"], swing["SL"]
+    mid = (rh + rl) / 2.0
     avg_daily_rise, avg_daily_drop = swing["avg_daily_rise"], swing["avg_daily_drop"]
 
     return {
@@ -2226,6 +2493,9 @@ def calculate_daily_box_levels(pair="B-ETH_USDT"):
         "SH": round_asset_price(sh, rh),
         "SL": round_asset_price(sl, rl),
         "MID": round_asset_price(mid, rh),
+        "macro_RH": round_asset_price(swing.get("macro_RH", rh), rh),
+        "macro_RL": round_asset_price(swing.get("macro_RL", rl), rl),
+        "daily_atr": round_asset_price(swing.get("daily_atr", rh - rl), rh),
         "EMA50": round_asset_price(ema50_val, rh),
         "EMA200": round_asset_price(ema200_val, rh),
         "daily_close": round_asset_price(daily_close, rh),
@@ -2900,9 +3170,14 @@ def run_strategy_backtest(
                         if (pos_dir == "LONG" and s5_high >= tp1_p) or (pos_dir == "SHORT" and s5_low <= tp1_p):
                             active_trade["tp1_hit"] = True
                             prev_c = df_records[idx - 1] if idx > 0 else candle
+                            is_box_trade = (
+                                "Box" in str(active_trade.get("strategy", ""))
+                                or strategy_id == "box_theory"
+                            )
                             new_sl = compute_tp1_profit_lock_sl(
                                 pair, pos_dir, entry_p, tp1_p,
                                 prev_candle_high=float(prev_c["high"]), prev_candle_low=float(prev_c["low"]),
+                                use_fee_be=is_box_trade,
                             )
                             sl_p = new_sl
                             active_trade["stop_loss"] = sl_p
@@ -4770,19 +5045,24 @@ def compute_tp1_profit_lock_sl(
     tp1_px: float,
     prev_candle_high: float = None,
     prev_candle_low: float = None,
+    use_fee_be: bool = False,
 ) -> float:
     """
-    Computes the optimal profit-preserving Stop Loss once TP1 (50% Partial Book) is reached (Strategy 3B/3C):
-      - Locks at least 50% of the Entry 1 -> TP1 profit distance (`entry +/- 0.5 * |tp1 - entry|`),
-        and never worse than Breakeven + fee buffer (`0.18%`).
-      - If the previous 15m candle's structure (`prev_candle_low` for LONG, `prev_candle_high` for SHORT)
-        tightens the stop even further into profit without exceeding `tp1_px`, uses that tighter level!
+    Computes the post-TP1 Stop Loss once TP1 (50% Partial Book) is reached:
+      - When `use_fee_be=True` (Box Sweep v2): shifts SL cleanly to fee-covered breakeven (`entry +/- 0.20%`)
+        so the remaining 50% runner has breathing room to reach the opposite box edge (`RH`/`RL`).
+      - Otherwise (EMA / Strategy 3B/3C): locks at least 50% of the Entry 1 -> TP1 profit distance
+        (`entry +/- 0.5 * |tp1 - entry|`, min `0.18%` BE+) or tighter previous 15m candle structure.
     """
     is_long = str(direction).upper() in ("LONG", "BUY")
     e_px = float(entry_px or 0.0)
     t1_px = float(tp1_px or e_px)
     if e_px <= 0:
         return 0.0
+
+    if use_fee_be:
+        target_sl = e_px * (1.0020 if is_long else 0.9980)
+        return format_order_price(pair, target_sl)
 
     # Base profit lock: 50% of Entry -> TP1 distance, minimum +0.18% fee-covered breakeven
     if is_long:
@@ -5071,6 +5351,7 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
         if hit_tp1 or wicked_tp1:
             entry_side = "buy" if is_long else "sell"
             cancel_coindcx_open_entry_orders(pair, side=entry_side)
+            _rec_sid = str(app_rec.get("strategy_id") or "box_theory")
             base_sl = compute_tp1_profit_lock_sl(
                 pair=pair,
                 direction=direction,
@@ -5078,6 +5359,7 @@ def _auto_protect_live_position_tp1_sl(pos: dict) -> None:
                 tp1_px=eff_tp1_px,
                 prev_candle_high=prev_h,
                 prev_candle_low=prev_l,
+                use_fee_be=(_rec_sid == "box_theory"),
             )
             if cur_sl > 0 and already_in_profit_sl:
                 base_sl = max(base_sl, cur_sl) if is_long else min(base_sl, cur_sl)
@@ -5595,7 +5877,8 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                         margin_currency="INR",
                                     )
 
-                        # 3. Ratchet Stop Loss into profit using Strategy 3B/3C (50% TP1 distance + Previous 15m Candle High/Low)
+                        # 3. Ratchet Stop Loss into profit (Box v2: +/-0.20% fee-covered BE; EMA/S3: 50% TP1 + prev 15m H/L)
+                        _lock_sid = str(lock.get("strategy_id") or "box_theory")
                         ratcheted_sl = compute_tp1_profit_lock_sl(
                             pair=l_pair,
                             direction=l_dir,
@@ -5603,6 +5886,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             tp1_px=l_tp1,
                             prev_candle_high=prev_15m_h,
                             prev_candle_low=prev_15m_l,
+                            use_fee_be=(_lock_sid == "box_theory"),
                         )
                         lock["tp1_hit"] = True
                         lock["stop_loss"] = ratcheted_sl
@@ -7039,6 +7323,10 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "execute_autotrade_two_entry_signal": execute_autotrade_two_entry_signal,
             "get_active_portfolio_trade_status": get_active_portfolio_trade_status,
             "compute_tp1_profit_lock_sl": compute_tp1_profit_lock_sl,
+            "compute_box_swing_levels": compute_box_swing_levels,
+            "calculate_daily_box_levels": calculate_daily_box_levels,
+            "extract_causal_4h_swings_for_cutoff": extract_causal_4h_swings_for_cutoff,
+            "extract_causal_4h_swings_by_day": extract_causal_4h_swings_by_day,
             "_check_recent_15m_tp1_touch_and_prev_hl": _check_recent_15m_tp1_touch_and_prev_hl,
             "_evaluate_smart_hybrid_runner_step": _evaluate_smart_hybrid_runner_step,
             "_find_matching_app_trade_record": _find_matching_app_trade_record,
