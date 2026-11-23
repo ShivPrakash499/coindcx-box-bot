@@ -255,6 +255,8 @@ def test_5_daily_bias_enforcement():
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+         patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+         patch.object(eng, "check_unrealized_pnl_daily_sl_pause", return_value=(False, "", {})), \
          patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")):
         bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
         with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
@@ -290,6 +292,8 @@ def test_5_daily_bias_enforcement():
             assert ok_r and "Daily Bias Guard" not in msg_r, f"Expected RANGE mode trade allowed, got: {ok_r} {msg_r}"
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+         patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+         patch.object(eng, "check_unrealized_pnl_daily_sl_pause", return_value=(False, "", {})), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
              {"pair": "B-INJ_USDT", "direction": "SHORT", "id": "pos_inj"},
              {"pair": "B-NEAR_USDT", "direction": "LONG", "id": "pos_near"},
@@ -1456,8 +1460,8 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
     )
 
     # 3. Regime-Adaptive v40 Row 9 Routing + v41 Clean 3-Option UI & Market-Trend Auto-Defaulting
-    assert [k for k, _ in strat.AUTOTRADE_MODE_CHOICES] == ["box_plus_ema50_200_regime", "box_theory", "ema50_200"]
-    assert [s.id for s in strat.list_strategies()] == ["box_theory", "ema50_200"]
+    assert [k for k, _ in strat.AUTOTRADE_MODE_CHOICES] == ["pw_ema9_21_flag", "box_plus_ema50_200_regime", "box_theory", "ema50_200"]
+    assert [s.id for s in strat.list_strategies()] == ["pw_ema9_21_flag", "box_theory", "ema50_200"]
     assert strat.recommended_strategy_for_regime("RANGING_CHOP") == "box_theory"
     assert strat.recommended_strategy_for_regime("STRONG_UPTREND") == "ema50_200"
     assert strat.recommended_strategy_for_regime("STRONG_DOWNTREND") == "ema50_200"
@@ -2248,6 +2252,25 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
     print("  -> PASS: Daemon v37/v38/v39 (Concurrent Slots, Auto-Split, 00:00 UTC Reset, Unrealized SL Pause & E0b/E0 Sizing Toggle) verified!")
 
 
+def test_19_youtube_standalone_ema9_21_strategy():
+    print("[19/19] Verifying Pure Standalone Patrick Wieland: 9/21 Clean-Space Flag (pw_ema9_21_flag) — ZERO Box/50-200 Mixing...")
+    import inspect
+    import strategies as strat
+    import signal_monitor as sm
+    assert "pw_ema9_21_flag" in strat.STRATEGY_REGISTRY
+    assert strat.resolve_autotrade_mode("pw_ema9_21_flag") == "pw_ema9_21_flag"
+    assert strat.autotrade_mode_strategy_ids("pw_ema9_21_flag") == ["pw_ema9_21_flag"]
+    assert sm._autotrade_signal_eligible("pw_ema9_21_flag", "LONG", "pw_ema9_21_flag") is True
+    assert sm._autotrade_signal_eligible("box_theory", "LONG", "pw_ema9_21_flag") is False
+    assert sm._autotrade_signal_eligible("ema50_200", "LONG", "pw_ema9_21_flag") is False
+    assert sm._autotrade_signal_eligible("pw_ema9_21_flag", "LONG", "box_plus_ema50_200_regime") is False
+    # Verify ZERO 50/200 EMA or BoxTheory references inside the pure 9/21 detector
+    det_src = inspect.getsource(strat._detect_yt_ema9_21_setup)
+    for forbidden in ("ema50", "ema200", "EMA50", "EMA200", "BoxTheory", "RH", "RL"):
+        assert forbidden not in det_src, f"Forbidden legacy reference {forbidden} found in pw_ema9_21_flag detector!"
+    print("  -> PASS: Pure Standalone Patrick Wieland: 9/21 Clean-Space Flag (pw_ema9_21_flag) isolation & zero Box/50-200 mixing verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -2267,6 +2290,7 @@ if __name__ == "__main__":
     test_16_three_tier_main_staging_experiment_parity()
     test_17_v36_six_sl_reduction_fixes()
     test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
+    test_19_youtube_standalone_ema9_21_strategy()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
