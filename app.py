@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 39
+_DAEMON_VERSION = 40
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -957,14 +957,21 @@ selected_autotrade_mode = st.sidebar.selectbox(
     format_func=lambda k: _auto_mode_labels.get(k, k),
     key="sidebar_autotrade_strategy_mode",
     on_change=_on_sidebar_autotrade_strategy_change,
-    help="Select what 24/7 AutoTrade & the default Scanner run: Regime-Adaptive (Box Sweep in all markets + Auto Bull/Bear 15m 50/200 EMA in Strong Trends, paused in Chop), Bear EMA, Bull & Bear EMA, Box Only, or EMA Only.",
+    help="Select what 24/7 AutoTrade & the default Scanner run: Regime-Adaptive v40 Row 9 (Chop-Only Box Sweep with No-Bear-Long Guard in RANGING/CHOP; Trend-Only 15m 50/200 EMA in Strong Trends with Box paused), Bear EMA, Bull & Bear EMA, Box Only, or EMA Only.",
 )
 _live_regime_info = get_cached_market_regime()
 _active_mode_strats = strategy_registry.autotrade_mode_strategy_ids(selected_autotrade_mode)
 st.sidebar.caption(f"🎯 **Mode:** `{_auto_mode_labels.get(selected_autotrade_mode, selected_autotrade_mode)}`")
+_cur_reg_code = str(_live_regime_info.get("regime", "RANGING_CHOP"))
+_reg_active_eng = (
+    "Box Sweep (No Bear L)"
+    if _cur_reg_code == "RANGING_CHOP"
+    else ("15m 50/200 EMA LONG (Box Paused)" if _cur_reg_code == "STRONG_UPTREND" else "15m 50/200 EMA SHORT (Box Paused)")
+)
+_reg_route_suffix = f" → **{_reg_active_eng}**" if selected_autotrade_mode == "box_plus_ema50_200_regime" else ""
 st.sidebar.caption(
     f"🧭 **Market Trend:** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
-    f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`)"
+    f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`){_reg_route_suffix}"
 )
 
 if (

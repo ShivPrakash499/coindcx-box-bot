@@ -88,7 +88,7 @@ def enabled_strategy_ids() -> list:
     return strat_registry.autotrade_mode_strategy_ids(auto_mode)
 
 
-def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str) -> bool:
+def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str, levels: dict | None = None) -> bool:
     """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
     m = strat_registry.resolve_autotrade_mode(auto_mode)
     d = str(direction or "").upper()
@@ -101,10 +101,19 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str)
     if m == "box_plus_ema50_200_both":
         return strategy_id in ("box_theory", "ema50_200")
     if m == "box_plus_ema50_200_regime":
+        reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
         if strategy_id == "box_theory":
+            # Row 9 (v40): Box Sweep runs strictly in RANGING_CHOP (paused in Strong Trends)
+            if reg != "RANGING_CHOP":
+                return False
+            # Row 9 No-Bear-Long Guard: block Box LONG when coin's prior Daily Close <= Daily 50 EMA
+            if d == "LONG" and isinstance(levels, dict):
+                dc = float(levels.get("daily_close", 0.0) or 0.0)
+                de50 = float(levels.get("EMA50", 0.0) or 0.0)
+                if dc > 0 and de50 > 0 and dc <= de50:
+                    return False
             return True
         if strategy_id == "ema50_200":
-            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             return (reg == "STRONG_DOWNTREND" and d == "SHORT") or (reg == "STRONG_UPTREND" and d == "LONG")
         return False
     return strategy_id == strat_registry.DEFAULT_STRATEGY_ID
@@ -338,10 +347,15 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if sid in ("box_theory", "atr_reversal"):
                     pair_primary_triggered = True
 
-                if auto_mode == "box_plus_ema50_200_regime" and s.id == "ema50_200":
-                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode):
-                        reg_lbl = eng.compute_market_regime().get("label", "RANGING / CHOP")
-                        results.append({**row, "signal": None, "message": f"paused by Regime-Adaptive mode ({reg_lbl})"})
+                if auto_mode == "box_plus_ema50_200_regime" and s.id in ("box_theory", "ema50_200"):
+                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode, levels=sig.get("levels")):
+                        reg_info_sm = eng.compute_market_regime()
+                        reg_lbl = reg_info_sm.get("label", "RANGING / CHOP")
+                        if s.id == "box_theory" and reg_info_sm.get("regime") == "RANGING_CHOP" and str(sig.get("signal", "")).upper() == "LONG":
+                            _p_msg = "blocked by Row-9 No-Bear-Long Guard (Prev Daily Close <= Daily 50 EMA)"
+                        else:
+                            _p_msg = f"paused by Regime-Adaptive v40 mode ({reg_lbl})"
+                        results.append({**row, "signal": None, "message": _p_msg})
                         continue
 
                 if float(sig.get("roe_tp1", 0.0)) < 3.0:

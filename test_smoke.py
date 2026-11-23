@@ -1109,6 +1109,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
              patch.object(eng, "_get_coindcx_credentials", return_value=("k1", "s1")), \
              patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.300, "bid": 7.299, "ask": 7.301}), \
              patch.object(eng, "place_coindcx_futures_order", side_effect=_fake_place_limit), \
              patch.object(eng.time, "sleep", return_value=None), \
@@ -1363,16 +1364,25 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
         f"Expected TP1 capped above 3h swing low $7.01, got {sig_cap}"
     )
 
-    # 3. Regime-Adaptive Routing across RANGING_CHOP, STRONG_DOWNTREND, STRONG_UPTREND + Max 2 EMA Slots
+    # 3. Regime-Adaptive v40 Row 9 Routing: Chop-Only Box (No Bear Long) + Trend-Only 15m 50/200 EMA + Max 2 EMA Slots
     with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}):
         assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory"]
         assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime", levels={"daily_close": 7.40, "EMA50": 7.10}) is True
+        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime", levels={"daily_close": 6.90, "EMA50": 7.10}) is False
         assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
 
     with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "label": "STRONG UPTREND", "median_2d_pct": 1.8}):
-        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory", "ema50_200"]
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["ema50_200"]
+        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime") is False
         assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is True
         assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
+
+    with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.5}):
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["ema50_200"]
+        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is False
+        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is False
 
     with tempfile.TemporaryDirectory() as tmpdir:
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
@@ -1383,7 +1393,7 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
              patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
              patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.090}), \
-             patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH", "daily_close": 6.90, "ema50": 7.10}), \
              patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
             eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
             eng.save_autotrade_config({
@@ -1393,7 +1403,7 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
                     {"pair": "B-AVAX_USDT", "strategy_id": "ema50_200", "opened_ts": now_t - 300},
                 ],
             })
-            # In RANGING_CHOP -> EMA SHORT is auto-paused!
+            # In RANGING_CHOP -> EMA SHORT is auto-paused, and Box LONG with daily_close <= EMA50 is blocked by Row-9 No-Bear-Long Guard!
             with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}), \
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]):
                 ok_ch, msg_ch, _ = eng.execute_autotrade_two_entry_signal(
@@ -1403,7 +1413,15 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
                 )
                 assert not ok_ch and "Market Regime Guard" in msg_ch, f"Expected RANGING_CHOP guard block, got {ok_ch} {msg_ch}"
 
-            # In STRONG_DOWNTREND with 2 EMA trades already open -> 3rd EMA trade is capped (reserving 3rd slot for Box)!
+                with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE", "daily_close": 6.90, "ema50": 7.10}):
+                    ok_nbl, msg_nbl, _ = eng.execute_autotrade_two_entry_signal(
+                        pair="B-INJ_USDT",
+                        sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 6.85, "tp1": 7.15, "tp2": 7.50, "stop_loss": 6.72, "levels": {**bear_box, "trend_bias": "NEUTRAL", "daily_close": 6.90, "EMA50": 7.10}},
+                        single_trade_margin_inr=20000.0, leverage=10,
+                    )
+                    assert not ok_nbl and "Row-9 No-Bear-Long Guard" in msg_nbl, f"Expected Row-9 No-Bear-Long Guard block, got {ok_nbl} {msg_nbl}"
+
+            # In STRONG_DOWNTREND: Box Sweep is PAUSED by v40 Row 9, and 3rd EMA trade is capped at 2/2!
             two_open = [{"pair": "B-SUI_USDT"}, {"pair": "B-AVAX_USDT"}]
             with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.5}), \
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=two_open):
@@ -1413,13 +1431,22 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
                     single_trade_margin_inr=20000.0, leverage=10,
                 )
                 assert not ok_cap and "EMA Slot Cap (2/2" in msg_cap, f"Expected Max 2 EMA Slot Cap, got {ok_cap} {msg_cap}"
-                # Meanwhile Box Theory Sweep CAN still take the 3rd slot!
+                ok_box_p, msg_box_p, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-INJ_USDT",
+                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.51, "tp1": 7.36, "tp2": 6.80, "stop_loss": 7.64, "levels": bear_box},
+                    single_trade_margin_inr=20000.0, leverage=10,
+                )
+                assert not ok_box_p and "auto-pausing Box Theory Sweep" in msg_box_p, f"Expected Box paused in STRONG_DOWNTREND, got {ok_box_p} {msg_box_p}"
+
+            # Under RANGING_CHOP with 2 EMA trades open -> Box Theory Sweep CAN still take the 3rd slot!
+            with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.4}), \
+                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=two_open):
                 ok_box3, msg_box3, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-INJ_USDT",
                     sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.51, "tp1": 7.36, "tp2": 6.80, "stop_loss": 7.64, "levels": bear_box},
                     single_trade_margin_inr=20000.0, leverage=10,
                 )
-                assert ok_box3, f"Expected 3rd slot reserved & open for Box Theory Sweep, got {ok_box3} {msg_box3}"
+                assert ok_box3, f"Expected 3rd slot open for Box Theory Sweep in RANGING_CHOP, got {ok_box3} {msg_box3}"
 
     print("  -> PASS: Market-Regime Classifier, Regime-Adaptive Routing, 3h Structure-Aware TP1 & Max 2 EMA Slots verified.")
 
@@ -2104,6 +2131,7 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
                     })
                     with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.30, "bid": 7.299, "ask": 7.301}), \
                          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+                         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
                          patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
                          patch.object(eng, "get_coindcx_live_usdt_inr_rate", return_value=95.0), \
                          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):

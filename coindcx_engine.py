@@ -476,7 +476,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 39
+_REQUIRED_DAEMON_VERSION = 40
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
@@ -6522,7 +6522,12 @@ def execute_autotrade_two_entry_signal(
 
     # Mandatory synchronous live CoinDCX position + resting open-order check:
     # count BOTH filled positions AND resting Entry 1 Limit Orders toward `max_slots` (3)!
-    live_ex_pos = _fetch_coindcx_active_positions_sync(return_none_on_error=True)
+    _is_paper_w_now = isinstance(_wallet_now, dict) and bool(_wallet_now.get("is_paper_wallet"))
+    live_ex_pos = (
+        []
+        if (staging_paper_only and _is_paper_w_now)
+        else _fetch_coindcx_active_positions_sync(return_none_on_error=True)
+    )
     if live_ex_pos is None and os.getenv("COINDCX_API_KEY") and not staging_paper_only:
         return False, (
             f"Portfolio Safety Guard: Could not verify live CoinDCX positions right now; "
@@ -6532,7 +6537,6 @@ def execute_autotrade_two_entry_signal(
     # Unrealized PnL Daily SL Pause Guard (v37):
     # If open unrealized loss (or realized + open unrealized loss today) >= 5% Daily SL,
     # pause initiating new trades until the open live/paper positions are closed!
-    _is_paper_w_now = isinstance(_wallet_now, dict) and bool(_wallet_now.get("is_paper_wallet"))
     _unr_paused, _unr_msg, _unr_info = check_unrealized_pnl_daily_sl_pause(
         _wallet_now,
         positions=None if _is_paper_w_now else (live_ex_pos if isinstance(live_ex_pos, list) else []),
@@ -6624,13 +6628,14 @@ def execute_autotrade_two_entry_signal(
     # Always verify against fresh compute_market_bias(pair) if sig_levels is missing or to prevent stale signals
     sig_levels = sig.get("levels") if isinstance(sig.get("levels"), dict) else {}
     daily_bias = str(sig_levels.get("trend_bias") or sig_levels.get("bias") or "").upper()
+    mb = {}
     try:
-        mb = compute_market_bias(pair)
+        mb = compute_market_bias(pair) or {}
         live_mb_bias = str(mb.get("bias", "")).upper()
         if live_mb_bias:
             daily_bias = live_mb_bias
     except Exception:
-        pass
+        mb = {}
 
     if "BULLISH" in daily_bias:
         daily_bias = "BULLISH"
@@ -6663,6 +6668,15 @@ def execute_autotrade_two_entry_signal(
                 f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
                 f"(switch to Combo: Regime-Adaptive or Bull & Bear EMA to enable Bullish EMA Longs)."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
+        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "box_theory":
+            reg_info = compute_market_regime()
+            cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
+            if cur_reg != "RANGING_CHOP":
+                return False, (
+                    f"Market Regime Guard ({reg_info.get('label', cur_reg)}): Market is trending "
+                    f"(14d {reg_info.get('median_14d_pct', 0.0):+.1f}%), auto-pausing Box Theory Sweep on {pair} "
+                    f"and running 15m 50/200 EMA Trend engine only (v40 Row 9)."
+                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
         if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "ema50_200":
             reg_info = compute_market_regime()
             cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
@@ -6695,6 +6709,14 @@ def execute_autotrade_two_entry_signal(
         return False, (
             f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
         ), {"daily_bias": daily_bias, "direction": norm_dir}
+    if (not allow_mode_override) and auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "box_theory" and norm_dir == "LONG":
+        _d_close_r9 = float(sig_levels.get("daily_close") or mb.get("daily_close") or 0.0)
+        _d_ema50_r9 = float(sig_levels.get("EMA50") or mb.get("ema50") or 0.0)
+        if _d_close_r9 > 0 and _d_ema50_r9 > 0 and _d_close_r9 <= _d_ema50_r9:
+            return False, (
+                f"Row-9 No-Bear-Long Guard: Blocking Box LONG on {pair} during Chop "
+                f"(Prev Daily Close ${_d_close_r9:,.4g} <= Daily 50 EMA ${_d_ema50_r9:,.4g})."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir, "no_bear_long": True}
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"

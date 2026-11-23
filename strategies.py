@@ -829,6 +829,8 @@ class BoxTheorySweep(Strategy):
                 "MID": eng.round_asset_price(mid, rh),
                 "SH": eng.round_asset_price(sh, rh), "SL": eng.round_asset_price(sl, rl),
                 "EMA50": eng.round_asset_price(ema50, rh), "EMA200": eng.round_asset_price(ema200, rh),
+                "daily_close": eng.round_asset_price(prev_close, rh),
+                "above_d50": bool(prev_close > ema50),
                 "ATR": atr_val, "bias": bias
             }
         return {"boxes": daily_boxes, "ema50_15m": ema50_15m_list, "ema9_15m": ema9_15m_list}
@@ -2225,11 +2227,12 @@ class BoxPlusEma50200Strategy(Strategy):
         self.allow_bull_ema = allow_bull_ema
         self.regime_adaptive = regime_adaptive
         if regime_adaptive:
-            self.timeframe = "Regime-Adaptive: Box Sweep (All Regimes) + Auto Bull/Bear 15m 50/200 EMA in Strong Trends"
+            self.timeframe = "Regime-Adaptive (v40 Row 9): Chop-Only Box Sweep (No Bear Long) + Trend-Only 15m 50/200 EMA"
             self.description = (
-                "2-Year Verified Regime-Adaptive Routing: always runs Strategy 1 (15m Box Theory Sweep L+S); "
-                "automatically activates Bull 15m 50/200 EMA Longs in STRONG UPTREND, Bear 15m 50/200 EMA Shorts "
-                "in STRONG DOWNTREND, and pauses EMA trend entries during RANGING / CHOP markets."
+                "2-Year Verified Regime-Split Routing (Row 9): strictly runs Strategy 1 (Box Theory Sweep, blocking "
+                "falling-knife Box LONGs when prior Daily Close <= Daily 50 EMA) ONLY during RANGING / CHOP markets; "
+                "automatically pauses Box Sweep and activates Bull 15m 50/200 EMA Longs in STRONG UPTREND or Bear "
+                "15m 50/200 EMA Shorts in STRONG DOWNTREND."
             )
         else:
             self.timeframe = (
@@ -2249,19 +2252,40 @@ class BoxPlusEma50200Strategy(Strategy):
 
     def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
-        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
-            return sig1
         if self.regime_adaptive:
             reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             if reg == "RANGING_CHOP":
+                sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+                if sig1 and sig1.get("signal") == "LONG":
+                    lv = sig1.get("levels") if isinstance(sig1.get("levels"), dict) else (levels or {})
+                    d_close = float(lv.get("daily_close", 0.0) or 0.0)
+                    d_ema50 = float(lv.get("EMA50", 0.0) or 0.0)
+                    if d_close > 0 and d_ema50 > 0 and d_close <= d_ema50:
+                        return self._stamp({
+                            **sig1,
+                            "signal": "NEUTRAL",
+                            "trigger_reason": (
+                                f"Row-9 No-Bear-Long Guard: Box LONG blocked in Chop "
+                                f"(Prev Daily Close ${d_close:,.4g} <= Daily 50 EMA ${d_ema50:,.4g})"
+                            ),
+                        })
                 return sig1
+            # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!
             sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
             if sig4 and (
                 (reg == "STRONG_DOWNTREND" and sig4.get("signal") == "SHORT")
                 or (reg == "STRONG_UPTREND" and sig4.get("signal") == "LONG")
             ):
                 return sig4
+            return self._stamp({
+                "pair": pair,
+                "signal": "NEUTRAL",
+                "signal_kind": "NONE",
+                "levels": levels,
+                "trigger_reason": f"Regime-Adaptive ({reg}): Box Sweep paused; awaiting trend-aligned 15m 50/200 EMA setup.",
+            })
+        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
             return sig1
         sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
         if sig4 and sig4.get("signal") in ("LONG", "SHORT"):
@@ -2313,13 +2337,16 @@ class BoxPlusEma50200Strategy(Strategy):
         return self.s1.backtest_has_context(candle, ctx["ctx1"])
 
     def backtest_entry(self, idx, candle, ctx, records):
-        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
-        if e1:
-            return e1
         if self.regime_adaptive:
             day_reg = (ctx.get("regime_map") or {}).get(candle["date_str"], "RANGING_CHOP")
             if day_reg == "RANGING_CHOP":
-                return None
+                e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+                if e1 and e1.get("direction") == "LONG":
+                    box = (ctx.get("boxes") or {}).get(candle["date_str"]) or {}
+                    if not bool(box.get("above_d50", True)):
+                        return None
+                return e1
+            # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!
             e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
             if e4 and (
                 (day_reg == "STRONG_DOWNTREND" and e4.get("direction") == "SHORT")
@@ -2327,11 +2354,14 @@ class BoxPlusEma50200Strategy(Strategy):
             ):
                 return e4
             return None
+        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+        if e1:
+            return e1
         return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
 
 
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
-    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Box + Auto Trend EMA] (Recommended)"),
+    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Chop Box (No Bear L) + Trend 50/200 EMA] (Recommended)"),
     ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA"),
     ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
     ("box_theory", "Box Theory Sweep Only (v27)"),
@@ -2363,8 +2393,11 @@ def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
             reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             if reg == "RANGING_CHOP":
                 return ["box_theory"]
+            if reg in ("STRONG_UPTREND", "STRONG_DOWNTREND"):
+                return ["ema50_200"]
         except Exception:
             pass
+        return ["box_theory"]
     return ["box_theory", "ema50_200"]
 
 
