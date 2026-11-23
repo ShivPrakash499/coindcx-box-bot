@@ -2797,8 +2797,8 @@ def fetch_historical_candles_paginated(
     }
     m = intv_minutes.get(interval.lower(), 15)
     total_candles_needed = int((duration_days * 24 * 60) / m) + 50
-    # Safety cap: up to 40,000 candles
-    total_candles_needed = min(total_candles_needed, 40000)
+    # Safety cap: up to 185,000 candles (supports full 5-year 15m backtests = ~175,200 bars)
+    total_candles_needed = min(total_candles_needed, 185000)
 
     all_candles = []
     end_time = None
@@ -3391,35 +3391,57 @@ def run_strategy_backtest(
         df["EMA21_15m"] = df["close"].astype(float).ewm(span=21, adjust=False).mean()
         df["EMA31_15m"] = df["close"].astype(float).ewm(span=31, adjust=False).mean()
 
-    # 2. Fetch daily candles for daily box & ATR establishment
-    df_daily = fetch_historical_candles_paginated(
-        pair=pair,
-        interval="1d",
-        duration_days=duration_days + strat.daily_warmup_days
-    )
-    if df_daily.empty or len(df_daily) < 5:
-        return {"error": f"Insufficient daily candle data for {pair}."}
+    # 2. Fetch daily candles (or 1H/4H Spot candles for standalone 4-EMA Stack)
+    _is_ema9_21_stack = (strategy_id == "ema9_21_stack")
+    if _is_ema9_21_stack:
+        df_daily = fetch_historical_candles_paginated(
+            pair=pair,
+            interval="1d",
+            duration_days=duration_days + strat.daily_warmup_days
+        )
+        df_1h = fetch_historical_candles_paginated(
+            pair=pair,
+            interval="1h",
+            duration_days=duration_days + 150
+        )
+        df_4h = fetch_historical_candles_paginated(
+            pair=pair,
+            interval="4h",
+            duration_days=duration_days + 150
+        )
+        df.attrs["df_1h"] = df_1h
+        df.attrs["df_4h"] = df_4h
+        sub5_by_15m_ts = {}
+    else:
+        df_daily = fetch_historical_candles_paginated(
+            pair=pair,
+            interval="1d",
+            duration_days=duration_days + strat.daily_warmup_days
+        )
+        if df_daily.empty or len(df_daily) < 5:
+            return {"error": f"Insufficient daily candle data for {pair}."}
 
-    # 3. Fetch 5m candles for Strategy 3 (5m 9 EMA confirmed cross & >=20% ATR 30% pullback exit / retest entry)
-    df_5m = fetch_historical_candles_paginated(
-        pair=pair,
-        interval="5m",
-        duration_days=duration_days + 2
-    )
-    sub5_by_15m_ts = {}
-    if df_5m is not None and not df_5m.empty:
-        df_5m = df_5m.copy().reset_index(drop=True)
-        df_5m["EMA9"] = df_5m["close"].ewm(span=9, adjust=False).mean()
-        for r5 in df_5m.to_dict("records"):
-            bucket = (int(r5["timestamp"]) // 900000) * 900000
-            sub5_by_15m_ts.setdefault(bucket, []).append(r5)
-        df.attrs["df_5m"] = df_5m
+        # 3. Fetch 5m candles for Strategy 3 (5m 9 EMA confirmed cross & >=20% ATR 30% pullback exit / retest entry)
+        df_5m = fetch_historical_candles_paginated(
+            pair=pair,
+            interval="5m",
+            duration_days=duration_days + 2
+        )
+        sub5_by_15m_ts = {}
+        if df_5m is not None and not df_5m.empty:
+            df_5m = df_5m.copy().reset_index(drop=True)
+            df_5m["EMA9"] = df_5m["close"].ewm(span=9, adjust=False).mean()
+            for r5 in df_5m.to_dict("records"):
+                bucket = (int(r5["timestamp"]) // 900000) * 900000
+                sub5_by_15m_ts.setdefault(bucket, []).append(r5)
+            df.attrs["df_5m"] = df_5m
 
     df['dt_ist'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
     df['date_str'] = df['dt_ist'].dt.strftime('%Y-%m-%d')
 
-    df_daily['dt_ist'] = pd.to_datetime(df_daily['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
-    df_daily['date_str'] = df_daily['dt_ist'].dt.strftime('%Y-%m-%d')
+    if df_daily is not None and not df_daily.empty:
+        df_daily['dt_ist'] = pd.to_datetime(df_daily['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
+        df_daily['date_str'] = df_daily['dt_ist'].dt.strftime('%Y-%m-%d')
 
     strat_ctx = strat.prepare_backtest(df, df_daily)
 
@@ -3446,7 +3468,15 @@ def run_strategy_backtest(
         "ema21_1to3_reentry_all": {"box_only": False, "ema_span": 21, "use_3r": True, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
         "ema21_v36tp_reentry_all": {"box_only": False, "ema_span": 21, "use_3r": False, "roe_arm": 1.5, "ticks": 8.0, "confirm_c": 2, "max_re": 2},
     }
-    _exp_re_cfg = _EXP_REENTRY_MODES.get(exit_mode)
+    _exp_re_cfg = None if _is_ema9_21_stack else _EXP_REENTRY_MODES.get(exit_mode)
+    _STACK_EXIT_MODES = {
+        "stack_half_1.5_trail21",
+        "stack_half_2.0_trail21",
+        "stack_pure_trail21",
+        "stack_fixed_1.5",
+        "stack_fixed_2.0",
+    }
+    _stack_exit_mode = (exit_mode if exit_mode in _STACK_EXIT_MODES else "stack_half_1.5_trail21") if _is_ema9_21_stack else None
     _pair_tick_sz = float(get_pair_lot_spec(pair).get("tick_size", 0.01) or 0.01)
 
     for idx, candle in enumerate(df_records):
@@ -3538,6 +3568,78 @@ def run_strategy_backtest(
             sub5_list = sub5_by_15m_ts.get((c_ts // 900000) * 900000) or [
                 {"open": c_open, "high": c_high, "low": c_low, "close": c_close, "EMA9": c_close}
             ]
+
+            if _is_ema9_21_stack:
+                # Standalone 4-EMA Stack Step-4 Exit Management (100% isolated from Box/v36/HYB-A)
+                _risk_init = abs(entry_p - float(active_trade.get("initial_stop_loss", sl_p) or sl_p))
+                _s_half_tp = 0.0
+                _s_fixed_tp = 0.0
+                _s_trail_after_tp1 = False
+                _s_trail_after_1r = False
+                if _stack_exit_mode == "stack_fixed_1.5":
+                    _s_fixed_tp = (entry_p + 1.5 * _risk_init) if pos_dir == "LONG" else (entry_p - 1.5 * _risk_init)
+                elif _stack_exit_mode == "stack_fixed_2.0":
+                    _s_fixed_tp = (entry_p + 2.0 * _risk_init) if pos_dir == "LONG" else (entry_p - 2.0 * _risk_init)
+                elif _stack_exit_mode == "stack_half_2.0_trail21":
+                    _s_half_tp = (entry_p + 2.0 * _risk_init) if pos_dir == "LONG" else (entry_p - 2.0 * _risk_init)
+                    _s_trail_after_tp1 = True
+                elif _stack_exit_mode == "stack_pure_trail21":
+                    _s_trail_after_1r = True
+                else:  # stack_half_1.5_trail21 (default)
+                    _s_half_tp = (entry_p + 1.5 * _risk_init) if pos_dir == "LONG" else (entry_p - 1.5 * _risk_init)
+                    _s_trail_after_tp1 = True
+
+                # 1. Conservative Hard / Fee-BE SL check FIRST
+                if (pos_dir == "LONG" and c_low <= sl_p) or (pos_dir == "SHORT" and c_high >= sl_p):
+                    exit_triggered = True
+                    if active_trade.get("tp1_hit", False) and _s_half_tp > 0:
+                        exit_price = 0.5 * _s_half_tp + 0.5 * sl_p
+                        exit_reason = "50% TP1 Maker + 50% Fee-BE SL"
+                    else:
+                        exit_price = sl_p
+                        exit_reason = "4-EMA Structure Hard SL"
+                # 2. Fixed full Maker TP check
+                elif _s_fixed_tp > 0 and ((pos_dir == "LONG" and c_high >= _s_fixed_tp) or (pos_dir == "SHORT" and c_low <= _s_fixed_tp)):
+                    exit_triggered = True
+                    exit_price = _s_fixed_tp
+                    active_trade["_stack_full_maker_tp"] = True
+                    exit_reason = f"100% Fixed Maker TP ({'1:2.0R' if _stack_exit_mode == 'stack_fixed_2.0' else '1:1.5R'})"
+                else:
+                    # 3. 50% Half TP check (Maker Limit) -> move SL to Fee-BE
+                    if _s_half_tp > 0 and not active_trade.get("tp1_hit", False):
+                        if (pos_dir == "LONG" and c_high >= _s_half_tp) or (pos_dir == "SHORT" and c_low <= _s_half_tp):
+                            active_trade["tp1_hit"] = True
+                            active_trade["tp1"] = _s_half_tp
+                            tp1_p = _s_half_tp
+                            _fee_be_s = entry_p * (1.0 + 0.0014) if pos_dir == "LONG" else entry_p * (1.0 - 0.0014)
+                            sl_p = _fee_be_s
+                            active_trade["stop_loss"] = sl_p
+                    # 4. Arm +1R for pure trend trailing mode
+                    if _s_trail_after_1r and not active_trade.get("_stack_1r_armed", False):
+                        _one_r = (entry_p + _risk_init) if pos_dir == "LONG" else (entry_p - _risk_init)
+                        if (pos_dir == "LONG" and c_high >= _one_r) or (pos_dir == "SHORT" and c_low <= _one_r):
+                            active_trade["_stack_1r_armed"] = True
+                    # 5. Trend Trailing Exit on candle CLOSE: decisive 21 EMA close OR 9/21 EMA cross back
+                    _trail_armed_now = (_s_trail_after_tp1 and active_trade.get("tp1_hit", False)) or (_s_trail_after_1r and active_trade.get("_stack_1r_armed", False))
+                    if _trail_armed_now:
+                        _e9k = float(candle.get("EMA9_15m", c_close) or c_close)
+                        _e21k = float(candle.get("EMA21_15m", c_close) or c_close)
+                        if pos_dir == "LONG":
+                            _dec21 = (c_close < _e21k) and (c_close < c_open or c_open < _e21k)
+                            _xbk = _e9k < _e21k
+                        else:
+                            _dec21 = (c_close > _e21k) and (c_close > c_open or c_open > _e21k)
+                            _xbk = _e9k > _e21k
+                        if _dec21 or _xbk:
+                            exit_triggered = True
+                            _lbl_tr = "9x21 Cross Exit" if _xbk else "21 EMA Close Exit"
+                            if active_trade.get("tp1_hit", False) and _s_half_tp > 0:
+                                exit_price = 0.5 * _s_half_tp + 0.5 * c_close
+                                exit_reason = f"50% TP1 Maker + 50% {_lbl_tr}"
+                            else:
+                                exit_price = c_close
+                                exit_reason = f"100% Trend Runner {_lbl_tr}"
+                sub5_list = []
 
             for s5 in sub5_list:
                 s5_open = float(s5.get("open", c_open))
@@ -3752,7 +3854,9 @@ def run_strategy_backtest(
                 _ent_fee_r = taker_fee_rate if active_trade.get("is_reentry") else maker_fee_rate
                 entry_fee_inr = notional_inr * _ent_fee_r
                 exit_notional_inr = (qty * exit_price) * usd_inr
-                if active_trade.get("tp1_hit", False) and not use_full_s3_mode and not is_exp_trail_active:
+                if active_trade.get("_stack_full_maker_tp", False):
+                    exit_fee_inr = exit_notional_inr * maker_fee_rate
+                elif active_trade.get("tp1_hit", False) and not use_full_s3_mode and not is_exp_trail_active:
                     tp1_notional_inr = (0.5 * qty * tp1_p) * usd_inr
                     exit_fee_inr = (tp1_notional_inr * maker_fee_rate) + (max(0.0, exit_notional_inr - tp1_notional_inr) * taker_fee_rate)
                 else:
@@ -7275,6 +7379,7 @@ def run_portfolio_single_slot_backtest(
     enforce_btc_impulse_veto: bool = True,
     use_fixed_risk_sizing: bool = True,
     risk_per_trade_pct: float = FIXED_RISK_PER_TRADE_PCT,
+    dynamic_allocation: bool = False,
 ) -> dict:
     """
     Simulates the exact Main Live Portfolio Engine across the High-Volatility Futures Universe
@@ -7529,9 +7634,13 @@ def run_portfolio_single_slot_backtest(
                     blocked_btc_veto += 1
                     continue
 
-        # Fixed 1.5% Wallet Risk Position Sizing (only applies when trade carries initial_stop_loss)
+        # Dynamic Allocation ON => slot margin compounds dynamically with running futures wallet (current_wallet / max_slots)
         tr_dict = tr.to_dict()
-        eff_trade_margin = float(margin_inr)
+        slot_cap_margin = round(current_wallet_inr / max_slots, 2) if dynamic_allocation else float(margin_inr)
+        eff_trade_margin = float(slot_cap_margin)
+        if (eff_trade_margin * leverage) < 2448.0:
+            blocked_margin += 1
+            continue
         init_sl_bt = float(tr_dict.get("initial_stop_loss", 0.0) or 0.0)
         ent_px_bt = float(tr_dict.get("entry_price", 0.0) or 0.0)
         if use_fixed_risk_sizing and init_sl_bt > 0 and ent_px_bt > 0 and current_wallet_inr > 0:
@@ -7540,12 +7649,12 @@ def run_portfolio_single_slot_backtest(
                 entry_px=ent_px_bt,
                 sl_px=init_sl_bt,
                 leverage=leverage,
-                max_margin_inr=float(margin_inr),
+                max_margin_inr=float(slot_cap_margin),
                 risk_pct=float(risk_per_trade_pct),
                 max_slots=max_slots,
             )
             if r_m_bt > 0 and (r_m_bt * leverage) >= 2448.0:
-                eff_trade_margin = min(float(margin_inr), float(r_m_bt))
+                eff_trade_margin = min(float(slot_cap_margin), float(r_m_bt))
 
         # Main-Parity <90% Free-Margin Anti-Crumb Guard against running wallet equity
         if enforce_free_margin_guard and eff_trade_margin >= 2500.0:
@@ -7575,7 +7684,11 @@ def run_portfolio_single_slot_backtest(
 
         if margin_inr > 0 and abs(eff_trade_margin - float(margin_inr)) > 0.01:
             scale_f = eff_trade_margin / float(margin_inr)
-            tr_dict["net_pnl_inr"] = round(float(tr_dict.get("net_pnl_inr", 0.0) or 0.0) * scale_f, 2)
+            scaled_net = round(float(tr_dict.get("net_pnl_inr", 0.0) or 0.0) * scale_f, 2)
+            # Isolated margin safety: single trade loss cannot exceed deployed slot margin
+            if scaled_net < -eff_trade_margin:
+                scaled_net = round(-eff_trade_margin, 2)
+            tr_dict["net_pnl_inr"] = scaled_net
             if "gross_pnl_inr" in tr_dict:
                 tr_dict["gross_pnl_inr"] = round(float(tr_dict.get("gross_pnl_inr", 0.0) or 0.0) * scale_f, 2)
             if "fees_inr" in tr_dict:
@@ -7615,6 +7728,7 @@ def run_portfolio_single_slot_backtest(
         "blocked_by_post_sl_lock": blocked_post_sl,
         "blocked_by_btc_veto": blocked_btc_veto,
         "use_fixed_risk_sizing": bool(use_fixed_risk_sizing),
+        "dynamic_allocation": bool(dynamic_allocation),
         "reentry_trades": len(_re_acc),
         "reentry_net_pnl_inr": round(sum(float(t.get("net_pnl_inr", 0.0) or 0.0) for t in _re_acc), 2),
     }

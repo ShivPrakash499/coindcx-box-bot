@@ -510,10 +510,99 @@ def test_7_ui_render_and_navigation_tabs_integrity():
         assert stale_ui_label not in app_src, f"Stale UI label '{stale_ui_label}' found in app.py!"
     assert "#### 🎫 Trade Execution Ticket" in app_src
 
-    # 7. Parse AST of app.py to ensure clean top-level structure
+    # 7. Full scope-aware AST undefined-name (NameError) audit across all 7 core modules
+    import builtins as _builtins
+    _bi_names = set(dir(_builtins)) | {"__file__", "__name__", "__doc__", "__package__", "__spec__", "__cached__", "__annotations__"}
+
+    def _scan_undefined_names(src_txt: str, fname: str) -> list[tuple[int, str]]:
+        _tr = ast.parse(src_txt, filename=fname)
+        _bad: list[tuple[int, str]] = []
+
+        def _walk_scope(node, parent_defs):
+            local_defs = set(parent_defs)
+
+            def _collect(n):
+                for ch in ast.iter_child_nodes(n):
+                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        local_defs.add(ch.name)
+                    elif isinstance(ch, (ast.Import, ast.ImportFrom)):
+                        for al in ch.names:
+                            local_defs.add(al.asname or al.name.split(".")[0])
+                    elif isinstance(ch, ast.Name) and isinstance(ch.ctx, (ast.Store, ast.Del)):
+                        local_defs.add(ch.id)
+                    elif isinstance(ch, ast.ExceptHandler):
+                        if ch.name:
+                            local_defs.add(ch.name)
+                        _collect(ch)
+                    elif isinstance(ch, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)):
+                        continue
+                    else:
+                        _collect(ch)
+
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for ag in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
+                    local_defs.add(ag.arg)
+                if node.args.vararg:
+                    local_defs.add(node.args.vararg.arg)
+                if node.args.kwarg:
+                    local_defs.add(node.args.kwarg.arg)
+            _collect(node)
+
+            def _check(n, defs):
+                for ch in ast.iter_child_nodes(n):
+                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        for d_node in ch.decorator_list + ch.args.defaults + [x for x in ch.args.kw_defaults if x]:
+                            _check(d_node, defs)
+                        _walk_scope(ch, defs)
+                    elif isinstance(ch, ast.ClassDef):
+                        for b_node in ch.bases + ch.decorator_list:
+                            _check(b_node, defs)
+                        _walk_scope(ch, defs)
+                    elif isinstance(ch, ast.Lambda):
+                        l_defs = set(defs) | {ag.arg for ag in ch.args.args + ch.args.posonlyargs + ch.args.kwonlyargs}
+                        if ch.args.vararg:
+                            l_defs.add(ch.args.vararg.arg)
+                        if ch.args.kwarg:
+                            l_defs.add(ch.args.kwarg.arg)
+                        _check(ch.body, l_defs)
+                    elif isinstance(ch, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                        c_defs = set(defs)
+                        for gen in ch.generators:
+                            _check(gen.iter, c_defs)
+                            for tgt in ast.walk(gen.target):
+                                if isinstance(tgt, ast.Name):
+                                    c_defs.add(tgt.id)
+                            for iff in gen.ifs:
+                                _check(iff, c_defs)
+                        if isinstance(ch, ast.DictComp):
+                            _check(ch.key, c_defs)
+                            _check(ch.value, c_defs)
+                        else:
+                            _check(ch.elt, c_defs)
+                    elif isinstance(ch, ast.NamedExpr):
+                        _check(ch.value, defs)
+                        if isinstance(ch.target, ast.Name):
+                            defs.add(ch.target.id)
+                    elif isinstance(ch, ast.Name) and isinstance(ch.ctx, ast.Load):
+                        if ch.id not in defs and ch.id not in _bi_names:
+                            _bad.append((ch.lineno, ch.id))
+                    else:
+                        _check(ch, defs)
+
+            _check(node, local_defs)
+
+        _walk_scope(_tr, set())
+        return _bad
+
     tree = ast.parse(app_src, filename="app.py")
     assert len(tree.body) > 20
-    print(f"  -> PASS: All 7 UI tabs ({', '.join(expected_tabs)}) & fragment non-loop invariants verified.")
+    for _mod_fn in ("app.py", "coindcx_engine.py", "strategies.py", "signal_monitor.py", "sheets_logger.py", "gemini_advisor.py", "email_notifier.py"):
+        _mod_p = os.path.join(ROOT_DIR, _mod_fn)
+        if os.path.exists(_mod_p):
+            with open(_mod_p, "r", encoding="utf-8") as _mf:
+                _undef = _scan_undefined_names(_mf.read(), _mod_fn)
+            assert not _undef, f"CRITICAL NameError risk in {_mod_fn}: undefined names {_undef[:10]}"
+    print(f"  -> PASS: All 7 UI tabs ({', '.join(expected_tabs)}), fragment guards & 0-NameError AST audit across all 7 modules verified.")
 
 
 def test_8_stale_cache_expiry_and_nat_pinner():
@@ -2080,6 +2169,131 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
     print("  -> PASS: Daemon v37 Configurable Concurrent Trades, Auto-Split Wallet Toggle & Unrealized PnL Daily SL Pause verified!")
 
 
+def test_19_ema9_21_stack_standalone_and_dynamic_allocation():
+    print("[19/19] Verifying Standalone 4-EMA Stack (9/21 Pullback) Strategy Isolation, 3 Chop Filters, 0.5% SL Budget & Dynamic Wallet Compounding...")
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+
+    # 1. Complete Standalone Isolation (never mixes with existing Box / 50-200 EMA strategies)
+    assert "ema9_21_stack" in strat.STRATEGY_REGISTRY
+    assert strat.resolve_autotrade_mode("ema9_21_stack") == "ema9_21_stack"
+    assert strat.autotrade_mode_strategy_ids("ema9_21_stack") == ["ema9_21_stack"]
+    assert sm._autotrade_signal_eligible("ema9_21_stack", "LONG", "ema9_21_stack") is True
+    assert sm._autotrade_signal_eligible("box_theory", "LONG", "ema9_21_stack") is False
+    assert sm._autotrade_signal_eligible("ema50_200", "LONG", "ema9_21_stack") is False
+    assert sm._autotrade_signal_eligible("ema9_21_stack", "LONG", "box_plus_ema50_200_regime") is False
+    assert sm._autotrade_signal_eligible("ema9_21_stack", "SHORT", "box_theory") is False
+
+    # 2. Verify Step 1-4 Detector Rules on Synthetic 15m Candles (ETH ~$3,000)
+    n = 25
+    recs = [{"open": 3006.0, "high": 3010.0, "low": 3004.0, "close": 3008.0, "volume": 100.0} for _ in range(n)]
+    # Bar 23 = clean red pullback candle touching 9/21 EMA zone without heavy close below 21 EMA
+    recs[23] = {"open": 3010.0, "high": 3011.0, "low": 3002.0, "close": 3004.0, "volume": 110.0}
+    # Bar 24 = strong solid green confirmation candle closing above 9 EMA (3008.6) & above prior red high (3011) with high volume
+    recs[24] = {"open": 3004.0, "high": 3013.5, "low": 3003.5, "close": 3012.5, "volume": 180.0}
+
+    def _base_ind():
+        return {
+            "ema9": [3005.0 + 0.15 * i for i in range(n)],
+            "ema21": [2999.0 + 0.10 * i for i in range(n)],
+            "ema50": [2990.0] * n,
+            "ema200": [2970.0] * n,
+            "vol_sma20": [100.0] * n,
+            "rsi14": [58.0] * n,
+            "atr14": [6.0] * n,
+            "cross50_20": [0] * n,
+            "bars_since_cross": [10] * n,
+            "last2_clean": [True] * n,
+            "h1_bias": [1] * n,
+            "h4_bias": [1] * n,
+        }
+
+    # 2A. Valid setup passes cleanly with SL <= 0.50% asset move and 1:1.5R TP1
+    ind_ok = _base_ind()
+    sig_ok = strat._detect_ema9_21_stack_setup(recs, 24, ind_ok)
+    assert sig_ok is not None and sig_ok["direction"] == "LONG", f"Expected valid LONG setup, got {sig_ok}"
+    assert sig_ok["sl_dist_pct"] <= 0.50, f"Expected SL <= 0.50%, got {sig_ok['sl_dist_pct']}"
+    assert abs((sig_ok["tp1"] - sig_ok["entry"]) - 1.5 * (sig_ok["entry"] - sig_ok["stop"])) < 1e-6
+
+    # 2B. Filter 1 (HTF Misalignment): 4H neutral/bearish blocks LONG
+    ind_htf = _base_ind()
+    ind_htf["h4_bias"][24] = -1
+    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_htf) is None
+
+    # 2C. Filter 1b (50 EMA Chop >= 3 crosses in 20 bars) blocks entry
+    ind_c50 = _base_ind()
+    ind_c50["cross50_20"][24] = 3
+    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_c50) is None
+
+    # 2D. Filter 2 (Last 2 Crossovers failed) blocks entry
+    ind_l2 = _base_ind()
+    ind_l2["last2_clean"][24] = False
+    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_l2) is None
+
+    # 2E. Step 2 (Initial Cross < 4 bars) blocks entry
+    ind_ic = _base_ind()
+    ind_ic["bars_since_cross"][24] = 2
+    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_ic) is None
+
+    # 2F. Step 3 (Weak volume <= 20-SMA) blocks entry
+    recs_lowv = [dict(r) for r in recs]
+    recs_lowv[24]["volume"] = 80.0
+    assert strat._detect_ema9_21_stack_setup(recs_lowv, 24, _base_ind()) is None
+
+    # 2G. Step 4 (SL > 0.50% asset move) blocks entry
+    recs_widesl = [dict(r) for r in recs]
+    recs_widesl[23]["low"] = 2992.0  # > 0.65% away from 3012.5
+    assert strat._detect_ema9_21_stack_setup(recs_widesl, 24, _base_ind()) is None
+
+    # 3. Verify Dynamic Allocation ON compounds margin with gains & losses + 5% Daily SL Stop
+    synth_comp = pd.DataFrame([
+        # Trade 1 on Day 1: +30% ROE on 1/3 of Rs.3,00,000 (Rs.1,00,000 margin) -> +Rs.30,000 => Wallet becomes Rs.3,30,000!
+        {"pair": "B-BTC_USDT", "strategy": "4-EMA Stack (9/21 Pullback)", "direction": "LONG",
+         "entry_time": "2026-11-10 08:00", "exit_time": "2026-11-10 10:00",
+         "entry_price": 60000.0, "exit_price": 61800.0, "initial_stop_loss": 59750.0,
+         "roe_pct": 30.0, "net_pnl_inr": 30000.0, "fees_inr": 500.0, "is_win": True, "exit_reason": "50% TP1 Maker + 50% 21 EMA Close Exit"},
+        # Trade 2 on Day 2: base PnL +Rs.10,000 at Rs.1,00,000 -> with Dynamic Alloc on Rs.3,30,000 wallet (slot=Rs.1,10,000),
+        # MUST scale by 1.10x to +Rs.11,000 => Wallet becomes Rs.3,41,000!
+        {"pair": "B-ETH_USDT", "strategy": "4-EMA Stack (9/21 Pullback)", "direction": "LONG",
+         "entry_time": "2026-11-11 08:00", "exit_time": "2026-11-11 10:00",
+         "entry_price": 3000.0, "exit_price": 3030.0, "initial_stop_loss": 2988.0,
+         "roe_pct": 10.0, "net_pnl_inr": 10000.0, "fees_inr": 500.0, "is_win": True, "exit_reason": "50% TP1 Maker + 50% 21 EMA Close Exit"},
+    ])
+    def _mock_bt_dyn(pair, **kwargs):
+        sub = synth_comp[synth_comp["pair"] == pair].copy()
+        return {
+            "total_trades": len(sub), "win_count": int((sub["is_win"] == True).sum()),
+            "loss_count": 0, "win_rate_pct": 100.0 if len(sub) else 0.0,
+            "net_profit_inr": float(sub["net_pnl_inr"].sum()), "profit_factor": 99.0, "trades_df": sub,
+        }
+
+    with patch.object(eng, "run_strategy_backtest", side_effect=_mock_bt_dyn):
+        res_dyn = eng.run_portfolio_single_slot_backtest(
+            pairs=["B-BTC_USDT", "B-ETH_USDT"],
+            duration_days=30,
+            margin_inr=100000.0,
+            leverage=10,
+            strategy_id="ema9_21_stack",
+            wallet_inr=300000.0,
+            exit_mode="stack_half_1.5_trail21",
+            max_concurrent_trades=3,
+            daily_loss_stop_pct=5.0,
+            enforce_free_margin_guard=True,
+            enforce_same_dir_guard=False,
+            enforce_post_sl_lock=False,
+            enforce_btc_impulse_veto=False,
+            use_fixed_risk_sizing=False,
+            dynamic_allocation=True,
+        )
+        assert res_dyn["total_trades"] == 2
+        assert res_dyn["guards_audit"]["dynamic_allocation"] is True
+        assert abs(res_dyn["ending_wallet_inr"] - 341000.0) < 0.05, f"Expected dynamic compounding Rs.3,41,000, got {res_dyn['ending_wallet_inr']}"
+
+    print("  -> PASS: Standalone 4-EMA Stack (9/21 Pullback), 3 Chop Filters, <=0.5% SL Budget & Dynamic Compounding Wallet verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -2099,6 +2313,7 @@ if __name__ == "__main__":
     test_16_three_tier_main_staging_experiment_parity()
     test_17_v36_six_sl_reduction_fixes()
     test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
+    test_19_ema9_21_stack_standalone_and_dynamic_allocation()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

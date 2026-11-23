@@ -3383,7 +3383,8 @@ elif active_section == "🧪 Backtest":
         format_func=lambda k: _bt_mode_labels.get(k, k),
         key="bt_multi_strat_mode",
     )
-    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days"], index=0, key="bt_multi_dur")
+    _is_stack_bt = (bt_strat_mode == "ema9_21_stack")
+    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days", "1825 Days"], index=5 if _is_stack_bt else 0, key="bt_multi_dur")
     _default_bt_wallet = max(1000.0, round(float(wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
     bt_wallet_inr = bc2.number_input(
         "Starting Funds / Wallet (₹)",
@@ -3402,10 +3403,10 @@ elif active_section == "🧪 Backtest":
         value=max(1000, int(round(margin_inr))),
         step=1000,
         key="bt_multi_cap",
-        help="Mirrors Main's exact Single-Trade Margin per slot.",
+        help="Base Single-Trade Margin per slot when Dynamic Allocation is OFF (auto-recalculated as Running Wallet ÷ Slots when Dynamic Allocation is ON).",
     )
 
-    bg1, bg2, bg3, bg4, bg5, bg6 = st.columns([0.8, 0.9, 0.7, 1.9, 1.1, 1.1])
+    bg1, bg2, bg3, bg4, bg5, bg6, bg7 = st.columns([0.8, 0.85, 0.65, 1.85, 1.0, 1.0, 1.0])
     bt_lev = bg1.slider("Leverage (x)", 1, 20, int(leverage), key="bt_multi_lev")
     bt_sl_threshold_pct = bg2.number_input(
         "Daily Loss Stop (%)",
@@ -3420,23 +3421,44 @@ elif active_section == "🧪 Backtest":
     _bt_slot_opts = [1, 2, 3, 4, 5, 6]
     _bt_slot_def_idx = _bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2
     bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=_bt_slot_def_idx, key="bt_max_slots")
-    _bt_exit_modes = {
-        "smart_hybrid": "Baseline: v36/v38 Structural Runner (50% TP1 + Fee-BE -> TP2)",
-        "box_ema31_1to3_no_reentry": "⭐ HYB-A (NO Re-Entry): Box=31 EMA(8t)+1:3 | EMA=v36 (OOS Verified)",
-        "box_ema31_1to3_reentry": "HYB-A (+Re-Entry 2c): Box=31 EMA(8t)+1:3+21EMA ReEntry | EMA=v36",
-        "ema31_1to3_reentry_all": "Uniform V10: All=31 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
-        "ema21_1to3_reentry_all": "Uniform V4: All=21 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
-        "ema21_v36tp_reentry_all": "Uniform V1: All=21 EMA(8t) Trail + v36 TP2 + 21EMA ReEntry(2c)",
-    }
+    if _is_stack_bt:
+        _bt_exit_modes = {
+            "stack_half_1.5_trail21": "⭐ 50% @ 1:1.5R Maker + 50% Trail 21 EMA Close (Default)",
+            "stack_pure_trail21": "100% Trend Runner: Trail 21 EMA Close / 9x21 Cross (+1R Arm)",
+            "stack_half_2.0_trail21": "50% @ 1:2.0R Maker + 50% Trail 21 EMA Close",
+            "stack_fixed_1.5": "Fixed 100% Target: 1:1.5R Maker Limit",
+            "stack_fixed_2.0": "Fixed 100% Target: 1:2.0R Maker Limit",
+        }
+        _bt_exit_key = "bt_exit_mode_stack_sel"
+        _bt_exit_def_idx = 0
+    else:
+        _bt_exit_modes = {
+            "smart_hybrid": "Baseline: v36/v38 Structural Runner (50% TP1 + Fee-BE -> TP2)",
+            "box_ema31_1to3_no_reentry": "⭐ HYB-A (NO Re-Entry): Box=31 EMA(8t)+1:3 | EMA=v36 (OOS Verified)",
+            "box_ema31_1to3_reentry": "HYB-A (+Re-Entry 2c): Box=31 EMA(8t)+1:3+21EMA ReEntry | EMA=v36",
+            "ema31_1to3_reentry_all": "Uniform V10: All=31 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
+            "ema21_1to3_reentry_all": "Uniform V4: All=21 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
+            "ema21_v36tp_reentry_all": "Uniform V1: All=21 EMA(8t) Trail + v36 TP2 + 21EMA ReEntry(2c)",
+        }
+        _bt_exit_key = "bt_exit_mode_sel"
+        _bt_exit_def_idx = 1 if _is_experiment_env else 0
     bt_exit_mode = bg4.selectbox(
         "Exit Mode",
         options=list(_bt_exit_modes.keys()),
         format_func=lambda k: _bt_exit_modes.get(k, k),
-        index=1 if _is_experiment_env else 0,
-        key="bt_exit_mode_sel",
-        help="Compare Baseline v36/v38 Structural Runner against the +1.5% ROE Trailing 31/21 EMA (8t) SL + 1:3/v36 TP + 21 EMA Touch & 2-Candle Confirmation Re-Entry modes.",
+        index=_bt_exit_def_idx,
+        key=_bt_exit_key,
+        help="Dedicated Step-4 exit management for 4-EMA Stack, or Baseline / HYB-A exit comparison for existing strategies.",
     )
     with bg5:
+        st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
+        bt_dynamic_alloc = st.checkbox(
+            "⚖️ Dynamic Alloc",
+            value=bool(auto_split_wallet or _is_stack_bt),
+            key="bt_dynamic_alloc",
+            help="ON = Dynamically splits live updated Futures Wallet (with gains & losses) across Max Slots on every trade (compounding).",
+        )
+    with bg6:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
         bt_free_margin_guard = st.checkbox(
             "<90% Free-Margin",
@@ -3444,7 +3466,7 @@ elif active_section == "🧪 Backtest":
             key="bt_free_margin_guard",
             help="Skips new entries when remaining free wallet equity is below 90% of Single-Trade Margin (identical to Main).",
         )
-    with bg6:
+    with bg7:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
         bt_fixed_risk_cap = st.checkbox(
             "1.5% Risk Cap (E0)",
@@ -3453,22 +3475,46 @@ elif active_section == "🧪 Backtest":
             help="OFF = E0b (Full Slot Margin). ON = E0 (1.5% Fixed Wallet Risk Cap).",
         )
 
+    _bt_universe_pairs = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
+    _bt_universe_lbl = f"All {len(_bt_universe_pairs)} High-Vol Movers"
+    if _is_stack_bt:
+        _stack_u_choice = st.radio(
+            "4-EMA Stack Universe",
+            [
+                "All 12 High-Vol Movers",
+                "Top-4 Majors (BTC, ETH, SOL, XRP)",
+                "BTC + ETH Majors Only",
+            ],
+            index=0,
+            horizontal=True,
+            key="bt_stack_universe_sel",
+        )
+        if _stack_u_choice.startswith("Top-4"):
+            _bt_universe_pairs = ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-XRP_USDT"]
+            _bt_universe_lbl = "Top-4 Majors"
+        elif _stack_u_choice.startswith("BTC + ETH"):
+            _bt_universe_pairs = ["B-BTC_USDT", "B-ETH_USDT"]
+            _bt_universe_lbl = "BTC + ETH Majors"
+
+    _eff_bt_cap_disp = (float(bt_wallet_inr) / int(bt_max_slots)) if bt_dynamic_alloc else float(bt_capital)
     st.caption(
         f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` • "
+        f"**Allocation:** `{'Dynamic Wallet÷Slots (Compounding)' if bt_dynamic_alloc else 'Fixed Slot Margin'}` • "
         f"**Sizing:** `{'E0 (1.5% Risk Cap)' if bt_fixed_risk_cap else 'E0b (Full Slot Margin)'}` • "
         f"**Exit:** `{_bt_exit_modes.get(bt_exit_mode, bt_exit_mode)}` • "
-        f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Margin/Trade:** `₹{bt_capital:,.0f}` @ `{bt_lev}x` | "
+        f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Start Margin/Slot:** `₹{_eff_bt_cap_disp:,.0f}` @ `{bt_lev}x` | "
         f"**SL Threshold Lock:** `{bt_sl_threshold_pct:.1f}%/day` (`₹{bt_wallet_inr * bt_sl_threshold_pct / 100.0:,.0f}`) | "
-        f"**Slots:** `{bt_max_slots}`. *Backtest results use historical CoinDCX data and are hypothetical.*"
+        f"**Slots:** `{bt_max_slots}`. *Backtest results use historical Spot/CoinDCX data and are hypothetical.*"
     )
 
-    if st.button("🏆 Run Main-Parity Portfolio Backtest (All 12 High-Vol Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
+    if st.button(f"🏆 Run Main-Parity Portfolio Backtest ({_bt_universe_lbl})", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
-        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} [{bt_exit_mode}] across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x)..."):
+        _run_base_margin = float(bt_wallet_inr) / int(bt_max_slots) if bt_dynamic_alloc else float(bt_capital)
+        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} [{bt_exit_mode}] across {len(_bt_universe_pairs)} pairs ({bt_dur_label} @ {bt_lev}x)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
-                pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
+                pairs=_bt_universe_pairs,
                 duration_days=days_p,
-                margin_inr=float(bt_capital),
+                margin_inr=float(_run_base_margin),
                 leverage=bt_lev,
                 usd_inr=usd_inr,
                 strategy_id=bt_strat_mode,
@@ -3477,7 +3523,11 @@ elif active_section == "🧪 Backtest":
                 max_concurrent_trades=int(bt_max_slots),
                 daily_loss_stop_pct=float(bt_sl_threshold_pct),
                 enforce_free_margin_guard=bool(bt_free_margin_guard),
+                enforce_same_dir_guard=(not _is_stack_bt),
+                enforce_post_sl_lock=(not _is_stack_bt),
+                enforce_btc_impulse_veto=(not _is_stack_bt),
                 use_fixed_risk_sizing=bool(bt_fixed_risk_cap),
+                dynamic_allocation=bool(bt_dynamic_alloc),
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 

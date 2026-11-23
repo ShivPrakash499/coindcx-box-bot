@@ -929,7 +929,7 @@ class BoxTheorySweep(Strategy):
             c_close > c_open and candle_range > 0 and (lower_wick / candle_range) >= 0.30
         )
         swept_rl_seq = (not lower_box_broken) and (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
-        swept_sl_seq = (not lower_box_broken) and (p_low <= sl or c_low <= sl) and (c_close > sl) and (c15_close >= rl * 0.999 if "c15_close" in locals() else c_close >= rl * 0.999) and (min(p_low, c_low) >= sl * 0.988)
+        swept_sl_seq = (not lower_box_broken) and (p_low <= sl or c_low <= sl) and (c_close > sl) and (c_close >= rl * 0.999) and (min(p_low, c_low) >= sl * 0.988)
 
         swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
         swept_sl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_sl_seq and has_bull_confirm
@@ -2330,12 +2330,544 @@ class BoxPlusEma50200Strategy(Strategy):
         return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
 
 
+# ----------------------------------------------------------------------------------------------
+# Strategy 5 (Standalone Experiment): 4-EMA Stack — 9/21 EMA Pullback (15m + 1H/4H Spot)
+# ----------------------------------------------------------------------------------------------
+def _calc_rsi_14(closes: list[float], period: int = 14) -> list[float]:
+    n = len(closes)
+    out = [50.0] * n
+    if n <= period:
+        return out
+    gains = [0.0] * n
+    losses = [0.0] * n
+    for i in range(1, n):
+        d = float(closes[i]) - float(closes[i - 1])
+        if d > 0:
+            gains[i] = d
+        else:
+            losses[i] = -d
+    avg_g = sum(gains[1:period + 1]) / period
+    avg_l = sum(losses[1:period + 1]) / period
+    alpha = 1.0 / period
+    for i in range(period, n):
+        if i > period:
+            avg_g = avg_g * (1.0 - alpha) + gains[i] * alpha
+            avg_l = avg_l * (1.0 - alpha) + losses[i] * alpha
+        if avg_l <= 1e-12:
+            out[i] = 100.0
+        else:
+            rs = avg_g / avg_l
+            out[i] = 100.0 - (100.0 / (1.0 + rs))
+    return out
+
+
+def _calc_atr_14(highs: list[float], lows: list[float], closes: list[float], period: int = 14) -> list[float]:
+    n = len(closes)
+    if n == 0:
+        return []
+    trs = [float(highs[0]) - float(lows[0])]
+    for i in range(1, n):
+        h_i, l_i, pc = float(highs[i]), float(lows[i]), float(closes[i - 1])
+        trs.append(max(h_i - l_i, abs(h_i - pc), abs(l_i - pc)))
+    return pd.Series(trs).ewm(span=period, adjust=False).mean().tolist()
+
+
+def _compute_last2_cross_state(
+    ema9: list[float],
+    ema21: list[float],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+) -> tuple[list[int], list[bool]]:
+    """
+    O(N) state tracker for Step 1 ('Last 2 Crossovers' Rule) & Step 2 (Skip Initial Cross):
+      - A prior crossover FAILED if it reversed within <= 6 bars OR achieved < 0.35% favorable follow-through.
+      - Current leg is clean iff prior crossover succeeded AND current crossover achieved >= 0.35% follow-through.
+    """
+    n = len(closes)
+    bars_since = [0] * n
+    last2_ok = [False] * n
+    c_dir = 0
+    c_idx = -999
+    c_px = 0.0
+    best_h = 0.0
+    best_l = 0.0
+    prev_ok = False
+    for i in range(1, n):
+        dp = 1 if ema9[i - 1] > ema21[i - 1] else (-1 if ema9[i - 1] < ema21[i - 1] else 0)
+        dn = 1 if ema9[i] > ema21[i] else (-1 if ema9[i] < ema21[i] else 0)
+        hi = float(highs[i])
+        lo = float(lows[i])
+        cl = float(closes[i])
+        if dn != 0 and dp != 0 and dn != dp:
+            if c_dir != 0 and c_px > 0:
+                lived = i - c_idx
+                mfe = ((best_h - c_px) / c_px) if c_dir == 1 else ((c_px - best_l) / c_px)
+                prev_ok = (lived > 6) and (mfe >= 0.0035)
+            else:
+                prev_ok = False
+            c_dir = dn
+            c_idx = i
+            c_px = cl
+            best_h = hi
+            best_l = lo
+        elif c_dir != 0:
+            if hi > best_h:
+                best_h = hi
+            if lo < best_l:
+                best_l = lo
+        if c_dir != 0 and c_px > 0:
+            bars_since[i] = i - c_idx
+            mfe_now = ((best_h - c_px) / c_px) if c_dir == 1 else ((c_px - best_l) / c_px)
+            last2_ok[i] = prev_ok and (mfe_now >= 0.0035)
+    return bars_since, last2_ok
+
+
+def _resample_15m_to_htf(df15: pd.DataFrame, bar_ms: int) -> pd.DataFrame:
+    if df15 is None or df15.empty:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+    d = df15.copy()
+    d["bucket"] = (d["timestamp"].astype("int64") // bar_ms) * bar_ms
+    agg = (
+        d.groupby("bucket", as_index=False)
+        .agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+        )
+        .rename(columns={"bucket": "timestamp"})
+        .sort_values("timestamp")
+        .reset_index(drop=True)
+    )
+    return agg
+
+
+def _align_htf_bias_to_15m(ts_15m: list[int], df_htf: pd.DataFrame, bar_ms: int) -> list[int]:
+    """
+    Zero-lookahead Higher-Timeframe alignment (1H or 4H):
+    For each 15m bar closing at ts_15m + 900_000, looks up ONLY the most recent COMPLETED
+    HTF candle (htf_open + bar_ms <= ts_15m + 900_000) and checks close vs 50 & 200 EMAs.
+    Returns +1 (close > EMA50 & close > EMA200), -1 (close < EMA50 & close < EMA200), or 0.
+    """
+    import bisect
+    n = len(ts_15m)
+    if df_htf is None or df_htf.empty or len(df_htf) < 50:
+        return [0] * n
+    c_h = df_htf["close"].astype(float).tolist()
+    e50_h = pd.Series(c_h).ewm(span=50, adjust=False).mean().tolist()
+    e200_h = pd.Series(c_h).ewm(span=200, adjust=False).mean().tolist()
+    close_ts_h = [int(t) + bar_ms for t in df_htf["timestamp"].tolist()]
+    out = [0] * n
+    min_warm = min(200, max(50, len(c_h) - 1))
+    for i, t15 in enumerate(ts_15m):
+        j = bisect.bisect_right(close_ts_h, int(t15) + 900_000) - 1
+        if j < min_warm:
+            continue
+        ch, e50, e200 = c_h[j], e50_h[j], e200_h[j]
+        if ch > e50 and ch > e200:
+            out[i] = 1
+        elif ch < e50 and ch < e200:
+            out[i] = -1
+    return out
+
+
+def _detect_ema9_21_stack_setup(
+    recs15: list[dict],
+    idx: int,
+    ind: dict,
+    max_sl_pct: float = 0.0050,
+    min_sep_pct: float = 0.0012,
+    require_rsi: bool = True,
+    strict_50_200: bool = True,
+) -> dict | None:
+    """
+    Shared 4-EMA Stack (9/21/50/200) 15m + 1H/4H Pullback detector (100% live <-> backtest parity):
+      Step 1: Three Chop Filters (1H & 4H 50/200 EMA alignment, 15m 50 EMA chop < 3 crosses in 20 bars,
+              'Last 2 Crossovers' follow-through rule, and clean 9/21 slope + >=0.12% separation).
+      Step 2: Skip initial crossover (>=4 bars since 9/21 cross) and wait for pullback into 9/21 zone
+              without heavy body closing far past 21 EMA.
+      Step 3: Strong confirmation candle (solid body >=45% or Hammer/Shooting Star) closing back across
+              9 EMA and beyond prior pullback candle H/L + volume > 20-SMA + RSI(14) momentum confirmation.
+      Step 4: Pullback swing SL + volatility buffer (max(0.12%, 0.15*ATR), ~$3-$5 on ETH), strictly
+              verified <= 0.50% asset-move risk budget, with 1:1.5R Maker TP1 & 21 EMA Runner TP2 ref.
+    """
+    if idx < 20 or idx >= len(recs15):
+        return None
+    if int(ind["cross50_20"][idx]) >= 3:
+        return None
+    if int(ind["bars_since_cross"][idx]) < 4 or not bool(ind["last2_clean"][idx]):
+        return None
+
+    h1_b = int(ind["h1_bias"][idx])
+    h4_b = int(ind["h4_bias"][idx])
+    if h1_b == 0 or h1_b != h4_b:
+        return None
+
+    e9 = float(ind["ema9"][idx])
+    e21 = float(ind["ema21"][idx])
+    e50 = float(ind["ema50"][idx])
+    e200 = float(ind["ema200"][idx])
+    e9_3 = float(ind["ema9"][idx - 3])
+    e21_3 = float(ind["ema21"][idx - 3])
+    vsma = float(ind["vol_sma20"][idx])
+    rsi_v = float(ind["rsi14"][idx])
+    atr_v = float(ind["atr14"][idx])
+
+    cur = recs15[idx]
+    prev = recs15[idx - 1]
+    c_o = float(cur.get("open", cur["close"]))
+    c_h = float(cur["high"])
+    c_l = float(cur["low"])
+    c_c = float(cur["close"])
+    c_v = float(cur.get("volume", 0.0) or 0.0)
+    c_rng = c_h - c_l
+    if c_c <= 0 or c_rng <= 1e-12 or vsma <= 0 or c_v <= vsma:
+        return None
+
+    p_o = float(prev.get("open", prev["close"]))
+    p_h = float(prev["high"])
+    p_l = float(prev["low"])
+    p_c = float(prev["close"])
+    p_e9 = float(ind["ema9"][idx - 1])
+    p_e21 = float(ind["ema21"][idx - 1])
+    p_e50 = float(ind["ema50"][idx - 1])
+
+    body = abs(c_c - c_o)
+    upper_w = c_h - max(c_o, c_c)
+    lower_w = min(c_o, c_c) - c_l
+    body_ratio = body / c_rng
+    pb_start = max(0, idx - 3)
+    buf = max(c_c * 0.0012, atr_v * 0.15)
+
+    # --- LONG SETUP ---
+    if h1_b == 1:
+        stack_ok = (e9 > e21 > e50 > e200 and c_c > e200) if strict_50_200 else (e9 > e21 and e21 > e50 and e21 > e200 and c_c > e200)
+        if not (stack_ok and e9 > e9_3 and e21 > e21_3 and ((e9 - e21) / c_c) >= min_sep_pct):
+            return None
+        if require_rsi and rsi_v <= 50.0:
+            return None
+        # Step 2: Red pullback candle into 9/21 zone, no heavy close far below 21 EMA, above 50 EMA
+        if not (p_c < p_o and min(p_l, c_l) <= p_e9 * 1.0015 and min(p_l, c_l) >= p_e50 * 0.998 and p_c >= p_e21 * (1.0 - 0.0025)):
+            return None
+        # Step 3: Strong green candle (solid body or bullish hammer) closing above 9 EMA and prior red high
+        strong_green = (c_c > c_o) and (
+            body_ratio >= 0.45 or (lower_w >= 1.8 * body and upper_w <= 0.25 * c_rng and body_ratio >= 0.20)
+        )
+        if not (strong_green and c_c > e9 and c_c > p_h):
+            return None
+        # Step 4: Structure-based SL below pullback swing low + volatility buffer, strictly <= 0.50% asset move
+        pb_low = min(float(recs15[k]["low"]) for k in range(pb_start, idx + 1))
+        sl_px = pb_low - buf
+        sl_dist = (c_c - sl_px) / c_c
+        if sl_dist < 0.0015 or sl_dist > max_sl_pct:
+            return None
+        risk_px = c_c - sl_px
+        tp1_px = c_c + 1.5 * risk_px
+        tp2_px = c_c + 3.0 * risk_px  # reference for runner projection; live/backtest trails 21 EMA close / 9x21 cross
+        tp1_roe = round((1.5 * risk_px / c_c) * DEFAULT_LEVERAGE * 100.0, 1)
+        return {
+            "direction": "LONG",
+            "entry": c_c,
+            "entry2_sweep": 0.0,
+            "stop": sl_px,
+            "tp1": tp1_px,
+            "tp2": tp2_px,
+            "tp1_label": f"50% Book 1:1.5R Maker (+{tp1_roe:.1f}% ROE -> Fee-BE)",
+            "tp2_label": "50% Runner (Trail 21 EMA Close / 9x21 Cross)",
+            "reason": f"4-EMA Stack LONG (9>21>50>200 | 1H+4H Bull | Vol {c_v/vsma:.1f}x | RSI {rsi_v:.0f} | SL {sl_dist*100:.2f}%)",
+            "trigger_zone": "15m 9/21 EMA VALUE ZONE",
+            "strategy_tag": "4-EMA Stack (9/21 Pullback)",
+            "sl_dist_pct": round(sl_dist * 100.0, 3),
+        }
+
+    # --- SHORT SETUP (EXACT MIRROR) ---
+    if h1_b == -1:
+        stack_ok = (e9 < e21 < e50 < e200 and c_c < e200) if strict_50_200 else (e9 < e21 and e21 < e50 and e21 < e200 and c_c < e200)
+        if not (stack_ok and e9 < e9_3 and e21 < e21_3 and ((e21 - e9) / c_c) >= min_sep_pct):
+            return None
+        if require_rsi and rsi_v >= 50.0:
+            return None
+        if not (p_c > p_o and max(p_h, c_h) >= p_e9 * 0.9985 and max(p_h, c_h) <= p_e50 * 1.002 and p_c <= p_e21 * (1.0 + 0.0025)):
+            return None
+        strong_red = (c_c < c_o) and (
+            body_ratio >= 0.45 or (upper_w >= 1.8 * body and lower_w <= 0.25 * c_rng and body_ratio >= 0.20)
+        )
+        if not (strong_red and c_c < e9 and c_c < p_l):
+            return None
+        pb_high = max(float(recs15[k]["high"]) for k in range(pb_start, idx + 1))
+        sl_px = pb_high + buf
+        sl_dist = (sl_px - c_c) / c_c
+        if sl_dist < 0.0015 or sl_dist > max_sl_pct:
+            return None
+        risk_px = sl_px - c_c
+        tp1_px = c_c - 1.5 * risk_px
+        tp2_px = c_c - 3.0 * risk_px
+        tp1_roe = round((1.5 * risk_px / c_c) * DEFAULT_LEVERAGE * 100.0, 1)
+        return {
+            "direction": "SHORT",
+            "entry": c_c,
+            "entry2_sweep": 0.0,
+            "stop": sl_px,
+            "tp1": tp1_px,
+            "tp2": tp2_px,
+            "tp1_label": f"50% Book 1:1.5R Maker (+{tp1_roe:.1f}% ROE -> Fee-BE)",
+            "tp2_label": "50% Runner (Trail 21 EMA Close / 9x21 Cross)",
+            "reason": f"4-EMA Stack SHORT (9<21<50<200 | 1H+4H Bear | Vol {c_v/vsma:.1f}x | RSI {rsi_v:.0f} | SL {sl_dist*100:.2f}%)",
+            "trigger_zone": "15m 9/21 EMA VALUE ZONE",
+            "strategy_tag": "4-EMA Stack (9/21 Pullback)",
+            "sl_dist_pct": round(sl_dist * 100.0, 3),
+        }
+    return None
+
+
+class Ema921StackStrategy(Strategy):
+    id = "ema9_21_stack"
+    name = "4-EMA Stack: 9/21 Pullback (15m + 1H/4H)"
+    short = "4-EMA 9/21 Stack"
+    timeframe = "15m Execution + 1H/4H 50/200 EMA Confirmation (Standalone)"
+    description = (
+        "Standalone 4-EMA Stack (9/21/50/200 Spot close): passes 3 chop filters (1H+4H 50/200 alignment, "
+        "15m 50 EMA chop veto, Last-2-Crossovers follow-through & 9/21 slope/separation), skips initial cross, "
+        "waits for pullback into 9/21 zone + strong confirmation candle with >20-SMA volume & RSI momentum, "
+        "structure swing SL + volatility buffer (<=0.50% asset move), 50% Maker @ 1:1.5R + 21 EMA Runner Trail."
+    )
+    daily_warmup_days = 30
+    tp1_name = "TP1 (50% Book 1:1.5R Maker -> Fee-BE)"
+    tp2_name = "Runner (Trail 21 EMA Close / 9x21 Cross)"
+    uses_live_price = True
+
+    def _build_indicators(self, df15: pd.DataFrame, df1h: pd.DataFrame | None = None, df4h: pd.DataFrame | None = None) -> dict:
+        df_full = df15.attrs.get("df_full_15m") if hasattr(df15, "attrs") else None
+        use_full = df_full is not None and not df_full.empty and len(df_full) >= len(df15)
+        src = df_full if use_full else df15
+        tail_n = len(df15)
+
+        cs = src["close"].astype(float)
+        hs = src["high"].astype(float).tolist()
+        ls = src["low"].astype(float).tolist()
+        c_list = cs.tolist()
+        vs = src["volume"].astype(float) if "volume" in src.columns else pd.Series([1.0] * len(src))
+
+        e9 = cs.ewm(span=9, adjust=False).mean().tolist()
+        e21 = cs.ewm(span=21, adjust=False).mean().tolist()
+        e50 = cs.ewm(span=50, adjust=False).mean().tolist()
+        e200 = cs.ewm(span=200, adjust=False).mean().tolist()
+        vsma = vs.rolling(20, min_periods=10).mean().fillna(0.0).tolist()
+        rsi14 = _calc_rsi_14(c_list, 14)
+        atr14 = _calc_atr_14(hs, ls, c_list, 14)
+
+        above50 = [1 if c_list[i] > e50[i] else 0 for i in range(len(c_list))]
+        cross50 = [0] + [1 if above50[i] != above50[i - 1] else 0 for i in range(1, len(c_list))]
+        cross50_20 = pd.Series(cross50).rolling(20, min_periods=1).sum().astype(int).tolist()
+        bsc, l2c = _compute_last2_cross_state(e9, e21, hs, ls, c_list)
+
+        ts15 = [int(t) for t in df15["timestamp"].tolist()]
+        if df1h is None or df1h.empty:
+            df1h = _resample_15m_to_htf(src, 3_600_000)
+        if df4h is None or df4h.empty:
+            df4h = _resample_15m_to_htf(src, 14_400_000)
+        h1_b = _align_htf_bias_to_15m(ts15, df1h, 3_600_000)
+        h4_b = _align_htf_bias_to_15m(ts15, df4h, 14_400_000)
+
+        return {
+            "ema9": e9[-tail_n:],
+            "ema21": e21[-tail_n:],
+            "ema50": e50[-tail_n:],
+            "ema200": e200[-tail_n:],
+            "vol_sma20": vsma[-tail_n:],
+            "rsi14": rsi14[-tail_n:],
+            "atr14": atr14[-tail_n:],
+            "cross50_20": cross50_20[-tail_n:],
+            "bars_since_cross": bsc[-tail_n:],
+            "last2_clean": l2c[-tail_n:],
+            "h1_bias": h1_b,
+            "h4_bias": h4_b,
+        }
+
+    def compute_levels(self, pair):
+        df15 = _closed_15m(pair, 320)
+        if df15.empty or len(df15) < 50:
+            return None
+        df1h = eng.fetch_coindcx_candles(pair=pair, interval="1h", limit=300, sync_live_price=False)
+        df4h = eng.fetch_coindcx_candles(pair=pair, interval="4h", limit=300, sync_live_price=False)
+        ind = self._build_indicators(df15, df1h=df1h, df4h=df4h)
+        i = len(df15) - 1
+        ref_px = float(df15["close"].iloc[i])
+        h1_b, h4_b = ind["h1_bias"][i], ind["h4_bias"][i]
+        htf_lbl = "BULLISH (1H+4H > 50/200)" if (h1_b == 1 and h4_b == 1) else ("BEARISH (1H+4H < 50/200)" if (h1_b == -1 and h4_b == -1) else "CHOP / MIXED")
+        bias = "BULLISH" if (h1_b == 1 and h4_b == 1) else ("BEARISH" if (h1_b == -1 and h4_b == -1) else "RANGE")
+        return {
+            "EMA9_15m": eng.round_asset_price(ind["ema9"][i], ref_px),
+            "EMA21_15m": eng.round_asset_price(ind["ema21"][i], ref_px),
+            "EMA50_15m": eng.round_asset_price(ind["ema50"][i], ref_px),
+            "EMA200_15m": eng.round_asset_price(ind["ema200"][i], ref_px),
+            "RSI14_15m": round(float(ind["rsi14"][i]), 1),
+            "ATR14_15m": eng.round_asset_price(ind["atr14"][i], ref_px),
+            "cross50_20": int(ind["cross50_20"][i]),
+            "last2_clean": bool(ind["last2_clean"][i]),
+            "bars_since_cross": int(ind["bars_since_cross"][i]),
+            "htf_alignment": htf_lbl,
+            "trend_bias": bias,
+            "bias": bias,
+            "MID": eng.round_asset_price(ind["ema21"][i], ref_px),
+            "RH": eng.round_asset_price(ref_px * 1.015, ref_px),
+            "RL": eng.round_asset_price(ref_px * 0.985, ref_px),
+            "SH": eng.round_asset_price(ref_px * 1.025, ref_px),
+            "SL": eng.round_asset_price(ref_px * 0.975, ref_px),
+            "_df15": df15,
+            "_ind": ind,
+        }
+
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+        levels = levels or self.compute_levels(pair)
+        if not levels:
+            return None
+        df15 = levels.get("_df15")
+        ind = levels.get("_ind")
+        if df15 is None or df15.empty or ind is None:
+            fresh = self.compute_levels(pair)
+            if not fresh:
+                return None
+            levels = fresh
+            df15, ind = fresh["_df15"], fresh["_ind"]
+
+        recs15 = df15.to_dict("records")
+        idx = len(recs15) - 1
+        cur = recs15[idx]
+        ref_px = float(cur["close"])
+        session = eng.get_current_session_info(datetime.now(IST))
+        candle_time = datetime.fromtimestamp(cur["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
+        clean_levels = {k: v for k, v in levels.items() if not str(k).startswith("_")}
+        out = {
+            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
+            "candle_evaluated": f"15m ({candle_time}) [{session['emoji']} {session['name']}]",
+            "session": session, "session_name": f"{session['emoji']} {session['name']}",
+            "is_prime_session": session["is_prime"], "is_us_open_candle": session["session_id"] == "NEW_YORK",
+            "pair": pair, "levels": clean_levels, "candle_ts": int(cur["timestamp"]),
+            "signal": "NEUTRAL", "signal_kind": None, "trigger_zone": None, "trigger_reason": "",
+            "setup": (
+                f"WAIT / NO TRADE (HTF: {clean_levels.get('htf_alignment', 'CHOP')} • "
+                f"9/21/50/200: {clean_levels.get('EMA9_15m')}/{clean_levels.get('EMA21_15m')}/"
+                f"{clean_levels.get('EMA50_15m')}/{clean_levels.get('EMA200_15m')})"
+            ),
+            "entry": ref_px, "entry2_sweep": 0.0, "stop_loss": 0.0, "tp1": 0.0, "tp2": 0.0,
+        }
+        out.update(position_metrics(pair, ref_px, 0.0, ref_px, ref_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+
+        sig = _detect_ema9_21_stack_setup(recs15, idx, ind)
+        if sig:
+            e_px = eng.round_asset_price(sig["entry"], ref_px)
+            sl_px = eng.round_asset_price(sig["stop"], ref_px)
+            tp1_px = eng.round_asset_price(sig["tp1"], ref_px)
+            tp2_px = eng.round_asset_price(sig["tp2"], ref_px)
+            out.update({
+                "signal": sig["direction"],
+                "signal_kind": "EMA9_21_STACK",
+                "trigger_zone": sig["trigger_zone"],
+                "trigger_reason": sig["reason"],
+                "setup": f"{sig['direction']} 4-EMA Stack 9/21 Pullback (SL {sig['sl_dist_pct']:.2f}%)",
+                "entry": e_px, "entry2_sweep": 0.0, "stop_loss": sl_px, "tp1": tp1_px, "tp2": tp2_px,
+                "tp1_label": sig["tp1_label"], "tp2_label": sig["tp2_label"],
+            })
+            out.update(position_metrics(pair, e_px, sl_px, tp1_px, tp2_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
+        return self._stamp(out)
+
+    def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
+        if not levels:
+            return {"BUY": None, "SELL": None, "note": ""}
+        px = float(live_price or levels.get("EMA9_15m") or 0.0)
+        e9 = float(levels.get("EMA9_15m") or px)
+        e21 = float(levels.get("EMA21_15m") or px)
+        if px <= 0:
+            return {"BUY": None, "SELL": None, "note": ""}
+
+        b_ent = eng.round_asset_price(e9, px)
+        b_sl = eng.round_asset_price(min(e21 * 0.9988, b_ent * 0.9955), px)
+        b_risk = max(b_ent - b_sl, b_ent * 0.0025)
+        b_tp1 = eng.round_asset_price(b_ent + 1.5 * b_risk, px)
+        b_tp2 = eng.round_asset_price(b_ent + 3.0 * b_risk, px)
+        buy_setup = {
+            "direction": "BUY", "setup": "LONG 4-EMA 9/21 Pullback (1:1.5R + 21 EMA Trail)",
+            "entry": b_ent, "entry2_sweep": 0.0, "stop_loss": b_sl, "tp1": b_tp1, "tp2": b_tp2,
+            **position_metrics(pair, b_ent, b_sl, b_tp1, b_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
+        }
+
+        s_ent = eng.round_asset_price(e9, px)
+        s_sl = eng.round_asset_price(max(e21 * 1.0012, s_ent * 1.0045), px)
+        s_risk = max(s_sl - s_ent, s_ent * 0.0025)
+        s_tp1 = eng.round_asset_price(s_ent - 1.5 * s_risk, px)
+        s_tp2 = eng.round_asset_price(s_ent - 3.0 * s_risk, px)
+        sell_setup = {
+            "direction": "SELL", "setup": "SHORT 4-EMA 9/21 Pullback (1:1.5R + 21 EMA Trail)",
+            "entry": s_ent, "entry2_sweep": 0.0, "stop_loss": s_sl, "tp1": s_tp1, "tp2": s_tp2,
+            **position_metrics(pair, s_ent, s_sl, s_tp1, s_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
+        }
+        note = (
+            f"4-EMA Stack 15m: 9=${levels.get('EMA9_15m')} | 21=${levels.get('EMA21_15m')} | "
+            f"50=${levels.get('EMA50_15m')} | 200=${levels.get('EMA200_15m')} | HTF: {levels.get('htf_alignment', '')}"
+        )
+        return {"BUY": self._stamp(buy_setup), "SELL": self._stamp(sell_setup), "note": note}
+
+    def chart_lines(self, levels, plan=None):
+        if not levels:
+            return []
+        lines = []
+        for k, lbl, col, dsh in (
+            ("EMA9_15m", "15m 9 EMA (Trigger)", "#22c55e", "solid"),
+            ("EMA21_15m", "15m 21 EMA (Value / Trail)", "#38bdf8", "solid"),
+            ("EMA50_15m", "15m 50 EMA (Chop Filter)", "#a855f7", "dash"),
+            ("EMA200_15m", "15m 200 EMA (Macro)", "#eab308", "dot"),
+        ):
+            if levels.get(k):
+                lines.append({"label": lbl, "price": levels[k], "color": col, "dash": dsh})
+        return lines
+
+    def metric_badges(self, levels):
+        if not levels:
+            return []
+        return [
+            {"label": lbl, "value": levels[k]}
+            for k, lbl in (("EMA9_15m", "9 EMA"), ("EMA21_15m", "21 EMA"), ("EMA50_15m", "50 EMA"), ("EMA200_15m", "200 EMA"))
+            if levels.get(k)
+        ]
+
+    def level_rows(self, levels, live_price):
+        if not levels:
+            return []
+        rows = []
+        for k, lbl in (
+            ("EMA9_15m", "15m 9 EMA (Momentum Trigger)"),
+            ("EMA21_15m", "15m 21 EMA (Dynamic Value Zone)"),
+            ("EMA50_15m", "15m 50 EMA (Mid-Trend / Chop)"),
+            ("EMA200_15m", "15m 200 EMA (Macro Regime)"),
+        ):
+            v = float(levels.get(k, 0.0) or 0.0)
+            if v > 0:
+                rows.append({"Level": lbl, "Price": v, "Distance %": round(((v - live_price) / live_price) * 100.0, 2) if live_price > 0 else 0.0})
+        return rows
+
+    def prepare_backtest(self, df, df_daily):
+        df1h = df.attrs.get("df_1h") if hasattr(df, "attrs") else None
+        df4h = df.attrs.get("df_4h") if hasattr(df, "attrs") else None
+        ind = self._build_indicators(df, df1h=df1h, df4h=df4h)
+        return {"ind": ind, "boxes": {}, "daily": {}}
+
+    def backtest_has_context(self, candle, ctx):
+        return bool(ctx and ctx.get("ind"))
+
+    def backtest_entry(self, idx, candle, ctx, records):
+        return _detect_ema9_21_stack_setup(records, idx, ctx["ind"])
+
+
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
     ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Box + Auto Trend EMA] (Recommended)"),
     ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA"),
     ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
     ("box_theory", "Box Theory Sweep Only (v27)"),
     ("ema50_200", "15m 50/200 EMA Pullback Only"),
+    ("ema9_21_stack", "🧪 4-EMA Stack: 9/21 Pullback (15m + 1H/4H) [Standalone]"),
 ]
 DEFAULT_AUTOTRADE_MODE = "box_plus_ema50_200_regime"
 
@@ -2354,6 +2886,8 @@ def autotrade_mode_label(mode: str | None) -> str:
 def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
     """Ordered component strategies for live scanning under a given AutoTrade/Backtest mode."""
     m = resolve_autotrade_mode(mode)
+    if m == "ema9_21_stack":
+        return ["ema9_21_stack"]
     if m == "box_theory":
         return ["box_theory"]
     if m == "ema50_200":
@@ -2376,6 +2910,7 @@ STRATEGY_REGISTRY: dict[str, Strategy] = {
     AtrReversal.id: AtrReversal(),
     Ema9RetestStrategy.id: Ema9RetestStrategy(),
     Ema50200PullbackStrategy.id: Ema50200PullbackStrategy(allow_bear=True, allow_bull=True),
+    Ema921StackStrategy.id: Ema921StackStrategy(),
     "box_plus_ema50_200_regime": BoxPlusEma50200Strategy(
         sid="box_plus_ema50_200_regime",
         name="Combo: Regime-Adaptive [Box + Auto Trend EMA]",
@@ -2408,6 +2943,7 @@ def list_strategies() -> list[Strategy]:
     return [
         STRATEGY_REGISTRY[BoxTheorySweep.id],
         STRATEGY_REGISTRY[Ema50200PullbackStrategy.id],
+        STRATEGY_REGISTRY[Ema921StackStrategy.id],
         STRATEGY_REGISTRY[AtrReversal.id],
         STRATEGY_REGISTRY[Ema9RetestStrategy.id],
     ]

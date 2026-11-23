@@ -92,6 +92,8 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str)
     """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
     m = strat_registry.resolve_autotrade_mode(auto_mode)
     d = str(direction or "").upper()
+    if m == "ema9_21_stack":
+        return strategy_id == "ema9_21_stack"
     if m == "box_theory":
         return strategy_id == "box_theory"
     if m == "ema50_200":
