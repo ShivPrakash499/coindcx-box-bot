@@ -5,6 +5,7 @@ import json
 import hmac
 import hashlib
 import requests
+import numpy as np
 import pandas as pd
 import pytz
 from datetime import datetime, timezone
@@ -4045,6 +4046,299 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
 
 
 _MARKET_REGIME_CACHE = _PERSIST.setdefault("market_regime_cache", {"ts": 0.0, "data": None})
+_PAIR_INTRADAY_STACK_CACHE = _PERSIST.setdefault("pair_intraday_stack_cache", {})
+
+
+def compute_wilder_adx(high: np.ndarray, low: np.ndarray, close: np.ndarray, period: int = 14) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Computes standard Wilder ADX(14), +DI(14), and -DI(14) with zero lookahead."""
+    n = len(close)
+    adx = np.zeros(n, dtype=float)
+    plus_di = np.zeros(n, dtype=float)
+    minus_di = np.zeros(n, dtype=float)
+    if n < period * 2 + 2:
+        return adx, plus_di, minus_di
+    tr = np.zeros(n, dtype=float)
+    pdm = np.zeros(n, dtype=float)
+    mdm = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        up = float(high[i]) - float(high[i - 1])
+        dn = float(low[i - 1]) - float(low[i])
+        pdm[i] = up if (up > dn and up > 0.0) else 0.0
+        mdm[i] = dn if (dn > up and dn > 0.0) else 0.0
+        tr[i] = max(
+            float(high[i]) - float(low[i]),
+            abs(float(high[i]) - float(close[i - 1])),
+            abs(float(low[i]) - float(close[i - 1])),
+        )
+    atr_s = float(np.sum(tr[1 : period + 1]))
+    pdm_s = float(np.sum(pdm[1 : period + 1]))
+    mdm_s = float(np.sum(mdm[1 : period + 1]))
+    dx = np.zeros(n, dtype=float)
+    for i in range(period, n):
+        if i > period:
+            atr_s = atr_s - (atr_s / period) + tr[i]
+            pdm_s = pdm_s - (pdm_s / period) + pdm[i]
+            mdm_s = mdm_s - (mdm_s / period) + mdm[i]
+        pdi = (100.0 * pdm_s / atr_s) if atr_s > 0 else 0.0
+        mdi = (100.0 * mdm_s / atr_s) if atr_s > 0 else 0.0
+        plus_di[i] = pdi
+        minus_di[i] = mdi
+        denom = pdi + mdi
+        dx[i] = (100.0 * abs(pdi - mdi) / denom) if denom > 0 else 0.0
+    s0 = period * 2 - 1
+    adx[s0] = float(np.mean(dx[period : s0 + 1]))
+    for i in range(s0 + 1, n):
+        adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+    return adx, plus_di, minus_di
+
+
+def compute_htf_market_structure_from_15m(
+    ts_ms: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    tf_ms: int = 3_600_000,
+    pivot_k: int = 2,
+) -> list[dict]:
+    """Causal 1H/4H Market Structure (HH/HL, LH/LL) + Early Reversal CHoCH from 15m bars."""
+    n = len(ts_ms)
+    if n == 0:
+        return []
+    buckets: list[tuple[int, float, float, float]] = []
+    cur_b = -1
+    bh = bl = bc = 0.0
+    for i in range(n):
+        b = int(ts_ms[i] // tf_ms)
+        if b != cur_b:
+            if cur_b >= 0:
+                buckets.append(((cur_b + 1) * tf_ms, bh, bl, bc))
+            cur_b = b
+            bh, bl, bc = float(high[i]), float(low[i]), float(close[i])
+        else:
+            if high[i] > bh:
+                bh = float(high[i])
+            if low[i] < bl:
+                bl = float(low[i])
+            bc = float(close[i])
+    if cur_b >= 0:
+        buckets.append(((cur_b + 1) * tf_ms, bh, bl, bc))
+
+    m = len(buckets)
+    h_a = [x[1] for x in buckets]
+    l_a = [x[2] for x in buckets]
+    c_a = [x[3] for x in buckets]
+    e_a = [x[0] for x in buckets]
+
+    htf_states: list[dict] = []
+    sh: list[float] = []
+    sl: list[float] = []
+    prev_tr = "CHOP"
+    for j in range(m):
+        p = j - pivot_k
+        if p >= pivot_k:
+            if all(h_a[p] > h_a[p - d] for d in range(1, pivot_k + 1)) and all(h_a[p] >= h_a[p + d] for d in range(1, pivot_k + 1)):
+                sh.append(h_a[p])
+            if all(l_a[p] < l_a[p - d] for d in range(1, pivot_k + 1)) and all(l_a[p] <= l_a[p + d] for d in range(1, pivot_k + 1)):
+                sl.append(l_a[p])
+        st = "CHOP"
+        choch = "NONE"
+        cn = c_a[j]
+        last_hl = sl[-1] if sl else 0.0
+        last_lh = sh[-1] if sh else 0.0
+        if len(sh) >= 2 and len(sl) >= 2:
+            hh = sh[-1] > sh[-2]
+            hl = sl[-1] > sl[-2]
+            lh = sh[-1] < sh[-2]
+            ll = sl[-1] < sl[-2]
+            if hh and hl:
+                if cn < sl[-1]:
+                    choch = "BEARISH_CHOCH"
+                    st = "CHOP"
+                else:
+                    st = "UP"
+                    prev_tr = "UP"
+            elif lh and ll:
+                if cn > sh[-1]:
+                    choch = "BULLISH_CHOCH"
+                    st = "CHOP"
+                else:
+                    st = "DOWN"
+                    prev_tr = "DOWN"
+            else:
+                if prev_tr == "UP" and cn < sl[-1]:
+                    choch = "BEARISH_CHOCH"
+                elif prev_tr == "DOWN" and cn > sh[-1]:
+                    choch = "BULLISH_CHOCH"
+        htf_states.append({"struct": st, "choch": choch, "last_hl": last_hl, "last_lh": last_lh})
+
+    out: list[dict] = []
+    ptr = -1
+    for i in range(n):
+        bar_end = int(ts_ms[i]) + 900_000
+        while ptr + 1 < m and e_a[ptr + 1] <= bar_end:
+            ptr += 1
+        out.append(htf_states[ptr] if ptr >= 0 else {"struct": "CHOP", "choch": "NONE", "last_hl": 0.0, "last_lh": 0.0})
+    return out
+
+
+def compute_intraday_3layer_series(df_15m: pd.DataFrame) -> list[dict]:
+    """Zero-lookahead per-bar 1H/4H structure, Session VWAP (00:00 UTC), 15m EMAs & Wilder ADX(14)."""
+    if df_15m is None or df_15m.empty:
+        return []
+    ts_ms = df_15m["timestamp"].to_numpy(dtype=np.int64)
+    hi = df_15m["high"].to_numpy(dtype=float)
+    lo = df_15m["low"].to_numpy(dtype=float)
+    cl = df_15m["close"].to_numpy(dtype=float)
+    vol = df_15m["volume"].to_numpy(dtype=float) if "volume" in df_15m.columns else np.ones(len(df_15m), dtype=float)
+    n = len(df_15m)
+
+    s1h = compute_htf_market_structure_from_15m(ts_ms, hi, lo, cl, tf_ms=3_600_000, pivot_k=2)
+    s4h = compute_htf_market_structure_from_15m(ts_ms, hi, lo, cl, tf_ms=14_400_000, pivot_k=2)
+
+    vwap = np.zeros(n, dtype=float)
+    vwap_state = ["CHOP_VWAP"] * n
+    cur_d = -1
+    cpv = 0.0
+    cv = 0.0
+    s0 = 0
+    for i in range(n):
+        d = int(ts_ms[i] // 86_400_000)
+        if d != cur_d:
+            cur_d = d
+            cpv = 0.0
+            cv = 0.0
+            s0 = i
+        tp = (hi[i] + lo[i] + cl[i]) / 3.0
+        vi = max(0.0, vol[i])
+        cpv += tp * vi
+        cv += vi
+        vwap[i] = (cpv / cv) if cv > 0 else tp
+        vr = vwap[max(s0, i - 4)]
+        slp = ((vwap[i] - vr) / vr * 100.0) if vr > 0 else 0.0
+        w0 = max(s0, i - 7)
+        crosses = 0
+        ps = 0
+        for k in range(w0, i + 1):
+            s = 1 if cl[k] > vwap[k] else (-1 if cl[k] < vwap[k] else 0)
+            if s != 0 and ps != 0 and s != ps:
+                crosses += 1
+            if s != 0:
+                ps = s
+        if crosses >= 3 or (crosses >= 2 and abs(slp) < 0.08):
+            vwap_state[i] = "CHOP_VWAP"
+        elif cl[i] > vwap[i] and slp >= 0.02:
+            vwap_state[i] = "BULL_VWAP"
+        elif cl[i] < vwap[i] and slp <= -0.02:
+            vwap_state[i] = "BEAR_VWAP"
+        else:
+            vwap_state[i] = "CHOP_VWAP"
+
+    sc = pd.Series(cl)
+    e9 = sc.ewm(span=9, adjust=False).mean().to_numpy()
+    e21 = sc.ewm(span=21, adjust=False).mean().to_numpy()
+    e50 = sc.ewm(span=50, adjust=False).mean().to_numpy()
+    e200 = sc.ewm(span=200, adjust=False).mean().to_numpy()
+    adx, _, _ = compute_wilder_adx(hi, lo, cl, period=14)
+
+    out: list[dict] = []
+    for i in range(n):
+        ci = float(cl[i])
+        e50p = float(e50[max(0, i - 3)])
+        e21p = float(e21[max(0, i - 3)])
+        e50_bull = (ci > 0) and (e50[i] > e200[i]) and ((e50[i] - e200[i]) / ci >= 0.0015) and (e50[i] >= e50p)
+        e50_bear = (ci > 0) and (e50[i] < e200[i]) and ((e200[i] - e50[i]) / ci >= 0.0015) and (e50[i] <= e50p)
+        e921_bull = (ci > 0) and (e9[i] > e21[i] > e50[i]) and ((e9[i] - e50[i]) / ci >= 0.0025) and (e21[i] > e21p)
+        e921_bear = (ci > 0) and (e9[i] < e21[i] < e50[i]) and ((e50[i] - e9[i]) / ci >= 0.0025) and (e21[i] < e21p)
+        ema_st = "BULL_EMA" if (e50_bull or e921_bull) else ("BEAR_EMA" if (e50_bear or e921_bear) else "CHOP_EMA")
+        out.append({
+            "timestamp": int(ts_ms[i]),
+            "s1_struct": s1h[i]["struct"],
+            "s1_choch": s1h[i]["choch"],
+            "s4_struct": s4h[i]["struct"],
+            "vwap_state": vwap_state[i],
+            "ema_state": ema_st,
+            "adx": round(float(adx[i]), 1),
+        })
+    return out
+
+
+def compute_pair_intraday_trend_stack(pair: str, df_15m: pd.DataFrame = None, force_refresh: bool = False) -> dict:
+    """Computes live closed-candle intraday 3-layer telemetry for `pair` (cached 45s)."""
+    now = time.time()
+    if df_15m is None and not force_refresh:
+        ent = _PAIR_INTRADAY_STACK_CACHE.get(pair)
+        if isinstance(ent, dict) and (now - float(ent.get("ts", 0.0))) < 45.0 and isinstance(ent.get("data"), dict):
+            return dict(ent["data"])
+    neutral = {
+        "pair": pair, "s1_struct": "CHOP", "s1_choch": "NONE",
+        "s4_struct": "CHOP", "vwap_state": "CHOP_VWAP", "ema_state": "CHOP_EMA", "adx": 0.0,
+    }
+    try:
+        df = df_15m
+        if df is None:
+            raw = fetch_coindcx_candles(pair=pair, interval="15m", limit=420, sync_live_price=False)
+            if raw is None or raw.empty or len(raw) < 40:
+                return neutral
+            now_ms = int(now * 1000)
+            df = raw[raw["timestamp"] + 900_000 <= now_ms].reset_index(drop=True)
+            if len(df) < 35:
+                df = raw.iloc[:-1].reset_index(drop=True)
+        if df is None or df.empty or len(df) < 30:
+            return neutral
+        series = compute_intraday_3layer_series(df)
+        if not series:
+            return neutral
+        last = dict(series[-1])
+        last["pair"] = pair
+        if df_15m is None:
+            _PAIR_INTRADAY_STACK_CACHE[pair] = {"ts": now, "data": dict(last)}
+        return last
+    except Exception:
+        return neutral
+
+
+def check_box_conflict_wait(layer_info: dict | None) -> tuple[bool, int, float]:
+    """
+    Surgical CONFLICT_WAIT Guard for S1 Box Sweep ONLY:
+    Returns `(is_conflict, score, adx)` where `is_conflict` is True strictly when
+    `ADX(14) >= 25.0` AND `abs(score) <= 1` (high-volatility split timeframes, e.g. 4H UP + Bull VWAP
+    fighting 1H DOWN + 15m Bear EMA). Leaves low-ADX chop and directional leans (`|score| >= 2`) untouched.
+    """
+    info = layer_info if isinstance(layer_info, dict) else {}
+    htf_4h = str(info.get("s4_struct") or info.get("htf_4h") or "CHOP").upper()
+    h1_struct = str(info.get("s1_struct") or info.get("h1_struct") or "CHOP").upper()
+    h1_choch = str(info.get("s1_choch") or info.get("h1_choch") or "NONE").upper()
+    vwap_bias = str(info.get("vwap_state") or info.get("vwap_bias") or "CHOP_VWAP").upper()
+    ema_15m = str(info.get("ema_state") or info.get("ema_15m") or "CHOP_EMA").upper()
+    raw_adx = info.get("adx") if info.get("adx") is not None else info.get("adx_14", 0.0)
+    try:
+        adx = float(raw_adx or 0.0)
+    except Exception:
+        adx = 0.0
+
+    score = 0
+    if htf_4h == "UP":
+        score += 1
+    elif htf_4h == "DOWN":
+        score -= 1
+    if h1_choch == "BULLISH_CHOCH":
+        score += 1
+    elif h1_choch == "BEARISH_CHOCH":
+        score -= 1
+    elif h1_struct == "UP":
+        score += 1
+    elif h1_struct == "DOWN":
+        score -= 1
+    if vwap_bias == "BULL_VWAP":
+        score += 1
+    elif vwap_bias == "BEAR_VWAP":
+        score -= 1
+    if ema_15m == "BULL_EMA":
+        score += 1
+    elif ema_15m == "BEAR_EMA":
+        score -= 1
+
+    return bool(adx >= 25.0 and abs(score) <= 1), score, round(adx, 1)
 
 
 def classify_universe_regime_from_stats(
@@ -6717,6 +7011,18 @@ def execute_autotrade_two_entry_signal(
                 f"Row-9 No-Bear-Long Guard: Blocking Box LONG on {pair} during Chop "
                 f"(Prev Daily Close ${_d_close_r9:,.4g} <= Daily 50 EMA ${_d_ema50_r9:,.4g})."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir, "no_bear_long": True}
+    # Surgical CONFLICT_WAIT Guard on S1 Box Sweep ONLY (ADX >= 25 & |score| <= 1):
+    # Leaves Strategy 4 (15m 50/200 EMA), Daily 50/200 EMA bias lock & Row-9 No-Bear-Long 100% untouched.
+    if (not allow_mode_override) and sig_strat_id == "box_theory":
+        try:
+            _is_cf, _cf_sc, _cf_adx = check_box_conflict_wait(compute_pair_intraday_trend_stack(pair))
+            if _is_cf:
+                return False, (
+                    f"CONFLICT_WAIT Box Guard (Score {_cf_sc:+d}, ADX {_cf_adx:.1f} >= 25): "
+                    f"Blocking S1 Box Sweep {norm_dir} on {pair} during high-volatility timeframe conflict."
+                ), {"strategy_id": sig_strat_id, "conflict_wait": True, "score": _cf_sc, "adx": _cf_adx}
+        except Exception:
+            pass
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
@@ -7826,6 +8132,11 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "classify_universe_regime_from_stats": classify_universe_regime_from_stats,
             "compute_market_regime": compute_market_regime,
             "build_historical_regime_map": build_historical_regime_map,
+            "compute_wilder_adx": compute_wilder_adx,
+            "compute_htf_market_structure_from_15m": compute_htf_market_structure_from_15m,
+            "compute_intraday_3layer_series": compute_intraday_3layer_series,
+            "compute_pair_intraday_trend_stack": compute_pair_intraday_trend_stack,
+            "check_box_conflict_wait": check_box_conflict_wait,
             "count_open_ema50_200_slots": count_open_ema50_200_slots,
             "_get_active_locks_map": _get_active_locks_map,
             "get_open_entry_limit_orders": get_open_entry_limit_orders,

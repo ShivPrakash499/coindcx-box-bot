@@ -2269,6 +2269,17 @@ class BoxPlusEma50200Strategy(Strategy):
                                 f"(Prev Daily Close ${d_close:,.4g} <= Daily 50 EMA ${d_ema50:,.4g})"
                             ),
                         })
+                if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
+                    is_cf, cf_sc, cf_adx = eng.check_box_conflict_wait(eng.compute_pair_intraday_trend_stack(pair))
+                    if is_cf:
+                        return self._stamp({
+                            **sig1,
+                            "signal": "NEUTRAL",
+                            "trigger_reason": (
+                                f"CONFLICT_WAIT Box Guard (Score {cf_sc:+d}, ADX {cf_adx:.1f} >= 25): "
+                                f"Blocked Box {sig1.get('signal')} on high-volatility timeframe conflict."
+                            ),
+                        })
                 return sig1
             # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!
             sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
@@ -2307,6 +2318,7 @@ class BoxPlusEma50200Strategy(Strategy):
     def prepare_backtest(self, df, df_daily):
         ctx1 = self.s1.prepare_backtest(df, df_daily)
         reg_map = {}
+        stack_by_ts = {}
         if self.regime_adaptive:
             reg_map = dict(eng._PERSIST.get("backtest_regime_map") or {})
             if not reg_map and df_daily is not None and len(df_daily) >= 18:
@@ -2326,11 +2338,18 @@ class BoxPlusEma50200Strategy(Strategy):
                     r5 = (pc / float(closes[i - 6]) - 1.0) * 100.0
                     r2 = (pc / float(closes[i - 3]) - 1.0) * 100.0
                     reg_map[dates[i]] = eng.classify_universe_regime_from_stats(bf, brf, r14, r5, r2)
+            src_15m = df.attrs.get("df_full_15m") if (df is not None and hasattr(df, "attrs")) else None
+            if not (isinstance(src_15m, pd.DataFrame) and not src_15m.empty and {"timestamp", "open", "high", "low", "close"}.issubset(src_15m.columns)):
+                src_15m = df
+            if src_15m is not None and not src_15m.empty and {"timestamp", "open", "high", "low", "close"}.issubset(src_15m.columns):
+                st_list = eng.compute_intraday_3layer_series(src_15m)
+                stack_by_ts = {int(x["timestamp"]): x for x in st_list}
         return {
             "ctx1": ctx1,
             "ctx4": self.s4.prepare_backtest(df, df_daily),
             "boxes": ctx1["boxes"],
             "regime_map": reg_map,
+            "stack_by_ts": stack_by_ts,
         }
 
     def backtest_has_context(self, candle, ctx):
@@ -2344,6 +2363,12 @@ class BoxPlusEma50200Strategy(Strategy):
                 if e1 and e1.get("direction") == "LONG":
                     box = (ctx.get("boxes") or {}).get(candle["date_str"]) or {}
                     if not bool(box.get("above_d50", True)):
+                        return None
+                if e1:
+                    ts_bar = int(candle.get("timestamp", 0) or 0)
+                    st = (ctx.get("stack_by_ts") or {}).get(ts_bar)
+                    is_cf, _, _ = eng.check_box_conflict_wait(st)
+                    if is_cf:
                         return None
                 return e1
             # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!

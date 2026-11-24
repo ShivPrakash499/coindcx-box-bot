@@ -2248,6 +2248,56 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
     print("  -> PASS: Daemon v37/v38/v39 (Concurrent Slots, Auto-Split, 00:00 UTC Reset, Unrealized SL Pause & E0b/E0 Sizing Toggle) verified!")
 
 
+def test_19_v41_conflict_wait_box_hybrid():
+    print("[19/19] Verifying v41 Surgical Hybrid: CONFLICT_WAIT (ADX >= 25 & |score| <= 1) on S1 Box Sweep ONLY...")
+    import coindcx_engine as eng
+    import strategies as strat
+
+    # 1. Exact conflict predicate boundaries
+    # High-ADX split conflict (ETH/SOL: 4H UP + Bull VWAP vs 1H DOWN + Bear EMA -> score 0, ADX 36) -> BLOCKED
+    assert eng.check_box_conflict_wait(
+        {"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BULL_VWAP", "ema_state": "BEAR_EMA", "adx": 36.0}
+    ) == (True, 0, 36.0)
+    # High-ADX slight lean (-1, ADX 25.7) -> BLOCKED
+    assert eng.check_box_conflict_wait(
+        {"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "BEAR_EMA", "adx": 25.7}
+    ) == (True, -1, 25.7)
+    # Low-ADX chop (score 0, ADX 17.5 < 25) -> ALLOWED (not a high-vol conflict!)
+    assert eng.check_box_conflict_wait(
+        {"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BULL_VWAP", "ema_state": "BEAR_EMA", "adx": 17.5}
+    ) == (False, 0, 17.5)
+    # High-ADX directional lean (BTC: score -2, ADX 30.5 -> |score| >= 2) -> ALLOWED!
+    assert eng.check_box_conflict_wait(
+        {"s4_struct": "CHOP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "BEAR_EMA", "adx": 30.5}
+    ) == (False, -2, 30.5)
+
+    # 2. BoxPlusEma50200Strategy blocks Box Sweep on CONFLICT_WAIT while keeping S4 (15m EMA) & Row-9 untouched!
+    combo = strat.STRATEGY_REGISTRY["box_plus_ema50_200_regime"]
+    fake_box_short = {"signal": "SHORT", "strategy_id": "box_theory", "entry": 100.0, "stop_loss": 101.5, "tp1": 98.5, "tp2": 97.0, "levels": {"daily_close": 95.0, "EMA50": 100.0}}
+    with patch.object(combo.s1, "evaluate_signal", return_value=fake_box_short), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP"}), \
+         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BULL_VWAP", "ema_state": "BEAR_EMA", "adx": 32.0}):
+        res_cf = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_cf["signal"] == "NEUTRAL" and "CONFLICT_WAIT Box Guard" in res_cf["trigger_reason"], res_cf
+
+    # Low-ADX chop -> Box SHORT passes cleanly!
+    with patch.object(combo.s1, "evaluate_signal", return_value=fake_box_short), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP"}), \
+         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "CHOP", "s1_struct": "CHOP", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "CHOP_EMA", "adx": 16.0}):
+        res_ok = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_ok["signal"] == "SHORT", res_ok
+
+    # Strategy 4 (15m 50/200 EMA) in STRONG_DOWNTREND is 100% untouched even if stack has ADX 32 & score 0!
+    fake_s4 = {"signal": "SHORT", "strategy_id": "ema50_200", "entry": 100.0, "stop_loss": 101.2, "tp1": 98.5, "tp2": 96.0}
+    with patch.object(combo.s4, "evaluate_signal", return_value=fake_s4), \
+         patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND"}), \
+         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BULL_VWAP", "ema_state": "BEAR_EMA", "adx": 32.0}):
+        res_s4 = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_s4["signal"] == "SHORT" and res_s4["strategy_id"] == "ema50_200", res_s4
+
+    print("  -> PASS: v41 Surgical Hybrid CONFLICT_WAIT Box Guard verified (S4, Daily Bias & Row-9 100% untouched)!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -2267,6 +2317,7 @@ if __name__ == "__main__":
     test_16_three_tier_main_staging_experiment_parity()
     test_17_v36_six_sl_reduction_fixes()
     test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
+    test_19_v41_conflict_wait_box_hybrid()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

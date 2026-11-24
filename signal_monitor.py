@@ -370,6 +370,20 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     })
                     continue
 
+                # Surgical CONFLICT_WAIT Box Guard (ADX >= 25 & |score| <= 1) on S1 Box Sweep ONLY
+                if s.id == "box_theory":
+                    try:
+                        _is_cf_m, _cf_sc_m, _cf_adx_m = eng.check_box_conflict_wait(eng.compute_pair_intraday_trend_stack(pair))
+                        if _is_cf_m:
+                            results.append({
+                                **row,
+                                "signal": None,
+                                "message": f"blocked by CONFLICT_WAIT Box Guard (Score {_cf_sc_m:+d}, ADX {_cf_adx_m:.1f} >= 25)",
+                            })
+                            continue
+                    except Exception:
+                        pass
+
                 # 1-Crypto-at-a-Time Guard: If any crypto is already active, do not alert/open another crypto
                 if portfolio_occupied and active_Slot_pair and _canon_pair(active_Slot_pair) != pair_base:
                     results.append({
