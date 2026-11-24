@@ -4941,7 +4941,7 @@ def get_effective_autotrade_wallet_inr(cfg: dict | None = None, exchange_wallet:
         at_w = float(c.get("autotrade_wallet_inr", 0.0) or 0.0)
     except Exception:
         at_w = 0.0
-    if at_w >= 500.0:
+    if at_w >= 100.0:
         return round(at_w, 2)
     ex_tot = float((exchange_wallet or {}).get("total_inr", 0.0) or 0.0) if isinstance(exchange_wallet, dict) else 0.0
     if ex_tot > 0:
@@ -5269,7 +5269,7 @@ def get_autotrade_config() -> dict:
                 auto_sp_c = is_auto_split_enabled(res)
                 res["auto_split_wallet_by_slots"] = auto_sp_c
                 _at_w_c = float(res.get("autotrade_wallet_inr", 0.0) or 0.0)
-                wb_c = _at_w_c if _at_w_c >= 500.0 else float(res.get("wallet_balance_inr", 47287.18) or 47287.18)
+                wb_c = _at_w_c if _at_w_c >= 100.0 else float(res.get("wallet_balance_inr", 47287.18) or 47287.18)
                 sm_c = float(res.get("single_trade_margin_inr", 0) or 0)
                 if sm_c <= 0 or sm_c in (15762.39, 30000.0, 250000.0, 100000.0) or auto_sp_c:
                     res["single_trade_margin_inr"] = round(wb_c / eff_sl_c, 2)
@@ -5286,7 +5286,7 @@ def get_autotrade_config() -> dict:
                     auto_sp = is_auto_split_enabled(default_cfg)
                     default_cfg["auto_split_wallet_by_slots"] = auto_sp
                     _at_w_d = float(default_cfg.get("autotrade_wallet_inr", 0.0) or 0.0)
-                    wb = _at_w_d if _at_w_d >= 500.0 else float(default_cfg.get("wallet_balance_inr", 47287.18) or 47287.18)
+                    wb = _at_w_d if _at_w_d >= 100.0 else float(default_cfg.get("wallet_balance_inr", 47287.18) or 47287.18)
                     sm_val = float(default_cfg.get("single_trade_margin_inr", 0) or 0)
                     if sm_val <= 0 or sm_val in (15762.39, 30000.0, 250000.0, 100000.0) or auto_sp:
                         default_cfg["single_trade_margin_inr"] = round(wb / eff_sl, 2)

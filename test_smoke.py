@@ -2376,6 +2376,7 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
     assert '"✏️ Update SL / TP on Position"' in app_src
     assert '"📧 Manual Intraday Router Alerts (24/7)"' in app_src
     assert '"🏦 Live CoinDCX Futures Wallet"' in app_src
+    assert "_margin_min_inr = 10.0" in app_src
     assert "_send_trade_email_async(" in app_src
     assert "healthcheck" in app_src
     assert "autotrade_wallet_inr" in eng._DURABLE_AUTOTRADE_KEYS

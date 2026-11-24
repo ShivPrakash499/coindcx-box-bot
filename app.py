@@ -814,9 +814,9 @@ if _is_staging_env or _is_experiment_env:
 if not wallet_data.get("is_live_api"):
     _manual_wallet_inr = st.sidebar.number_input(
         "Sync Wallet Balance (INR)",
-        min_value=500.0,
+        min_value=100.0,
         max_value=10000000.0,
-        value=float(wallet_data["total_inr"]),
+        value=max(100.0, min(10000000.0, float(wallet_data["total_inr"] or 100.0))),
         step=100.0,
         format="%.2f",
         help="Your total CoinDCX Futures Wallet balance in INR (auto-synced when CoinDCX API key is active)."
@@ -827,19 +827,23 @@ if not wallet_data.get("is_live_api"):
         _auto_cfg = coindcx_engine.save_autotrade_config({"wallet_balance_inr": round(_manual_wallet_inr, 2)})
         get_cached_balance.clear()
 
-_saved_max_slots = coindcx_engine.get_configured_max_slots(_auto_cfg)
+_saved_max_slots = max(1, min(6, int(coindcx_engine.get_configured_max_slots(_auto_cfg) or 3)))
 _saved_auto_split = coindcx_engine.is_auto_split_enabled(_auto_cfg)
-_saved_at_wallet = coindcx_engine.get_effective_autotrade_wallet_inr(_auto_cfg, wallet_data)
+_saved_at_wallet = max(100.0, min(10000000.0, float(coindcx_engine.get_effective_autotrade_wallet_inr(_auto_cfg, wallet_data) or 100.0)))
 if "sidebar_autotrade_wallet_input" not in st.session_state:
     st.session_state["sidebar_autotrade_wallet_input"] = float(_saved_at_wallet)
+else:
+    st.session_state["sidebar_autotrade_wallet_input"] = max(100.0, min(10000000.0, float(st.session_state.get("sidebar_autotrade_wallet_input") or _saved_at_wallet)))
 if "sidebar_max_concurrent_trades" not in st.session_state:
     st.session_state["sidebar_max_concurrent_trades"] = int(_saved_max_slots)
+else:
+    st.session_state["sidebar_max_concurrent_trades"] = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades") or _saved_max_slots)))
 if "sidebar_auto_split_wallet" not in st.session_state:
     st.session_state["sidebar_auto_split_wallet"] = bool(_saved_auto_split)
 
 
 def _on_sidebar_autotrade_wallet_change():
-    new_at_w = round(max(500.0, float(st.session_state.get("sidebar_autotrade_wallet_input", _saved_at_wallet) or _saved_at_wallet)), 2)
+    new_at_w = round(max(100.0, float(st.session_state.get("sidebar_autotrade_wallet_input", _saved_at_wallet) or _saved_at_wallet)), 2)
     cur_slots = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
     cur_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
     upd = {
@@ -847,7 +851,7 @@ def _on_sidebar_autotrade_wallet_change():
         "wallet_balance_inr": _live_ex_wallet_inr,
     }
     if cur_auto_split and new_at_w > 0:
-        auto_m = round(new_at_w / cur_slots, 2)
+        auto_m = max(100.0, round(new_at_w / cur_slots, 2))
         upd["single_trade_margin_inr"] = auto_m
         st.session_state["sidebar_single_trade_margin_input"] = float(auto_m)
     coindcx_engine.save_autotrade_config(upd)
@@ -859,7 +863,7 @@ def _on_sidebar_autotrade_wallet_change():
 autotrade_wallet_inr = float(
     st.sidebar.number_input(
         "💼 AutoTrade Wallet (INR)",
-        min_value=500.0,
+        min_value=100.0,
         max_value=10000000.0,
         step=500.0,
         format="%.2f",
@@ -876,12 +880,12 @@ _match_target_lbl = (
 )
 
 def _on_match_autotrade_wallet_exchange():
-    _ex_w = round(float(_match_target_inr), 2)
+    _ex_w = max(100.0, round(float(_match_target_inr), 2))
     st.session_state["sidebar_autotrade_wallet_input"] = float(_ex_w)
     _cur_s = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
     _upd_m = {"autotrade_wallet_inr": _ex_w}
     if bool(st.session_state.get("sidebar_auto_split_wallet", True)):
-        _upd_m["single_trade_margin_inr"] = round(_ex_w / _cur_s, 2)
+        _upd_m["single_trade_margin_inr"] = max(100.0, round(_ex_w / _cur_s, 2))
         st.session_state["sidebar_single_trade_margin_input"] = float(_upd_m["single_trade_margin_inr"])
     coindcx_engine.save_autotrade_config(_upd_m)
     get_cached_signals_scan.clear()
@@ -900,7 +904,7 @@ if abs(autotrade_wallet_inr - float(_match_target_inr)) >= 1.0:
 def _on_sidebar_slots_or_split_change():
     new_slots = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
     new_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
-    at_w_tot = round(max(500.0, float(st.session_state.get("sidebar_autotrade_wallet_input", autotrade_wallet_inr) or autotrade_wallet_inr)), 2)
+    at_w_tot = round(max(100.0, float(st.session_state.get("sidebar_autotrade_wallet_input", autotrade_wallet_inr) or autotrade_wallet_inr)), 2)
     upd = {
         "max_concurrent_trades": new_slots,
         "auto_split_wallet_by_slots": new_auto_split,
@@ -909,7 +913,7 @@ def _on_sidebar_slots_or_split_change():
         "wallet_balance_inr": _live_ex_wallet_inr,
     }
     if new_auto_split and at_w_tot > 0:
-        auto_m = round(at_w_tot / new_slots, 2)
+        auto_m = max(100.0, round(at_w_tot / new_slots, 2))
         upd["single_trade_margin_inr"] = auto_m
         st.session_state["sidebar_single_trade_margin_input"] = float(auto_m)
     coindcx_engine.save_autotrade_config(upd)
@@ -938,26 +942,34 @@ auto_split_wallet = bool(
     )
 )
 
-_auto_split_margin = round(float(autotrade_wallet_inr) / max(1, max_concurrent_trades), 2)
+_margin_min_inr = 10.0
+_margin_max_inr = max(float(autotrade_wallet_inr) * 2.0, float(wallet_data["total_inr"]) * 2.0, 1000000.0)
+_auto_split_margin = round(max(_margin_min_inr, min(_margin_max_inr, float(autotrade_wallet_inr) / max(1, max_concurrent_trades))), 2)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
 if auto_split_wallet or _saved_margin <= 0 or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0):
     default_margin = _auto_split_margin
 else:
-    default_margin = _saved_margin
+    default_margin = round(max(_margin_min_inr, min(_margin_max_inr, _saved_margin)), 2)
 
-# Keep Streamlit widget state synced to (AutoTrade Wallet ÷ Concurrent Trades) whenever Auto-Split is ON
+# Keep Streamlit widget state synced & strictly clamped within [min_value, max_value] so StreamlitValueBelowMinError never fires
 if auto_split_wallet:
     if st.session_state.get("_last_synced_split_margin") != (_auto_split_margin, max_concurrent_trades):
         st.session_state["_last_synced_split_margin"] = (_auto_split_margin, max_concurrent_trades)
         st.session_state["sidebar_single_trade_margin_input"] = float(_auto_split_margin)
+if "sidebar_single_trade_margin_input" not in st.session_state:
+    st.session_state["sidebar_single_trade_margin_input"] = float(default_margin)
+else:
+    _cur_sm_in = st.session_state.get("sidebar_single_trade_margin_input")
+    if _cur_sm_in is None or float(_cur_sm_in) < _margin_min_inr or float(_cur_sm_in) > _margin_max_inr:
+        st.session_state["sidebar_single_trade_margin_input"] = float(default_margin)
 
 
 def _on_sidebar_margin_change():
     raw_in = st.session_state.get("sidebar_single_trade_margin_input")
-    at_w_cur = round(max(500.0, float(st.session_state.get("sidebar_autotrade_wallet_input", autotrade_wallet_inr) or autotrade_wallet_inr)), 2)
+    at_w_cur = round(max(100.0, float(st.session_state.get("sidebar_autotrade_wallet_input", autotrade_wallet_inr) or autotrade_wallet_inr)), 2)
     if raw_in is None or float(raw_in or 0.0) <= 0.0:
         # Blank / cleared margin -> seamlessly fall back to AutoTrade Wallet ÷ Concurrent Trades
-        fallback_m = round(at_w_cur / max(1, max_concurrent_trades), 2)
+        fallback_m = max(10.0, round(at_w_cur / max(1, max_concurrent_trades), 2))
         coindcx_engine.save_autotrade_config({
             "single_trade_margin_inr": fallback_m,
             "autotrade_wallet_inr": at_w_cur,
@@ -966,7 +978,7 @@ def _on_sidebar_margin_change():
             "user_custom_margin": False,
         })
     else:
-        new_m = round(float(raw_in), 2)
+        new_m = max(10.0, round(float(raw_in), 2))
         coindcx_engine.save_autotrade_config({
             "single_trade_margin_inr": new_m,
             "autotrade_wallet_inr": at_w_cur,
@@ -980,10 +992,9 @@ def _on_sidebar_margin_change():
 
 _margin_widget_val = st.sidebar.number_input(
     "Single-Trade Margin (INR)",
-    min_value=500.0,
-    max_value=max(float(autotrade_wallet_inr) * 2.0, float(wallet_data["total_inr"]) * 2.0, 1000000.0),
-    value=float(default_margin),
-    step=500.0,
+    min_value=_margin_min_inr,
+    max_value=_margin_max_inr,
+    step=100.0,
     format="%.2f",
     disabled=auto_split_wallet,
     key="sidebar_single_trade_margin_input",
@@ -2615,17 +2626,20 @@ elif active_section == "🎯 Execute":
             )
 
         avail_margin_int = max(1000, int(max(float(wallet.get("available_inr", 0.0) or 0.0), float(autotrade_wallet_inr))))
+        _exec_m_max = max(avail_margin_int, 1000000)
         margin_key = f"exec_margin_inr_{selected_pair}"
         if margin_key not in st.session_state:
             _init_exec_m = int(round(float((_exec_ir_tk or {}).get("suggested_margin_inr") or margin_inr)))
-            st.session_state[margin_key] = max(500, _init_exec_m)
+            st.session_state[margin_key] = max(100, min(_exec_m_max, _init_exec_m))
+        else:
+            st.session_state[margin_key] = max(100, min(_exec_m_max, int(st.session_state.get(margin_key) or 100)))
 
         m_col1, m_col2 = st.columns(2)
         with m_col1:
             trade_margin_inr = st.number_input(
                 "Total Trade Margin (INR)",
-                min_value=500,
-                max_value=max(avail_margin_int, 1000000),
+                min_value=100,
+                max_value=_exec_m_max,
                 step=500,
                 key=margin_key,
                 help=f"Reads from AutoTrade Wallet Margin (₹{margin_inr:,.0f}) scaled by Intraday Router risk weight.",
@@ -4214,13 +4228,15 @@ elif active_section == "📈 Chart & Levels":
                         _ov_tp2 = float(st.number_input("TP2 Runner ($)", step=_ch_step, format=_ch_fmt, key=_ctp2_k))
                         _ov_tp1_pct = int(st.selectbox("TP1 Book %", [50, 70], format_func=lambda v: f"{v}% Book", key=_ctp1p_k))
 
+                    _ch_m_max = max(float(autotrade_wallet_inr) * 2.0, float(wallet_data["total_inr"]) * 2.0, 1000000.0)
+                    st.session_state[_cm_k] = max(100.0, min(_ch_m_max, float(st.session_state.get(_cm_k) or margin_inr or 100.0)))
                     _ml_c1, _ml_c2 = st.columns(2)
                     with _ml_c1:
                         _ch_margin = float(
                             st.number_input(
                                 "Margin (₹)",
-                                min_value=500.0,
-                                max_value=max(float(autotrade_wallet_inr) * 2.0, float(wallet_data["total_inr"]) * 2.0, 1000000.0),
+                                min_value=100.0,
+                                max_value=_ch_m_max,
                                 step=500.0,
                                 format="%.2f",
                                 key=_cm_k,
@@ -4482,6 +4498,8 @@ elif active_section == "🧪 Backtest":
     )
     bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days"], index=0, key="bt_multi_dur")
     _default_bt_wallet = max(1000.0, round(float(autotrade_wallet_inr or wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
+    if "bt_multi_wallet" in st.session_state:
+        st.session_state["bt_multi_wallet"] = max(1000.0, min(10000000.0, float(st.session_state.get("bt_multi_wallet") or _default_bt_wallet)))
     bt_wallet_inr = bc2.number_input(
         "Starting Funds / Wallet (₹)",
         min_value=1000.0,
@@ -4492,11 +4510,13 @@ elif active_section == "🧪 Backtest":
         key="bt_multi_wallet",
         help="Mirrors Main's Futures Wallet balance so the 5% Daily Loss Stop (SL Threshold) & Free-Margin Guard behave identically to Main.",
     )
+    if "bt_multi_cap" in st.session_state:
+        st.session_state["bt_multi_cap"] = max(500, min(5000000, int(st.session_state.get("bt_multi_cap") or 1000)))
     bt_capital = bc3.number_input(
         "Single-Trade Margin (₹)",
-        min_value=1000,
+        min_value=500,
         max_value=5000000,
-        value=max(1000, int(round(margin_inr))),
+        value=max(500, min(5000000, int(round(margin_inr)))),
         step=1000,
         key="bt_multi_cap",
         help="Mirrors Main's exact Single-Trade Margin per slot.",
