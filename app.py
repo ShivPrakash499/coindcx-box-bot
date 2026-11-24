@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 42
+_DAEMON_VERSION = 43
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -942,7 +942,7 @@ _reg_active_eng = (
 
 _auto_mode_keys = [k for k, _ in strategy_registry.AUTOTRADE_MODE_CHOICES]
 _auto_mode_labels = dict(strategy_registry.AUTOTRADE_MODE_CHOICES)
-_auto_mode_labels["box_plus_ema50_200_regime"] = f"🤖 Auto ({_reg_active_eng})"
+_auto_mode_labels["box_plus_ema50_200_regime"] = "🤖 Auto (Per-Coin Intraday Router)"
 
 if (not _auto_cfg.get("regime_mode_migrated_v41")) or (_auto_cfg.get("autotrade_strategy_mode") not in _auto_mode_keys):
     _mig_updates = {"regime_mode_migrated_v41": True}
@@ -972,10 +972,10 @@ selected_autotrade_mode = st.sidebar.selectbox(
     format_func=lambda k: _auto_mode_labels.get(k, k),
     key="sidebar_autotrade_strategy_mode",
     on_change=_on_sidebar_autotrade_strategy_change,
-    help="🤖 Auto automatically switches to the best-suited strategy for the live Market Trend: Box Theory Sweep (No Bear Long) in RANGING/CHOP, or 15m 50/200 EMA Pullback in Strong Uptrend/Downtrend.",
+    help="🤖 Auto scores each coin independently (-4 to +4 from 4H/1H Structure+CHoCH, Session VWAP & 15m EMA) and routes by 15m ADX(14): |Score|>=3 & ADX>=20 runs 15m 50/200 EMA + Box; otherwise Box Sweep (or stands aside on high-ADX conflicts). Daily 50/200 EMA scales margin (1.0x/0.8x/0.6x + 70% counter-daily TP1) instead of deadlocking setups.",
 )
 _active_mode_strats = strategy_registry.autotrade_mode_strategy_ids(selected_autotrade_mode)
-_reg_route_suffix = f" → **{_reg_active_eng}**" if selected_autotrade_mode == "box_plus_ema50_200_regime" else ""
+_reg_route_suffix = " → **Per-Coin Intraday Router (1.0×/0.8×/0.6×)**" if selected_autotrade_mode == "box_plus_ema50_200_regime" else ""
 _intraday_sfx = (
     f" • 3-Layer 15m: {_live_regime_info.get('intraday_emoji', '🟡')} **{_live_regime_info.get('intraday_label', 'INTRADAY CHOP')}**"
     if _live_regime_info.get("intraday_valid", 0)
@@ -1894,6 +1894,9 @@ if active_section == "⚡ Signals":
                             str((r.get("signal") or {}).get("strategy_id") or r.get("strategy_id") or strategy_registry.DEFAULT_STRATEGY_ID),
                             (r.get("signal") or {}).get("signal"),
                             selected_autotrade_mode,
+                            levels=(r.get("signal") or {}).get("levels"),
+                            pair=r.get("pair"),
+                            intraday_policy=(r.get("signal") or {}).get("intraday_policy") or r.get("intraday_policy"),
                         )
                         if signal_monitor and hasattr(signal_monitor, "_autotrade_signal_eligible")
                         else r.get("strategy_id", strategy_registry.DEFAULT_STRATEGY_ID) == strategy_registry.DEFAULT_STRATEGY_ID
@@ -1930,7 +1933,10 @@ if active_section == "⚡ Signals":
                 st.warning(f"⚠️ **AutoTrade Notice ({clean_sym(_err_r['pair'])}):** {_err_r['autotrade_error']}")
 
         # 📲 iPhone Air CoinDCX Push Notification Reader & Synced Feed
-        _recent_push_list = coindcx_engine.get_recent_coindcx_notifications(limit=5)
+        _recent_push_list = [
+            _it for _it in (coindcx_engine.get_recent_coindcx_notifications(limit=8) or [])
+            if "healthcheck" not in str(_it.get("raw_text", "")).lower()
+        ][:5]
         with st.expander(
             f"📲 CoinDCX iPhone Air Notification Reader ({len(_recent_push_list)} Recent)",
             expanded=True,
@@ -2091,11 +2097,25 @@ if active_section == "⚡ Signals":
             )
             _raw_15m = str(sig_lv.get("ema_15m_trend") or "")
             ema15_lbl = "🔴 50<200" if "BEAR" in _raw_15m else ("🟢 50>200" if "BULL" in _raw_15m else "—")
-            sig_status = f"🔥 {active_r['signal']['signal']} ({active_r.get('strategy_name', '')[:12]})" if active_r else "⏳ Watching"
+            _pol_w = next(
+                (pr_r.get("intraday_policy") or (pr_r.get("signal") or {}).get("intraday_policy") for pr_r in pair_res if pr_r.get("intraday_policy") or (isinstance(pr_r.get("signal"), dict) and pr_r["signal"].get("intraday_policy"))),
+                None,
+            )
+            if not isinstance(_pol_w, dict):
+                try:
+                    _st_w = coindcx_engine.compute_pair_intraday_trend_stack(pair_w) or {}
+                    _pol_w = coindcx_engine.resolve_intraday_execution_policy(_st_w, (lv or {}).get("trend_bias", "NEUTRAL"))
+                except Exception:
+                    _pol_w = {}
+            intraday_lbl = str(_pol_w.get("badge") or "—")
+            sig_status = f"🔥 {active_r['signal']['signal']} ({active_r.get('strategy_name', '')[:12]})" if active_r else (
+                "⏸️ Conflict Wait" if _pol_w.get("regime") == "CONFLICT_WAIT" else "⏳ Watching"
+            )
             matrix_rows.append({
                 "Asset": sym_w,
                 "Price": fmt_px(px),
                 "Bias": bias_lbl,
+                "Intraday": intraday_lbl,
                 "15m EMA": ema15_lbl,
                 "Zone": zone,
                 "Status": sig_status,
@@ -2115,6 +2135,7 @@ if active_section == "⚡ Signals":
                     f"<td style='font-weight:800;'>{_mr['Asset']}</td>"
                     f"<td>{_mr['Price']}</td>"
                     f"<td>{_mr['Bias']}</td>"
+                    f"<td style='font-weight:700;'>{_mr['Intraday']}</td>"
                     f"<td>{_mr['15m EMA']}</td>"
                     f"<td>{_mr['Zone']}</td>"
                     f"<td style='color:{_st_col};font-weight:700;'>{_mr['Status']}</td>"
@@ -2127,7 +2148,7 @@ if active_section == "⚡ Signals":
                 )
             st.html(
                 f"<div class='pro-table-wrap'><table class='pro-table'>"
-                f"<thead><tr><th>Asset</th><th>Price</th><th>Bias</th><th>15m EMA</th><th>Zone</th><th>Status</th>"
+                f"<thead><tr><th>Asset</th><th>Price</th><th>Bias</th><th>Intraday Policy</th><th>15m EMA</th><th>Zone</th><th>Status</th>"
                 f"<th>SH</th><th>RH</th><th>MID</th><th>RL</th><th>SL</th></tr></thead>"
                 f"<tbody>{''.join(_m_trs)}</tbody></table></div>"
             )

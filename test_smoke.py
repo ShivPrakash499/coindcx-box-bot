@@ -244,7 +244,7 @@ def test_4_strategy_and_two_entry_levels():
 
 
 def test_5_daily_bias_enforcement():
-    print("[5/10] Verifying Daily 50 & 200 EMA Bias rules (BEARISH->SHORT, BULLISH->LONG, RANGE->Both Box Zones)...")
+    print("[5/10] Verifying Per-Coin Intraday Policy + Daily Bias Risk Weighting (1.0x Aligned / 0.8x Neutral / 0.6x Counter-Daily + 70% TP1)...")
     import coindcx_engine as eng
     import pandas as pd
 
@@ -252,44 +252,79 @@ def test_5_daily_bias_enforcement():
         "RH": 7.31, "RL": 6.89, "SH": 7.43, "SL": 6.86, "MID": 7.10,
         "EMA50": 7.38, "EMA200": 6.09, "daily_close": 6.98, "trend_bias": "NEUTRAL"
     }
+    bear_levels = {**neutral_levels, "RH": 1.60, "RL": 1.49, "SH": 1.65, "SL": 1.48, "MID": 1.545, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
+    bull_stack_early = {"s4_struct": "UP", "s1_struct": "CHOP", "s1_choch": "BULLISH_CHOCH", "vwap_state": "BULL_VWAP", "ema_state": "BULL_EMA", "adx": 19.8}
+    bear_stack_trend = {"s4_struct": "DOWN", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 28.0}
+    conflict_stack = {"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BULL_VWAP", "ema_state": "BEAR_EMA", "adx": 36.0}
+    lean_bear_stack = {"s4_struct": "CHOP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "BEAR_EMA", "adx": 30.5}
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
-         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")):
-        bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
-        with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
+         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
+         patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
+         patch.object(eng, "save_autotrade_config", return_value={}), \
+         patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+        # 1. Counter-Daily LONG in Daily BEARISH with bullish intraday (+4, ADX 19.8) -> ALLOWED at 0.60x margin & 70% TP1!
+        with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value=bull_stack_early), \
+             patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.50, "bid": 1.499, "ask": 1.501}):
+            ok_cd, msg_cd, det_cd = eng.execute_autotrade_two_entry_signal(
+                pair="B-RENDER_USDT",
+                sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 1.50, "tp1": 1.53, "tp2": 1.59, "stop_loss": 1.47, "levels": bear_levels},
+                single_trade_margin_inr=15762.39,
+                leverage=10,
+            )
+            assert ok_cd, f"Expected counter-daily intraday LONG allowed at 0.60x sizing, got: {ok_cd} {msg_cd}"
+            assert abs(float(det_cd["size_mult"]) - 0.60) < 1e-6 and abs(float(det_cd["tp1_book_frac"]) - 0.70) < 1e-6, det_cd
+            assert abs(float(det_cd["lock"]["margin_inr"]) - round(15762.39 * 0.60, 2)) < 0.05, det_cd["lock"]
+
+        # 2. Counter-Intraday LONG when intraday stack is bearish (-4) -> BLOCKED by Intraday Policy Guard!
+        with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value=bear_stack_trend):
             ok_b, msg_b, _ = eng.execute_autotrade_two_entry_signal(
                 pair="B-RENDER_USDT",
-                sig={"signal": "LONG", "entry": 1.50, "entry2_sweep": 1.49, "tp1": 1.53, "tp2": 1.59, "stop_loss": 1.48, "levels": bear_levels},
+                sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 1.50, "tp1": 1.53, "tp2": 1.59, "stop_loss": 1.47, "levels": bear_levels},
                 single_trade_margin_inr=15762.39,
                 leverage=10,
             )
-            assert not ok_b and "Daily Bias Guard" in msg_b, f"Expected counter-trend LONG in BEARISH block, got: {ok_b} {msg_b}"
+            assert not ok_b and "Intraday Policy Guard" in msg_b, f"Expected counter-intraday LONG blocked, got: {ok_b} {msg_b}"
 
-        bull_levels = {**neutral_levels, "EMA50": 85.0, "EMA200": 80.0, "daily_close": 92.0, "trend_bias": "BULLISH"}
-        with patch.object(eng, "compute_market_bias", return_value={"bias": "BULLISH"}):
-            ok_u, msg_u, _ = eng.execute_autotrade_two_entry_signal(
+        # 3. High-ADX Split Conflict (ETH/SOL score 0, ADX 36) -> BLOCKED by CONFLICT_WAIT!
+        with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value=conflict_stack):
+            ok_cf, msg_cf, _ = eng.execute_autotrade_two_entry_signal(
                 pair="B-SOL_USDT",
-                sig={"signal": "SHORT", "entry": 92.0, "entry2_sweep": 92.5, "tp1": 90.5, "tp2": 88.0, "stop_loss": 93.0, "levels": bull_levels},
+                sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 92.0, "tp1": 90.5, "tp2": 88.0, "stop_loss": 93.0, "levels": bear_levels},
                 single_trade_margin_inr=15762.39,
                 leverage=10,
             )
-            assert not ok_u and "Daily Bias Guard" in msg_u, f"Expected counter-trend SHORT in BULLISH block, got: {ok_u} {msg_u}"
+            assert not ok_cf and "CONFLICT_WAIT" in msg_cf, f"Expected CONFLICT_WAIT block, got: {ok_cf} {msg_cf}"
 
+        # 4. Neutral Daily + Bearish Lean (-2, ADX 30.5) -> ALLOWED at 0.80x margin & 50% TP1!
         with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE"}), \
-             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP"}), \
-             patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
-             patch.object(eng, "place_coindcx_futures_order", return_value=(True, "SIMULATED_RANGE_OK", {"id": "sim_1"})), \
-             patch.object(eng, "save_autotrade_config", return_value={}), \
-             patch.object(eng, "update_coindcx_position_tpsl", return_value=(True, "OK", {})), \
-             patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
-            ok_r, msg_r, _ = eng.execute_autotrade_two_entry_signal(
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value=lean_bear_stack), \
+             patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.30, "bid": 7.299, "ask": 7.301}):
+            ok_r, msg_r, det_r = eng.execute_autotrade_two_entry_signal(
                 pair="B-INJ_USDT",
-                sig={"signal": "SHORT", "entry": 7.30, "entry2_sweep": 7.43, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.49, "levels": neutral_levels},
+                sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.30, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.49, "levels": neutral_levels},
                 single_trade_margin_inr=15762.39,
                 leverage=10,
             )
-            assert ok_r and "Daily Bias Guard" not in msg_r, f"Expected RANGE mode trade allowed, got: {ok_r} {msg_r}"
+            assert ok_r and abs(float(det_r["size_mult"]) - 0.80) < 1e-6 and abs(float(det_r["tp1_book_frac"]) - 0.50) < 1e-6, (ok_r, msg_r, det_r)
+            assert abs(float(det_r["lock"]["margin_inr"]) - round(15762.39 * 0.80, 2)) < 0.05, det_r["lock"]
+
+        # 5. Aligned Daily BEARISH + Intraday DOWNTREND (-4, ADX 28) -> ALLOWED at 1.00x full slot margin & 50% TP1!
+        with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value=bear_stack_trend), \
+             patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.30, "bid": 7.299, "ask": 7.301}):
+            ok_al, msg_al, det_al = eng.execute_autotrade_two_entry_signal(
+                pair="B-INJ_USDT",
+                sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.30, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.49, "levels": bear_levels},
+                single_trade_margin_inr=15762.39,
+                leverage=10,
+            )
+            assert ok_al and abs(float(det_al["size_mult"]) - 1.00) < 1e-6 and abs(float(det_al["tp1_book_frac"]) - 0.50) < 1e-6, (ok_al, msg_al, det_al)
+            assert abs(float(det_al["lock"]["margin_inr"]) - 15762.39) < 0.05, det_al["lock"]
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
@@ -1099,24 +1134,25 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         assert meta_stg["lock"]["is_live_exchange"] is False
         assert meta_stg["lock"]["strategy_id"] == "box_theory"
 
-        # Counter-trend LONG in BEARISH bias MUST ALWAYS be blocked (even if legacy BREAKOUT_CONTINUATION tag is passed)
-        ok_ct, msg_ct, _ = eng.execute_autotrade_two_entry_signal(
-            pair="B-FET_USDT",
-            sig={
-                "signal": "LONG",
-                "signal_kind": "BREAKOUT_CONTINUATION",
-                "strategy_id": "box_theory",
-                "entry": 0.1525,
-                "entry2_sweep": 0.1473,
-                "tp1": 0.1543,
-                "tp2": 0.1772,
-                "stop_loss": 0.1466,
-                "levels": {"trend_bias": "BEARISH", "RH": 0.1473, "RL": 0.1399, "MID": 0.1436, "SH": 0.1515, "SL": 0.1371},
-            },
-            single_trade_margin_inr=23267.74,
-            leverage=10,
-        )
-        assert not ok_ct and "Daily Bias Guard" in msg_ct, f"Expected Daily Bias Guard to block counter-trend LONG, got: {ok_ct} {msg_ct}"
+        # Counter-intraday LONG when intraday stack is bearish (-2 lean -> SHORT only) MUST be blocked by Intraday Policy Guard!
+        with patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "CHOP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "BEAR_EMA", "adx": 22.0}):
+            ok_ct, msg_ct, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-FET_USDT",
+                sig={
+                    "signal": "LONG",
+                    "signal_kind": "BREAKOUT_CONTINUATION",
+                    "strategy_id": "box_theory",
+                    "entry": 0.1525,
+                    "entry2_sweep": 0.1473,
+                    "tp1": 0.1543,
+                    "tp2": 0.1772,
+                    "stop_loss": 0.1466,
+                    "levels": {"trend_bias": "BEARISH", "RH": 0.1473, "RL": 0.1399, "MID": 0.1436, "SH": 0.1515, "SL": 0.1371},
+                },
+                single_trade_margin_inr=23267.74,
+                leverage=10,
+            )
+            assert not ok_ct and "Intraday Policy Guard" in msg_ct, f"Expected Intraday Policy Guard to block counter-intraday LONG, got: {ok_ct} {msg_ct}"
 
     # Box Theory Sweep: Broken-Box Invalidation Guard & Setup 0 Removal (RENDER 2026-11-09 & FET 2026-11-12 scenarios)
     render_recs = [
@@ -1205,7 +1241,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
              patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
              patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
-             patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
+             patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "CHOP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "BEAR_EMA", "adx": 22.0}), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.300, "bid": 7.299, "ask": 7.301}), \
              patch.object(eng, "place_coindcx_futures_order", side_effect=_fake_place_limit), \
              patch.object(eng.time, "sleep", return_value=None), \
@@ -1376,7 +1412,8 @@ def test_11_ema50_200_pullback_and_combo_modes():
                     single_trade_margin_inr=20000.0, leverage=10,
                 )
                 assert not ok_blk and "Bear-Only 15m 50/200 EMA" in msg_blk, f"Expected Bear-Only mode block on EMA LONG, got: {ok_blk} {msg_blk}"
-            with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
+            with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "DOWN", "s1_struct": "DOWN", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 28.0}):
                 ok_ema_s, msg_ema_s, meta_ema_s = eng.execute_autotrade_two_entry_signal(
                     pair="B-INJ_USDT",
                     sig={"signal": "SHORT", "strategy_id": "ema50_200", "entry": 7.090, "tp1": 6.950, "tp2": 6.800, "stop_loss": 7.185, "levels": bear_box},
@@ -1460,30 +1497,28 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
         f"Expected TP1 capped above 3h swing low $7.01, got {sig_cap}"
     )
 
-    # 3. Regime-Adaptive v40 Row 9 Routing + v41 Clean 3-Option UI & Market-Trend Auto-Defaulting
+    # 3. Per-Coin Intraday Score Router (v43) + Clean 3-Option UI & Strategy Eligibility
     assert [k for k, _ in strat.AUTOTRADE_MODE_CHOICES] == ["box_plus_ema50_200_regime", "box_theory", "ema50_200"]
     assert [s.id for s in strat.list_strategies()] == ["box_theory", "ema50_200"]
     assert strat.recommended_strategy_for_regime("RANGING_CHOP") == "box_theory"
     assert strat.recommended_strategy_for_regime("STRONG_UPTREND") == "ema50_200"
     assert strat.recommended_strategy_for_regime("STRONG_DOWNTREND") == "ema50_200"
-    with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}):
-        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory"]
-        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is True
-        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime", levels={"daily_close": 7.40, "EMA50": 7.10}) is True
-        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime", levels={"daily_close": 6.90, "EMA50": 7.10}) is False
-        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
+    assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory", "ema50_200"]
 
-    with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "label": "STRONG UPTREND", "median_2d_pct": 1.8}):
-        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["ema50_200"]
-        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime") is False
-        assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is True
-        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
+    pol_chop = eng.resolve_intraday_execution_policy({"s4_struct": "CHOP", "s1_struct": "CHOP", "vwap_state": "CHOP_VWAP", "ema_state": "CHOP_EMA", "adx": 15.0}, "BEARISH")
+    assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime", intraday_policy=pol_chop) is True
+    assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime", intraday_policy=pol_chop) is True
+    assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime", intraday_policy=pol_chop) is False
 
-    with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.5}):
-        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["ema50_200"]
-        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is False
-        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is True
-        assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is False
+    pol_up = eng.resolve_intraday_execution_policy({"s4_struct": "UP", "s1_struct": "UP", "vwap_state": "BULL_VWAP", "ema_state": "BULL_EMA", "adx": 26.0}, "BEARISH")
+    assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime", intraday_policy=pol_up) is True
+    assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime", intraday_policy=pol_up) is True
+    assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime", intraday_policy=pol_up) is False
+
+    pol_dn = eng.resolve_intraday_execution_policy({"s4_struct": "DOWN", "s1_struct": "DOWN", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 28.0}, "BEARISH")
+    assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime", intraday_policy=pol_dn) is True
+    assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime", intraday_policy=pol_dn) is True
+    assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime", intraday_policy=pol_dn) is False
 
     with tempfile.TemporaryDirectory() as tmpdir:
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
@@ -1504,27 +1539,19 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
                     {"pair": "B-AVAX_USDT", "strategy_id": "ema50_200", "opened_ts": now_t - 300},
                 ],
             })
-            # In RANGING_CHOP -> EMA SHORT is auto-paused, and Box LONG with daily_close <= EMA50 is blocked by Row-9 No-Bear-Long Guard!
-            with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}), \
+            # In Low-ADX / Chop (score 0, ADX 15) -> EMA SHORT is auto-paused by Intraday Policy Guard!
+            with patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "CHOP", "s1_struct": "CHOP", "vwap_state": "CHOP_VWAP", "ema_state": "CHOP_EMA", "adx": 15.0}), \
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]):
                 ok_ch, msg_ch, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-INJ_USDT",
                     sig={"signal": "SHORT", "strategy_id": "ema50_200", "entry": 7.09, "tp1": 7.015, "tp2": 6.80, "stop_loss": 7.185, "levels": bear_box},
                     single_trade_margin_inr=20000.0, leverage=10,
                 )
-                assert not ok_ch and "Market Regime Guard" in msg_ch, f"Expected RANGING_CHOP guard block, got {ok_ch} {msg_ch}"
+                assert not ok_ch and "Intraday Policy Guard" in msg_ch, f"Expected Chop EMA pause, got {ok_ch} {msg_ch}"
 
-                with patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL / RANGE", "daily_close": 6.90, "ema50": 7.10}):
-                    ok_nbl, msg_nbl, _ = eng.execute_autotrade_two_entry_signal(
-                        pair="B-INJ_USDT",
-                        sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 6.85, "tp1": 7.15, "tp2": 7.50, "stop_loss": 6.72, "levels": {**bear_box, "trend_bias": "NEUTRAL", "daily_close": 6.90, "EMA50": 7.10}},
-                        single_trade_margin_inr=20000.0, leverage=10,
-                    )
-                    assert not ok_nbl and "Row-9 No-Bear-Long Guard" in msg_nbl, f"Expected Row-9 No-Bear-Long Guard block, got {ok_nbl} {msg_nbl}"
-
-            # In STRONG_DOWNTREND: Box Sweep is PAUSED by v40 Row 9, and 3rd EMA trade is capped at 2/2!
+            # In INTRADAY_DOWNTREND (-4, ADX 28) with 2 EMA trades open -> 3rd EMA is capped at 2/2, while Box SHORT takes slot 3!
             two_open = [{"pair": "B-SUI_USDT"}, {"pair": "B-AVAX_USDT"}]
-            with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.5}), \
+            with patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "DOWN", "s1_struct": "DOWN", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 28.0}), \
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=two_open):
                 ok_cap, msg_cap, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-INJ_USDT",
@@ -1532,23 +1559,12 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
                     single_trade_margin_inr=20000.0, leverage=10,
                 )
                 assert not ok_cap and "EMA Slot Cap (2/2" in msg_cap, f"Expected Max 2 EMA Slot Cap, got {ok_cap} {msg_cap}"
-                ok_box_p, msg_box_p, _ = eng.execute_autotrade_two_entry_signal(
-                    pair="B-INJ_USDT",
-                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.51, "tp1": 7.36, "tp2": 6.80, "stop_loss": 7.64, "levels": bear_box},
-                    single_trade_margin_inr=20000.0, leverage=10,
-                )
-                assert not ok_box_p and "auto-pausing Box Theory Sweep" in msg_box_p, f"Expected Box paused in STRONG_DOWNTREND, got {ok_box_p} {msg_box_p}"
-
-            # Under RANGING_CHOP with 2 EMA trades open -> Box Theory Sweep CAN still take the 3rd slot!
-            with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP", "median_2d_pct": 0.4}), \
-                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
-                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=two_open):
                 ok_box3, msg_box3, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-INJ_USDT",
                     sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.51, "tp1": 7.36, "tp2": 6.80, "stop_loss": 7.64, "levels": bear_box},
                     single_trade_margin_inr=20000.0, leverage=10,
                 )
-                assert ok_box3, f"Expected 3rd slot open for Box Theory Sweep in RANGING_CHOP, got {ok_box3} {msg_box3}"
+                assert ok_box3, f"Expected 3rd slot open for trend-aligned Box SHORT, got {ok_box3} {msg_box3}"
 
     print("  -> PASS: Market-Regime Classifier, Regime-Adaptive Routing, 3h Structure-Aware TP1 & Max 2 EMA Slots verified.")
 
@@ -1681,6 +1697,7 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
                  patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
                  patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
                  patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "DOWN", "s1_struct": "DOWN", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 28.0}), \
                  patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.4079, "bid": 1.4078, "ask": 1.4080}):
                 ok_dr, msg_dr, _ = eng.execute_autotrade_two_entry_signal(
                     pair="B-RENDER_USDT",
@@ -1711,6 +1728,7 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
                  }, clear=True), \
                  patch.object(sm, "scan_pair", return_value=fake_apt_sig), \
                  patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "DOWN", "s1_struct": "DOWN", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 28.0}), \
                  patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": []}), \
                  patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
                  patch.object(eng, "execute_autotrade_two_entry_signal") as mock_exec_auto:
@@ -1985,6 +2003,7 @@ def test_17_v36_six_sl_reduction_fixes():
             }
             with patch.object(sm, "scan_pair", return_value=fake_ren_sig), \
                  patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND"}), \
+                 patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "DOWN", "s1_struct": "DOWN", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 28.0}), \
                  patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": []}), \
                  patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
                  patch.object(eng, "execute_autotrade_two_entry_signal") as mock_ex_sl:
@@ -2234,7 +2253,7 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
                     with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.30, "bid": 7.299, "ask": 7.301}), \
                          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
                          patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CHOP_RANGE", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
-                         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}), \
+                         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "CHOP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "BEAR_EMA", "adx": 22.0}), \
                          patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
                          patch.object(eng, "get_coindcx_live_usdt_inr_rate", return_value=95.0), \
                          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
@@ -2284,21 +2303,22 @@ def test_19_v41_3layer_box_guard_and_3_safety_fixes():
     clean_ups = [x for x in st_up[-24:] if x["regime"] == "CLEAN_UPTREND"]
     assert clean_ups and clean_ups[-1]["s1_struct"] == "UP" and clean_ups[-1]["vwap_state"] == "BULL_VWAP" and clean_ups[-1]["adx"] > 20.0, st_up[-1]
 
-    # BoxPlusEma50200Strategy blocks Box SHORT during Chop when 3-Layer Intraday is CLEAN_UPTREND (or BULLISH_CHOCH),
-    # while leaving Strategy 4 (15m 50/200 EMA) in STRONG_UPTREND completely untouched!
+    # BoxPlusEma50200Strategy routes per-coin via resolve_intraday_execution_policy:
+    # - High-ADX split timeframes (ETH/SOL score 0, ADX 36) -> CONFLICT_WAIT (NEUTRAL / flat)
+    # - Intraday Uptrend (+4, ADX 24) even in Daily BEARISH -> unlocks Ema50200 LONG with 0.60x margin & 70% TP1!
     combo = strat.STRATEGY_REGISTRY["box_plus_ema50_200_regime"]
-    fake_box_short = {"signal": "SHORT", "strategy_id": "box_theory", "entry": 100.0, "stop_loss": 101.5, "tp1": 98.5, "tp2": 97.0, "levels": {"daily_close": 95.0, "EMA50": 100.0}}
+    fake_box_short = {"signal": "SHORT", "strategy_id": "box_theory", "entry": 100.0, "stop_loss": 101.5, "tp1": 98.5, "tp2": 97.0, "levels": {"trend_bias": "BEARISH", "daily_close": 95.0, "EMA50": 100.0}}
     with patch.object(combo.s1, "evaluate_signal", return_value=fake_box_short), \
-         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CLEAN_UPTREND"}), \
-         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}):
-        res_blk = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
-        assert res_blk["signal"] == "NEUTRAL" and "3-Layer Intraday Trend Guard" in res_blk["trigger_reason"], res_blk
+         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BULL_VWAP", "ema_state": "BEAR_EMA", "adx": 36.0}):
+        res_blk = combo.evaluate_signal("B-SOL_USDT", levels={"trend_bias": "BEARISH", "RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_blk["signal"] == "NEUTRAL" and "CONFLICT_WAIT" in res_blk["trigger_reason"], res_blk
 
     fake_s4_long = {"signal": "LONG", "strategy_id": "ema50_200", "entry": 100.0, "stop_loss": 99.0, "tp1": 101.5, "tp2": 103.0}
     with patch.object(combo.s4, "evaluate_signal", return_value=fake_s4_long), \
-         patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "intraday_regime": "CHOP_RANGE"}):
-        res_s4 = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
-        assert res_s4["signal"] == "LONG" and res_s4["strategy_id"] == "ema50_200", f"Strategy 4 must remain untouched: {res_s4}"
+         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"s4_struct": "UP", "s1_struct": "CHOP", "s1_choch": "BULLISH_CHOCH", "vwap_state": "BULL_VWAP", "ema_state": "BULL_EMA", "adx": 24.0}):
+        res_s4 = combo.evaluate_signal("B-NEAR_USDT", levels={"trend_bias": "BEARISH", "RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_s4["signal"] == "LONG" and res_s4["strategy_id"] == "ema50_200", f"Expected intraday LONG EMA unlocked: {res_s4}"
+        assert abs(res_s4["size_mult"] - 0.60) < 1e-6 and abs(res_s4["tp1_book_frac"] - 0.70) < 1e-6, res_s4
 
     # 2. Safety Fix #1: 8h-old active live lock MUST NOT expire while live position is open on CoinDCX (or API unverified)
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2349,6 +2369,133 @@ def test_19_v41_3layer_box_guard_and_3_safety_fixes():
     print("  -> PASS: v41 + 3-Layer Intraday Trend Stack Box Guard & All 3 Live-Engine Safety Fixes verified!")
 
 
+def test_20_per_coin_intraday_score_router():
+    print("[20/20] Verifying Per-Coin Intraday Score Router (-4..+4), Counter-Daily 0.6x + 70% TP1 & Zero Double-Scaling...")
+    import tempfile
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+
+    # 1. Exact per-coin routing matrix from Nov 24 live analysis (canonical keys AND alias keys!)
+    # APT / NEAR (+4, ADX 16.7 / 19.8, Daily BEARISH) -> EARLY_BULL_SHIFT: Box LONG only @ 0.60x + 70% TP1
+    pol_apt = eng.resolve_intraday_execution_policy(
+        {"s4_struct": "UP", "s1_struct": "CHOP", "s1_choch": "BULLISH_CHOCH", "vwap_state": "BULL_VWAP", "ema_state": "BULL_EMA", "adx": 16.7},
+        "BEARISH",
+    )
+    assert pol_apt["score"] == 4 and pol_apt["regime"] == "EARLY_BULL_SHIFT", pol_apt
+    assert pol_apt["allowed_dirs"] == ["LONG"] and pol_apt["strategies"] == ["box_theory"], pol_apt
+    assert pol_apt["size_mult"] == 0.60 and pol_apt["tp1_book_frac"] == 0.70 and pol_apt["is_counter_daily"] is True, pol_apt
+
+    # NEAR ticks ADX >= 20 -> INTRADAY_UPTREND: auto-activates 15m EMA LONG + Box LONG @ 0.60x + 70% TP1!
+    pol_near_20 = eng.resolve_intraday_execution_policy(
+        {"htf_4h": "UP", "h1_struct": "CHOP", "h1_choch": "BULLISH_CHOCH", "vwap_bias": "BULL_VWAP", "ema_15m": "BULL_EMA", "adx_14": 20.4},
+        "BEARISH",
+    )
+    assert pol_near_20["score"] == 4 and pol_near_20["regime"] == "INTRADAY_UPTREND", pol_near_20
+    assert pol_near_20["allowed_dirs"] == ["LONG"] and pol_near_20["strategies"] == ["ema50_200", "box_theory"], pol_near_20
+    assert pol_near_20["size_mult"] == 0.60 and pol_near_20["tp1_book_frac"] == 0.70, pol_near_20
+
+    # XRP (+4, ADX 11.6, Daily BEARISH) -> EARLY_BULL_SHIFT (Box LONG only, EMA paused)
+    pol_xrp = eng.resolve_intraday_execution_policy(
+        {"s4_struct": "UP", "s1_struct": "CHOP", "s1_choch": "BULLISH_CHOCH", "vwap_state": "BULL_VWAP", "ema_state": "BULL_EMA", "adx": 11.6},
+        "BEARISH",
+    )
+    assert pol_xrp["regime"] == "EARLY_BULL_SHIFT" and pol_xrp["strategies"] == ["box_theory"] and pol_xrp["size_mult"] == 0.60, pol_xrp
+
+    # BTC (-2, ADX 30.5, Daily BEARISH) -> Bearish Lean: Box SHORT only @ 1.00x full size, 50% TP1
+    pol_btc = eng.resolve_intraday_execution_policy(
+        {"s4_struct": "CHOP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "CHOP_VWAP", "ema_state": "BEAR_EMA", "adx": 30.5},
+        "BEARISH",
+    )
+    assert pol_btc["score"] == -2 and pol_btc["regime"] == "INTRADAY_CHOP", pol_btc
+    assert pol_btc["allowed_dirs"] == ["SHORT"] and pol_btc["strategies"] == ["box_theory"] and pol_btc["size_mult"] == 1.00, pol_btc
+
+    # BTC VWAP flips BEAR_VWAP (-3, ADX 30.5, Daily BEARISH) -> INTRADAY_DOWNTREND unlocks 15m EMA SHORT @ 1.00x!
+    pol_btc_dn = eng.resolve_intraday_execution_policy(
+        {"s4_struct": "CHOP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 30.5},
+        "BEARISH",
+    )
+    assert pol_btc_dn["score"] == -3 and pol_btc_dn["regime"] == "INTRADAY_DOWNTREND", pol_btc_dn
+    assert pol_btc_dn["strategies"] == ["ema50_200", "box_theory"] and pol_btc_dn["size_mult"] == 1.00, pol_btc_dn
+
+    # ETH / SOL (score 0, ADX 36.0 / 28.2) -> CONFLICT_WAIT (stand aside!)
+    pol_eth = eng.resolve_intraday_execution_policy(
+        {"s4_struct": "UP", "s1_struct": "DOWN", "s1_choch": "NONE", "vwap_state": "BULL_VWAP", "ema_state": "BEAR_EMA", "adx": 36.0},
+        "BEARISH",
+    )
+    assert pol_eth["score"] == 0 and pol_eth["regime"] == "CONFLICT_WAIT" and pol_eth["allowed_dirs"] == [] and pol_eth["size_mult"] == 0.0, pol_eth
+
+    # Symmetric 1H CHoCH override: prior 1H UP + fresh BEARISH_CHOCH MUST score -1 (not +1)!
+    pol_sym = eng.resolve_intraday_execution_policy(
+        {"s4_struct": "DOWN", "s1_struct": "UP", "s1_choch": "BEARISH_CHOCH", "vwap_state": "BEAR_VWAP", "ema_state": "BEAR_EMA", "adx": 25.0},
+        "BEARISH",
+    )
+    assert pol_sym["score"] == -4 and pol_sym["regime"] == "INTRADAY_DOWNTREND", pol_sym
+
+    # Two-sided Chop (score 0, ADX 15, Daily BEARISH): policy summary is 0.75x,
+    # while concrete Counter-Daily LONG gets 0.60x + 70% TP1 and Aligned SHORT gets 0.75x + 50% TP1!
+    pol_2s = eng.resolve_intraday_execution_policy(
+        {"s4_struct": "CHOP", "s1_struct": "CHOP", "vwap_state": "CHOP_VWAP", "ema_state": "CHOP_EMA", "adx": 15.0},
+        "BEARISH",
+    )
+    assert pol_2s["allowed_dirs"] == ["LONG", "SHORT"] and pol_2s["size_mult"] == 0.75, pol_2s
+    rp_l_cd = eng.resolve_direction_risk_profile("LONG", "BEARISH", two_sided_chop=True)
+    rp_s_al = eng.resolve_direction_risk_profile("SHORT", "BEARISH", two_sided_chop=True)
+    assert rp_l_cd["size_mult"] == 0.60 and rp_l_cd["tp1_book_frac"] == 0.70, rp_l_cd
+    assert rp_s_al["size_mult"] == 0.75 and rp_s_al["tp1_book_frac"] == 0.50, rp_s_al
+
+    # 2. _detect_ema50_200_setup unlocks Bullish 15m EMA LONG in Daily BEARISH when allowed_dirs=["LONG"]!
+    bear_daily_box = {"trend_bias": "BEARISH", "bias": "BEARISH", "RH": 4.30, "RL": 3.50, "MID": 3.90, "SH": 4.40, "SL": 3.40}
+    bull_ema_recs = [
+        {"open": 3.85, "high": 3.95, "low": 3.83, "close": 3.88},
+        {"open": 3.88, "high": 3.96, "low": 3.86, "close": 3.90},
+        {"open": 3.90, "high": 3.98, "low": 3.88, "close": 3.91},
+        {"open": 3.91, "high": 4.02, "low": 3.89, "close": 3.92},
+        {"open": 3.92, "high": 4.05, "low": 3.88, "close": 3.90},
+        {"open": 3.90, "high": 3.92, "low": 3.83, "close": 3.85},  # dips into 15m EMA50 ($3.84)
+        {"open": 3.85, "high": 3.91, "low": 3.82, "close": 3.90},  # bullish reclaim above EMA50 ($3.84)
+    ]
+    # Without allowed_dirs (legacy standalone Daily Bias): blocked in BEARISH daily bias
+    assert strat._detect_ema50_200_setup(
+        bull_ema_recs, 6, bear_daily_box, ema50_val=3.84, ema200_val=3.78,
+        prior_e50=[3.84] * 6, prior_e200=[3.78] * 6, allow_bear=True, allow_bull=True,
+    ) is None
+    # With allowed_dirs=["LONG"] from Per-Coin Intraday Router: fires clean LONG!
+    sig_cd_ema = strat._detect_ema50_200_setup(
+        bull_ema_recs, 6, bear_daily_box, ema50_val=3.84, ema200_val=3.78,
+        prior_e50=[3.84] * 6, prior_e200=[3.78] * 6, allow_bear=True, allow_bull=True,
+        allowed_dirs=["LONG"],
+    )
+    assert sig_cd_ema is not None and sig_cd_ema["direction"] == "LONG", sig_cd_ema
+
+    # 3. Staging Paper 70/30 TP1 blended exit PnL math check
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        closed_records = []
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch("sheets_logger.log_trade_closed", side_effect=lambda rec: closed_records.append(rec) or True):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng.save_autotrade_config({
+                "paper_wallet_inr": 24000.0,
+                "active_trade_locks": {
+                    "B-NEAR_USDT": {
+                        "pair": "B-NEAR_USDT", "direction": "LONG", "strategy_id": "box_theory",
+                        "entry": 100.0, "tp1": 102.0, "tp2": 105.0, "stop_loss": 100.20,
+                        "tp1_hit": True, "tp1_book_frac": 0.70, "size_mult": 0.60,
+                        "margin_inr": 4800.0, "leverage": 10, "opened_ts": time.time() - 120.0,
+                        "is_live_exchange": False, "mode": "Staging Paper AutoTrade (Live Market)",
+                    }
+                },
+            })
+            # Runner stops at Fee-BE ($100.20): 70% @ +2.0% + 30% @ +0.20% = +1.46% move -> @ 10x = +14.6% - 1.18% fees = +13.42% ROE!
+            with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 100.20}):
+                eng.get_active_portfolio_trade_status(manage_exchange=True)
+            time.sleep(0.08)
+            assert closed_records and abs(float(closed_records[0]["roe_pct"]) - 13.42) < 0.05, closed_records
+
+    print("  -> PASS: Per-Coin Intraday Score Router, 1.0x/0.8x/0.6x Daily Weighting, Counter-Daily EMA Unlock & 70/30 TP1 verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -2369,6 +2516,7 @@ if __name__ == "__main__":
     test_17_v36_six_sl_reduction_fixes()
     test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
     test_19_v41_3layer_box_guard_and_3_safety_fixes()
+    test_20_per_coin_intraday_score_router()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

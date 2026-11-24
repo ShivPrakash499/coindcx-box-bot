@@ -477,7 +477,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 42
+_REQUIRED_DAEMON_VERSION = 43
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
@@ -3637,10 +3637,12 @@ def run_strategy_backtest(
                             sl_p = new_sl
                             active_trade["stop_loss"] = sl_p
                             if (pos_dir == "LONG" and tp2_p > 0 and s5_high >= tp2_p) or (pos_dir == "SHORT" and tp2_p > 0 and s5_low <= tp2_p):
+                                w_tp1 = max(0.10, min(0.90, float(active_trade.get("tp1_book_frac", 0.50) or 0.50)))
+                                w_run = max(0.0, 1.0 - w_tp1)
                                 exit_triggered = True
-                                exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                                exit_price = w_tp1 * tp1_p + w_run * tp2_p
                                 active_trade["tp2_hit"] = True
-                                exit_reason = f"TP1 (50% Booked) + 50% TP2 Target Hit{scale_tag}"
+                                exit_reason = f"TP1 ({int(round(w_tp1 * 100))}% Booked) + {int(round(w_run * 100))}% TP2 Target Hit{scale_tag}"
                                 break
                             if tp2_p > 0:
                                 ratchet60_tp2 = tp1_p + 0.60 * (tp2_p - tp1_p)
@@ -3654,18 +3656,20 @@ def run_strategy_backtest(
                                     active_trade["halfway_ratcheted"] = True
                             continue
                     else:
-                        # TP1 (50%) already booked; managing the remaining 50% Structural Runner
+                        # TP1 (50% or 70% counter-daily) already booked; managing the remaining Structural Runner
+                        w_tp1 = max(0.10, min(0.90, float(active_trade.get("tp1_book_frac", 0.50) or 0.50)))
+                        w_run = max(0.0, 1.0 - w_tp1)
                         if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
                             exit_triggered = True
-                            exit_price = 0.5 * tp1_p + 0.5 * sl_p
+                            exit_price = w_tp1 * tp1_p + w_run * sl_p
                             r_lbl = "Runner 60%-Ratchet SL" if active_trade.get("halfway_ratcheted") else "Runner Fee-BE SL"
-                            exit_reason = f"TP1 (50% Booked) + 50% {r_lbl}{scale_tag}"
+                            exit_reason = f"TP1 ({int(round(w_tp1 * 100))}% Booked) + {int(round(w_run * 100))}% {r_lbl}{scale_tag}"
                             break
                         if (pos_dir == "LONG" and tp2_p > 0 and s5_high >= tp2_p) or (pos_dir == "SHORT" and tp2_p > 0 and s5_low <= tp2_p):
                             exit_triggered = True
-                            exit_price = 0.5 * tp1_p + 0.5 * tp2_p
+                            exit_price = w_tp1 * tp1_p + w_run * tp2_p
                             active_trade["tp2_hit"] = True
-                            exit_reason = f"TP1 (50% Booked) + 50% TP2 Target Hit{scale_tag}"
+                            exit_reason = f"TP1 ({int(round(w_tp1 * 100))}% Booked) + {int(round(w_run * 100))}% TP2 Target Hit{scale_tag}"
                             break
                         if tp2_p > 0:
                             ratchet60_tp2 = tp1_p + 0.60 * (tp2_p - tp1_p)
@@ -3688,7 +3692,8 @@ def run_strategy_backtest(
                 entry_fee_inr = notional_inr * maker_fee_rate
                 exit_notional_inr = (qty * exit_price) * usd_inr
                 if active_trade.get("tp1_hit", False) and not use_full_s3_mode:
-                    tp1_notional_inr = (0.5 * qty * tp1_p) * usd_inr
+                    w_tp1_fee = max(0.10, min(0.90, float(active_trade.get("tp1_book_frac", 0.50) or 0.50)))
+                    tp1_notional_inr = (w_tp1_fee * qty * tp1_p) * usd_inr
                     exit_fee_inr = (tp1_notional_inr * maker_fee_rate) + (max(0.0, exit_notional_inr - tp1_notional_inr) * taker_fee_rate)
                 else:
                     exit_fee_inr = exit_notional_inr * taker_fee_rate
@@ -3730,7 +3735,13 @@ def run_strategy_backtest(
                     "is_win": net_pnl_inr > 0,
                     "duration_candles": idx - active_trade["entry_idx"],
                     "strategy": active_trade.get("strategy_tag") or strat.name,
-                    "trigger": active_trade.get("reason", "")
+                    "trigger": active_trade.get("reason", ""),
+                    "deployed_margin_inr": round(float(deployed_margin_inr), 2),
+                    "size_mult": round(float(active_trade.get("size_mult", 1.0) or 1.0), 2),
+                    "tp1_book_frac": round(float(active_trade.get("tp1_book_frac", 0.50) or 0.50), 2),
+                    "intraday_score": active_trade.get("intraday_score"),
+                    "intraday_regime": active_trade.get("intraday_regime", ""),
+                    "is_counter_daily": bool(active_trade.get("is_counter_daily", False)),
                 })
 
                 equity_curve.append({
@@ -3757,11 +3768,19 @@ def run_strategy_backtest(
                 tp1_p = entry_sig["tp1"]
                 tp2_p = entry_sig["tp2"]
 
-                margin_usd = margin_inr / usd_inr
+                size_mult_bt = float(entry_sig.get("size_mult", 1.0) or 1.0)
+                if size_mult_bt <= 0:
+                    continue
+                tp1_frac_bt = max(0.10, min(0.90, float(entry_sig.get("tp1_book_frac", 0.50) or 0.50)))
+                trade_margin_inr = round(margin_inr * size_mult_bt, 2)
+                if (trade_margin_inr * leverage) < 2448.0 and (margin_inr * leverage) >= 2448.0:
+                    continue
+
+                margin_usd = trade_margin_inr / usd_inr
                 pos_usd = margin_usd * leverage
                 raw_qty = pos_usd / entry_p if entry_p > 0 else 0
                 qty = format_order_quantity(pair, raw_qty)
-                notional_inr = margin_inr * leverage
+                notional_inr = trade_margin_inr * leverage
 
                 sess_name = _strategies.backtest_session_name(c_time)
 
@@ -3780,14 +3799,19 @@ def run_strategy_backtest(
                     "tp2": tp2_p,
                     "quantity": qty,
                     "notional_inr": notional_inr,
-                    "deployed_margin_inr": margin_inr,
+                    "deployed_margin_inr": trade_margin_inr,
+                    "size_mult": size_mult_bt,
+                    "tp1_book_frac": tp1_frac_bt,
+                    "intraday_score": entry_sig.get("intraday_score"),
+                    "intraday_regime": entry_sig.get("intraday_regime", ""),
+                    "is_counter_daily": bool(entry_sig.get("is_counter_daily", False)),
                     "session": sess_name,
                     "tp1_hit": False,
                     "ema9_armed": False,
                     "wrong_ema9_streak": 0,
                     "atr20_pb_armed": False,
-                    "tp1_label": entry_sig.get("tp1_label", "50% Book"),
-                    "tp2_label": entry_sig.get("tp2_label", "50% Runner"),
+                    "tp1_label": entry_sig.get("tp1_label", f"{int(round(tp1_frac_bt * 100))}% Book"),
+                    "tp2_label": entry_sig.get("tp2_label", f"{int(round((1.0 - tp1_frac_bt) * 100))}% Runner"),
                     "reason": entry_sig.get("reason", ""),
                     "strategy_tag": entry_sig.get("strategy_tag", strat.name),
                 }
@@ -4423,6 +4447,188 @@ def compute_pair_intraday_trend_stack(pair: str, df_15m: pd.DataFrame = None, fo
         return last
     except Exception:
         return neutral
+
+
+def resolve_direction_risk_profile(direction: str, daily_bias: str, two_sided_chop: bool = False) -> dict:
+    """
+    Maps an intraday execution direction against the Daily 50/200 EMA Bias into position-sizing
+    and TP1 booking rules (Daily Bias weights risk & runner ambition instead of hard-blocking):
+      - Aligned (Intraday LONG + Daily BULLISH, or Intraday SHORT + Daily BEARISH): 1.00x margin, 50% TP1 / 50% Runner
+      - Neutral Daily (Price between Daily 50 & 200 EMA):                           0.80x margin, 50% TP1 / 50% Runner
+      - Two-Sided Intraday Chop (non-counter-daily):                                0.75x margin, 50% TP1 / 50% Runner
+      - Counter-Daily (Intraday LONG + Daily BEARISH, or SHORT + Daily BULLISH):    0.60x margin, 70% TP1 / 30% Runner
+    """
+    norm_dir = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
+    raw_b = str(daily_bias or "NEUTRAL").upper()
+    if "BULLISH" in raw_b:
+        d_bias = "BULLISH"
+    elif "BEARISH" in raw_b:
+        d_bias = "BEARISH"
+    else:
+        d_bias = "NEUTRAL"
+
+    is_aligned = (d_bias == "BULLISH" and norm_dir == "LONG") or (d_bias == "BEARISH" and norm_dir == "SHORT")
+    is_counter_daily = (d_bias == "BEARISH" and norm_dir == "LONG") or (d_bias == "BULLISH" and norm_dir == "SHORT")
+
+    if is_counter_daily:
+        return {
+            "direction": norm_dir,
+            "daily_bias": d_bias,
+            "alignment": "COUNTER_DAILY",
+            "is_counter_daily": True,
+            "size_mult": 0.60,
+            "tp1_book_frac": 0.70,
+        }
+    if two_sided_chop:
+        return {
+            "direction": norm_dir,
+            "daily_bias": d_bias,
+            "alignment": "CHOP_ALIGNED" if is_aligned else "CHOP_NEUTRAL",
+            "is_counter_daily": False,
+            "size_mult": 0.75,
+            "tp1_book_frac": 0.50,
+        }
+    if d_bias == "NEUTRAL":
+        return {
+            "direction": norm_dir,
+            "daily_bias": d_bias,
+            "alignment": "NEUTRAL_DAILY",
+            "is_counter_daily": False,
+            "size_mult": 0.80,
+            "tp1_book_frac": 0.50,
+        }
+    return {
+        "direction": norm_dir,
+        "daily_bias": d_bias,
+        "alignment": "ALIGNED",
+        "is_counter_daily": False,
+        "size_mult": 1.00,
+        "tp1_book_frac": 0.50,
+    }
+
+
+def resolve_intraday_execution_policy(layer_info: dict, daily_bias: str) -> dict:
+    """
+    Converts per-coin 3-Layer Intraday Trend Stack telemetry into active execution direction,
+    permitted strategies, and Daily-Bias-weighted risk/TP1 profile.
+    Accepts both canonical engine keys (`s4_struct`, `s1_struct`, `s1_choch`, `vwap_state`,
+    `ema_state`, `adx`) and shorthand aliases (`htf_4h`, `h1_struct`, `h1_choch`, `vwap_bias`,
+    `ema_15m`, `adx_14`).
+    """
+    info = layer_info if isinstance(layer_info, dict) else {}
+
+    htf_4h = str(info.get("s4_struct") or info.get("htf_4h") or "CHOP").upper()
+    h1_struct = str(info.get("s1_struct") or info.get("h1_struct") or "CHOP").upper()
+    h1_choch = str(info.get("s1_choch") or info.get("h1_choch") or "NONE").upper()
+    vwap_bias = str(info.get("vwap_state") or info.get("vwap_bias") or "CHOP_VWAP").upper()
+    ema_15m = str(info.get("ema_state") or info.get("ema_15m") or "CHOP_EMA").upper()
+
+    raw_adx = info.get("adx") if info.get("adx") is not None else info.get("adx_14", 0.0)
+    try:
+        adx = float(raw_adx or 0.0)
+    except Exception:
+        adx = 0.0
+
+    raw_b = str(daily_bias or "NEUTRAL").upper()
+    if "BULLISH" in raw_b:
+        d_bias = "BULLISH"
+    elif "BEARISH" in raw_b:
+        d_bias = "BEARISH"
+    else:
+        d_bias = "NEUTRAL"
+
+    # Step A: Per-Coin Intraday Trend Score (-4 to +4)
+    score = 0
+    if htf_4h == "UP":
+        score += 1
+    elif htf_4h == "DOWN":
+        score -= 1
+
+    # Give fresh 1H CHoCH full execution weight (symmetric override over prior 1H swing structure)
+    if h1_choch == "BULLISH_CHOCH":
+        score += 1
+    elif h1_choch == "BEARISH_CHOCH":
+        score -= 1
+    elif h1_struct == "UP":
+        score += 1
+    elif h1_struct == "DOWN":
+        score -= 1
+
+    if vwap_bias == "BULL_VWAP":
+        score += 1
+    elif vwap_bias == "BEAR_VWAP":
+        score -= 1
+
+    if ema_15m == "BULL_EMA":
+        score += 1
+    elif ema_15m == "BEAR_EMA":
+        score -= 1
+
+    # Step B: Per-Coin Execution Routing Matrix
+    if score >= 3:
+        allowed_dirs = ["LONG"]
+        strategies = ["ema50_200", "box_theory"] if adx >= 20.0 else ["box_theory"]
+        regime = "INTRADAY_UPTREND" if adx >= 20.0 else "EARLY_BULL_SHIFT"
+    elif score <= -3:
+        allowed_dirs = ["SHORT"]
+        strategies = ["ema50_200", "box_theory"] if adx >= 20.0 else ["box_theory"]
+        regime = "INTRADAY_DOWNTREND" if adx >= 20.0 else "EARLY_BEAR_SHIFT"
+    else:
+        # High ADX with conflicting timeframes (e.g. ETH/SOL split 4H/VWAP vs 1H/15m) -> stand aside
+        if adx >= 25.0 and abs(score) <= 1:
+            return {
+                "regime": "CONFLICT_WAIT",
+                "score": score,
+                "adx": round(adx, 1),
+                "allowed_dirs": [],
+                "strategies": [],
+                "size_mult": 0.0,
+                "tp1_book_frac": 0.50,
+                "is_counter_daily": False,
+                "daily_bias": d_bias,
+                "badge": f"⏸️ {score:+d} CONFLICT (ADX {adx:.0f})",
+            }
+        allowed_dirs = ["SHORT"] if score == -2 else (["LONG"] if score == 2 else ["LONG", "SHORT"])
+        strategies = ["box_theory"]
+        regime = "INTRADAY_CHOP"
+
+    # Step C: Daily 50/200 EMA scales margin & TP1 booking instead of hard-blocking intraday trends
+    if len(allowed_dirs) == 1:
+        rp = resolve_direction_risk_profile(allowed_dirs[0], d_bias, two_sided_chop=False)
+        size_mult = rp["size_mult"]
+        tp1_book_frac = rp["tp1_book_frac"]
+        is_counter_daily = rp["is_counter_daily"]
+    else:
+        size_mult = 0.75
+        tp1_book_frac = 0.50
+        is_counter_daily = False
+
+    reg_emoji = (
+        "🟢" if regime == "INTRADAY_UPTREND"
+        else ("🔴" if regime == "INTRADAY_DOWNTREND" else ("🟡" if regime.startswith("EARLY_") else "⚪"))
+    )
+    short_reg = {
+        "INTRADAY_UPTREND": "UPTREND",
+        "INTRADAY_DOWNTREND": "DOWNTREND",
+        "EARLY_BULL_SHIFT": "EARLY BULL",
+        "EARLY_BEAR_SHIFT": "EARLY BEAR",
+        "INTRADAY_CHOP": "CHOP",
+    }.get(regime, regime)
+    dir_txt = "/".join("L" if d == "LONG" else "S" for d in allowed_dirs)
+    badge = f"{reg_emoji} {score:+d} {short_reg} ({dir_txt} • {size_mult:.2g}×)"
+
+    return {
+        "regime": regime,
+        "score": score,
+        "adx": round(adx, 1),
+        "allowed_dirs": allowed_dirs,
+        "strategies": strategies,
+        "size_mult": size_mult,
+        "tp1_book_frac": tp1_book_frac,
+        "is_counter_daily": is_counter_daily,
+        "daily_bias": d_bias,
+        "badge": badge,
+    }
 
 
 def classify_universe_regime_from_stats(
@@ -5380,6 +5586,9 @@ def sync_full_2entry_runner_to_position(
     leverage: int = 10,
     usd_inr: float = None,
     strategy_id: str = "box_theory",
+    tp1_book_frac: float = 0.50,
+    size_mult: float = 1.0,
+    intraday_policy: dict | None = None,
 ) -> tuple[bool, str, dict]:
     """
     Synchronizes all components of the Smart Hybrid setup onto an active CoinDCX position:
@@ -5455,9 +5664,11 @@ def sync_full_2entry_runner_to_position(
             elif o_side == opp_side and not existing_opp_side_limit:
                 existing_opp_side_limit = o
 
-    # 2. Place TP1 (50% Partial Book) opposite-side Limit Order if not already open (Strategy 3 keeps 100% Full Runner)
+    # 2. Place TP1 (50% normal or 70% counter-daily Partial Book) opposite-side Limit Order if not already open
+    eff_tp1_frac = max(0.10, min(0.90, float(tp1_book_frac or 0.50)))
+    tp1_pct_lbl = int(round(eff_tp1_frac * 100))
     tp1_order_id = ""
-    tp1_qty = format_order_quantity(pair, pos_qty * 0.5) if not use_full_s3_runner else 0.0
+    tp1_qty = format_order_quantity(pair, pos_qty * eff_tp1_frac) if not use_full_s3_runner else 0.0
     if not use_full_s3_runner and (tp1_qty * tp1_val * u_inr) < 2448.0 and (pos_qty * tp1_val * u_inr) >= 2448.0:
         tp1_qty = min(pos_qty, format_order_quantity(pair, (2500.0 / u_inr) / tp1_val))
 
@@ -5492,13 +5703,13 @@ def sync_full_2entry_runner_to_position(
         details["tp1_order"] = extra_tp1
         if ok_tp1:
             tp1_order_id = str((extra_tp1 or {}).get("order_id", ""))
-            status_parts.append(f"TP1 50% Limit ({opp_side} {tp1_qty} @ ${tp1_val}): Placed")
+            status_parts.append(f"TP1 {tp1_pct_lbl}% Limit ({opp_side} {tp1_qty} @ ${tp1_val}): Placed")
         else:
             tp1_order_id = "DAEMON_50PCT_REDUCE_AT_TP1"
-            status_parts.append(f"TP1 Limit (Daemon 50% Market Reduce Armed @ ${tp1_val})")
+            status_parts.append(f"TP1 Limit (Daemon {tp1_pct_lbl}% Market Reduce Armed @ ${tp1_val})")
     else:
         tp1_order_id = "DAEMON_50PCT_REDUCE_AT_TP1"
-        status_parts.append(f"TP1 (Daemon 50% Reduce Armed @ ${tp1_val})")
+        status_parts.append(f"TP1 (Daemon {tp1_pct_lbl}% Reduce Armed @ ${tp1_val})")
 
     # 3. Place Entry 2 / Trade 2 (50% Sweep Scale-In) same-side Limit Order if Strategy 1 (has_second_entry)
     e2_order_id = ""
@@ -5556,6 +5767,9 @@ def sync_full_2entry_runner_to_position(
         strategy_id=strat_id,
         entry1_pending=False,
         entry2_filled=already_full_2entry_sized,
+        tp1_book_frac=eff_tp1_frac,
+        size_mult=float(size_mult or 1.0),
+        intraday_policy=intraday_policy,
     )
     details["lock"] = lock_info
     _ACTIVE_POSITIONS_CACHE["data"] = None
@@ -5582,12 +5796,18 @@ def register_app_trade_lock(
     entry1_order_id: str = "",
     entry1_pending: bool = False,
     entry2_filled: bool = False,
+    tp1_book_frac: float = 0.50,
+    size_mult: float = 1.0,
+    intraday_policy: dict | None = None,
 ) -> dict:
     """
     Registers an active 1-Crypto-at-a-Time lock strictly for trades executed via our App/API.
     Manual trades placed directly on CoinDCX outside our App/API do NOT trigger this lock.
     """
     now_str = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
+    eff_tp1_f = round(max(0.10, min(0.90, float(tp1_book_frac or 0.50))), 2)
+    eff_sz_m = round(float(size_mult or 1.0), 2)
+    pol_d = intraday_policy if isinstance(intraday_policy, dict) else {}
     lock_info = {
         "pair": pair,
         "direction": str(direction).upper(),
@@ -5602,6 +5822,10 @@ def register_app_trade_lock(
         "tp1_order_id": str(tp1_order_id or ""),
         "tp1": float(tp1 or 0.0),
         "tp2": float(tp2 or tp1 or 0.0),
+        "tp1_book_frac": eff_tp1_f,
+        "size_mult": eff_sz_m,
+        "intraday_regime": str(pol_d.get("regime", "") or ""),
+        "intraday_score": pol_d.get("score"),
         "tp1_hit": False,
         "runner_halfway_ratcheted": False,
         "stop_loss": float(stop_loss or 0.0),
@@ -6167,6 +6391,8 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                     total_margin_inr=float(lock.get("margin_inr", 20000.0) or 20000.0),
                                     leverage=int(lock.get("leverage", 10) or 10),
                                     strategy_id=str(lock.get("strategy_id", "box_theory") or "box_theory"),
+                                    tp1_book_frac=max(0.10, min(0.90, float(lock.get("tp1_book_frac", 0.50) or 0.50))),
+                                    size_mult=float(lock.get("size_mult", 1.0) or 1.0),
                                 )
                                 if _sync_ok_p and isinstance((_sync_det_p or {}).get("lock"), dict):
                                     lock = _sync_det_p["lock"]
@@ -6186,7 +6412,8 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                 _old_tp1_oid = str(lock.get("tp1_order_id", "") or "")
                                 if _old_tp1_oid and not _old_tp1_oid.startswith(("DAEMON_", "FULL_", "STRATEGY")):
                                     cancel_coindcx_open_entry_orders(l_pair, _old_tp1_oid, side=_opp_r.lower())
-                                _new_tp1_q = format_order_quantity(l_pair, _pos_qty_now2 * 0.5)
+                                _lock_tp1_f = max(0.10, min(0.90, float(lock.get("tp1_book_frac", 0.50) or 0.50)))
+                                _new_tp1_q = format_order_quantity(l_pair, _pos_qty_now2 * _lock_tp1_f)
                                 _r_lev = int(round(float(matched_live_pos.get("leverage") or lock.get("leverage", 10) or 10)))
                                 if _new_tp1_q > 0:
                                     _ok_r1, _msg_r1, _ext_r1 = place_coindcx_futures_order(
@@ -6233,7 +6460,8 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                 if _cur_tp1_oid and not _cur_tp1_oid.startswith(("DAEMON_", "FULL_", "STRATEGY")):
                                     cancel_coindcx_open_entry_orders(l_pair, _cur_tp1_oid, side=_opp_s.lower())
                                 _pos_q = float(matched_live_pos.get("quantity", 0.0) or 0.0)
-                                _tp1_q = format_order_quantity(l_pair, _pos_q * 0.5)
+                                _tp1_f_heal = max(0.10, min(0.90, float(lock.get("tp1_book_frac", 0.50) or 0.50)))
+                                _tp1_q = format_order_quantity(l_pair, _pos_q * _tp1_f_heal)
                                 _pos_lev = int(round(float(matched_live_pos.get("leverage") or lock.get("leverage", 10) or 10)))
                                 if _tp1_q > 0 and str(lock.get("strategy_id", "box_theory")) != "ema9_retest":
                                     _ok_tp1, _msg_tp1, _ext_tp1 = place_coindcx_futures_order(
@@ -6386,8 +6614,9 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             raw_pct = ((exit_p - e_p) / e_p) if (_is_long and e_p > 0) else (((e_p - exit_p) / e_p) if e_p > 0 else 0.0)
                             is_s3_p = (str(_lock_snap.get("strategy_id", "")) == "ema9_retest")
                             if _lock_snap.get("tp1_hit") and not is_s3_p and _l_tp1 > 0 and e_p > 0:
+                                _w_tp1_p = max(0.10, min(0.90, float(_lock_snap.get("tp1_book_frac", 0.50) or 0.50)))
                                 tp1_pct = ((_l_tp1 - e_p) / e_p) if _is_long else ((e_p - _l_tp1) / e_p)
-                                raw_pct = 0.5 * tp1_pct + 0.5 * raw_pct
+                                raw_pct = _w_tp1_p * tp1_pct + (1.0 - _w_tp1_p) * raw_pct
                             roe_v = round((raw_pct * lev_v - 0.0118) * 100.0, 2)
                             net_inr = round(m_inr * (roe_v / 100.0), 2)
 
@@ -6463,13 +6692,15 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             closed_notes.append(f"{l_pair} completed ({'TP2' if hit_tp2 else 'SL'})")
                             continue
 
-                        # Stage 1: Price reaches TP1 -> Book 50%, Cancel Entry 2, move SL to Fee-Covered Breakeven (0.20%)
+                        # Stage 1: Price reaches TP1 -> Book 50% (or 70% counter-daily), Cancel Entry 2, move SL to Fee-Covered Breakeven (0.20%)
+                        _lock_tp1_frac = max(0.10, min(0.90, float(lock.get("tp1_book_frac", 0.50) or 0.50)))
+                        _lock_tp1_pct = int(round(_lock_tp1_frac * 100))
                         hit_tp1 = (px >= l_tp1) if (is_long and l_tp1 > 0) else ((px <= l_tp1) if (not is_long and l_tp1 > 0) else False)
                         partial_tp1_already_filled = False
                         if is_live_ex and matched_live_pos and not tp1_already_hit:
                             open_pos_qty_chk = float(matched_live_pos.get("quantity", 0.0) or 0.0)
                             init_qty1_chk = float(lock.get("qty1", open_pos_qty_chk) or open_pos_qty_chk)
-                            if init_qty1_chk > 0 and open_pos_qty_chk > 0 and open_pos_qty_chk <= init_qty1_chk * 0.68:
+                            if init_qty1_chk > 0 and open_pos_qty_chk > 0 and open_pos_qty_chk <= init_qty1_chk * min(0.68, max(0.45, 1.0 - _lock_tp1_frac + 0.18)):
                                 partial_tp1_already_filled = True
                                 hit_tp1 = True
 
@@ -6492,7 +6723,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                                 if not partial_tp1_already_filled and open_pos_qty >= init_qty1 * 0.75:
                                     if tp1_oid and tp1_oid != "DAEMON_50PCT_REDUCE_AT_TP1":
                                         cancel_coindcx_open_entry_orders(l_pair, tp1_oid, side="sell" if is_long else "buy")
-                                    half_pos_qty = format_order_quantity(l_pair, open_pos_qty * 0.5)
+                                    half_pos_qty = format_order_quantity(l_pair, open_pos_qty * _lock_tp1_frac)
                                     pos_lev = int(round(float(matched_live_pos.get("leverage", lock.get("leverage", 10)) or 10)))
                                     opp_side = "SELL" if is_long else "BUY"
                                     if half_pos_qty > 0:
@@ -6515,7 +6746,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             )
                             lock["tp1_hit"] = True
                             lock["stop_loss"] = ratcheted_sl
-                            lock["mode"] = f"{lock.get('mode', 'App Trade')} [TP1 50% Booked -> SL Fee-BE @ ${ratcheted_sl}]"
+                            lock["mode"] = f"{lock.get('mode', 'App Trade')} [TP1 {_lock_tp1_pct}% Booked -> SL Fee-BE @ ${ratcheted_sl}]"
                             l_sl = ratcheted_sl
                             _hist_tp1 = list(cfg.get("history") or [])
                             for _hh in _hist_tp1:
@@ -7168,34 +7399,29 @@ def execute_autotrade_two_entry_signal(
         if auto_mode == "box_plus_ema50_200_bear" and sig_strat_id == "ema50_200" and norm_dir != "SHORT":
             return False, (
                 f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
-                f"(switch to Combo: Regime-Adaptive or Bull & Bear EMA to enable Bullish EMA Longs)."
+                f"(switch to Auto Per-Coin Intraday Router to enable Bullish EMA Longs)."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
-        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "box_theory":
-            reg_info = compute_market_regime()
-            cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
-            if cur_reg != "RANGING_CHOP":
-                return False, (
-                    f"Market Regime Guard ({reg_info.get('label', cur_reg)}): Market is trending "
-                    f"(14d {reg_info.get('median_14d_pct', 0.0):+.1f}%), auto-pausing Box Theory Sweep on {pair} "
-                    f"and running 15m 50/200 EMA Trend engine only (v40 Row 9)."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "ema50_200":
-            reg_info = compute_market_regime()
-            cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
-            if cur_reg == "RANGING_CHOP":
-                return False, (
-                    f"Market Regime Guard ({reg_info.get('label', 'RANGING / CHOP')}): Market is ranging "
-                    f"(2d median {reg_info.get('median_2d_pct', 0.0):+.2f}%), auto-pausing 15m 50/200 EMA on {pair} "
-                    f"and trading Box Theory Sweep only."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-            if cur_reg == "STRONG_DOWNTREND" and norm_dir != "SHORT":
-                return False, (
-                    f"Market Regime Guard (STRONG DOWNTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-            if cur_reg == "STRONG_UPTREND" and norm_dir != "LONG":
-                return False, (
-                    f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+
+    # Per-Coin Intraday Trend Score Router (-4 to +4) + 15m ADX(14) Strategy Router + Daily Bias Risk Weighting:
+    # Replaces hard Daily 50/200 EMA veto with intraday execution direction and 1.0x / 0.8x / 0.6x margin + 70% counter-daily TP1.
+    try:
+        _p_st = compute_pair_intraday_trend_stack(pair) or {}
+    except Exception:
+        _p_st = {}
+    intraday_policy = resolve_intraday_execution_policy(_p_st, daily_bias)
+    if not allow_mode_override:
+        if intraday_policy["regime"] == "CONFLICT_WAIT" or norm_dir not in intraday_policy["allowed_dirs"]:
+            return False, (
+                f"Intraday Policy Guard ({intraday_policy['regime']}, Score {intraday_policy['score']:+d}, "
+                f"ADX {intraday_policy['adx']:.1f}): Blocking {norm_dir} {sig_strat_id} on {pair} "
+                f"(Allowed dirs: {intraday_policy['allowed_dirs'] or 'FLAT'})."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode, "intraday_policy": intraday_policy}
+        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id not in intraday_policy["strategies"]:
+            return False, (
+                f"Intraday Policy Guard ({intraday_policy['regime']}, Score {intraday_policy['score']:+d}, "
+                f"ADX {intraday_policy['adx']:.1f}): Pausing {sig_strat_id} on {pair} "
+                f"(Active strategies: {intraday_policy['strategies'] or 'NONE'})."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode, "intraday_policy": intraday_policy}
         if sig_strat_id == "ema50_200":
             open_ema_cnt = count_open_ema50_200_slots(
                 live_positions=live_ex_pos if live_ex_pos is not None else [],
@@ -7207,39 +7433,23 @@ def execute_autotrade_two_entry_signal(
                     f"EMA Slot Cap ({open_ema_cnt}/{MAX_EMA_CONCURRENT_TRADES} EMA slots active): "
                     f"Reserving final portfolio slot for Box Theory Sweep; skipping correlated EMA trade on {pair}."
                 ), {"strategy_id": sig_strat_id, "open_ema_slots": open_ema_cnt}
-    if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
-        return False, (
-            f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
-        ), {"daily_bias": daily_bias, "direction": norm_dir}
-    if (not allow_mode_override) and auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "box_theory" and norm_dir == "LONG":
-        _d_close_r9 = float(sig_levels.get("daily_close") or mb.get("daily_close") or 0.0)
-        _d_ema50_r9 = float(sig_levels.get("EMA50") or mb.get("ema50") or 0.0)
-        if _d_close_r9 > 0 and _d_ema50_r9 > 0 and _d_close_r9 <= _d_ema50_r9:
-            return False, (
-                f"Row-9 No-Bear-Long Guard: Blocking Box LONG on {pair} during Chop "
-                f"(Prev Daily Close ${_d_close_r9:,.4g} <= Daily 50 EMA ${_d_ema50_r9:,.4g})."
-            ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir, "no_bear_long": True}
 
-    # 3-Layer Intraday Trend Stack Box Guard (1H/4H Structure+CHoCH + Session VWAP + 15m EMA/ADX14):
-    # Strictly protects Box mean-reversion from fading active intraday trends or CHoCH reversals; leaves 15m 50/200 EMA untouched!
-    if (not allow_mode_override) and sig_strat_id == "box_theory":
-        try:
-            _mkt_i = str(compute_market_regime().get("intraday_regime", "CHOP_RANGE"))
-            _p_st = compute_pair_intraday_trend_stack(pair)
-            _coin_i = str((_p_st or {}).get("regime", "CHOP_RANGE"))
-            _s1_ch = str((_p_st or {}).get("s1_choch", "NONE"))
-            if norm_dir == "SHORT" and (_mkt_i == "CLEAN_UPTREND" or _coin_i == "CLEAN_UPTREND" or _s1_ch == "BULLISH_CHOCH"):
-                return False, (
-                    f"3-Layer Intraday Trend Guard: Blocking counter-trend Box SHORT on {pair} "
-                    f"(Mkt15m={_mkt_i}, Coin={_coin_i}, 1H CHoCH={_s1_ch})."
-                ), {"strategy_id": sig_strat_id, "intraday_mkt": _mkt_i, "intraday_coin": _coin_i, "s1_choch": _s1_ch}
-            if norm_dir == "LONG" and (_mkt_i == "CLEAN_DOWNTREND" or _coin_i == "CLEAN_DOWNTREND" or _s1_ch == "BEARISH_CHOCH"):
-                return False, (
-                    f"3-Layer Intraday Trend Guard: Blocking counter-trend Box LONG on {pair} "
-                    f"(Mkt15m={_mkt_i}, Coin={_coin_i}, 1H CHoCH={_s1_ch})."
-                ), {"strategy_id": sig_strat_id, "intraday_mkt": _mkt_i, "intraday_coin": _coin_i, "s1_choch": _s1_ch}
-        except Exception:
-            pass
+    _two_sided_chop = len(intraday_policy.get("allowed_dirs") or []) == 2
+    risk_prof = resolve_direction_risk_profile(norm_dir, daily_bias, two_sided_chop=_two_sided_chop)
+    eff_size_mult = 1.0 if allow_mode_override else float(risk_prof["size_mult"])
+    eff_tp1_book_frac = max(0.10, min(0.90, float(sig.get("tp1_book_frac") or risk_prof["tp1_book_frac"] or 0.50)))
+    if not allow_mode_override and eff_size_mult > 0 and abs(eff_size_mult - 1.0) > 1e-6:
+        margin_inr = round(margin_inr * eff_size_mult, 2)
+        _sz_note = (
+            f"Daily {daily_bias} ({risk_prof['alignment']}): {eff_size_mult:.2f}x slot margin "
+            f"(Rs.{margin_inr:,.0f}) & {int(round(eff_tp1_book_frac * 100))}% TP1 book"
+        )
+        _cap_note = f"{_cap_note} | {_sz_note}".strip(" |") if _cap_note else _sz_note
+    if (margin_inr * lev) < 2448.0:
+        return False, (
+            f"Insufficient Notional after {eff_size_mult:.2f}x Daily Sizing: Rs.{margin_inr:,.2f} x {lev}x = "
+            f"Rs.{margin_inr * lev:,.0f} (< Rs.2,448 CoinDCX minimum)."
+        ), {"margin_inr": margin_inr, "size_mult": eff_size_mult, "intraday_policy": intraday_policy}
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
@@ -7310,7 +7520,7 @@ def execute_autotrade_two_entry_signal(
             else 0.0
         )
         if _w_risk_total > 0:
-            _risk_pct_cfg = float(cfg.get("risk_per_trade_pct", FIXED_RISK_PER_TRADE_PCT) or FIXED_RISK_PER_TRADE_PCT)
+            _risk_pct_cfg = float(cfg.get("risk_per_trade_pct", FIXED_RISK_PER_TRADE_PCT) or FIXED_RISK_PER_TRADE_PCT) * eff_size_mult
             _risk_margin, _risk_note = compute_risk_based_margin_inr(
                 wallet_inr=_w_risk_total,
                 entry_px=entry1_px,
@@ -7333,8 +7543,10 @@ def execute_autotrade_two_entry_signal(
     if (qty1 * entry1_px * u_inr) < 2448.0 and (margin_inr * lev) >= 2448.0:
         qty1 = format_order_quantity(pair, ((margin_inr * lev) / u_inr) / entry1_px)
 
-    # 50% of Entry 1 quantity to book at TP1 (remaining 50% of Entry 1 rides to TP2)
-    qty1_tp1_half = format_order_quantity(pair, qty1 * 0.5)
+    # 50% (normal) or 70% (counter-daily) of Entry 1 quantity to book at TP1; remainder rides to TP2
+    qty1_tp1_half = format_order_quantity(pair, qty1 * eff_tp1_book_frac)
+    _tp1_pct_s = int(round(eff_tp1_book_frac * 100))
+    _run_pct_s = 100 - _tp1_pct_s
 
     if staging_paper_only:
         # Staging Environment: NEVER place live CoinDCX orders; execute strictly as Live-Market Paper AutoTrade!
@@ -7345,11 +7557,15 @@ def execute_autotrade_two_entry_signal(
             mode="Staging Paper AutoTrade (Live Market)", is_live_exchange=False,
             tp1_order_id="STRATEGY3_FULL_RUNNER_SL_RATCHET" if sig_strat_id == "ema9_retest" else "DAEMON_50PCT_REDUCE_AT_TP1",
             strategy_id=sig_strat_id,
+            tp1_book_frac=eff_tp1_book_frac,
+            size_mult=eff_size_mult,
+            intraday_policy=intraday_policy,
         )
         return True, (
             f"Staging Paper AutoTrade Executed: {norm_dir} {pair} ({sig_strat_id}) | "
-            f"Entry 1 Limit: ${entry1_px} ({qty1}) | TP1: ${tp1_px} | TP2: ${tp2_px} | SL: ${sl_px} @ {lev}x"
-        ), {"lock": lock_info, "paper_mode": True}
+            f"Entry 1 Limit: ${entry1_px} ({qty1}) | TP1 ({_tp1_pct_s}%): ${tp1_px} | TP2 ({_run_pct_s}%): ${tp2_px} | SL: ${sl_px} @ {lev}x"
+            + (f" | {_cap_note}" if _cap_note else "")
+        ), {"lock": lock_info, "paper_mode": True, "size_mult": eff_size_mult, "tp1_book_frac": eff_tp1_book_frac, "intraday_policy": intraday_policy}
 
     wallet = fetch_coindcx_futures_balance()
     api_key_now, api_secret_now = _get_coindcx_credentials()
@@ -7436,6 +7652,9 @@ def execute_autotrade_two_entry_signal(
                 leverage=lev,
                 usd_inr=u_inr,
                 strategy_id=sig_strat_id,
+                tp1_book_frac=eff_tp1_book_frac,
+                size_mult=eff_size_mult,
+                intraday_policy=intraday_policy,
             )
             if not sync_ok:
                 time.sleep(0.6)
@@ -7451,6 +7670,9 @@ def execute_autotrade_two_entry_signal(
                     leverage=lev,
                     usd_inr=u_inr,
                     strategy_id=sig_strat_id,
+                    tp1_book_frac=eff_tp1_book_frac,
+                    size_mult=eff_size_mult,
+                    intraday_policy=intraday_policy,
                 )
             lock_obj = (sync_details or {}).get("lock")
             if not lock_obj:
@@ -7491,6 +7713,9 @@ def execute_autotrade_two_entry_signal(
                     strategy_id=sig_strat_id,
                     entry1_order_id=e1_order_id,
                     entry1_pending=True,
+                    tp1_book_frac=eff_tp1_book_frac,
+                    size_mult=eff_size_mult,
+                    intraday_policy=intraday_policy,
                 )
                 sync_msg = f"Entry 1 Maker Limit Resting{e2_note} -> Auto-Attaches TP1/TP2/SL on Fill"
             return True, (
@@ -7500,6 +7725,9 @@ def execute_autotrade_two_entry_signal(
                 "entry1_order": extra1,
                 "sync_details": sync_details,
                 "lock": lock_obj,
+                "size_mult": eff_size_mult,
+                "tp1_book_frac": eff_tp1_book_frac,
+                "intraday_policy": intraday_policy,
             }
         return False, f"CoinDCX Live AutoTrade Error on {pair}: {msg1}", {"entry1_order": extra1}
     else:
@@ -7510,11 +7738,14 @@ def execute_autotrade_two_entry_signal(
             leverage=lev, qty1=qty1, qty2=qty2,
             mode="App/API Simulated AutoTrade (100% Maker Limit Armed)", is_live_exchange=False,
             strategy_id=sig_strat_id,
+            tp1_book_frac=eff_tp1_book_frac,
+            size_mult=eff_size_mult,
+            intraday_policy=intraday_policy,
         )
         return True, (
             f"AutoTrade Armed (Simulated): {direction} {pair} | "
-            f"Entry 1 (100% Slot Maker Limit): ${entry1_px} ({qty1}) -> 50% books at TP1 ${tp1_px} ({qty1_tp1_half}) & 50% rides to TP2 ${tp2_px} @ {lev}x"
-        ), {"lock": lock_info}
+            f"Entry 1 (100% Slot Maker Limit): ${entry1_px} ({qty1}) -> {_tp1_pct_s}% books at TP1 ${tp1_px} ({qty1_tp1_half}) & {_run_pct_s}% rides to TP2 ${tp2_px} @ {lev}x"
+        ), {"lock": lock_info, "size_mult": eff_size_mult, "tp1_book_frac": eff_tp1_book_frac, "intraday_policy": intraday_policy}
 
 
 def run_portfolio_single_slot_backtest(
@@ -7779,9 +8010,15 @@ def run_portfolio_single_slot_backtest(
                     blocked_btc_veto += 1
                     continue
 
-        # Fixed 1.5% Wallet Risk Position Sizing (only applies when trade carries initial_stop_loss)
+        # Daily-Bias Risk Multiplier + Optional Fixed 1.5% Wallet Risk Position Sizing
         tr_dict = tr.to_dict()
-        eff_trade_margin = float(margin_inr)
+        tr_size_mult = float(tr_dict.get("size_mult", 1.0) or 1.0)
+        if tr_size_mult <= 0:
+            continue
+        eff_max_m = round(float(margin_inr) * tr_size_mult, 2)
+        if (eff_max_m * leverage) < 2448.0 and (float(margin_inr) * leverage) >= 2448.0:
+            continue
+        eff_trade_margin = eff_max_m
         init_sl_bt = float(tr_dict.get("initial_stop_loss", 0.0) or 0.0)
         ent_px_bt = float(tr_dict.get("entry_price", 0.0) or 0.0)
         if use_fixed_risk_sizing and init_sl_bt > 0 and ent_px_bt > 0 and current_wallet_inr > 0:
@@ -7790,12 +8027,12 @@ def run_portfolio_single_slot_backtest(
                 entry_px=ent_px_bt,
                 sl_px=init_sl_bt,
                 leverage=leverage,
-                max_margin_inr=float(margin_inr),
-                risk_pct=float(risk_per_trade_pct),
+                max_margin_inr=eff_max_m,
+                risk_pct=float(risk_per_trade_pct) * tr_size_mult,
                 max_slots=max_slots,
             )
             if r_m_bt > 0 and (r_m_bt * leverage) >= 2448.0:
-                eff_trade_margin = min(float(margin_inr), float(r_m_bt))
+                eff_trade_margin = min(eff_max_m, float(r_m_bt))
 
         # Main-Parity <90% Free-Margin Anti-Crumb Guard against running wallet equity
         if enforce_free_margin_guard and eff_trade_margin >= 2500.0:
@@ -7823,8 +8060,11 @@ def run_portfolio_single_slot_backtest(
                     blocked_zone += 1
                     continue
 
-        if margin_inr > 0 and abs(eff_trade_margin - float(margin_inr)) > 0.01:
-            scale_f = eff_trade_margin / float(margin_inr)
+        base_row_margin = float(tr_dict.get("deployed_margin_inr", 0.0) or 0.0)
+        if base_row_margin <= 0:
+            base_row_margin = float(margin_inr)
+        if base_row_margin > 0 and abs(eff_trade_margin - base_row_margin) > 0.01:
+            scale_f = eff_trade_margin / base_row_margin
             tr_dict["net_pnl_inr"] = round(float(tr_dict.get("net_pnl_inr", 0.0) or 0.0) * scale_f, 2)
             if "gross_pnl_inr" in tr_dict:
                 tr_dict["gross_pnl_inr"] = round(float(tr_dict.get("gross_pnl_inr", 0.0) or 0.0) * scale_f, 2)
@@ -8355,6 +8595,8 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "compute_intraday_3layer_series": compute_intraday_3layer_series,
             "classify_universe_intraday_regime": classify_universe_intraday_regime,
             "compute_pair_intraday_trend_stack": compute_pair_intraday_trend_stack,
+            "resolve_direction_risk_profile": resolve_direction_risk_profile,
+            "resolve_intraday_execution_policy": resolve_intraday_execution_policy,
             "build_historical_intraday_regime_map": build_historical_intraday_regime_map,
             "_persist_autotrade_state_bg": _persist_autotrade_state_bg,
             "count_open_ema50_200_slots": count_open_ema50_200_slots,

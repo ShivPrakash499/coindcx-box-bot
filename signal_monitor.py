@@ -88,10 +88,17 @@ def enabled_strategy_ids() -> list:
     return strat_registry.autotrade_mode_strategy_ids(auto_mode)
 
 
-def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str, levels: dict | None = None) -> bool:
-    """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
+def _autotrade_signal_eligible(
+    strategy_id: str,
+    direction: str,
+    auto_mode: str,
+    levels: dict | None = None,
+    pair: str | None = None,
+    intraday_policy: dict | None = None,
+) -> bool:
+    """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy & Per-Coin Intraday Policy."""
     m = strat_registry.resolve_autotrade_mode(auto_mode)
-    d = str(direction or "").upper()
+    d = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
     if m == "box_theory":
         return strategy_id == "box_theory"
     if m == "ema50_200":
@@ -101,29 +108,31 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str,
     if m == "box_plus_ema50_200_both":
         return strategy_id in ("box_theory", "ema50_200")
     if m == "box_plus_ema50_200_regime":
-        reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
-        if strategy_id == "box_theory":
-            # Row 9 (v40): Box Sweep runs strictly in RANGING_CHOP (paused in Strong Trends)
-            if reg != "RANGING_CHOP":
-                return False
-            # Row 9 No-Bear-Long Guard: block Box LONG when coin's prior Daily Close <= Daily 50 EMA
-            if d == "LONG" and isinstance(levels, dict):
-                dc = float(levels.get("daily_close", 0.0) or 0.0)
-                de50 = float(levels.get("EMA50", 0.0) or 0.0)
-                if dc > 0 and de50 > 0 and dc <= de50:
-                    return False
-            return True
-        if strategy_id == "ema50_200":
-            return (reg == "STRONG_DOWNTREND" and d == "SHORT") or (reg == "STRONG_UPTREND" and d == "LONG")
-        return False
+        pol = intraday_policy if isinstance(intraday_policy, dict) else None
+        if pol is None:
+            d_bias = str((levels or {}).get("trend_bias") or (levels or {}).get("bias") or "NEUTRAL").upper()
+            p_st = eng.compute_pair_intraday_trend_stack(pair) if pair else {}
+            pol = eng.resolve_intraday_execution_policy(p_st or {}, d_bias)
+        if pol.get("regime") == "CONFLICT_WAIT":
+            return False
+        return (strategy_id in (pol.get("strategies") or [])) and (d in (pol.get("allowed_dirs") or []))
     return strategy_id == strat_registry.DEFAULT_STRATEGY_ID
 
 
-def scan_pair(pair: str, margin_inr: float, leverage: int, usd_inr: float, strategy_id: str = "box_theory"):
+def scan_pair(
+    pair: str,
+    margin_inr: float,
+    leverage: int,
+    usd_inr: float,
+    strategy_id: str = "box_theory",
+    allowed_dirs: list[str] | None = None,
+):
     s = strat_registry.get_strategy(strategy_id)
     levels = s.compute_levels(pair)
     if not levels:
         return None
+    if allowed_dirs is not None and strategy_id in ("box_theory", "ema50_200"):
+        return s.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr, allowed_dirs=allowed_dirs)
     return s.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
 
 
@@ -327,16 +336,55 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
             email_daily_count = int(state.get(email_daily_key, 0))
 
             pair_primary_triggered = False
-            for sid in strategy_ids:
-                if sid in ("ema9_retest", "ema50_200") and pair_primary_triggered:
-                    continue  # Fallback / continuation strategies only run when Box / primary yielded no setup on this pair
+            if pair in open_live_pairs or (pair_base and pair_base in open_live_bases):
+                results.append({
+                    "pair": pair,
+                    "strategy_id": strategy_ids[0] if strategy_ids else "box_theory",
+                    "strategy_name": strat_registry.get_strategy(strategy_ids[0]).name if strategy_ids else "Box Theory Sweep",
+                    "signal": None, "emailed": False, "autotraded": False, "autotrade_error": "",
+                    "message": f"skipped: {pair} is already in an active Live Trade",
+                })
+                continue
+            pair_stack_i = None
+            pre_policy_i = None
+            pair_sids = list(strategy_ids)
+            if auto_mode == "box_plus_ema50_200_regime":
+                try:
+                    pair_stack_i = eng.compute_pair_intraday_trend_stack(pair) or {}
+                except Exception:
+                    pair_stack_i = {}
+                pre_policy_i = eng.resolve_intraday_execution_policy(pair_stack_i, "NEUTRAL")
+                if pre_policy_i["regime"] == "CONFLICT_WAIT" or not pre_policy_i["allowed_dirs"] or not pre_policy_i["strategies"]:
+                    results.append({
+                        "pair": pair, "strategy_id": "box_plus_ema50_200_regime",
+                        "strategy_name": "Per-Coin Intraday Router",
+                        "signal": None, "emailed": False, "autotraded": False, "autotrade_error": "",
+                        "intraday_policy": pre_policy_i,
+                        "message": (
+                            f"standing aside ({pre_policy_i['regime']}, Score {pre_policy_i['score']:+d}, "
+                            f"ADX {pre_policy_i['adx']:.1f})"
+                        ),
+                    })
+                    continue
+                pair_sids = [sid for sid in pre_policy_i["strategies"] if sid in strategy_ids]
+                if not pair_sids:
+                    pair_sids = list(strategy_ids)
+
+            for sid in pair_sids:
+                if pair_primary_triggered:
+                    continue  # Stop evaluating secondary strategies once primary strategy triggered on this pair
                 s = strat_registry.get_strategy(sid)
                 row = {
                     "pair": pair, "strategy_id": s.id, "strategy_name": s.name,
                     "signal": None, "emailed": False, "autotraded": False, "autotrade_error": ""
                 }
+                if pre_policy_i is not None:
+                    row["intraday_policy"] = pre_policy_i
                 try:
-                    sig = scan_pair(pair, margin_inr, leverage, usd_inr, s.id)
+                    if pre_policy_i is not None and s.id in ("box_theory", "ema50_200"):
+                        sig = scan_pair(pair, margin_inr, leverage, usd_inr, s.id, allowed_dirs=pre_policy_i["allowed_dirs"])
+                    else:
+                        sig = scan_pair(pair, margin_inr, leverage, usd_inr, s.id)
                 except Exception as e:
                     results.append({**row, "message": f"scan error: {e}"})
                     continue
@@ -344,19 +392,31 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if not sig or sig["signal"] == "NEUTRAL":
                     results.append({**row, "message": "no signal"})
                     continue
-                if sid in ("box_theory", "atr_reversal"):
-                    pair_primary_triggered = True
 
                 if auto_mode == "box_plus_ema50_200_regime" and s.id in ("box_theory", "ema50_200"):
-                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode, levels=sig.get("levels")):
-                        reg_info_sm = eng.compute_market_regime()
-                        reg_lbl = reg_info_sm.get("label", "RANGING / CHOP")
-                        if s.id == "box_theory" and reg_info_sm.get("regime") == "RANGING_CHOP" and str(sig.get("signal", "")).upper() == "LONG":
-                            _p_msg = "blocked by Row-9 No-Bear-Long Guard (Prev Daily Close <= Daily 50 EMA)"
-                        else:
-                            _p_msg = f"paused by Regime-Adaptive v40 mode ({reg_lbl})"
+                    _lv_d = sig.get("levels") if isinstance(sig.get("levels"), dict) else {}
+                    _d_bias_m = str(_lv_d.get("trend_bias") or _lv_d.get("bias") or "NEUTRAL").upper()
+                    _pol_full = eng.resolve_intraday_execution_policy(pair_stack_i or {}, _d_bias_m)
+                    row["intraday_policy"] = _pol_full
+                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode, levels=_lv_d, pair=pair, intraday_policy=_pol_full):
+                        _p_msg = (
+                            f"blocked by Per-Coin Intraday Policy ({_pol_full['regime']}, Score {_pol_full['score']:+d}, "
+                            f"ADX {_pol_full['adx']:.1f} -> {_pol_full['allowed_dirs'] or 'FLAT'} / {_pol_full['strategies']})"
+                        )
                         results.append({**row, "signal": None, "message": _p_msg})
                         continue
+                    _rp_m = eng.resolve_direction_risk_profile(
+                        sig.get("signal"), _d_bias_m, two_sided_chop=(len(_pol_full.get("allowed_dirs") or []) == 2)
+                    )
+                    sig = dict(sig)
+                    sig["size_mult"] = _rp_m["size_mult"]
+                    sig["tp1_book_frac"] = _rp_m["tp1_book_frac"]
+                    sig["is_counter_daily"] = _rp_m["is_counter_daily"]
+                    sig["intraday_score"] = _pol_full["score"]
+                    sig["intraday_regime"] = _pol_full["regime"]
+                    sig["intraday_policy"] = _pol_full
+                    row["signal"] = sig
+                pair_primary_triggered = True
 
                 if float(sig.get("roe_tp1", 0.0)) < 3.0:
                     results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})
@@ -369,27 +429,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         "message": f"skipped: {pair} is already in an active Live Trade"
                     })
                     continue
-
-                # 3-Layer Intraday Trend Stack Box Guard (protects Box mean-reversion against intraday trends/CHoCH)
-                if s.id == "box_theory":
-                    try:
-                        _mkt_i_m = str((eng.compute_market_regime() or {}).get("intraday_regime", "CHOP_RANGE"))
-                        _p_st_m = eng.compute_pair_intraday_trend_stack(pair) or {}
-                        _coin_i_m = str(_p_st_m.get("regime", "CHOP_RANGE"))
-                        _ch_m = str(_p_st_m.get("s1_choch", "NONE"))
-                        _d_m = "LONG" if str(sig.get("signal", "")).upper() in ("LONG", "BUY") else "SHORT"
-                        if (
-                            (_d_m == "SHORT" and (_mkt_i_m == "CLEAN_UPTREND" or _coin_i_m == "CLEAN_UPTREND" or _ch_m == "BULLISH_CHOCH"))
-                            or (_d_m == "LONG" and (_mkt_i_m == "CLEAN_DOWNTREND" or _coin_i_m == "CLEAN_DOWNTREND" or _ch_m == "BEARISH_CHOCH"))
-                        ):
-                            results.append({
-                                **row,
-                                "signal": None,
-                                "message": f"blocked by 3-Layer Intraday Trend Guard (Mkt15m={_mkt_i_m}, Coin={_coin_i_m}, 1H CHoCH={_ch_m})",
-                            })
-                            continue
-                    except Exception:
-                        pass
 
                 # 1-Crypto-at-a-Time Guard: If any crypto is already active, do not alert/open another crypto
                 if portfolio_occupied and active_Slot_pair and _canon_pair(active_Slot_pair) != pair_base:

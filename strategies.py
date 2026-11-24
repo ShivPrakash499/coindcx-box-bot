@@ -510,7 +510,7 @@ class BoxTheorySweep(Strategy):
     def _reason(sig: dict) -> str:
         return sig.get("trigger_reason", "")
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
@@ -525,6 +525,11 @@ class BoxTheorySweep(Strategy):
         daily_ema200 = float(levels.get("EMA200", rh))
         daily_close = float(levels.get("daily_close", mid))
         trend_bias = levels.get("trend_bias") or classify_daily_ema_bias(daily_close, daily_ema50, daily_ema200)
+        norm_allowed = {str(x).upper() for x in allowed_dirs} if allowed_dirs is not None else None
+        allow_short_box = ("SHORT" in norm_allowed) if norm_allowed is not None else (trend_bias in ("BEARISH", "NEUTRAL"))
+        allow_long_box = ("LONG" in norm_allowed) if norm_allowed is not None else (trend_bias in ("BULLISH", "NEUTRAL"))
+        allow_short_d50 = (("SHORT" in norm_allowed) and trend_bias == "BEARISH") if norm_allowed is not None else (trend_bias == "BEARISH")
+        allow_long_d50 = (("LONG" in norm_allowed) and trend_bias == "BULLISH") if norm_allowed is not None else (trend_bias == "BULLISH")
 
         session = eng.get_current_session_info(datetime.now(IST))
 
@@ -586,8 +591,8 @@ class BoxTheorySweep(Strategy):
         swept_rh_15m = (not upper_box_broken) and (prev_c15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(prev_c15_high, c15_high) <= sh * 1.005)
         swept_sh_15m = (not upper_box_broken) and (prev_c15_high >= sh or c15_high >= sh) and (c15_close < sh) and (c15_close <= rh * 1.001) and (max(prev_c15_high, c15_high) <= sh * 1.012)
 
-        rejected_rh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_rh_15m and has_bear_confirm_15m
-        rejected_sh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_sh_15m and has_bear_confirm_15m
+        rejected_rh_15m = allow_short_box and swept_rh_15m and has_bear_confirm_15m
+        rejected_sh_15m = allow_short_box and swept_sh_15m and has_bear_confirm_15m
 
         if rejected_rh_15m or rejected_sh_15m:
             entry = eng.round_asset_price(c15_close, rh)
@@ -616,7 +621,7 @@ class BoxTheorySweep(Strategy):
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                 return self._stamp(out)
 
-        if trend_bias == "BEARISH":
+        if allow_short_d50:
             touched_daily_ema50 = (
                 (daily_close < daily_ema50)
                 and (
@@ -669,8 +674,8 @@ class BoxTheorySweep(Strategy):
         swept_rl_15m = (not lower_box_broken) and (prev_c15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(prev_c15_low, c15_low) >= sl * 0.995)
         swept_sl_15m = (not lower_box_broken) and (prev_c15_low <= sl or c15_low <= sl) and (c15_close > sl) and (c15_close >= rl * 0.999) and (min(prev_c15_low, c15_low) >= sl * 0.988)
 
-        rejected_rl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_rl_15m and has_bull_confirm_15m
-        rejected_sl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_sl_15m and has_bull_confirm_15m
+        rejected_rl_15m = allow_long_box and swept_rl_15m and has_bull_confirm_15m
+        rejected_sl_15m = allow_long_box and swept_sl_15m and has_bull_confirm_15m
 
         if rejected_rl_15m or rejected_sl_15m:
             entry = eng.round_asset_price(c15_close, rl)
@@ -699,7 +704,7 @@ class BoxTheorySweep(Strategy):
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                 return self._stamp(out)
 
-        if trend_bias == "BULLISH":
+        if allow_long_d50:
             touched_daily_ema50 = (
                 (daily_close > daily_ema50)
                 and (
@@ -838,11 +843,16 @@ class BoxTheorySweep(Strategy):
     def backtest_has_context(self, candle, ctx):
         return bool(ctx["boxes"].get(candle["date_str"]))
 
-    def backtest_entry(self, idx, candle, ctx, records):
+    def backtest_entry(self, idx, candle, ctx, records, allowed_dirs=None):
         if idx < 1:
             return None
         box = ctx["boxes"][candle["date_str"]]
         bias = box["bias"]
+        norm_allowed = {str(x).upper() for x in allowed_dirs} if allowed_dirs is not None else None
+        allow_short_box = ("SHORT" in norm_allowed) if norm_allowed is not None else (bias in ("BEARISH", "NEUTRAL"))
+        allow_long_box = ("LONG" in norm_allowed) if norm_allowed is not None else (bias in ("BULLISH", "NEUTRAL"))
+        allow_short_d50 = (("SHORT" in norm_allowed) and bias == "BEARISH") if norm_allowed is not None else (bias == "BEARISH")
+        allow_long_d50 = (("LONG" in norm_allowed) and bias == "BULLISH") if norm_allowed is not None else (bias == "BULLISH")
 
         rh, rl, mid = box["RH"], box["RL"], box["MID"]
         sh, sl = box["SH"], box["SL"]
@@ -880,8 +890,8 @@ class BoxTheorySweep(Strategy):
         swept_rh_seq = (not upper_box_broken) and (p_high >= rh or c_high >= rh) and (c_close < rh) and (max(p_high, c_high) <= sh * 1.005)
         swept_sh_seq = (not upper_box_broken) and (p_high >= sh or c_high >= sh) and (c_close < sh) and (c_close <= rh * 1.001) and (max(p_high, c_high) <= sh * 1.012)
 
-        swept_rh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_rh_seq and has_bear_confirm
-        swept_sh_rej = (bias in ("BEARISH", "NEUTRAL")) and swept_sh_seq and has_bear_confirm
+        swept_rh_rej = allow_short_box and swept_rh_seq and has_bear_confirm
+        swept_sh_rej = allow_short_box and swept_sh_seq and has_bear_confirm
 
         if swept_rh_rej or swept_sh_rej:
             scale_in_lvl = max(sh, p_high, c_high)
@@ -902,7 +912,7 @@ class BoxTheorySweep(Strategy):
                 }
 
         #    B: Daily 50 EMA Touch + 15m Bearish Rejection (No 65% Box Filter)
-        if bias == "BEARISH":
+        if allow_short_d50:
             touched_d_ema50 = (
                 (p_high >= daily_ema50 * 0.9995 and p_low <= daily_ema50 * 1.005)
                 or (c_high >= daily_ema50 * 0.9995 and c_low <= daily_ema50 * 1.005)
@@ -933,8 +943,8 @@ class BoxTheorySweep(Strategy):
         swept_rl_seq = (not lower_box_broken) and (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
         swept_sl_seq = (not lower_box_broken) and (p_low <= sl or c_low <= sl) and (c_close > sl) and (c_close >= rl * 0.999) and (min(p_low, c_low) >= sl * 0.988)
 
-        swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
-        swept_sl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_sl_seq and has_bull_confirm
+        swept_rl_rej = allow_long_box and swept_rl_seq and has_bull_confirm
+        swept_sl_rej = allow_long_box and swept_sl_seq and has_bull_confirm
 
         if swept_rl_rej or swept_sl_rej:
             scale_in_lvl = min(sl, p_low, c_low)
@@ -955,7 +965,7 @@ class BoxTheorySweep(Strategy):
                 }
 
         #    D: Daily 50 EMA Touch + 15m Bullish Rejection (No 65% Box Filter)
-        if bias == "BULLISH":
+        if allow_long_d50:
             touched_d_ema50 = (
                 (p_low <= daily_ema50 * 1.0005 and p_high >= daily_ema50 * 0.995)
                 or (c_low <= daily_ema50 * 1.0005 and c_high >= daily_ema50 * 0.995)
@@ -1861,19 +1871,32 @@ def _detect_ema50_200_setup(
     prior_e200: list[float],
     allow_bear: bool = True,
     allow_bull: bool = True,
+    allowed_dirs: list[str] | None = None,
 ) -> dict | None:
     """
     Shared 15m 50/200 EMA Pullback detection (100% live <-> backtest parity):
-      - Bearish Daily Bias -> SHORT when 15m EMA50 < EMA200, price pulls up from below into [50, 200] EMA,
-        and 15m candle rejects back below EMA50. SL placed above max(15m EMA200, reach_high); TP2 = RL.
-      - Bullish Daily Bias -> LONG (Mirror Replica) when 15m EMA50 > EMA200, price pulls down from above
-        into [200, 50] EMA, and 15m candle rejects back above EMA50. SL placed below min(15m EMA200, reach_low); TP2 = RH.
+      - SHORT when 15m EMA50 < EMA200, price pulls up from below into [50, 200] EMA, and 15m candle rejects
+        back below EMA50. SL placed above max(15m EMA200, reach_high); TP2 = RL.
+      - LONG (Mirror Replica) when 15m EMA50 > EMA200, price pulls down from above into [200, 50] EMA,
+        and 15m candle rejects back above EMA50. SL placed below min(15m EMA200, reach_low); TP2 = RH.
+      - When `allowed_dirs` is supplied by the Per-Coin Intraday Score Router, execution direction follows
+        `allowed_dirs` (unlocking intraday 15m EMA trends even during counter-daily relief rallies, scaled
+        to 0.60x margin + 70% TP1 by the caller); otherwise falls back to Daily Bias (`box["bias"]`).
     """
     if idx < 6 or not box or len(prior_e50) < 4 or len(prior_e200) < 4:
         return None
     bias = str(box.get("trend_bias") or box.get("bias") or "").upper()
-    if bias not in ("BEARISH", "BULLISH"):
-        return None
+    if allowed_dirs is not None:
+        norm_allowed = {str(x).upper() for x in allowed_dirs}
+        can_short = bool(allow_bear and ("SHORT" in norm_allowed))
+        can_long = bool(allow_bull and ("LONG" in norm_allowed))
+        if not can_short and not can_long:
+            return None
+    else:
+        if bias not in ("BEARISH", "BULLISH"):
+            return None
+        can_short = bool(allow_bear and bias == "BEARISH")
+        can_long = bool(allow_bull and bias == "BULLISH")
 
     rh = float(box.get("RH", 0.0) or 0.0)
     rl = float(box.get("RL", 0.0) or 0.0)
@@ -1895,7 +1918,7 @@ def _detect_ema50_200_setup(
     p_low = float(prev["low"])
     p_close = float(prev["close"])
 
-    if allow_bear and bias == "BEARISH" and e50 < e200:
+    if can_short and e50 < e200:
         # Skip dead-flat tangled EMAs (<0.20% spread) that cause noise whipsaw stop-outs
         if ((e200 - e50) / c_close) < 0.0020:
             return None
@@ -1952,7 +1975,7 @@ def _detect_ema50_200_setup(
                                 "ema200_15m": e200,
                             }
 
-    if allow_bull and bias == "BULLISH" and e50 > e200:
+    if can_long and e50 > e200:
         # Skip dead-flat tangled EMAs (<0.20% spread) that cause noise whipsaw stop-outs
         if ((e50 - e200) / c_close) < 0.0020:
             return None
@@ -2044,7 +2067,7 @@ class Ema50200PullbackStrategy(Strategy):
             lv["ema_15m_trend"] = "BEAR (50 < 200)" if e50 < e200 else ("BULL (50 > 200)" if e50 > e200 else "FLAT")
         return lv
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
@@ -2085,6 +2108,7 @@ class Ema50200PullbackStrategy(Strategy):
         sig = _detect_ema50_200_setup(
             recs15, idx, levels, e50, e200, prior_e50, prior_e200,
             allow_bear=self.allow_bear, allow_bull=self.allow_bull,
+            allowed_dirs=allowed_dirs,
         )
         if sig:
             e_px = eng.round_asset_price(sig["entry"], ref_px)
@@ -2196,7 +2220,7 @@ class Ema50200PullbackStrategy(Strategy):
     def backtest_has_context(self, candle, ctx):
         return bool(ctx["boxes"].get(candle["date_str"]))
 
-    def backtest_entry(self, idx, candle, ctx, records):
+    def backtest_entry(self, idx, candle, ctx, records, allowed_dirs=None):
         if idx < 6:
             return None
         box = ctx["boxes"].get(candle["date_str"])
@@ -2209,6 +2233,7 @@ class Ema50200PullbackStrategy(Strategy):
         return _detect_ema50_200_setup(
             records, idx, box, e50, e200, prior_e50, prior_e200,
             allow_bear=self.allow_bear, allow_bull=self.allow_bull,
+            allowed_dirs=allowed_dirs,
         )
 
 
@@ -2227,12 +2252,13 @@ class BoxPlusEma50200Strategy(Strategy):
         self.allow_bull_ema = allow_bull_ema
         self.regime_adaptive = regime_adaptive
         if regime_adaptive:
-            self.timeframe = "Regime-Adaptive (v40 Row 9): Chop-Only Box Sweep (No Bear Long) + Trend-Only 15m 50/200 EMA"
+            self.timeframe = "Per-Coin Intraday Score Router (-4..+4 & 15m ADX14) + Daily 50/200 EMA Risk Weighting"
             self.description = (
-                "2-Year Verified Regime-Split Routing (Row 9): strictly runs Strategy 1 (Box Theory Sweep, blocking "
-                "falling-knife Box LONGs when prior Daily Close <= Daily 50 EMA) ONLY during RANGING / CHOP markets; "
-                "automatically pauses Box Sweep and activates Bull 15m 50/200 EMA Longs in STRONG UPTREND or Bear "
-                "15m 50/200 EMA Shorts in STRONG DOWNTREND."
+                "Per-Coin Intraday Trend Router (v43): scores each coin independently (-4 to +4) from 4H Structure, "
+                "1H Structure/CHoCH, Session VWAP, and 15m EMA. |Score|>=3 & ADX>=20 runs 15m 50/200 EMA + trend-aligned "
+                "Box Sweep; |Score|>=3 & ADX<20 runs trend-aligned Box Sweep only; |Score|<=2 runs Box Sweep (standing "
+                "aside on high-ADX timeframe conflicts). Daily 50/200 EMA scales margin (1.0x Aligned / 0.8x Neutral / "
+                "0.6x Counter-Daily + 70% TP1 book) instead of deadlocking intraday setups."
             )
         else:
             self.timeframe = (
@@ -2258,6 +2284,12 @@ class BoxPlusEma50200Strategy(Strategy):
                     lv["HTF_1H_Struct"] = st.get("s1_struct", "CHOP")
                     lv["HTF_1H_CHoCH"] = st.get("s1_choch", "NONE")
                     lv["Intraday_3Layer"] = st.get("regime", "CHOP_RANGE")
+                pol = eng.resolve_intraday_execution_policy(st or {}, lv.get("trend_bias", "NEUTRAL"))
+                lv["Intraday_Score"] = pol["score"]
+                lv["Intraday_Policy"] = pol["regime"]
+                lv["Intraday_SizeMult"] = pol["size_mult"]
+                lv["Intraday_TP1Frac"] = pol["tp1_book_frac"]
+                lv["Intraday_Badge"] = pol["badge"]
             except Exception:
                 pass
         return lv
@@ -2265,56 +2297,63 @@ class BoxPlusEma50200Strategy(Strategy):
     def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
         if self.regime_adaptive:
-            mkt_meta = eng.compute_market_regime() or {}
-            reg = str(mkt_meta.get("regime", "RANGING_CHOP"))
-            if reg == "RANGING_CHOP":
-                sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-                if sig1 and sig1.get("signal") == "LONG":
-                    lv = sig1.get("levels") if isinstance(sig1.get("levels"), dict) else (levels or {})
-                    d_close = float(lv.get("daily_close", 0.0) or 0.0)
-                    d_ema50 = float(lv.get("EMA50", 0.0) or 0.0)
-                    if d_close > 0 and d_ema50 > 0 and d_close <= d_ema50:
-                        return self._stamp({
-                            **sig1,
-                            "signal": "NEUTRAL",
-                            "trigger_reason": (
-                                f"Row-9 No-Bear-Long Guard: Box LONG blocked in Chop "
-                                f"(Prev Daily Close ${d_close:,.4g} <= Daily 50 EMA ${d_ema50:,.4g})"
-                            ),
-                        })
-                if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
-                    mkt_i_reg = str(mkt_meta.get("intraday_regime", "CHOP_RANGE"))
-                    p_stack = eng.compute_pair_intraday_trend_stack(pair) or {}
-                    coin_i_reg = str(p_stack.get("regime", "CHOP_RANGE"))
-                    s1_choch = str(p_stack.get("s1_choch", "NONE"))
-                    d1 = str(sig1.get("signal")).upper()
-                    block_box = (
-                        (d1 == "SHORT" and (mkt_i_reg == "CLEAN_UPTREND" or coin_i_reg == "CLEAN_UPTREND" or s1_choch == "BULLISH_CHOCH"))
-                        or (d1 == "LONG" and (mkt_i_reg == "CLEAN_DOWNTREND" or coin_i_reg == "CLEAN_DOWNTREND" or s1_choch == "BEARISH_CHOCH"))
+            p_stack = eng.compute_pair_intraday_trend_stack(pair) or {}
+            daily_bias = str((levels or {}).get("trend_bias") or (levels or {}).get("bias") or "NEUTRAL").upper()
+            policy = eng.resolve_intraday_execution_policy(p_stack, daily_bias)
+            if policy["regime"] == "CONFLICT_WAIT" or not policy["allowed_dirs"] or not policy["strategies"]:
+                return self._stamp({
+                    "pair": pair,
+                    "signal": "NEUTRAL",
+                    "signal_kind": "NONE",
+                    "levels": levels,
+                    "intraday_policy": policy,
+                    "trigger_reason": (
+                        f"Intraday Policy ({policy['regime']}, Score {policy['score']:+d}, ADX {policy['adx']:.1f}): "
+                        f"Conflicting timeframes — standing aside."
+                    ),
+                })
+
+            two_sided = len(policy["allowed_dirs"]) == 2
+            last_neutral = None
+            for sid in policy["strategies"]:
+                if sid == "ema50_200":
+                    cand = self.s4.evaluate_signal(
+                        pair, levels, margin_inr, leverage, usd_inr, allowed_dirs=policy["allowed_dirs"]
                     )
-                    if block_box:
-                        return self._stamp({
-                            **sig1,
-                            "signal": "NEUTRAL",
-                            "trigger_reason": (
-                                f"3-Layer Intraday Trend Guard: Blocked Box {d1} against active intraday trend/CHoCH "
-                                f"(Mkt15m={mkt_i_reg}, Coin={coin_i_reg}, 1H CHoCH={s1_choch})"
-                            ),
-                        })
-                return sig1
-            # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!
-            sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-            if sig4 and (
-                (reg == "STRONG_DOWNTREND" and sig4.get("signal") == "SHORT")
-                or (reg == "STRONG_UPTREND" and sig4.get("signal") == "LONG")
-            ):
-                return sig4
+                else:
+                    cand = self.s1.evaluate_signal(
+                        pair, levels, margin_inr, leverage, usd_inr, allowed_dirs=policy["allowed_dirs"]
+                    )
+                if cand and cand.get("signal") in ("LONG", "SHORT"):
+                    rp = eng.resolve_direction_risk_profile(cand["signal"], daily_bias, two_sided_chop=two_sided)
+                    cand = dict(cand)
+                    cand["size_mult"] = rp["size_mult"]
+                    cand["tp1_book_frac"] = rp["tp1_book_frac"]
+                    cand["is_counter_daily"] = rp["is_counter_daily"]
+                    cand["intraday_score"] = policy["score"]
+                    cand["intraday_regime"] = policy["regime"]
+                    cand["intraday_policy"] = policy
+                    if rp["tp1_book_frac"] >= 0.69:
+                        cand["tp1_label"] = str(cand.get("tp1_label", "50% Book")).replace("50% Book", "70% Book")
+                        cand["tp2_label"] = str(cand.get("tp2_label", "50% Runner")).replace("50%", "30%")
+                    return cand
+                if cand is not None:
+                    last_neutral = cand
+
+            if last_neutral is not None:
+                last_neutral = dict(last_neutral)
+                last_neutral["intraday_policy"] = policy
+                return last_neutral
             return self._stamp({
                 "pair": pair,
                 "signal": "NEUTRAL",
                 "signal_kind": "NONE",
                 "levels": levels,
-                "trigger_reason": f"Regime-Adaptive ({reg}): Box Sweep paused; awaiting trend-aligned 15m 50/200 EMA setup.",
+                "intraday_policy": policy,
+                "trigger_reason": (
+                    f"Intraday Policy ({policy['regime']}, Score {policy['score']:+d}, ADX {policy['adx']:.1f}): "
+                    f"Watching {policy['strategies']} ({'/'.join(policy['allowed_dirs'])})."
+                ),
             })
         sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
         if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
@@ -2359,26 +2398,12 @@ class BoxPlusEma50200Strategy(Strategy):
         stack_by_ts = {}
         if self.regime_adaptive:
             reg_map = dict(eng._PERSIST.get("backtest_regime_map") or {})
-            if not reg_map and df_daily is not None and len(df_daily) >= 18:
-                d = df_daily.copy().reset_index(drop=True)
-                if "date_str" not in d.columns:
-                    d["dt_ist"] = pd.to_datetime(d["timestamp"], unit="ms").dt.tz_localize("UTC").dt.tz_convert(IST)
-                    d["date_str"] = d["dt_ist"].dt.strftime("%Y-%m-%d")
-                e50_s = d["close"].ewm(span=50, adjust=False).mean().tolist()
-                e200_s = d["close"].ewm(span=200, adjust=False).mean().tolist()
-                closes = d["close"].tolist()
-                dates = d["date_str"].tolist()
-                for i in range(16, len(closes)):
-                    pc, pe50, pe200 = float(closes[i - 1]), float(e50_s[i - 1]), float(e200_s[i - 1])
-                    bf = 1.0 if (pc > pe50 and pc > pe200) else 0.0
-                    brf = 1.0 if (pc < pe50 and pc < pe200) else 0.0
-                    r14 = (pc / float(closes[i - 15]) - 1.0) * 100.0
-                    r5 = (pc / float(closes[i - 6]) - 1.0) * 100.0
-                    r2 = (pc / float(closes[i - 3]) - 1.0) * 100.0
-                    reg_map[dates[i]] = eng.classify_universe_regime_from_stats(bf, brf, r14, r5, r2)
             intraday_mkt_map = dict(eng._PERSIST.get("backtest_intraday_regime_map") or {})
-            if df is not None and not df.empty and {"timestamp", "open", "high", "low", "close"}.issubset(df.columns):
-                st_list = eng.compute_intraday_3layer_series(df)
+            src_15m = df.attrs.get("df_full_15m") if (df is not None and hasattr(df, "attrs")) else None
+            if not (isinstance(src_15m, pd.DataFrame) and not src_15m.empty and {"timestamp", "open", "high", "low", "close"}.issubset(src_15m.columns)):
+                src_15m = df
+            if src_15m is not None and not src_15m.empty and {"timestamp", "open", "high", "low", "close"}.issubset(src_15m.columns):
+                st_list = eng.compute_intraday_3layer_series(src_15m)
                 stack_by_ts = {int(x["timestamp"]): x for x in st_list}
         return {
             "ctx1": ctx1,
@@ -2394,36 +2419,40 @@ class BoxPlusEma50200Strategy(Strategy):
 
     def backtest_entry(self, idx, candle, ctx, records):
         if self.regime_adaptive:
-            day_reg = (ctx.get("regime_map") or {}).get(candle["date_str"], "RANGING_CHOP")
-            if day_reg == "RANGING_CHOP":
-                e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
-                if e1 and e1.get("direction") == "LONG":
-                    box = (ctx.get("boxes") or {}).get(candle["date_str"]) or {}
-                    if not bool(box.get("above_d50", True)):
-                        return None
-                if e1:
-                    ts_bar = int(candle.get("timestamp", 0) or 0)
-                    pair_name = ctx.get("pair")
-                    p_stacks = eng._PERSIST.get("backtest_pair_stacks") or {}
-                    st = (p_stacks.get(pair_name) or {}).get(ts_bar) if pair_name else None
-                    if st is None:
-                        st = (ctx.get("stack_by_ts") or {}).get(ts_bar)
-                    mkt_i_reg = (ctx.get("intraday_mkt_map") or {}).get(ts_bar, "CHOP_RANGE")
-                    coin_i_reg = str((st or {}).get("regime", "CHOP_RANGE"))
-                    s1_choch = str((st or {}).get("s1_choch", "NONE"))
-                    d1 = str(e1.get("direction", "")).upper()
-                    if d1 == "SHORT" and (mkt_i_reg == "CLEAN_UPTREND" or coin_i_reg == "CLEAN_UPTREND" or s1_choch == "BULLISH_CHOCH"):
-                        return None
-                    if d1 == "LONG" and (mkt_i_reg == "CLEAN_DOWNTREND" or coin_i_reg == "CLEAN_DOWNTREND" or s1_choch == "BEARISH_CHOCH"):
-                        return None
-                return e1
-            # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!
-            e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
-            if e4 and (
-                (day_reg == "STRONG_DOWNTREND" and e4.get("direction") == "SHORT")
-                or (day_reg == "STRONG_UPTREND" and e4.get("direction") == "LONG")
-            ):
-                return e4
+            box = (ctx.get("boxes") or {}).get(candle["date_str"]) or {}
+            daily_bias = str(box.get("bias") or box.get("trend_bias") or "NEUTRAL").upper()
+            ts_bar = int(candle.get("timestamp", 0) or 0)
+            pair_name = ctx.get("pair")
+            p_stacks = eng._PERSIST.get("backtest_pair_stacks") or {}
+            st = (p_stacks.get(pair_name) or {}).get(ts_bar) if pair_name else None
+            if st is None:
+                st = (ctx.get("stack_by_ts") or {}).get(ts_bar)
+            policy = eng.resolve_intraday_execution_policy(st or {}, daily_bias)
+            if policy["regime"] == "CONFLICT_WAIT" or not policy["allowed_dirs"] or not policy["strategies"]:
+                return None
+
+            two_sided = len(policy["allowed_dirs"]) == 2
+            for sid in policy["strategies"]:
+                if sid == "ema50_200":
+                    cand = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records, allowed_dirs=policy["allowed_dirs"])
+                else:
+                    cand = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records, allowed_dirs=policy["allowed_dirs"])
+                if cand:
+                    rp = eng.resolve_direction_risk_profile(cand["direction"], daily_bias, two_sided_chop=two_sided)
+                    out_c = dict(cand)
+                    out_c["size_mult"] = rp["size_mult"]
+                    out_c["tp1_book_frac"] = rp["tp1_book_frac"]
+                    out_c["is_counter_daily"] = rp["is_counter_daily"]
+                    out_c["intraday_score"] = policy["score"]
+                    out_c["intraday_regime"] = policy["regime"]
+                    if rp["tp1_book_frac"] >= 0.69:
+                        out_c["tp1_label"] = str(out_c.get("tp1_label", "50% Book")).replace("50% Book", "70% Book")
+                        out_c["tp2_label"] = str(out_c.get("tp2_label", "50% Runner")).replace("50%", "30%")
+                    out_c["reason"] = (
+                        f"{out_c.get('reason', '')} [Score {policy['score']:+d} {policy['regime']} • "
+                        f"{rp['size_mult']:.2g}x / {int(round(rp['tp1_book_frac'] * 100))}% TP1]"
+                    ).strip()
+                    return out_c
             return None
         e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
         if e1:
@@ -2467,15 +2496,8 @@ def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
     if m == "ema50_200":
         return ["ema50_200"]
     if m == "box_plus_ema50_200_regime":
-        try:
-            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
-            if reg == "RANGING_CHOP":
-                return ["box_theory"]
-            if reg in ("STRONG_UPTREND", "STRONG_DOWNTREND"):
-                return ["ema50_200"]
-        except Exception:
-            pass
-        return ["box_theory"]
+        # Per-Coin Intraday Score Router decides per coin whether ema50_200 and/or box_theory runs
+        return ["box_theory", "ema50_200"]
     return ["box_theory", "ema50_200"]
 
 
