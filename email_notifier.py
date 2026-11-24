@@ -220,10 +220,15 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
         rows.append(("Entry (100% Slot — Maker Limit Order)", f"${entry:,.4f}  (₹{margin_inr:,.0f})"))
     if is_manual_router or tp1_pct != 50 or abs(size_mult_clean - 1.0) > 1e-3:
         rows.append(("Risk Sizing & Split", f"{size_mult_clean:.2g}× Margin • {tp1_pct}% TP1 / {tp2_pct}% Runner"))
+    _sl_lbl_email = (
+        "Stop Loss (Beyond 15m 200 EMA)"
+        if strategy_id == "ema50_200"
+        else ("Stop Loss (Beyond 15m 50 EMA)" if strategy_id == "ema21_pullback" else f"Catastrophe SL (Beyond {'SL' if is_long else 'SH'} Sweep)")
+    )
     rows += [
         (f"TP1 — Close {tp1_pct}% (Book Profit & Lock Runner SL)", f"${tp1:,.4f}  (+{tp1_roe:.2f}% ROE)"),
         (f"TP2 — Hold {tp2_pct}% Structural Runner (Halfway Ratchet -> TP2)", f"${tp2:,.4f}  (+{tp2_roe:.2f}% ROE)"),
-        (f"Catastrophe SL (Beyond {'SL' if is_long else 'SH'} Sweep)", f"${stop_loss:,.4f}  (-{sl_roe:.2f}% ROE)"),
+        (_sl_lbl_email, f"${stop_loss:,.4f}  (-{sl_roe:.2f}% ROE)"),
         ("Single-Trade Margin", f"₹{margin_inr:,.0f} INR  (100% Slot)" if not has_e2 else f"₹{margin_inr:,.0f} INR  (2 x ₹{tranche_margin_inr:,.0f})"),
         ("Leverage", f"{leverage}x"),
         ("Timestamp (IST)", now),

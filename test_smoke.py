@@ -1464,12 +1464,15 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
         f"Expected TP1 capped above 3h swing low $7.01, got {sig_cap}"
     )
 
-    # 3. Regime-Adaptive v40 Row 9 Routing + v41 Clean 3-Option UI & Market-Trend Auto-Defaulting
-    assert [k for k, _ in strat.AUTOTRADE_MODE_CHOICES] == ["box_plus_ema50_200_regime", "box_theory", "ema50_200"]
-    assert [s.id for s in strat.list_strategies()] == ["box_theory", "ema50_200"]
+    # 3. Regime-Adaptive v40 Row 9 Routing + Clean 4-Option UI (Auto, Box, 50/200 EMA, 21 EMA) & Market-Trend Auto-Defaulting
+    assert [k for k, _ in strat.AUTOTRADE_MODE_CHOICES] == ["box_plus_ema50_200_regime", "box_theory", "ema50_200", "ema21_pullback"]
+    assert [s.id for s in strat.list_strategies()] == ["box_theory", "ema50_200", "ema21_pullback"]
     assert strat.recommended_strategy_for_regime("RANGING_CHOP") == "box_theory"
     assert strat.recommended_strategy_for_regime("STRONG_UPTREND") == "ema50_200"
     assert strat.recommended_strategy_for_regime("STRONG_DOWNTREND") == "ema50_200"
+    assert strat.autotrade_mode_strategy_ids("ema21_pullback") == ["ema21_pullback"]
+    assert sm._autotrade_signal_eligible("ema21_pullback", "SHORT", "ema21_pullback") is True
+    assert sm._autotrade_signal_eligible("ema21_pullback", "SHORT", "box_plus_ema50_200_regime") is False
     with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 2.27}):
         assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory"]
         assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is True
@@ -2461,6 +2464,8 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
          patch.object(eng, "calculate_daily_box_levels", return_value=fake_lvls_bear), \
          patch.object(strat.STRATEGY_REGISTRY["ema50_200"], "compute_levels", return_value=fake_lvls_bear), \
          patch.object(strat.STRATEGY_REGISTRY["ema50_200"], "evaluate_signal", return_value={"signal": "NEUTRAL"}), \
+         patch.object(strat.STRATEGY_REGISTRY["ema21_pullback"], "compute_levels", return_value=fake_lvls_bear), \
+         patch.object(strat.STRATEGY_REGISTRY["ema21_pullback"], "evaluate_signal", return_value={"signal": "NEUTRAL"}), \
          patch.object(strat.STRATEGY_REGISTRY["box_theory"], "evaluate_signal", return_value={"signal": "NEUTRAL"}), \
          patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.04}):
         mi = strat.evaluate_manual_intraday_setup("B-APT_USDT", margin_inr=10000.0, leverage=10, usd_inr=90.0)
@@ -2525,7 +2530,86 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
             r_dup = sm.alert_manual_intraday_signals(["B-APT_USDT"], margin_inr=6000.0, leverage=10, usd_inr=90.0, send=True, already_alerted_pairs=set())
             assert not r_dup[0].get("manual_emailed") and len(captured_emails) == 1, (r_dup, captured_emails)
 
-    print("  -> PASS: AutoTrade Wallet, Manual Intraday Score Router Prefill, 24/7 Email Alerts & CoinDCX-Style Chart Trading verified!")
+    # 8. Unified `evaluate_autotrade_margin_plan` + AutoTrade Wallet cross-module dependency parity:
+    w_scr = {"is_live_api": True, "total_inr": 18142.68, "available_inr": 8149.35}
+    cfg_scr = {"autotrade_wallet_inr": 10000.0, "max_concurrent_trades": 1, "auto_split_wallet_by_slots": True, "user_custom_margin": False}
+    plan_skip = eng.evaluate_autotrade_margin_plan(10000.0, 10, wallet=w_scr, cfg=cfg_scr, max_slots=1, honor_custom_margin=False)
+    assert plan_skip["will_skip"] is True and plan_skip["skip_kind"] == "FREE_MARGIN_GUARD" and plan_skip["ui_level"] == "error", plan_skip
+    assert "SKIP new trades" in plan_skip["ui_message"]
+
+    w_band = {"is_live_api": True, "total_inr": 18142.68, "available_inr": 9500.0}
+    plan_cap = eng.evaluate_autotrade_margin_plan(10000.0, 10, wallet=w_band, cfg=cfg_scr, max_slots=1, honor_custom_margin=False)
+    assert plan_cap["will_skip"] is False and abs(plan_cap["effective_margin_inr"] - 9310.0) < 0.01 and plan_cap["ui_level"] == "warning", plan_cap
+
+    w_full = {"is_live_api": True, "total_inr": 18142.68, "available_inr": 18142.68}
+    cfg_cust = {"autotrade_wallet_inr": 10000.0, "max_concurrent_trades": 1, "auto_split_wallet_by_slots": False, "user_custom_margin": True}
+    plan_at_cap = eng.evaluate_autotrade_margin_plan(12000.0, 10, wallet=w_full, cfg=cfg_cust, max_slots=1, honor_custom_margin=True, honor_autotrade_wallet_cap=True)
+    assert plan_at_cap["will_skip"] is False and abs(plan_at_cap["effective_margin_inr"] - 9800.0) < 0.01, plan_at_cap
+    plan_man_ok = eng.evaluate_autotrade_margin_plan(12000.0, 10, wallet=w_full, cfg=cfg_cust, max_slots=1, honor_custom_margin=True, honor_autotrade_wallet_cap=False)
+    assert plan_man_ok["will_skip"] is False and abs(plan_man_ok["effective_margin_inr"] - 12000.0) < 0.01, plan_man_ok
+
+    prev_cfg_cache = eng._AUTOTRADE_CFG_MEM_CACHE.get("data")
+    try:
+        eng._AUTOTRADE_CFG_MEM_CACHE["data"] = {"autotrade_wallet_inr": 12000.0, "max_concurrent_trades": 2}
+        rot_at = eng.get_rotational_margin_inr(leverage=10)
+        assert abs(rot_at["wallet_equity_inr"] - 12000.0) < 0.01 and abs(rot_at["margin_inr"] - 6000.0) < 0.01, rot_at
+    finally:
+        eng._AUTOTRADE_CFG_MEM_CACHE["data"] = prev_cfg_cache
+
+    with open(os.path.join(ROOT_DIR, "sheets_logger.py"), "r", encoding="utf-8") as fh_sl:
+        sl_src = fh_sl.read()
+    assert '"autotrade_wallet_inr":' in sl_src and '"risk_per_trade_pct":' in sl_src
+    with open(os.path.join(ROOT_DIR, "gemini_advisor.py"), "r", encoding="utf-8") as fh_ga:
+        ga_src = fh_ga.read()
+    assert "get_effective_autotrade_wallet_inr" in ga_src
+
+    # 9. Strategy 5 (`ema21_pullback`: 15m 21 EMA Touch & Bounce) mirrors ALL Strategy 4 (50/200 EMA) guards!
+    assert "ema21_pullback" in strat.STRATEGY_REGISTRY
+    s21 = strat.STRATEGY_REGISTRY["ema21_pullback"]
+    bear_box_21 = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
+    recs21 = [
+        {"open": 7.05, "high": 7.08, "low": 6.99, "close": 7.01},
+        {"open": 7.01, "high": 7.06, "low": 6.98, "close": 7.02},
+        {"open": 7.02, "high": 7.08, "low": 7.00, "close": 7.04},
+        {"open": 7.04, "high": 7.09, "low": 7.01, "close": 7.05},
+        {"open": 7.05, "high": 7.10, "low": 7.03, "close": 7.06},
+        {"open": 7.06, "high": 7.11, "low": 7.04, "close": 7.09},
+        {"open": 7.09, "high": 7.12, "low": 7.04, "close": 7.06},  # touches 21 EMA (7.10) & rejects down
+    ]
+    # 9A: Dead-flat EMA spread (<0.20% between 21 & 50 EMA) MUST be blocked!
+    assert strat._detect_ema21_pullback_setup(
+        recs21, 6, bear_box_21, ema9_val=7.07, ema21_val=7.10, ema50_val=7.11,
+        prior_e21=[7.10] * 6, prior_e50=[7.11] * 6, allow_bear=True, allow_bull=False,
+    ) is None, "Expected <0.20% dead-flat 21/50 EMA spread blocked"
+    # 9B: Tight 50 EMA SL MUST be floored at >= 0.65% SL floor!
+    sig21_ok = strat._detect_ema21_pullback_setup(
+        recs21, 6, bear_box_21, ema9_val=7.07, ema21_val=7.10, ema50_val=7.12,
+        prior_e21=[7.10] * 6, prior_e50=[7.12] * 6, allow_bear=True, allow_bull=False,
+    )
+    assert sig21_ok is not None and sig21_ok["direction"] == "SHORT", sig21_ok
+    assert ((sig21_ok["stop"] - sig21_ok["entry"]) / sig21_ok["entry"]) >= 0.00649, sig21_ok
+    assert abs(sig21_ok["tp2"] - 6.80) < 1e-4, sig21_ok
+    # 9C: Bottom-of-Box Floor Guard (entry in bottom 15% of [6.80, 7.50]) MUST be blocked!
+    recs21_bot = list(recs21[:-1]) + [{"open": 6.89, "high": 6.91, "low": 6.86, "close": 6.87}]
+    assert strat._detect_ema21_pullback_setup(
+        recs21_bot, 6, bear_box_21, ema9_val=6.88, ema21_val=6.90, ema50_val=6.95,
+        prior_e21=[6.90] * 6, prior_e50=[6.95] * 6, allow_bear=True, allow_bull=False,
+    ) is None, "Expected bottom-of-box floor guard to block 21 EMA SHORT"
+    # 9D: `count_open_ema50_200_slots` counts `ema21_pullback` toward MAX_EMA_CONCURRENT_TRADES (2)
+    assert eng.count_open_ema50_200_slots(cfg={
+        "active_trade_locks": {
+            "B-SOL_USDT": {"pair": "B-SOL_USDT", "strategy_id": "ema50_200"},
+            "B-ETH_USDT": {"pair": "B-ETH_USDT", "strategy_id": "ema21_pullback"},
+        }
+    }) == 2
+    # 9E: Intraday Score Router includes `ema21_pullback` alongside `ema50_200` when |score|>=3 & ADX>=20
+    pol_21 = eng.resolve_intraday_execution_policy(fake_stack_bull4, "BEARISH")
+    assert "ema21_pullback" in pol_21["strategies"] and "ema50_200" in pol_21["strategies"], pol_21
+    # 9F: `plan_setups` produces valid BUY & SELL plans for Execute & Chart tabs
+    pl21 = s21.plan_setups("B-SOL_USDT", {**bear_box_21, "EMA21_15m": 7.10, "EMA50_15m": 7.20}, 7.08, 6000.0, 10, 90.0)
+    assert pl21["BUY"] and pl21["SELL"] and pl21["SELL"]["stop_loss"] > pl21["SELL"]["entry"] > pl21["SELL"]["tp1"] >= pl21["SELL"]["tp2"], pl21
+
+    print("  -> PASS: AutoTrade Wallet, Margin Plan Deps, Manual Router, 24/7 Email Alerts, 15m 21 EMA Bounce & Chart Trading verified!")
 
 
 if __name__ == "__main__":

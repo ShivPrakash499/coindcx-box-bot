@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 45
+_DAEMON_VERSION = 46
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 def _send_trade_email_async(**kwargs):
@@ -1062,20 +1062,26 @@ if autotrade_wallet_inr > float(wallet_data["total_inr"]) + 1.0:
             f"⚠️ AutoTrade Wallet (`₹{autotrade_wallet_inr:,.0f}`) exceeds Futures Wallet (`₹{float(wallet_data['total_inr']):,.0f}`); live trades will cap at actual exchange funds."
         )
 try:
-    _at_wallet_snap = {
-        **wallet_data,
-        "total_inr": min(float(wallet_data["total_inr"]), float(autotrade_wallet_inr)),
-        "available_inr": min(float(wallet_data.get("available_inr", wallet_data["total_inr"])), float(autotrade_wallet_inr)),
+    _plan_cfg_sb = {
+        **_auto_cfg,
+        "autotrade_wallet_inr": round(float(autotrade_wallet_inr), 2),
+        "max_concurrent_trades": int(max_concurrent_trades),
+        "auto_split_wallet_by_slots": bool(auto_split_wallet),
+        "user_custom_margin": not bool(auto_split_wallet),
     }
-    _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(
-        float(margin_inr),
-        int(leverage),
-        _at_wallet_snap,
+    _sb_m_plan = coindcx_engine.evaluate_autotrade_margin_plan(
+        requested_margin_inr=float(margin_inr),
+        leverage=int(leverage),
+        wallet=wallet_data,
+        cfg=_plan_cfg_sb,
         max_slots=max_concurrent_trades,
         honor_custom_margin=not auto_split_wallet,
     )
-    if _eff_note:
-        st.sidebar.warning(f"⚠️ AutoTrade will use **₹{_eff_margin:,.2f}** per trade. {_eff_note}")
+    if _sb_m_plan.get("ui_message"):
+        if _sb_m_plan.get("ui_level") == "error":
+            st.sidebar.error(_sb_m_plan["ui_message"])
+        else:
+            st.sidebar.warning(_sb_m_plan["ui_message"])
 except Exception:
     pass
 
@@ -2129,6 +2135,7 @@ if active_section == "⚡ Signals":
                             str((r.get("signal") or {}).get("strategy_id") or r.get("strategy_id") or strategy_registry.DEFAULT_STRATEGY_ID),
                             (r.get("signal") or {}).get("signal"),
                             selected_autotrade_mode,
+                            levels=(r.get("signal") or {}).get("levels"),
                         )
                         if signal_monitor and hasattr(signal_monitor, "_autotrade_signal_eligible")
                         else r.get("strategy_id", strategy_registry.DEFAULT_STRATEGY_ID) == strategy_registry.DEFAULT_STRATEGY_ID
@@ -2286,11 +2293,13 @@ if active_section == "⚡ Signals":
                         unsafe_allow_html=True
                     )
                     m1, m2, m3, m4 = st.columns(4)
-                    _is_ema_sig = (str(sig.get("strategy_id") or r.get("strategy_id")) == "ema50_200")
+                    _sig_id_c = str(sig.get("strategy_id") or r.get("strategy_id"))
+                    _is_ema_sig = _sig_id_c in ("ema50_200", "ema21_pullback")
+                    _sl_m_lbl = "SL (15m 200 EMA)" if _sig_id_c == "ema50_200" else ("SL (15m 50 EMA)" if _sig_id_c == "ema21_pullback" else "Catastrophe SL")
                     m1.metric("Entry (100% Limit)", fmt_px(sig["entry"]))
                     m2.metric("TP1 (50% -> Lock SL)", fmt_px(sig["tp1"]), f"+{sig['roe_tp1']}% ROE")
                     m3.metric("TP2 (RL/RH Runner)" if _is_ema_sig else "TP2 (50% Runner)", fmt_px(sig["tp2"]), f"+{sig['roe_tp2']}% ROE")
-                    m4.metric("SL (15m 200 EMA)" if _is_ema_sig else "Catastrophe SL", fmt_px(sig["stop_loss"]), f"-{sig['roe_sl']}% ROE")
+                    m4.metric(_sl_m_lbl, fmt_px(sig["stop_loss"]), f"-{sig['roe_sl']}% ROE")
 
                     _v41_prefill = {
                         **sig,
@@ -2405,7 +2414,8 @@ if active_section == "⚡ Signals":
                     mm1.metric("Prefilled Entry", fmt_px(_mtk.get("entry")))
                     mm2.metric(f"TP1 ({_mtp1_pct}% Book)", fmt_px(_mtk.get("tp1")), f"+{float(_mtk.get('roe_tp1', 0.0)):.1f}% ROE")
                     mm3.metric(f"TP2 ({100 - _mtp1_pct}% Runner)", fmt_px(_mtk.get("tp2")), f"+{float(_mtk.get('roe_tp2', 0.0)):.1f}% ROE")
-                    mm4.metric("Stop Loss", fmt_px(_mtk.get("stop_loss")), f"-{float(_mtk.get('roe_sl', 0.0)):.1f}% ROE")
+                    _m_sl_lbl = "SL (15m 200 EMA)" if _msid == "ema50_200" else ("SL (15m 50 EMA)" if _msid == "ema21_pullback" else "Stop Loss")
+                    mm4.metric(_m_sl_lbl, fmt_px(_mtk.get("stop_loss")), f"-{float(_mtk.get('roe_sl', 0.0)):.1f}% ROE")
 
                     _prefill_payload = {
                         **_mtk,
@@ -2761,11 +2771,13 @@ elif active_section == "🎯 Execute":
                     strategy_registry.setup_tag(_s.id, "SIGNAL"),
                     _s
                 ))
-            if _s.id not in ("box_theory", "ema50_200"):
+            if _s.id not in ("box_theory", "ema50_200", "ema21_pullback"):
                 continue
             _plan = get_cached_strategy_plan(_s.id, selected_pair, float(cur_price), trade_margin_inr, trade_leverage, trade_usd_inr)
             _multi_plan_mode = len(armed_strats) > 1
-            _plan_sfx = (" [Box]" if _s.id == "box_theory" else " [50/200 EMA]") if _multi_plan_mode else ""
+            _plan_sfx = (
+                " [Box]" if _s.id == "box_theory" else (" [50/200 EMA]" if _s.id == "ema50_200" else " [21 EMA]")
+            ) if _multi_plan_mode else ""
             for _d, _ico in (("BUY", "🟢"), ("SELL", "🔴")):
                 _st = _plan.get(_d)
                 if not _st or _st.get("signal_kind"):
@@ -2880,7 +2892,10 @@ elif active_section == "🎯 Execute":
             adj_col1, adj_col2 = st.columns(2)
             with adj_col1:
                 custom_entry = st.number_input("Entry (100% Maker Limit) ($)", value=float(st.session_state.get(entry_key, _init_norm["entry"])), step=step_val, format=fmt_str, key=entry_key)
-                _sl_input_lbl = "SL (15m 200 EMA) ($)" if _sig_sid == "ema50_200" else "Catastrophe SL ($)"
+                _sl_input_lbl = (
+                    "SL (15m 200 EMA) ($)" if _sig_sid == "ema50_200"
+                    else ("SL (15m 50 EMA) ($)" if _sig_sid == "ema21_pullback" else "Catastrophe SL ($)")
+                )
                 custom_sl = st.number_input(_sl_input_lbl, value=float(st.session_state.get(sl_key, _init_norm["stop_loss"])), step=step_val, format=fmt_str, key=sl_key)
                 custom_e2 = 0.0
             with adj_col2:
@@ -2947,7 +2962,10 @@ elif active_section == "🎯 Execute":
             _e2_lvl = 0.0
             _has_e2 = False
             _is_full_runner = (_sig_sid == "ema9_retest")
-            _exec_strat_name = "15m 50/200 EMA Pullback" if _sig_sid == "ema50_200" else strategy_registry.get_strategy(_sig_sid).name
+            _exec_strat_name = (
+                "15m 50/200 EMA Pullback" if _sig_sid == "ema50_200"
+                else ("15m 21 EMA Touch & Bounce" if _sig_sid == "ema21_pullback" else strategy_registry.get_strategy(_sig_sid).name)
+            )
             _cur_fill_mode = str(st.session_state.get(f"e1_fill_mode_{selected_pair}", "📌 Limit"))
             _user_custom_e1 = abs(float(active_trade["entry"]) - float(_init_norm["entry"])) > 1e-6
             _user_custom_tp1 = abs(float(active_trade["tp1"]) - float(_formula_norm_for_e1["tp1"])) > 1e-6
@@ -3009,10 +3027,10 @@ elif active_section == "🎯 Execute":
                     <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else f'{_tp1_eff_pct}% Limit Order -> SL Ratchet'}):</span>
                     <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
 
-                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else ('RL / RH Structural Target' if _sig_sid == 'ema50_200' else f'{_tp2_eff_pct}% Position TP Runner')}):</span>
+                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else ('RL / RH Structural Target' if _sig_sid in ('ema50_200', 'ema21_pullback') else f'{_tp2_eff_pct}% Position TP Runner')}):</span>
                     <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(_disp_trade['tp2'])} (+{_disp_trade['roe_tp2']}% ROE)</span>
 
-                    <span style="color:{subtext_color};">{'Stop Loss (15m 200 EMA)' if _sig_sid == 'ema50_200' else 'Catastrophe Stop Loss (Position SL)'}:</span>
+                    <span style="color:{subtext_color};">{'Stop Loss (15m 200 EMA)' if _sig_sid == 'ema50_200' else ('Stop Loss (15m 50 EMA)' if _sig_sid == 'ema21_pullback' else 'Catastrophe Stop Loss (Position SL)')}:</span>
                     <span style="text-align:right; color:#ef4444; font-weight:700;">{fmt_px(_disp_trade['stop_loss'])} (-{_disp_trade['roe_sl']}%)</span>
 
                     <span style="color:{subtext_color};">Est. Fee (incl. GST) / Breakeven:</span>
@@ -3895,7 +3913,7 @@ elif active_section == "📈 Chart & Levels":
             _psid_c = str(_ch_pref_t.get("strategy_id") or "")
             if _psid_c == "ema50_200":
                 st.session_state[f"chart_strategy_sel_{selected_pair}"] = "📈 50/200 EMA Crossover"
-            elif _psid_c == "ema9_21_cross":
+            elif _psid_c in ("ema21_pullback", "ema9_21_cross"):
                 st.session_state[f"chart_strategy_sel_{selected_pair}"] = "⚡ 9/21 EMA Crossover"
             else:
                 st.session_state[f"chart_strategy_sel_{selected_pair}"] = "📦 Box Theory Sweep"
@@ -4154,7 +4172,7 @@ elif active_section == "📈 Chart & Levels":
                         _ch_sid = "ema50_200"
                     elif chart_strategy == "⚡ 9/21 EMA Crossover":
                         _strat_plan_obj = _ema9_21_plan.get(_ov_dir) or (_box_buy if _ov_dir == "BUY" else _box_sell)
-                        _ch_sid = "ema9_21_cross"
+                        _ch_sid = "ema21_pullback"
                     else:
                         _strat_plan_obj = _box_buy if _ov_dir == "BUY" else _box_sell
                         _ch_sid = "box_theory"

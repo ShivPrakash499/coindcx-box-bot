@@ -96,6 +96,8 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str,
         return strategy_id == "box_theory"
     if m == "ema50_200":
         return strategy_id == "ema50_200"
+    if m == "ema21_pullback":
+        return strategy_id == "ema21_pullback"
     if m == "box_plus_ema50_200_bear":
         return (strategy_id == "box_theory") or (strategy_id == "ema50_200" and d == "SHORT")
     if m == "box_plus_ema50_200_both":
@@ -328,7 +330,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
             pair_primary_triggered = False
             for sid in strategy_ids:
-                if sid in ("ema9_retest", "ema50_200") and pair_primary_triggered:
+                if sid in ("ema9_retest", "ema50_200", "ema21_pullback") and pair_primary_triggered:
                     continue  # Fallback / continuation strategies only run when Box / primary yielded no setup on this pair
                 s = strat_registry.get_strategy(sid)
                 row = {
@@ -347,7 +349,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if sid in ("box_theory", "atr_reversal"):
                     pair_primary_triggered = True
 
-                if auto_mode == "box_plus_ema50_200_regime" and s.id in ("box_theory", "ema50_200"):
+                if auto_mode == "box_plus_ema50_200_regime" and s.id in ("box_theory", "ema50_200", "ema21_pullback"):
                     if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode, levels=sig.get("levels")):
                         reg_info_sm = eng.compute_market_regime()
                         reg_lbl = reg_info_sm.get("label", "RANGING / CHOP")

@@ -949,6 +949,7 @@ def load_main_live_setup_from_sheet(force_refresh: bool = False) -> dict | None:
 
         setup = {
             "wallet_balance_inr": main_wallet_inr,
+            "autotrade_wallet_inr": round(float(main_state.get("autotrade_wallet_inr", 0.0) or 0.0), 2),
             "wallet_updated_ist": main_wallet_ts,
             "single_trade_margin_inr": round(float(main_state.get("single_trade_margin_inr", 0.0) or 0.0), 2),
             "user_custom_margin": bool(main_state.get("user_custom_margin", False)),
@@ -959,6 +960,8 @@ def load_main_live_setup_from_sheet(force_refresh: bool = False) -> dict | None:
                 else (not bool(main_state.get("user_custom_margin", False)))
             ),
             "fixed_risk_sizing_enabled": bool(main_state.get("fixed_risk_sizing_enabled", False)),
+            "risk_per_trade_pct": round(float(main_state.get("risk_per_trade_pct", 1.5) or 1.5), 2),
+            "manual_intraday_email_alerts_enabled": bool(main_state.get("manual_intraday_email_alerts_enabled", True)),
             "leverage": int(main_state.get("leverage", 10) or 10),
             "autotrade_strategy_mode": str(main_state.get("autotrade_strategy_mode") or "box_plus_ema50_200_regime"),
             "source": "Main Live Sheet Sync",

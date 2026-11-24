@@ -477,7 +477,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 45
+_REQUIRED_DAEMON_VERSION = 46
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
@@ -4493,11 +4493,11 @@ def resolve_intraday_execution_policy(layer_info: dict, daily_bias: str) -> dict
 
     if score >= 3:
         allowed_dirs = ["LONG"]
-        strategies = ["ema50_200", "box_theory"] if adx >= 20.0 else ["box_theory"]
+        strategies = ["ema50_200", "ema21_pullback", "box_theory"] if adx >= 20.0 else ["box_theory"]
         regime = "INTRADAY_UPTREND" if adx >= 20.0 else "EARLY_BULL_SHIFT"
     elif score <= -3:
         allowed_dirs = ["SHORT"]
-        strategies = ["ema50_200", "box_theory"] if adx >= 20.0 else ["box_theory"]
+        strategies = ["ema50_200", "ema21_pullback", "box_theory"] if adx >= 20.0 else ["box_theory"]
         regime = "INTRADAY_DOWNTREND" if adx >= 20.0 else "EARLY_BEAR_SHIFT"
     else:
         if adx >= 25.0 and abs(score) <= 1:
@@ -4581,7 +4581,7 @@ def _format_regime_metadata(
         routing = "Bear 15m 50/200 EMA (SHORT) Only (Box Paused in Strong Trend)"
     else:
         emoji, label = "🟡", "RANGING / CHOP"
-        routing = "Box Theory Sweep (3-Layer Intraday Guarded + No Bear Long; EMA Paused in Chop)"
+        routing = "Box Theory Sweep (Strict v41 + No Bear Long; EMA Paused in Chop)"
 
     intraday_note = (
         f" | 3-Layer 15m: {i_emoji} {i_label} ({intraday_bull_votes}B/{intraday_bear_votes}S of {intraday_valid}, "
@@ -4891,11 +4891,11 @@ def count_open_ema50_200_slots(
                 ),
                 None,
             )
-            if matched_rec and str(matched_rec.get("strategy_id", "")) == "ema50_200":
+            if matched_rec and str(matched_rec.get("strategy_id", "")) in ("ema50_200", "ema21_pullback"):
                 ema_cnt += 1
         return ema_cnt
 
-    return sum(1 for lk in locks_map.values() if str(lk.get("strategy_id", "")) == "ema50_200")
+    return sum(1 for lk in locks_map.values() if str(lk.get("strategy_id", "")) in ("ema50_200", "ema21_pullback"))
 
 
 _AUTOTRADE_CFG_MEM_CACHE = _PERSIST.setdefault("autotrade_cfg_cache", {"mtime": 0.0, "data": None})
@@ -5794,6 +5794,7 @@ def register_app_trade_lock(
             "atr_reversal": "Strategy 2: 1-Candle 25% ATR Reversal",
             "ema9_retest": "Strategy 3: 9 EMA Touch & Confirm",
             "ema50_200": "Strategy 4: 15m 50/200 EMA Pullback",
+            "ema21_pullback": "Strategy 5: 15m 21 EMA Touch & Bounce",
         }
         _base_strat = _strat_map.get(str(strategy_id or "box_theory"), "Box Theory Sweep")
         _tag_suffix = "Staging Paper AutoTrade" if not is_live_exchange else "App Live Order"
@@ -6576,6 +6577,7 @@ def get_active_portfolio_trade_status(manage_exchange: bool = True) -> dict:
                             _strat_names_p = {
                                 "box_theory": "Strategy 1: Box Theory Sweep (Staging Paper AutoTrade)",
                                 "ema50_200": "Strategy 4: 15m 50/200 EMA Pullback (Staging Paper AutoTrade)",
+                                "ema21_pullback": "Strategy 5: 15m 21 EMA Touch & Bounce (Staging Paper AutoTrade)",
                                 "ema9_retest": "Strategy 3: 9 EMA Touch & Confirm (Staging Paper AutoTrade)",
                             }
                             _s_name_p = _strat_names_p.get(str(_lock_snap.get("strategy_id", "box_theory")), "Staging Paper AutoTrade")
@@ -7167,6 +7169,111 @@ def compute_wallet_capped_margin(
     return round(eff, 2), note
 
 
+def evaluate_autotrade_margin_plan(
+    requested_margin_inr: float,
+    leverage: int,
+    wallet: dict | None = None,
+    cfg: dict | None = None,
+    max_slots: int | None = None,
+    honor_custom_margin: bool | None = None,
+    enforce_free_margin: bool | None = None,
+    honor_autotrade_wallet_cap: bool = True,
+) -> dict:
+    """
+    Single canonical source of truth shared by BOTH the Sidebar warning in `app.py` AND live/paper
+    execution in `execute_autotrade_two_entry_signal()`.
+    Enforces:
+      1. Dedicated `AutoTrade Wallet` cap (`min(exchange_total, autotrade_wallet_inr)`),
+      2. Anti-Crumb `<90%` Free-Margin Guard (`usable_free = eff_avail * 0.98 < target_slot_m * 0.90`),
+      3. CoinDCX `₹2,448` minimum notional guard (`eff_margin * leverage >= 2448.0`).
+    Guarantees the Sidebar status message ALWAYS matches what AutoTrade will actually do!
+    """
+    c = cfg if isinstance(cfg, dict) else get_autotrade_config()
+    w = wallet if isinstance(wallet, dict) else fetch_coindcx_futures_balance()
+    slots = max(1, int(max_slots or get_configured_max_slots(c) or MAX_CONCURRENT_TRADES))
+    auto_split = is_auto_split_enabled(c)
+    honor_custom = (not auto_split and bool(c.get("user_custom_margin", False))) if honor_custom_margin is None else bool(honor_custom_margin)
+    lev = max(1, int(leverage or c.get("leverage", 10) or 10))
+    req_m = round(float(requested_margin_inr or 0.0), 2)
+
+    is_verified_w = isinstance(w, dict) and bool(w.get("is_live_api") or w.get("is_paper_wallet"))
+    do_enforce_fm = is_verified_w if enforce_free_margin is None else bool(enforce_free_margin)
+
+    ex_total = float(w.get("total_inr", 0.0) or 0.0) if isinstance(w, dict) else 0.0
+    ex_avail = float(w.get("available_inr", ex_total) or 0.0) if isinstance(w, dict) else 0.0
+    at_w_raw = float(c.get("autotrade_wallet_inr", 0.0) or 0.0)
+    has_at_w = bool(honor_autotrade_wallet_cap and at_w_raw >= 100.0)
+    eff_total = min(ex_total, at_w_raw) if (has_at_w and ex_total > 0) else (at_w_raw if has_at_w else ex_total)
+    eff_avail = min(ex_avail, at_w_raw) if (has_at_w and ex_avail > 0) else ex_avail
+
+    eff_wallet = {**(w if isinstance(w, dict) else {}), "total_inr": round(eff_total, 2), "available_inr": round(eff_avail, 2)}
+    per_slot_cap = ((eff_total * 0.98) if honor_custom else (eff_total / slots)) if eff_total > 0 else req_m
+    target_slot_m = round(min(req_m, per_slot_cap) if eff_total > 0 else req_m, 2)
+    usable_free = round(max(0.0, eff_avail * 0.98), 2)
+
+    eff_m, cap_note = compute_wallet_capped_margin(
+        req_m, lev, eff_wallet, max_slots=slots, honor_custom_margin=honor_custom
+    )
+
+    wallet_lbl = "AutoTrade Wallet" if has_at_w else "Futures Wallet"
+    will_skip = False
+    skip_kind = ""
+    skip_reason = ""
+    ui_level = ""
+    ui_message = ""
+
+    if do_enforce_fm and target_slot_m >= 2500.0 and usable_free < (target_slot_m * 0.90):
+        min_free_needed = round((target_slot_m * 0.90) / 0.98, 2)
+        will_skip = True
+        skip_kind = "FREE_MARGIN_GUARD"
+        skip_reason = (
+            f"Insufficient Free Margin Guard: Free Futures margin ₹{ex_avail:,.2f} (usable ₹{usable_free:,.2f}) "
+            f"is below 90% of target slot margin ₹{target_slot_m:,.2f} (Sidebar ₹{req_m:,.2f}). "
+            f"Skipping instead of placing an under-sized dust order."
+        )
+        ui_level = "error"
+        ui_message = (
+            f"⛔ **AutoTrade will SKIP new trades right now:** Exchange Free margin `₹{ex_avail:,.2f}` "
+            f"(usable `₹{usable_free:,.2f}`) is below 90% of your `₹{target_slot_m:,.2f}` target "
+            f"(needs ≥ `₹{min_free_needed:,.0f}` free). Free up margin, lower AutoTrade Wallet to `≤ ₹{int(ex_avail):,}`, "
+            f"or increase Concurrent Trades."
+        )
+    elif (eff_m * lev) < 2448.0:
+        will_skip = True
+        skip_kind = "MIN_NOTIONAL"
+        skip_reason = (
+            f"Insufficient Futures Wallet: usable margin ₹{eff_m:,.2f} x {lev}x = ₹{eff_m * lev:,.2f} notional "
+            f"is below CoinDCX's ₹2,448 minimum. {cap_note}"
+        )
+        ui_level = "error"
+        ui_message = (
+            f"⛔ **AutoTrade will SKIP new trades:** Usable margin `₹{eff_m:,.2f} × {lev}x` = `₹{eff_m * lev:,.0f}` "
+            f"is below CoinDCX's `₹2,448` minimum order value."
+        )
+    elif cap_note and eff_m + 0.01 < req_m:
+        ui_level = "warning"
+        ui_message = (
+            f"⚠️ AutoTrade will use **₹{eff_m:,.2f}** per trade "
+            f"({wallet_lbl} `₹{eff_total:,.2f}` / {slots} slot{'s' if slots != 1 else ''}; "
+            f"Exchange Free `₹{ex_avail:,.2f}` → usable `₹{usable_free:,.2f}`)."
+        )
+
+    return {
+        "effective_margin_inr": round(eff_m, 2),
+        "target_slot_margin_inr": target_slot_m,
+        "requested_margin_inr": req_m,
+        "effective_wallet_total_inr": round(eff_total, 2),
+        "exchange_free_inr": round(ex_avail, 2),
+        "usable_free_inr": usable_free,
+        "will_skip": will_skip,
+        "skip_kind": skip_kind,
+        "skip_reason": skip_reason,
+        "cap_note": cap_note,
+        "ui_level": ui_level,
+        "ui_message": ui_message,
+    }
+
+
 def execute_autotrade_two_entry_signal(
     pair: str,
     sig: dict,
@@ -7216,33 +7323,35 @@ def execute_autotrade_two_entry_signal(
     if _stop_hit:
         return False, _stop_msg, {"daily_loss_stop": _stop_info}
 
-    # Anti-Crumb Free-Margin Guard (enforced on BOTH Main Live Wallet AND Staging Paper Wallet!):
-    # never downsize a full slot into a leftover-cash dust trade!
+    # Unified AutoTrade Wallet Cap + Anti-Crumb <90% Free-Margin Guard + ₹2,448 Min-Notional Check
+    # (exact same function used by Sidebar status warning in app.py so UI and live execution NEVER disagree!)
     _enforce_free_margin = isinstance(_wallet_now, dict) and (
         (_wallet_now.get("is_live_api") and not staging_paper_only)
         or bool(_wallet_now.get("is_paper_wallet"))
     )
-    if _enforce_free_margin:
-        _tot_w = float(_wallet_now.get("total_inr", 0.0) or 0.0)
-        _avail_w = float(_wallet_now.get("available_inr", _tot_w) or 0.0)
-        _target_slot_m = (
-            min(raw_requested_margin, (_tot_w * 0.98 if honor_custom_margin else (_tot_w / max(1, max_slots))))
-            if _tot_w > 0 else raw_requested_margin
-        )
-        if _target_slot_m >= 2500.0 and (_avail_w * 0.98) < (_target_slot_m * 0.90):
-            return False, (
-                f"Insufficient Free Margin Guard: Free Futures margin ₹{_avail_w:,.2f} is below 90% of target slot margin "
-                f"₹{_target_slot_m:,.2f} (Sidebar ₹{raw_requested_margin:,.2f}). Skipping {pair} instead of placing an under-sized dust order."
-            ), {"wallet": _wallet_now, "target_slot_margin_inr": round(_target_slot_m, 2)}
-
-    margin_inr, _cap_note = compute_wallet_capped_margin(
-        raw_requested_margin, lev, _wallet_now, max_slots, honor_custom_margin=honor_custom_margin
+    _allow_ov_early = bool(sig.get("manual_override", False))
+    _m_plan = evaluate_autotrade_margin_plan(
+        requested_margin_inr=raw_requested_margin,
+        leverage=lev,
+        wallet=_wallet_now,
+        cfg=cfg,
+        max_slots=max_slots,
+        honor_custom_margin=honor_custom_margin or _allow_ov_early,
+        enforce_free_margin=_enforce_free_margin,
+        honor_autotrade_wallet_cap=not _allow_ov_early,
     )
-    if (margin_inr * lev) < 2448.0:
-        return False, (
-            f"Insufficient Futures Wallet: usable margin ₹{margin_inr:,.2f} x {lev}x = ₹{margin_inr * lev:,.2f} notional "
-            f"is below CoinDCX's ₹2,448 minimum. {_cap_note}"
-        ), {"wallet": _wallet_now}
+    if _m_plan["will_skip"]:
+        _skip_msg = _m_plan["skip_reason"]
+        if _m_plan["skip_kind"] == "FREE_MARGIN_GUARD" and pair not in _skip_msg:
+            _skip_msg = _skip_msg.replace("Skipping instead", f"Skipping {pair} instead")
+        return False, _skip_msg, {
+            "wallet": _wallet_now,
+            "target_slot_margin_inr": _m_plan["target_slot_margin_inr"],
+            "margin_plan": _m_plan,
+        }
+
+    margin_inr = float(_m_plan["effective_margin_inr"])
+    _cap_note = str(_m_plan["cap_note"] or "")
 
     slot = get_active_portfolio_trade_status()
     slot_pairs = list(slot.get("active_pairs") or ([slot.get("active_pair")] if slot.get("active_pair") else []))
@@ -7384,14 +7493,14 @@ def execute_autotrade_two_entry_signal(
     else:
         daily_bias = "NEUTRAL"
 
-    # AutoTrade Strategy Enforcement: supports `box_theory` (Strategy 1) and `ema50_200` (Strategy 4)
-    # per the configured `autotrade_strategy_mode` (default: `box_plus_ema50_200_bear`)
+    # AutoTrade Strategy Enforcement: supports `box_theory` (Strategy 1), `ema50_200` (Strategy 4),
+    # and `ema21_pullback` (Strategy 5) per the configured `autotrade_strategy_mode`
     import strategies as _strat_mod
     auto_mode = _strat_mod.resolve_autotrade_mode(cfg.get("autotrade_strategy_mode"))
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
-    if (not allow_mode_override) and sig_strat_id not in ("box_theory", "ema50_200"):
+    if (not allow_mode_override) and sig_strat_id not in ("box_theory", "ema50_200", "ema21_pullback"):
         return False, (
-            f"AutoTrade Strategy Guard: AutoTrade only executes Box Theory Sweep or 15m 50/200 EMA Pullback; "
+            f"AutoTrade Strategy Guard: AutoTrade only executes Box Theory Sweep, 15m 50/200 EMA Pullback, or 15m 21 EMA Touch & Bounce; "
             f"skipping {sig_strat_id} on {pair}."
         ), {"strategy_id": sig_strat_id}
     if not allow_mode_override:
@@ -7403,11 +7512,20 @@ def execute_autotrade_two_entry_signal(
             return False, (
                 f"AutoTrade Mode Guard: Sidebar AutoTrade Strategy is 15m 50/200 EMA Only; skipping {sig_strat_id} on {pair}."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode}
+        if auto_mode == "ema21_pullback" and sig_strat_id != "ema21_pullback":
+            return False, (
+                f"AutoTrade Mode Guard: Sidebar AutoTrade Strategy is 15m 21 EMA Touch & Bounce Only; skipping {sig_strat_id} on {pair}."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode}
         if auto_mode == "box_plus_ema50_200_bear" and sig_strat_id == "ema50_200" and norm_dir != "SHORT":
             return False, (
                 f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
                 f"(switch to Combo: Regime-Adaptive or Bull & Bear EMA to enable Bullish EMA Longs)."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
+        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "ema21_pullback":
+            return False, (
+                f"AutoTrade Mode Guard: Strict v41 Auto mode runs Box Sweep (Chop) & 15m 50/200 EMA (Strong Trend) only; "
+                f"skipping {sig_strat_id} on {pair} (switch AutoTrade Strategy to 15m 21 EMA Touch & Bounce or trigger manually)."
+            ), {"strategy_id": sig_strat_id, "mode": auto_mode}
         if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "box_theory":
             reg_info = compute_market_regime()
             cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
@@ -7434,7 +7552,7 @@ def execute_autotrade_two_entry_signal(
                 return False, (
                     f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
                 ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-        if sig_strat_id == "ema50_200":
+        if sig_strat_id in ("ema50_200", "ema21_pullback"):
             open_ema_cnt = count_open_ema50_200_slots(
                 live_positions=live_ex_pos if live_ex_pos is not None else [],
                 cfg=cfg,
@@ -8055,9 +8173,12 @@ def run_portfolio_single_slot_backtest(
             if (avail_m * 0.98) < (eff_trade_margin * 0.90):
                 blocked_margin += 1
                 continue
-        is_ema_tr = "50/200 EMA" in str(tr.get("strategy", ""))
+        is_ema_tr = ("50/200 EMA" in str(tr.get("strategy", ""))) or ("21 EMA" in str(tr.get("strategy", "")))
         if is_ema_tr:
-            open_ema_bt = sum(1 for t in active_open_trades if "50/200 EMA" in str(t.get("strategy", "")))
+            open_ema_bt = sum(
+                1 for t in active_open_trades
+                if ("50/200 EMA" in str(t.get("strategy", ""))) or ("21 EMA" in str(t.get("strategy", "")))
+            )
             if open_ema_bt >= MAX_EMA_CONCURRENT_TRADES:
                 blocked_ema += 1
                 continue
@@ -8556,8 +8677,12 @@ def get_rotational_margin_inr(leverage: int = 10) -> dict:
         else:
             equity, live = _get_saved_wallet_balance_default(), True
         cfg_r = _AUTOTRADE_CFG_MEM_CACHE.get("data")
-        if isinstance(cfg_r, dict) and cfg_r.get("max_concurrent_trades"):
-            slots = max(1, min(10, int(cfg_r.get("max_concurrent_trades") or MAX_CONCURRENT_TRADES)))
+        if isinstance(cfg_r, dict):
+            if cfg_r.get("max_concurrent_trades"):
+                slots = max(1, min(10, int(cfg_r.get("max_concurrent_trades") or MAX_CONCURRENT_TRADES)))
+            _at_r = float(cfg_r.get("autotrade_wallet_inr", 0.0) or 0.0)
+            if _at_r >= 100.0:
+                equity = round(_at_r, 2)
     except Exception as e:
         print(f"[Wallet Sizing Fallback]: {e}")
     margin = round(equity / max(1, slots), 2)
@@ -8617,6 +8742,7 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "_get_active_locks_map": _get_active_locks_map,
             "get_open_entry_limit_orders": get_open_entry_limit_orders,
             "compute_wallet_capped_margin": compute_wallet_capped_margin,
+            "evaluate_autotrade_margin_plan": evaluate_autotrade_margin_plan,
             "save_autotrade_config": save_autotrade_config,
             "clear_autotrade_active_lock": clear_autotrade_active_lock,
             "register_app_trade_lock": register_app_trade_lock,
