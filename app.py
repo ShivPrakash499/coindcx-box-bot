@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 42
+_DAEMON_VERSION = 44
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -408,6 +408,24 @@ def get_cached_signals_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: f
         send=False, strategy_ids=list(strat_tuple), autotrade=auto_trade
     )
 
+@st.cache_data(ttl=45)
+def get_cached_manual_intraday_scan(watch_tuple: tuple, m_inr: float, lev: int, u_inr: float):
+    """Read-only `exp-staging-intraday-score-router` manual scanner powering Signals & Watchlist."""
+    if signal_monitor and hasattr(signal_monitor, "scan_manual_intraday_signals"):
+        return signal_monitor.scan_manual_intraday_signals(
+            list(watch_tuple), margin_inr=float(m_inr), leverage=int(lev), usd_inr=float(u_inr)
+        )
+    return []
+
+@st.cache_data(ttl=30)
+def get_cached_manual_intraday_setup(pair: str, m_inr: float, lev: int, u_inr: float):
+    """Per-coin `exp-staging-intraday-score-router` prefill & policy powering Execute & Chart Trading."""
+    if hasattr(strategy_registry, "evaluate_manual_intraday_setup"):
+        return strategy_registry.evaluate_manual_intraday_setup(
+            pair=pair, margin_inr=float(m_inr), leverage=int(lev), usd_inr=float(u_inr)
+        )
+    return {"pair": pair, "daily_bias": "NEUTRAL", "levels": {}, "stack": {}, "policy": {}, "live_signal": None, "prefill_ticket": None}
+
 def fmt_px(p):
     if p is None:
         return "$0.0000"
@@ -584,8 +602,13 @@ if is_execution_link and st.session_state.get("_url_applied") != _url_sig:
     except Exception:
         pass
 
-def _switch_pair_and_nav(target_pair: str, nav_section: str | None = None, strategy_name: str | None = None):
-    """Single-click callback that updates both selected_pair and dropdown widget key in sync."""
+def _switch_pair_and_nav(
+    target_pair: str,
+    nav_section: str | None = None,
+    strategy_name: str | None = None,
+    prefill_ticket: dict | None = None,
+):
+    """Single-click callback that updates selected_pair, optional manual prefill ticket, and active tab in sync."""
     if target_pair in GLOBAL_FUTURES_PAIRS:
         st.session_state.selected_pair = target_pair
         st.session_state.pair_selector_widget = target_pair
@@ -593,6 +616,22 @@ def _switch_pair_and_nav(target_pair: str, nav_section: str | None = None, strat
         st.session_state["_user_manual_pair_selected"] = True
     if strategy_name:
         st.session_state["exec_strategy_mode"] = f"{strategy_name} Only"
+    if isinstance(prefill_ticket, dict) and float(prefill_ticket.get("entry", 0.0) or 0.0) > 0:
+        _pt = dict(prefill_ticket)
+        _pt["pair"] = target_pair
+        st.session_state["manual_exec_prefill"] = _pt
+        _sugg_m = float(_pt.get("suggested_margin_inr") or _pt.get("margin_inr") or 0.0)
+        if _sugg_m >= 500.0:
+            st.session_state[f"exec_margin_inr_{target_pair}"] = int(round(_sugg_m))
+        _tp1_frac = float(_pt.get("tp1_book_frac", 0.50) or 0.50)
+        st.session_state[f"exec_tp1_book_pct_{target_pair}"] = 70 if _tp1_frac >= 0.65 else 50
+        st.session_state[f"last_setup_tag_{target_pair}"] = ""
+        # Reset chart trading ticket key so Chart & Levels picks up prefilled Entry/SL/TP1/TP2 immediately
+        st.session_state["chart_prefill_ticket"] = _pt
+        st.session_state.pop(f"chart_ticket_sync_{target_pair}", None)
+        # Ensure Execute radio selects the prefilled ticket rather than an old cached radio label
+        for _rk in [k for k in list(st.session_state.keys()) if k.startswith(f"trade_choice_exec_{target_pair}_")]:
+            st.session_state.pop(_rk, None)
     if nav_section in NAV_SECTIONS:
         st.session_state.active_nav_section = nav_section
 
@@ -700,12 +739,13 @@ _wallet_delta = (
 st.sidebar.metric(_wallet_lbl, f"₹{wallet_data['total_inr']:,.2f}", _wallet_delta)
 
 if _is_staging_env or _is_experiment_env:
-    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, Margin, Leverage, Concurrent Trades & Strategy Mode from Google Sheet."):
+    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, AutoTrade Wallet, Margin, Leverage, Concurrent Trades & Strategy Mode from Google Sheet."):
         _ok_s, _msg_s, _ = coindcx_engine.sync_setup_from_main(reset_paper_wallet=_is_staging_env)
         st.session_state["_sb_main_sync_msg"] = (_ok_s, _msg_s)
-        for _k_clr in ("sidebar_single_trade_margin_input", "sidebar_autotrade_strategy_mode", "sidebar_max_concurrent_trades", "sidebar_auto_split_wallet", "sidebar_fixed_risk_cap_toggle"):
+        for _k_clr in ("sidebar_autotrade_wallet_input", "sidebar_single_trade_margin_input", "sidebar_autotrade_strategy_mode", "sidebar_max_concurrent_trades", "sidebar_auto_split_wallet", "sidebar_fixed_risk_cap_toggle", "sidebar_risk_per_trade_pct"):
             st.session_state.pop(_k_clr, None)
         get_cached_signals_scan.clear()
+        get_cached_manual_intraday_scan.clear()
         st.rerun()
     if st.session_state.get("_sb_main_sync_msg"):
         _sm_ok, _sm_txt = st.session_state.pop("_sb_main_sync_msg")
@@ -729,28 +769,86 @@ if not wallet_data.get("is_live_api"):
 
 _saved_max_slots = coindcx_engine.get_configured_max_slots(_auto_cfg)
 _saved_auto_split = coindcx_engine.is_auto_split_enabled(_auto_cfg)
+_saved_at_wallet = coindcx_engine.get_effective_autotrade_wallet_inr(_auto_cfg, wallet_data)
+if "sidebar_autotrade_wallet_input" not in st.session_state:
+    st.session_state["sidebar_autotrade_wallet_input"] = float(_saved_at_wallet)
 if "sidebar_max_concurrent_trades" not in st.session_state:
     st.session_state["sidebar_max_concurrent_trades"] = int(_saved_max_slots)
 if "sidebar_auto_split_wallet" not in st.session_state:
     st.session_state["sidebar_auto_split_wallet"] = bool(_saved_auto_split)
 
 
+def _on_sidebar_autotrade_wallet_change():
+    new_at_w = round(max(500.0, float(st.session_state.get("sidebar_autotrade_wallet_input", _saved_at_wallet) or _saved_at_wallet)), 2)
+    cur_slots = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
+    cur_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
+    upd = {
+        "autotrade_wallet_inr": new_at_w,
+        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+    }
+    if cur_auto_split and new_at_w > 0:
+        auto_m = round(new_at_w / cur_slots, 2)
+        upd["single_trade_margin_inr"] = auto_m
+        st.session_state["sidebar_single_trade_margin_input"] = float(auto_m)
+    coindcx_engine.save_autotrade_config(upd)
+    get_cached_signals_scan.clear()
+    get_cached_manual_intraday_scan.clear()
+    get_cached_positions.clear()
+
+
+autotrade_wallet_inr = float(
+    st.sidebar.number_input(
+        "💼 AutoTrade Wallet (INR)",
+        min_value=500.0,
+        max_value=10000000.0,
+        step=500.0,
+        format="%.2f",
+        key="sidebar_autotrade_wallet_input",
+        on_change=_on_sidebar_autotrade_wallet_change,
+        help="Dedicated AutoTrade capital budget in INR. Single-Trade Margin (Auto-Split = AutoTrade Wallet ÷ Concurrent Trades) and Risk-Based Sizing read strictly from this wallet.",
+    )
+)
+def _on_match_autotrade_wallet_exchange():
+    _ex_w = round(float(wallet_data["total_inr"]), 2)
+    st.session_state["sidebar_autotrade_wallet_input"] = float(_ex_w)
+    _cur_s = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
+    _upd_m = {"autotrade_wallet_inr": _ex_w}
+    if bool(st.session_state.get("sidebar_auto_split_wallet", True)):
+        _upd_m["single_trade_margin_inr"] = round(_ex_w / _cur_s, 2)
+        st.session_state["sidebar_single_trade_margin_input"] = float(_upd_m["single_trade_margin_inr"])
+    coindcx_engine.save_autotrade_config(_upd_m)
+    get_cached_signals_scan.clear()
+    get_cached_manual_intraday_scan.clear()
+
+
+if abs(autotrade_wallet_inr - float(wallet_data["total_inr"])) >= 1.0:
+    st.sidebar.button(
+        f"🔄 Match AutoTrade Wallet to Exchange (₹{float(wallet_data['total_inr']):,.0f})",
+        key="btn_match_autotrade_wallet_exchange",
+        on_click=_on_match_autotrade_wallet_exchange,
+        use_container_width=True,
+    )
+
+
 def _on_sidebar_slots_or_split_change():
     new_slots = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
     new_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
+    at_w_tot = round(max(500.0, float(st.session_state.get("sidebar_autotrade_wallet_input", autotrade_wallet_inr) or autotrade_wallet_inr)), 2)
     w_tot = round(float(wallet_data["total_inr"]), 2)
     upd = {
         "max_concurrent_trades": new_slots,
         "auto_split_wallet_by_slots": new_auto_split,
         "user_custom_margin": not new_auto_split,
+        "autotrade_wallet_inr": at_w_tot,
         "wallet_balance_inr": w_tot,
     }
-    if new_auto_split and w_tot > 0:
-        auto_m = round(w_tot / new_slots, 2)
+    if new_auto_split and at_w_tot > 0:
+        auto_m = round(at_w_tot / new_slots, 2)
         upd["single_trade_margin_inr"] = auto_m
         st.session_state["sidebar_single_trade_margin_input"] = float(auto_m)
     coindcx_engine.save_autotrade_config(upd)
     get_cached_signals_scan.clear()
+    get_cached_manual_intraday_scan.clear()
     get_cached_positions.clear()
 
 
@@ -770,18 +868,18 @@ auto_split_wallet = bool(
         "⚖️ Auto-Split Wallet by Concurrent Trades",
         key="sidebar_auto_split_wallet",
         on_change=_on_sidebar_slots_or_split_change,
-        help="When ON, automatically divides your Futures Wallet evenly by Number of Concurrent Trades (Wallet ÷ N) and updates whenever your wallet changes. Turn OFF to type a custom Single-Trade Margin.",
+        help="When ON, automatically divides your AutoTrade Wallet evenly by Number of Concurrent Trades (AutoTrade Wallet ÷ N). Turn OFF to type a custom Single-Trade Margin.",
     )
 )
 
-_auto_split_margin = round(float(wallet_data["total_inr"]) / max(1, max_concurrent_trades), 2)
+_auto_split_margin = round(float(autotrade_wallet_inr) / max(1, max_concurrent_trades), 2)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
 if auto_split_wallet or _saved_margin <= 0 or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0):
     default_margin = _auto_split_margin
 else:
     default_margin = _saved_margin
 
-# Keep Streamlit widget state synced to (Wallet ÷ Concurrent Trades) whenever Auto-Split is ON
+# Keep Streamlit widget state synced to (AutoTrade Wallet ÷ Concurrent Trades) whenever Auto-Split is ON
 if auto_split_wallet:
     if st.session_state.get("_last_synced_split_margin") != (_auto_split_margin, max_concurrent_trades):
         st.session_state["_last_synced_split_margin"] = (_auto_split_margin, max_concurrent_trades)
@@ -790,11 +888,13 @@ if auto_split_wallet:
 
 def _on_sidebar_margin_change():
     raw_in = st.session_state.get("sidebar_single_trade_margin_input")
+    at_w_cur = round(max(500.0, float(st.session_state.get("sidebar_autotrade_wallet_input", autotrade_wallet_inr) or autotrade_wallet_inr)), 2)
     if raw_in is None or float(raw_in or 0.0) <= 0.0:
-        # Blank / cleared margin -> seamlessly fall back to Wallet ÷ Concurrent Trades
-        fallback_m = round(float(wallet_data["total_inr"]) / max(1, max_concurrent_trades), 2)
+        # Blank / cleared margin -> seamlessly fall back to AutoTrade Wallet ÷ Concurrent Trades
+        fallback_m = round(at_w_cur / max(1, max_concurrent_trades), 2)
         coindcx_engine.save_autotrade_config({
             "single_trade_margin_inr": fallback_m,
+            "autotrade_wallet_inr": at_w_cur,
             "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
             "auto_split_wallet_by_slots": True,
             "user_custom_margin": False,
@@ -803,24 +903,26 @@ def _on_sidebar_margin_change():
         new_m = round(float(raw_in), 2)
         coindcx_engine.save_autotrade_config({
             "single_trade_margin_inr": new_m,
+            "autotrade_wallet_inr": at_w_cur,
             "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
             "auto_split_wallet_by_slots": False,
             "user_custom_margin": True,
         })
     get_cached_signals_scan.clear()
+    get_cached_manual_intraday_scan.clear()
 
 
 _margin_widget_val = st.sidebar.number_input(
     "Single-Trade Margin (INR)",
     min_value=500.0,
-    max_value=max(float(wallet_data["total_inr"]) * 2.0, 1000000.0),
+    max_value=max(float(autotrade_wallet_inr) * 2.0, float(wallet_data["total_inr"]) * 2.0, 1000000.0),
     value=float(default_margin),
     step=500.0,
     format="%.2f",
     disabled=auto_split_wallet,
     key="sidebar_single_trade_margin_input",
     on_change=_on_sidebar_margin_change,
-    help="Per-trade margin ceiling used by AutoTrade & Execute. Auto-calculated as (Wallet ÷ Concurrent Trades) when Auto-Split is ON, or when left blank.",
+    help="Per-trade margin ceiling read from your AutoTrade Wallet (AutoTrade Wallet ÷ Concurrent Trades when Auto-Split is ON).",
 )
 margin_inr = float(_auto_split_margin if (auto_split_wallet or _margin_widget_val is None or float(_margin_widget_val) <= 0) else _margin_widget_val)
 
@@ -828,10 +930,18 @@ _saved_fixed_risk_on = bool(_auto_cfg.get("fixed_risk_sizing_enabled", False))
 if "sidebar_fixed_risk_cap_toggle" not in st.session_state:
     st.session_state["sidebar_fixed_risk_cap_toggle"] = _saved_fixed_risk_on
 
+_risk_pct_choices = [1.5, 2.0, 2.5]
+_saved_risk_pct = float(_auto_cfg.get("risk_per_trade_pct", 1.5) or 1.5)
+if _saved_risk_pct not in _risk_pct_choices:
+    _saved_risk_pct = 1.5
+if "sidebar_risk_per_trade_pct" not in st.session_state:
+    st.session_state["sidebar_risk_per_trade_pct"] = _saved_risk_pct
+
 
 def _on_sidebar_fixed_risk_change():
     new_fr = bool(st.session_state.get("sidebar_fixed_risk_cap_toggle", False))
-    coindcx_engine.save_autotrade_config({"fixed_risk_sizing_enabled": new_fr})
+    new_rp = float(st.session_state.get("sidebar_risk_per_trade_pct", 1.5) or 1.5)
+    coindcx_engine.save_autotrade_config({"fixed_risk_sizing_enabled": new_fr, "risk_per_trade_pct": round(new_rp, 2)})
     get_cached_signals_scan.clear()
 
 
@@ -840,24 +950,44 @@ fixed_risk_sizing_on = bool(
         "🛡️ Cap Margin by 1.5% Wallet Risk",
         key="sidebar_fixed_risk_cap_toggle",
         on_change=_on_sidebar_fixed_risk_change,
-        help="OFF (E0b Default): deploys full Single-Trade Margin / Auto-Split (Wallet ÷ N) for maximum compounding (+₹58k / PF 1.97 in 30d backtest). ON (E0 Safe): shrinks margin on wide SLs so max SL loss <= 1.5% of wallet.",
+        help="OFF (E0b): deploys full AutoTrade Slot Margin (AutoTrade Wallet ÷ N). ON (E0 Risk-Based Sizing): caps each trade's margin so SL loss stays within your selected Risk % of AutoTrade Wallet (2.0% recommended for 2-Year safety + growth).",
+    )
+)
+risk_per_trade_pct = float(
+    st.sidebar.selectbox(
+        "Risk per Trade (% of AutoTrade Wallet)",
+        options=_risk_pct_choices,
+        format_func=lambda x: f"{x:.1f}% Risk/Trade" + (" (Recommended)" if x == 2.0 else ""),
+        disabled=not fixed_risk_sizing_on,
+        key="sidebar_risk_per_trade_pct",
+        on_change=_on_sidebar_fixed_risk_change,
+        help="Active when Risk Cap is ON: scales trade margin off AutoTrade Wallet so max SL loss stays within this % (e.g., 2.0% = balanced 2-Year growth without E0b drawdown cliffs).",
     )
 )
 
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
-_sizing_badge = "1.5% Risk Cap ON" if fixed_risk_sizing_on else "E0b Full Slot Margin"
+_sizing_badge = f"E0 {risk_per_trade_pct:.1f}% Risk Cap ON" if fixed_risk_sizing_on else "E0b Full Slot Margin"
 if auto_split_wallet:
     st.sidebar.caption(
-        f"⚖️ **Auto-Split:** `₹{wallet_data['total_inr']:,.2f} ÷ {max_concurrent_trades}` = **₹{margin_inr:,.2f}/trade** @ {leverage}x *({_sizing_badge})*"
+        f"⚖️ **AutoTrade Wallet Split:** `₹{autotrade_wallet_inr:,.2f} ÷ {max_concurrent_trades}` = **₹{margin_inr:,.2f}/trade** @ {leverage}x *({_sizing_badge})*"
     )
 else:
-    st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (Custom Margin, max {max_concurrent_trades} concurrent) @ {leverage}x *({_sizing_badge})*")
+    st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (Custom Margin • AutoTrade Wallet ₹{autotrade_wallet_inr:,.0f}, max {max_concurrent_trades} slots) @ {leverage}x *({_sizing_badge})*")
+if autotrade_wallet_inr > float(wallet_data["total_inr"]) + 1.0:
+    st.sidebar.warning(
+        f"⚠️ AutoTrade Wallet (`₹{autotrade_wallet_inr:,.0f}`) exceeds Futures Wallet (`₹{float(wallet_data['total_inr']):,.0f}`); live trades will cap at actual exchange funds."
+    )
 try:
+    _at_wallet_snap = {
+        **wallet_data,
+        "total_inr": min(float(wallet_data["total_inr"]), float(autotrade_wallet_inr)),
+        "available_inr": min(float(wallet_data.get("available_inr", wallet_data["total_inr"])), float(autotrade_wallet_inr)),
+    }
     _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(
         float(margin_inr),
         int(leverage),
-        wallet_data,
+        _at_wallet_snap,
         max_slots=max_concurrent_trades,
         honor_custom_margin=not auto_split_wallet,
     )
@@ -982,27 +1112,32 @@ _intraday_sfx = (
     else ""
 )
 st.sidebar.caption(
-    f"🧭 **Market Trend:** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
+    f"🧭 **Market Trend (Strict v41 AutoTrade):** {_live_regime_info.get('emoji', '🟡')} **{_live_regime_info.get('label', 'RANGING / CHOP')}** "
     f"(`14d {_live_regime_info.get('median_14d_pct', 0.0):+.1f}%` • `2d {_live_regime_info.get('median_2d_pct', 0.0):+.1f}%`){_intraday_sfx}{_reg_route_suffix}"
 )
 
 if (
     round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
+    or round(float(autotrade_wallet_inr), 2) != round(float(_auto_cfg.get("autotrade_wallet_inr", 0.0) or 0.0), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
     or int(max_concurrent_trades) != int(_auto_cfg.get("max_concurrent_trades", 3) or 3)
     or bool(auto_split_wallet) != coindcx_engine.is_auto_split_enabled(_auto_cfg)
     or bool(fixed_risk_sizing_on) != bool(_auto_cfg.get("fixed_risk_sizing_enabled", False))
+    or round(float(risk_per_trade_pct), 2) != round(float(_auto_cfg.get("risk_per_trade_pct", 1.5) or 1.5), 2)
 ):
     _auto_cfg = coindcx_engine.save_autotrade_config({
         "single_trade_margin_inr": round(float(margin_inr), 2),
+        "autotrade_wallet_inr": round(float(autotrade_wallet_inr), 2),
         "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
         "leverage": int(leverage),
         "max_concurrent_trades": int(max_concurrent_trades),
         "auto_split_wallet_by_slots": bool(auto_split_wallet),
         "user_custom_margin": not bool(auto_split_wallet),
         "fixed_risk_sizing_enabled": bool(fixed_risk_sizing_on),
+        "risk_per_trade_pct": round(float(risk_per_trade_pct), 2),
     })
     get_cached_signals_scan.clear()
+    get_cached_manual_intraday_scan.clear()
     get_cached_positions.clear()
 
 _slot_status = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
@@ -1832,8 +1967,8 @@ if active_section == "⚡ Signals":
                 )
             else:
                 st.caption(
-                    f"🟢 **App Slots Free (0/{_s_max})** • Wallet: **₹{wallet_data['total_inr']:,.2f}** • Single-Trade Margin: **₹{margin_inr:,.2f}** (`{leverage}x`) • "
-                    f"AutoTrade: **{'ON 🚀' if autotrade_on else 'OFF'}**"
+                    f"🟢 **App Slots Free (0/{_s_max})** • AutoTrade Wallet: **₹{autotrade_wallet_inr:,.2f}** • Single-Trade Margin: **₹{margin_inr:,.2f}** (`{leverage}x`) • "
+                    f"AutoTrade (Strict v41): **{'ON 🚀' if autotrade_on else 'OFF'}**"
                 )
         with hdr_s2:
             if st.button("🔄 Scan Now", key="btn_force_rescan_signals", use_container_width=True):
@@ -1845,6 +1980,8 @@ if active_section == "⚡ Signals":
                 get_cached_market_regime.clear()
                 get_cached_top_movers.clear()
                 get_cached_signals_scan.clear()
+                get_cached_manual_intraday_scan.clear()
+                get_cached_manual_intraday_setup.clear()
                 st.rerun()
 
         st.caption(f"🧭 **Detected Market Trend:** {_live_regime_info.get('summary', '')}")
@@ -1929,11 +2066,14 @@ if active_section == "⚡ Signals":
             if _err_r.get("autotrade_error"):
                 st.warning(f"⚠️ **AutoTrade Notice ({clean_sym(_err_r['pair'])}):** {_err_r['autotrade_error']}")
 
-        # 📲 iPhone Air CoinDCX Push Notification Reader & Synced Feed
-        _recent_push_list = coindcx_engine.get_recent_coindcx_notifications(limit=5)
+        # 📲 iPhone Air CoinDCX Push Notification Reader & Synced Feed (filter out keep-alive 'healthcheck' pings)
+        _recent_push_list = [
+            _np_x for _np_x in coindcx_engine.get_recent_coindcx_notifications(limit=10)
+            if "healthcheck" not in str(_np_x.get("raw_text", "")).lower()
+        ][:5]
         with st.expander(
             f"📲 CoinDCX iPhone Air Notification Reader ({len(_recent_push_list)} Recent)",
-            expanded=True,
+            expanded=bool(_recent_push_list),
         ):
             st.caption(
                 "Captures CoinDCX mobile push notifications from your **iPhone Air Shortcut** (`?coindcx_alert=...`) "
@@ -2014,8 +2154,18 @@ if active_section == "⚡ Signals":
                             else:
                                 st.error(_msg_p)
 
+        # Manual Intraday Score Router (`exp-staging-intraday-score-router`) scan — read-only, powers Manual Signals & Watchlist
+        _manual_intraday_list = get_cached_manual_intraday_scan(
+            tuple(monitor_pairs), round(float(margin_inr), 0), int(leverage), round(float(usd_inr), 0)
+        )
+        _manual_intraday_by_pair = {
+            str(_mi.get("pair")): _mi
+            for _mi in (_manual_intraday_list or [])
+            if isinstance(_mi, dict) and _mi.get("pair")
+        }
+
         if active_signals:
-            st.markdown(f"#### 🔥 Active Confirmed Signals ({len(active_signals)})")
+            st.markdown(f"#### 🤖 Active Strict v41 AutoTrade Signals ({len(active_signals)})")
             for r in active_signals:
                 pair_r = r["pair"]
                 name_r = clean_sym(pair_r)
@@ -2026,7 +2176,7 @@ if active_section == "⚡ Signals":
                     _trig_txt = str(sig.get("trigger_reason") or sig.get("trigger_zone") or "").replace("$", "&#36;")
                     st.markdown(
                         f"<span class='{badge}'>{sig['signal']} {name_r}/USDT</span> &nbsp; "
-                        f"**{r['strategy_name']}** • {_trig_txt}",
+                        f"**🤖 Strict v41 • {r['strategy_name']}** • {_trig_txt}",
                         unsafe_allow_html=True
                     )
                     m1, m2, m3, m4 = st.columns(4)
@@ -2036,16 +2186,33 @@ if active_section == "⚡ Signals":
                     m3.metric("TP2 (RL/RH Runner)" if _is_ema_sig else "TP2 (50% Runner)", fmt_px(sig["tp2"]), f"+{sig['roe_tp2']}% ROE")
                     m4.metric("SL (15m 200 EMA)" if _is_ema_sig else "Catastrophe SL", fmt_px(sig["stop_loss"]), f"-{sig['roe_sl']}% ROE")
 
-                    b1, b2 = st.columns(2)
+                    _v41_prefill = {
+                        **sig,
+                        "pair": pair_r,
+                        "direction": "BUY" if is_l else "SELL",
+                        "strategy_id": str(sig.get("strategy_id") or r.get("strategy_id") or "box_theory"),
+                        "strategy_name": r["strategy_name"],
+                        "suggested_margin_inr": float(margin_inr),
+                        "tp1_book_frac": 0.50,
+                        "size_mult": 1.0,
+                    }
+                    b1, b2, b3 = st.columns([1.0, 0.9, 1.3])
                     b1.button(
                         f"🎯 Load {name_r} into Execute",
                         key=f"btn_load_sig_{r['strategy_id']}_{pair_r}",
                         use_container_width=True,
                         on_click=_switch_pair_and_nav,
-                        args=(pair_r, "🎯 Execute", r["strategy_name"]),
+                        args=(pair_r, "🎯 Execute", r["strategy_name"], _v41_prefill),
                     )
-                    if b2.button(
-                        f"🤖 Auto-Execute {name_r} (₹{margin_inr:,.0f} @ {leverage}x)",
+                    b2.button(
+                        f"📈 Chart Trade",
+                        key=f"btn_chart_sig_{r['strategy_id']}_{pair_r}",
+                        use_container_width=True,
+                        on_click=_switch_pair_and_nav,
+                        args=(pair_r, "📈 Chart & Levels", None, _v41_prefill),
+                    )
+                    if b3.button(
+                        f"🤖 Execute {name_r} (₹{margin_inr:,.0f} @ {leverage}x)",
                         key=f"btn_auto_exec_{r['strategy_id']}_{pair_r}",
                         type="primary",
                         use_container_width=True,
@@ -2054,13 +2221,127 @@ if active_section == "⚡ Signals":
                             pair=pair_r, sig={**sig, "manual_override": True}, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
                         )
                         if ok_a:
-                            st.session_state["last_autotrade_banner"] = f"🚀 **Auto-Executed ({name_r}):** {msg_a}"
+                            st.session_state["last_autotrade_banner"] = f"🚀 **Executed ({name_r}):** {msg_a}"
                             get_cached_signals_scan.clear()
                             get_cached_positions.clear()
                             get_cached_balance.clear()
                             st.rerun()
                         else:
                             st.error(msg_a)
+
+        # 🧭 Manual Trading Signals & Ready Prefilled Setups (`exp-staging-intraday-score-router`)
+        _intraday_live_sigs = [
+            _mi for _mi in (_manual_intraday_list or [])
+            if isinstance(_mi, dict) and isinstance(_mi.get("live_signal"), dict)
+            and _mi["live_signal"].get("signal") in ("LONG", "SHORT")
+        ]
+        _intraday_ready_setups = [
+            _mi for _mi in (_manual_intraday_list or [])
+            if isinstance(_mi, dict) and not _mi.get("live_signal")
+            and isinstance(_mi.get("prefill_ticket"), dict)
+            and abs(int((_mi.get("policy") or {}).get("score", 0) or 0)) >= 3
+        ]
+        if _intraday_live_sigs or _intraday_ready_setups:
+            _m_title = (
+                f"#### 🧭 Manual Intraday Score Router Signals ({len(_intraday_live_sigs)} Live • {len(_intraday_ready_setups)} Directional Setups)"
+            )
+            st.markdown(_m_title)
+            st.caption(
+                "Powered by **`exp-staging-intraday-score-router`** (`-4..+4` Intraday Score + ADX + Daily `1.0× / 0.8× / 0.6×` sizing & `70%` Counter-Daily TP1). "
+                "Automated AutoTrade remains strictly locked to **`v41 (main)`** rules — use the buttons below to manually load prefilled Entry/SL/TP1/TP2 or trigger trades."
+            )
+            _manual_cards = [(_mi, True) for _mi in _intraday_live_sigs] + [(_mi, False) for _mi in _intraday_ready_setups[:6]]
+            for _mc_idx, (_mi, _is_live_m) in enumerate(_manual_cards):
+                _mp = _mi["pair"]
+                _msym = clean_sym(_mp)
+                _mpol = _mi.get("policy") or {}
+                _mst = _mi.get("stack") or {}
+                _mtk = _mi.get("live_signal") if _is_live_m else _mi.get("prefill_ticket")
+                if not isinstance(_mtk, dict):
+                    continue
+                _mdir = "LONG" if str(_mtk.get("signal") or _mtk.get("direction", "LONG")).upper() in ("LONG", "BUY") else "SHORT"
+                _mbadge = "badge-buy" if _mdir == "LONG" else "badge-sell"
+                _msid = str(_mtk.get("strategy_id") or "box_theory")
+                _msname = str(_mtk.get("strategy_name") or strategy_registry.get_strategy(_msid).name)
+                _msmult = float(_mtk.get("size_mult", _mpol.get("size_mult", 1.0)) or 1.0)
+                _mtp1_frac = float(_mtk.get("tp1_book_frac", _mpol.get("tp1_book_frac", 0.50)) or 0.50)
+                _mtp1_pct = int(round(_mtp1_frac * 100))
+                _msugg_m = round(max(500.0, float(_mtk.get("suggested_margin_inr") or (margin_inr * _msmult))), 2)
+                _m_counter = bool(_mtk.get("is_counter_daily", _mpol.get("is_counter_daily", False)))
+                _m_v41_tag = (
+                    "🤖 AutoTrade-Eligible (v41)"
+                    if (_is_live_m and _mi.get("strict_v41_autotrade_eligible"))
+                    else ("✋ Manual Counter-Daily Relief Rally" if _m_counter else "✋ Manual Intraday Setup")
+                )
+                _m_status_tag = "⚡ LIVE TRIGGERED" if _is_live_m else "📋 PREFILLED LIMIT PLAN"
+                with st.container(border=True):
+                    st.markdown(
+                        f"<span class='{_mbadge}'>{_mdir} {_msym}/USDT</span> &nbsp; "
+                        f"**{_m_status_tag}** • `{_mpol.get('badge', '')}` • **{_msname}** • {_m_v41_tag}<br>"
+                        f"<span style='font-size:0.80rem;opacity:0.85;'>"
+                        f"4H: <b>{_mst.get('s4_struct', 'CHOP')}</b> | 1H: <b>{_mst.get('s1_struct', 'CHOP')}</b> "
+                        f"(CHoCH: <b>{_mst.get('s1_choch', 'NONE')}</b>) | VWAP: <b>{_mst.get('vwap_state', 'CHOP')}</b> | "
+                        f"15m EMA: <b>{_mst.get('ema_state', 'CHOP')}</b> | ADX: <b>{float(_mpol.get('adx', 0.0)):.1f}</b> | "
+                        f"Daily: <b>{_mi.get('daily_bias', 'NEUTRAL')}</b> → Size <b>{_msmult:.2g}× (₹{_msugg_m:,.0f})</b> • TP1 <b>{_mtp1_pct}%</b>"
+                        f"</span>",
+                        unsafe_allow_html=True,
+                    )
+                    mm1, mm2, mm3, mm4 = st.columns(4)
+                    mm1.metric("Prefilled Entry", fmt_px(_mtk.get("entry")))
+                    mm2.metric(f"TP1 ({_mtp1_pct}% Book)", fmt_px(_mtk.get("tp1")), f"+{float(_mtk.get('roe_tp1', 0.0)):.1f}% ROE")
+                    mm3.metric(f"TP2 ({100 - _mtp1_pct}% Runner)", fmt_px(_mtk.get("tp2")), f"+{float(_mtk.get('roe_tp2', 0.0)):.1f}% ROE")
+                    mm4.metric("Stop Loss", fmt_px(_mtk.get("stop_loss")), f"-{float(_mtk.get('roe_sl', 0.0)):.1f}% ROE")
+
+                    _prefill_payload = {
+                        **_mtk,
+                        "pair": _mp,
+                        "signal": _mdir,
+                        "direction": "BUY" if _mdir == "LONG" else "SELL",
+                        "strategy_id": _msid,
+                        "strategy_name": _msname,
+                        "suggested_margin_inr": _msugg_m,
+                        "tp1_book_frac": _mtp1_frac,
+                        "size_mult": _msmult,
+                        "is_counter_daily": _m_counter,
+                        "intraday_policy": _mpol,
+                    }
+                    mb1, mb2, mb3 = st.columns([1.1, 0.9, 1.3])
+                    mb1.button(
+                        f"🎯 Load Prefilled in Execute",
+                        key=f"btn_manual_load_exec_{_mc_idx}_{_mp}",
+                        use_container_width=True,
+                        on_click=_switch_pair_and_nav,
+                        args=(_mp, "🎯 Execute", _msname, _prefill_payload),
+                    )
+                    mb2.button(
+                        f"📈 Chart Trade",
+                        key=f"btn_manual_load_chart_{_mc_idx}_{_mp}",
+                        use_container_width=True,
+                        on_click=_switch_pair_and_nav,
+                        args=(_mp, "📈 Chart & Levels", None, _prefill_payload),
+                    )
+                    if mb3.button(
+                        f"🚀 Trigger Manual {_mdir} (₹{_msugg_m:,.0f} @ {leverage}x)",
+                        key=f"btn_manual_trig_{_mc_idx}_{_mp}",
+                        type="primary" if _is_live_m else "secondary",
+                        use_container_width=True,
+                    ):
+                        ok_m, msg_m, _ = coindcx_engine.execute_autotrade_two_entry_signal(
+                            pair=_mp,
+                            sig={**_prefill_payload, "manual_override": True},
+                            single_trade_margin_inr=float(_msugg_m),
+                            leverage=int(leverage),
+                            usd_inr=float(usd_inr),
+                        )
+                        if ok_m:
+                            st.session_state["last_autotrade_banner"] = f"🚀 **Manual Intraday Trade ({_msym}):** {msg_m}"
+                            get_cached_signals_scan.clear()
+                            get_cached_manual_intraday_scan.clear()
+                            get_cached_positions.clear()
+                            get_cached_balance.clear()
+                            st.rerun()
+                        else:
+                            st.error(msg_m)
 
         st.markdown("#### 📡 High-Volatility Watchlist Matrix")
         matrix_rows = []
@@ -2070,6 +2351,10 @@ if active_section == "⚡ Signals":
             px = float(get_cached_ticker(pair_w).get("last_price", 0.0))
             pair_res = [r for r in results if r["pair"] == pair_w]
             active_r = next((r for r in pair_res if r.get("signal") and r["signal"].get("signal") not in (None, "NEUTRAL")), None)
+            mi_w = _manual_intraday_by_pair.get(pair_w) or {}
+            pol_w = mi_w.get("policy") or {}
+            stk_w = mi_w.get("stack") or {}
+            intraday_badge_w = str(pol_w.get("badge") or "—")
 
             if lv and px > 0:
                 if px >= lv["RH"]:
@@ -2089,13 +2374,20 @@ if active_section == "⚡ Signals":
                 (pr_r.get("signal", {}).get("levels", {}) for pr_r in pair_res if isinstance(pr_r.get("signal"), dict) and isinstance(pr_r["signal"].get("levels"), dict) and pr_r["signal"]["levels"].get("ema_15m_trend")),
                 {},
             )
-            _raw_15m = str(sig_lv.get("ema_15m_trend") or "")
+            _raw_15m = str(sig_lv.get("ema_15m_trend") or stk_w.get("ema_state") or "")
             ema15_lbl = "🔴 50<200" if "BEAR" in _raw_15m else ("🟢 50>200" if "BULL" in _raw_15m else "—")
-            sig_status = f"🔥 {active_r['signal']['signal']} ({active_r.get('strategy_name', '')[:12]})" if active_r else "⏳ Watching"
+            mi_live_w = mi_w.get("live_signal")
+            if active_r:
+                sig_status = f"🤖 {active_r['signal']['signal']} ({active_r.get('strategy_name', '')[:12]})"
+            elif isinstance(mi_live_w, dict) and mi_live_w.get("signal") in ("LONG", "SHORT"):
+                sig_status = f"✋ {mi_live_w['signal']} Manual"
+            else:
+                sig_status = "⏳ Watching"
             matrix_rows.append({
                 "Asset": sym_w,
                 "Price": fmt_px(px),
                 "Bias": bias_lbl,
+                "Intraday Router": intraday_badge_w,
                 "15m EMA": ema15_lbl,
                 "Zone": zone,
                 "Status": sig_status,
@@ -2115,6 +2407,7 @@ if active_section == "⚡ Signals":
                     f"<td style='font-weight:800;'>{_mr['Asset']}</td>"
                     f"<td>{_mr['Price']}</td>"
                     f"<td>{_mr['Bias']}</td>"
+                    f"<td style='font-weight:700;'>{_mr['Intraday Router']}</td>"
                     f"<td>{_mr['15m EMA']}</td>"
                     f"<td>{_mr['Zone']}</td>"
                     f"<td style='color:{_st_col};font-weight:700;'>{_mr['Status']}</td>"
@@ -2127,10 +2420,40 @@ if active_section == "⚡ Signals":
                 )
             st.html(
                 f"<div class='pro-table-wrap'><table class='pro-table'>"
-                f"<thead><tr><th>Asset</th><th>Price</th><th>Bias</th><th>15m EMA</th><th>Zone</th><th>Status</th>"
+                f"<thead><tr><th>Asset</th><th>Price</th><th>Daily Bias</th><th>Intraday Router (Manual)</th><th>15m EMA</th><th>Zone</th><th>Status</th>"
                 f"<th>SH</th><th>RH</th><th>MID</th><th>RL</th><th>SL</th></tr></thead>"
                 f"<tbody>{''.join(_m_trs)}</tbody></table></div>"
             )
+
+            # 1-Click Quick Prefill Launcher for ANY Watchlist Coin
+            ql1, ql2, ql3 = st.columns([1.4, 1.3, 1.1])
+            with ql1:
+                _ql_pair = st.selectbox(
+                    "Quick Load Coin (Intraday Router Prefill)",
+                    options=monitor_pairs,
+                    format_func=lambda p: f"{clean_sym(p)}/USDT — {(_manual_intraday_by_pair.get(p, {}).get('policy') or {}).get('badge', 'Ready')}",
+                    key="signals_quick_load_pair",
+                    label_visibility="collapsed",
+                )
+            _ql_info = _manual_intraday_by_pair.get(_ql_pair) or {}
+            _ql_ticket = _ql_info.get("live_signal") or _ql_info.get("prefill_ticket")
+            _ql_sname = str((_ql_ticket or {}).get("strategy_name") or "") or None
+            with ql2:
+                st.button(
+                    f"🎯 Load {clean_sym(_ql_pair)} Prefilled in Execute",
+                    key="btn_quick_load_exec",
+                    use_container_width=True,
+                    on_click=_switch_pair_and_nav,
+                    args=(_ql_pair, "🎯 Execute", _ql_sname, _ql_ticket),
+                )
+            with ql3:
+                st.button(
+                    f"📈 Open {clean_sym(_ql_pair)} Chart Trade",
+                    key="btn_quick_load_chart",
+                    use_container_width=True,
+                    on_click=_switch_pair_and_nav,
+                    args=(_ql_pair, "📈 Chart & Levels", None, _ql_ticket),
+                )
 
 # ==============================================================================
 # SECTION 2: STREAMLINED ORDER EXECUTION STATION
@@ -2161,10 +2484,27 @@ elif active_section == "🎯 Execute":
 
     with exec_left:
         st.markdown(f"#### 🎛️ Order Setup — {cur_asset}/USDT")
-        avail_margin_int = max(1000, int(wallet["available_inr"]))
+        _exec_intraday_info = get_cached_manual_intraday_setup(selected_pair, float(margin_inr), int(leverage), float(usd_inr))
+        _exec_ir_pol = _exec_intraday_info.get("policy") or {}
+        _exec_ir_stk = _exec_intraday_info.get("stack") or {}
+        _exec_ir_tk = _exec_intraday_info.get("live_signal") or _exec_intraday_info.get("prefill_ticket")
+        if _exec_ir_pol:
+            _ir_sm_disp = float(_exec_ir_pol.get("size_mult", 1.0) or 1.0)
+            _ir_tp1_disp = int(round(float(_exec_ir_pol.get("tp1_book_frac", 0.50) or 0.50) * 100))
+            _ir_sugg_m_disp = round(max(500.0, float(margin_inr) * (_ir_sm_disp if _ir_sm_disp > 0 else 0.60)), 2)
+            st.caption(
+                f"🧭 **Intraday Score Router (`exp-staging-intraday-score-router`):** `{_exec_ir_pol.get('badge', '—')}` • "
+                f"4H `{_exec_ir_stk.get('s4_struct', 'CHOP')}` | 1H `{_exec_ir_stk.get('s1_struct', 'CHOP')}` "
+                f"(CHoCH `{_exec_ir_stk.get('s1_choch', 'NONE')}`) | VWAP `{_exec_ir_stk.get('vwap_state', 'CHOP')}` | "
+                f"15m `{_exec_ir_stk.get('ema_state', 'CHOP')}` | ADX `{float(_exec_ir_pol.get('adx', 0.0)):.1f}` • "
+                f"Daily `{_exec_intraday_info.get('daily_bias', 'NEUTRAL')}` → **{_ir_sm_disp:.2g}× (₹{_ir_sugg_m_disp:,.0f}) / {_ir_tp1_disp}% TP1**"
+            )
+
+        avail_margin_int = max(1000, int(max(float(wallet.get("available_inr", 0.0) or 0.0), float(autotrade_wallet_inr))))
         margin_key = f"exec_margin_inr_{selected_pair}"
         if margin_key not in st.session_state:
-            st.session_state[margin_key] = int(margin_inr)
+            _init_exec_m = int(round(float((_exec_ir_tk or {}).get("suggested_margin_inr") or margin_inr)))
+            st.session_state[margin_key] = max(500, _init_exec_m)
 
         m_col1, m_col2 = st.columns(2)
         with m_col1:
@@ -2172,8 +2512,9 @@ elif active_section == "🎯 Execute":
                 "Total Trade Margin (INR)",
                 min_value=500,
                 max_value=max(avail_margin_int, 1000000),
-                step=1000,
-                key=margin_key
+                step=500,
+                key=margin_key,
+                help=f"Reads from AutoTrade Wallet Margin (₹{margin_inr:,.0f}) scaled by Intraday Router risk weight.",
             )
         with m_col2:
             matching_active_pos = next((p for p in live_positions if p["pair"] == selected_pair), None)
@@ -2221,6 +2562,63 @@ elif active_section == "🎯 Execute":
                 }
                 choices.append((f"📧 Alert {_pref['direction']} ({fmt_px(_pref['entry'])})", _pset, strategy_registry.setup_tag(_ps.id, "EMAIL"), _ps))
 
+        _mpref = st.session_state.get("manual_exec_prefill")
+        _mpref_added = False
+        if isinstance(_mpref, dict) and _mpref.get("pair") == selected_pair and float(_mpref.get("entry", 0.0) or 0.0) > 0:
+            _mp_sid = str(_mpref.get("strategy_id") or "box_theory")
+            _mp_strat = strategy_registry.get_strategy(_mp_sid) if _mp_sid in strategy_registry.STRATEGY_REGISTRY else strategy_registry.get_strategy("box_theory")
+            _mp_dir = "BUY" if str(_mpref.get("direction") or _mpref.get("signal") or "BUY").upper() in ("BUY", "LONG") else "SELL"
+            _mp_pm = strategy_registry.position_metrics(
+                selected_pair, float(_mpref["entry"]), float(_mpref["stop_loss"]), float(_mpref["tp1"]), float(_mpref["tp2"]),
+                trade_margin_inr, trade_leverage, trade_usd_inr
+            )
+            _mp_set = {
+                **_mpref,
+                "direction": _mp_dir,
+                "entry": float(_mpref["entry"]),
+                "stop_loss": float(_mpref["stop_loss"]),
+                "tp1": float(_mpref["tp1"]),
+                "tp2": float(_mpref["tp2"]),
+                **_mp_pm,
+                "strategy_id": _mp_sid,
+                "strategy_name": str(_mpref.get("strategy_name") or _mp_strat.name),
+            }
+            _mp_tp1_p = int(round(float(_mpref.get("tp1_book_frac", 0.50) or 0.50) * 100))
+            choices.append((
+                f"🧭 Prefilled {_mp_dir} ({fmt_px(_mp_set['entry'])} • {_mp_tp1_p}% TP1)",
+                _mp_set,
+                strategy_registry.setup_tag(_mp_strat.id, "INTRADAY_PREFILL"),
+                _mp_strat,
+            ))
+            _mpref_added = True
+
+        if isinstance(_exec_ir_tk, dict) and float(_exec_ir_tk.get("entry", 0.0) or 0.0) > 0 and not _mpref_added:
+            _ir_sid = str(_exec_ir_tk.get("strategy_id") or "box_theory")
+            _ir_strat = strategy_registry.get_strategy(_ir_sid) if _ir_sid in strategy_registry.STRATEGY_REGISTRY else strategy_registry.get_strategy("box_theory")
+            _ir_dir = "BUY" if str(_exec_ir_tk.get("direction") or _exec_ir_tk.get("signal") or "BUY").upper() in ("BUY", "LONG") else "SELL"
+            _ir_pm = strategy_registry.position_metrics(
+                selected_pair, float(_exec_ir_tk["entry"]), float(_exec_ir_tk["stop_loss"]), float(_exec_ir_tk["tp1"]), float(_exec_ir_tk["tp2"]),
+                trade_margin_inr, trade_leverage, trade_usd_inr
+            )
+            _ir_set = {
+                **_exec_ir_tk,
+                "direction": _ir_dir,
+                "entry": float(_exec_ir_tk["entry"]),
+                "stop_loss": float(_exec_ir_tk["stop_loss"]),
+                "tp1": float(_exec_ir_tk["tp1"]),
+                "tp2": float(_exec_ir_tk["tp2"]),
+                **_ir_pm,
+                "strategy_id": _ir_sid,
+                "strategy_name": str(_exec_ir_tk.get("strategy_name") or _ir_strat.name),
+            }
+            _ir_live_ico = "⚡" if _exec_ir_tk.get("is_live_signal") else "🧭"
+            choices.append((
+                f"{_ir_live_ico} Intraday Router {_ir_dir} ({fmt_px(_ir_set['entry'])} • {int(_exec_ir_pol.get('score', 0)):+d})",
+                _ir_set,
+                strategy_registry.setup_tag(_ir_strat.id, "INTRADAY_ROUTER"),
+                _ir_strat,
+            ))
+
         for _s in armed_strats:
             _sig = get_cached_strategy_signal(_s.id, selected_pair, trade_margin_inr, trade_leverage, trade_usd_inr)
             _sig_live = bool(_sig and _sig.get("signal") in ("LONG", "SHORT"))
@@ -2252,7 +2650,13 @@ elif active_section == "🎯 Execute":
             _labels = [c[0] for c in choices]
             _def = next(
                 (i for i, c in enumerate(choices) if c[2].endswith("EMAIL")),
-                next((i for i, c in enumerate(choices) if c[2].endswith("SIGNAL")), 0)
+                next(
+                    (i for i, c in enumerate(choices) if c[2].endswith("INTRADAY_PREFILL")),
+                    next(
+                        (i for i, c in enumerate(choices) if c[2].endswith("SIGNAL")),
+                        next((i for i, c in enumerate(choices) if c[2].endswith("INTRADAY_ROUTER")), 0),
+                    ),
+                ),
             )
             trade_choice = st.radio("Select Ticket", _labels, index=_def, horizontal=True, key=f"trade_choice_exec_{selected_pair}_{exec_strategy_mode}")
             _, active_trade, setup_tag, active_strategy = choices[_labels.index(trade_choice)]
@@ -2278,7 +2682,7 @@ elif active_section == "🎯 Execute":
                 direction=trade_dir,
                 entry1_px=float(active_trade["entry"]),
                 entry2_px=None,
-                tp1_px=None if _is_box_strat else float(active_trade["tp1"]),
+                tp1_px=None if (_is_box_strat and not (setup_tag.endswith("INTRADAY_PREFILL") or setup_tag.endswith("INTRADAY_ROUTER"))) else float(active_trade["tp1"]),
                 tp2_px=float(active_trade["tp2"]),
                 sl_px=float(active_trade["stop_loss"]),
                 live_px=float(active_trade["entry"]),
@@ -2286,6 +2690,7 @@ elif active_section == "🎯 Execute":
             )
             _init_norm["entry2_sweep"] = 0.0
 
+            _tp1_pct_key = f"exec_tp1_book_pct_{selected_pair}"
             if (
                 st.session_state.get(choice_tracker_key) != setup_tag
                 or st.session_state.get(levels_tracker_key) != float(active_trade["entry"])
@@ -2300,6 +2705,10 @@ elif active_section == "🎯 Execute":
                 st.session_state[sl_key] = float(_init_norm["stop_loss"])
                 st.session_state[tp1_key] = float(_init_norm["tp1"])
                 st.session_state[tp2_key] = float(_init_norm["tp2"])
+                st.session_state[_tp1_pct_key] = 70 if float(active_trade.get("tp1_book_frac", 0.50) or 0.50) >= 0.65 else 50
+
+            if _tp1_pct_key not in st.session_state:
+                st.session_state[_tp1_pct_key] = 70 if float(active_trade.get("tp1_book_frac", 0.50) or 0.50) >= 0.65 else 50
 
             # If the user changed Limit Entry 1 (`entry_key`), automatically recalculate TP1 (Midpoint(Entry1, TP2) vs 15m 50 EMA) and SL
             _pending_e1 = float(st.session_state.get(entry_key, _init_norm["entry"]))
@@ -2325,6 +2734,18 @@ elif active_section == "🎯 Execute":
             step_val = 0.0001 if p_ref >= 0.001 else 0.000001
             fmt_str = "%.4f" if p_ref >= 0.001 else "%.6f"
 
+            exec_tp1_book_pct = int(
+                st.radio(
+                    "TP1 Partial Book Split",
+                    options=[50, 70],
+                    format_func=lambda v: "50% TP1 / 50% Runner (Standard)" if v == 50 else "70% TP1 / 30% Runner (Counter-Daily Safe)",
+                    horizontal=True,
+                    key=_tp1_pct_key,
+                )
+            )
+            _exec_tp1_frac = 0.70 if exec_tp1_book_pct == 70 else 0.50
+            _exec_size_mult = float(active_trade.get("size_mult", 1.0) or 1.0)
+
             adj_col1, adj_col2 = st.columns(2)
             with adj_col1:
                 custom_entry = st.number_input("Entry (100% Maker Limit) ($)", value=float(st.session_state.get(entry_key, _init_norm["entry"])), step=step_val, format=fmt_str, key=entry_key)
@@ -2332,8 +2753,8 @@ elif active_section == "🎯 Execute":
                 custom_sl = st.number_input(_sl_input_lbl, value=float(st.session_state.get(sl_key, _init_norm["stop_loss"])), step=step_val, format=fmt_str, key=sl_key)
                 custom_e2 = 0.0
             with adj_col2:
-                _tp1_label = "TP1 (SL -> Ratchet, 100% Runner) ($)" if active_strategy.id == "ema9_retest" else "TP1 (50% Book -> SL Ratchet) ($)"
-                _tp2_label = "TP2 (100% Full Runner) ($)" if active_strategy.id == "ema9_retest" else "TP2 (50% Runner) ($)"
+                _tp1_label = "TP1 (SL -> Ratchet, 100% Runner) ($)" if active_strategy.id == "ema9_retest" else f"TP1 ({exec_tp1_book_pct}% Book -> SL Ratchet) ($)"
+                _tp2_label = "TP2 (100% Full Runner) ($)" if active_strategy.id == "ema9_retest" else f"TP2 ({100 - exec_tp1_book_pct}% Runner) ($)"
                 custom_tp1 = st.number_input(_tp1_label, value=float(st.session_state.get(tp1_key, _init_norm["tp1"])), step=step_val, format=fmt_str, key=tp1_key)
                 custom_tp2 = st.number_input(_tp2_label, value=float(st.session_state.get(tp2_key, _init_norm["tp2"])), step=step_val, format=fmt_str, key=tp2_key)
 
@@ -2433,10 +2854,13 @@ elif active_section == "🎯 Execute":
             _avg_2x = (_disp_trade["entry"] + float(_e2_lvl)) / 2.0 if _has_e2 else _disp_trade["entry"]
             _tranche_m = trade_margin_inr * (0.5 if _has_e2 else 1.0)
             _tranche_q = format_order_quantity(selected_pair, _disp_trade["crypto_qty"] * (0.5 if _has_e2 else 1.0))
-            _tp1_half_q = 0.0 if _is_full_runner else format_order_quantity(selected_pair, _tranche_q * 0.5)
+            _tp1_eff_frac = 0.0 if _is_full_runner else float(_exec_tp1_frac)
+            _tp1_eff_pct = int(round(_tp1_eff_frac * 100))
+            _tp2_eff_pct = 100 - _tp1_eff_pct
+            _tp1_half_q = 0.0 if _is_full_runner else format_order_quantity(selected_pair, _tranche_q * _tp1_eff_frac)
             _e2_q = format_order_quantity(selected_pair, ((trade_margin_inr * 0.5 * trade_leverage) / trade_usd_inr) / _e2_lvl) if _has_e2 else 0.0
-            _blended_profit = _disp_trade["profit_tp2_inr"] if _is_full_runner else (0.5 * _disp_trade["profit_tp1_inr"] + 0.5 * _disp_trade["profit_tp2_inr"])
-            _blended_roe = round(_disp_trade["roe_tp2"], 2) if _is_full_runner else round(0.5 * _disp_trade["roe_tp1"] + 0.5 * _disp_trade["roe_tp2"], 2)
+            _blended_profit = _disp_trade["profit_tp2_inr"] if _is_full_runner else (_tp1_eff_frac * _disp_trade["profit_tp1_inr"] + (1.0 - _tp1_eff_frac) * _disp_trade["profit_tp2_inr"])
+            _blended_roe = round(_disp_trade["roe_tp2"], 2) if _is_full_runner else round(_tp1_eff_frac * _disp_trade["roe_tp1"] + (1.0 - _tp1_eff_frac) * _disp_trade["roe_tp2"], 2)
             _fee_inr = cost_details["total_cost_inr"] if cost_details else 0.0
             _be_px = cost_details["breakeven_price"] if cost_details else _disp_trade["entry"]
             _tp1_display = f"{fmt_px(_disp_trade['tp1'])} (SL Ratchet Only • 100% Runner)" if _is_full_runner else f"{fmt_px(_disp_trade['tp1'])} ({_tp1_half_q} {cur_asset} • +{_disp_trade['roe_tp1']}% ROE)"
@@ -2451,10 +2875,10 @@ elif active_section == "🎯 Execute":
                     <span style="color:{subtext_color};">Entry (100% Single-Slot):</span>
                     <span style="text-align:right; font-weight:700;">{fmt_px(_disp_trade['entry'])} (₹{_tranche_m:,.0f} / {_tranche_q} {cur_asset})</span>
 
-                    <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else '50% Limit Order -> SL Ratchet'}):</span>
+                    <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else f'{_tp1_eff_pct}% Limit Order -> SL Ratchet'}):</span>
                     <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
 
-                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else ('RL / RH Structural Target' if _sig_sid == 'ema50_200' else '50% Position TP Runner')}):</span>
+                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else ('RL / RH Structural Target' if _sig_sid == 'ema50_200' else f'{_tp2_eff_pct}% Position TP Runner')}):</span>
                     <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(_disp_trade['tp2'])} (+{_disp_trade['roe_tp2']}% ROE)</span>
 
                     <span style="color:{subtext_color};">{'Stop Loss (15m 200 EMA)' if _sig_sid == 'ema50_200' else 'Catastrophe Stop Loss (Position SL)'}:</span>
@@ -2464,7 +2888,7 @@ elif active_section == "🎯 Execute":
                     <span style="text-align:right; color:{subtext_color}; font-weight:600;">₹{_fee_inr:,.0f} • BE {fmt_px(_be_px)}</span>
                 </div>
                 <div style="margin-top:10px; padding-top:8px; border-top:1px solid {card_border}; display:flex; justify-content:space-between; align-items:center;">
-                    <span style="font-size:0.85rem; font-weight:700; color:{subtext_color};">Projected Runner Profit:</span>
+                    <span style="font-size:0.85rem; font-weight:700; color:{subtext_color};">Projected Runner Profit ({_tp1_eff_pct}/{_tp2_eff_pct}):</span>
                     <span style="font-size:1.05rem; font-weight:800; color:#10b981;">+₹{_blended_profit:,.0f} (+{_blended_roe}% ROE)</span>
                 </div>
             </div>
@@ -2530,6 +2954,8 @@ elif active_section == "🎯 Execute":
                             leverage=trade_leverage,
                             usd_inr=trade_usd_inr,
                             strategy_id=_sig_sid,
+                            tp1_book_frac=_tp1_eff_frac if _tp1_eff_frac > 0 else 0.50,
+                            size_mult=_exec_size_mult,
                         )
                         get_cached_positions.clear()
                         get_cached_open_orders.clear()
@@ -2614,6 +3040,8 @@ elif active_section == "🎯 Execute":
                                     leverage=trade_leverage,
                                     usd_inr=trade_usd_inr,
                                     strategy_id=_sig_sid,
+                                    tp1_book_frac=_tp1_eff_frac if _tp1_eff_frac > 0 else 0.50,
+                                    size_mult=_exec_size_mult,
                                 )
                                 if s_ok:
                                     _synced_live_lock = True
@@ -2666,6 +3094,8 @@ elif active_section == "🎯 Execute":
                             entry2_order_id=_e2_order_id if is_live else "",
                             tp1_order_id=_tp1_order_id if is_live else ("FULL_RUNNER_SL_RATCHET_AT_TP1" if _is_full_runner else "DAEMON_50PCT_REDUCE_AT_TP1"),
                             strategy_id=_sig_sid,
+                            tp1_book_frac=_tp1_eff_frac if _tp1_eff_frac > 0 else 0.50,
+                            size_mult=_exec_size_mult,
                         )
 
                     _sig_strat_obj = strategy_registry.get_strategy(_sig_sid)
@@ -3298,13 +3728,15 @@ elif active_section == "💰 Funds":
                     st.dataframe(pd.DataFrame(parsed_csv["rows"]), use_container_width=True, hide_index=True)
 
 # ==============================================================================
-# SECTION 4: INTERACTIVE CHART & KEY BOX LEVELS
+# SECTION 4: INTERACTIVE CHART TRADING & KEY LEVELS (COINDCX-STYLE WORKSTATION)
 # ==============================================================================
 elif active_section == "📈 Chart & Levels":
     if levels:
         _bias = get_cached_bias(selected_pair)
         _bias_name = _bias["bias"]
         _bias_icon = "🟢" if _bias_name == "BULLISH" else ("🔴" if _bias_name == "BEARISH" else "🟡")
+        _ch_ir_info = get_cached_manual_intraday_setup(selected_pair, float(margin_inr), int(leverage), float(usd_inr))
+        _ch_ir_pol = _ch_ir_info.get("policy") or {}
 
         k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Swing High (SH)", fmt_px(levels["SH"]))
@@ -3313,12 +3745,37 @@ elif active_section == "📈 Chart & Levels":
         k4.metric("Range Low (RL)", fmt_px(levels["RL"]))
         k5.metric("Swing Low (SL)", fmt_px(levels["SL"]))
 
-        st.caption(f"**Daily Trend Bias ({asset_name}):** {_bias_icon} **{_bias_name}** — " + " • ".join(_bias["reasons"]))
+        st.caption(
+            f"**Daily Bias ({asset_name}):** {_bias_icon} **{_bias_name}** • "
+            f"**Intraday Router:** `{_ch_ir_pol.get('badge', '—')}` (ADX `{float(_ch_ir_pol.get('adx', 0.0)):.1f}`) — "
+            + " • ".join(_bias["reasons"])
+        )
 
-        b_setup = calculate_trade_setup_details("BUY", levels, live_price, margin_inr, leverage, usd_inr, pair=selected_pair)
-        s_setup = calculate_trade_setup_details("SELL", levels, live_price, margin_inr, leverage, usd_inr, pair=selected_pair)
+        # Chart Strategy + Timeframe + Box Toggle + Bars Control Bar
+        _chart_strat_opts = [
+            "📦 Box Theory Sweep",
+            "📈 50/200 EMA Crossover",
+            "⚡ 9/21 EMA Crossover",
+        ]
+        _ch_pref_t = st.session_state.get("chart_prefill_ticket")
+        if isinstance(_ch_pref_t, dict) and _ch_pref_t.get("pair") == selected_pair and st.session_state.get(f"chart_prefill_applied_{selected_pair}") != str(_ch_pref_t.get("entry")):
+            _psid_c = str(_ch_pref_t.get("strategy_id") or "")
+            if _psid_c == "ema50_200":
+                st.session_state[f"chart_strategy_sel_{selected_pair}"] = "📈 50/200 EMA Crossover"
+            elif _psid_c == "ema9_21_cross":
+                st.session_state[f"chart_strategy_sel_{selected_pair}"] = "⚡ 9/21 EMA Crossover"
+            else:
+                st.session_state[f"chart_strategy_sel_{selected_pair}"] = "📦 Box Theory Sweep"
 
-        tf_col, overlay_col, slider_col, reload_col = st.columns([1.8, 1.8, 1.4, 0.9])
+        cs_col, tf_col, box_col, slider_col, reload_col = st.columns([1.85, 1.85, 0.95, 1.15, 0.75])
+        with cs_col:
+            chart_strategy = st.selectbox(
+                "Chart Trading Strategy",
+                options=_chart_strat_opts,
+                key=f"chart_strategy_sel_{selected_pair}",
+                label_visibility="collapsed",
+                help="Select strategy overlays & auto-calculated Entry / SL / TP1 / TP2 levels on the chart.",
+            )
         with tf_col:
             tf_options = ["1m", "5m", "15m", "1h", "4h", "1d"]
             cur_tf_idx = tf_options.index(st.session_state.chart_timeframe) if st.session_state.chart_timeframe in tf_options else 2
@@ -3326,84 +3783,529 @@ elif active_section == "📈 Chart & Levels":
             if selected_tf != st.session_state.chart_timeframe:
                 st.session_state.chart_timeframe = selected_tf
                 st.rerun()
-        with overlay_col:
-            overlay_mode = st.selectbox(
-                "Overlay Mode",
-                ["Price & Box Levels Only", "Both BUY & SELL Setups", "BUY Setup Only", "SELL Setup Only"],
-                index=0, label_visibility="collapsed", key=f"overlay_mode_{selected_pair}"
-            )
+        with box_col:
+            show_box_levels = st.toggle("📦 Box Levels", value=True, key=f"show_box_lvls_{selected_pair}")
         with slider_col:
-            candle_count = st.slider("Bars", min_value=30, max_value=150, value=75, step=15, label_visibility="collapsed", key=f"bars_{selected_pair}")
+            candle_count = st.slider("Bars", min_value=30, max_value=150, value=90, step=15, label_visibility="collapsed", key=f"bars_{selected_pair}")
         with reload_col:
-            if st.button("🔄 Refresh Chart", key=f"btn_chart_refresh_{selected_pair}", use_container_width=True):
+            if st.button("🔄 Refresh", key=f"btn_chart_refresh_{selected_pair}", use_container_width=True):
+                get_cached_positions.clear()
                 st.rerun()
 
+        if st.session_state.get("chart_trade_banner"):
+            _ct_kind, _ct_msg = st.session_state.pop("chart_trade_banner")
+            (st.success if _ct_kind == "success" else (st.info if _ct_kind == "info" else st.error))(_ct_msg)
+
         active_tf = st.session_state.chart_timeframe
-        _fetch_bars = max(int(candle_count), 600) if active_tf in ("5m", "15m", "1h") else int(candle_count)
+        _fetch_bars = max(int(candle_count) + 220, 600) if active_tf in ("1m", "5m", "15m", "1h") else max(int(candle_count) + 210, 260)
         df_chart_raw = fetch_coindcx_candles(selected_pair, interval=active_tf, limit=_fetch_bars, sync_live_price=True)
 
         if not df_chart_raw.empty:
             df_chart_raw = df_chart_raw.copy()
+            df_chart_raw["EMA9_CALC"] = df_chart_raw["close"].ewm(span=9, adjust=False).mean()
+            df_chart_raw["EMA21_CALC"] = df_chart_raw["close"].ewm(span=21, adjust=False).mean()
             df_chart_raw["EMA50_CALC"] = df_chart_raw["close"].ewm(span=50, adjust=False).mean()
             df_chart_raw["EMA200_CALC"] = df_chart_raw["close"].ewm(span=200, adjust=False).mean()
+            # Session VWAP resetting cleanly at 00:00 UTC
+            _utc_dates = pd.to_datetime(df_chart_raw["timestamp"], unit="ms", utc=True).dt.strftime("%Y-%m-%d")
+            _typ_px = (df_chart_raw["high"].astype(float) + df_chart_raw["low"].astype(float) + df_chart_raw["close"].astype(float)) / 3.0
+            _vol_s = df_chart_raw["volume"].astype(float).clip(lower=1e-9)
+            _pv_s = _typ_px * _vol_s
+            df_chart_raw["VWAP_CALC"] = _pv_s.groupby(_utc_dates).cumsum() / _vol_s.groupby(_utc_dates).cumsum()
+
             df_chart = df_chart_raw.iloc[-int(candle_count):].reset_index(drop=True)
             ts_series = pd.to_datetime(df_chart["timestamp"], unit="ms")
-            fig = go.Figure()
+            _ch_ref_px = float(live_price if live_price > 0 else df_chart["close"].iloc[-1])
 
-            fig.add_hrect(y0=levels["RH"], y1=levels["SH"], fillcolor="rgba(239,68,68,0.12)", line_width=0, layer="below")
-            fig.add_hrect(y0=levels["SL"], y1=levels["RL"], fillcolor="rgba(16,185,129,0.12)", line_width=0, layer="below")
-
-            fig.add_trace(go.Candlestick(
-                x=ts_series, open=df_chart["open"], high=df_chart["high"], low=df_chart["low"], close=df_chart["close"],
-                name=f"{asset_name} ({active_tf})",
-                increasing_line_color=candle_up, increasing_fillcolor=candle_up,
-                decreasing_line_color=candle_down, decreasing_fillcolor=candle_down
-            ))
-
-            ema50_curve = df_chart["EMA50_CALC"]
-            ema200_curve = df_chart["EMA200_CALC"]
-            fig.add_trace(go.Scatter(x=ts_series, y=ema50_curve, mode="lines", name="50 EMA", line=dict(color="#8b5cf6", width=1.8)))
-            fig.add_trace(go.Scatter(x=ts_series, y=ema200_curve, mode="lines", name="200 EMA", line=dict(color="#f59e0b", width=1.8, dash="dot")))
-
-            for lbl, key_l, col_l, dsh in [
-                ("SH", "SH", "#ef4444", "dash"),
-                ("RH", "RH", "#f97316", "solid"),
-                ("MID", "MID", "#0284c7", "dot"),
-                ("RL", "RL", "#10b981", "solid"),
-                ("SL", "SL", "#059669", "dash"),
-            ]:
-                fig.add_hline(
-                    y=levels[key_l], line_dash=dsh, line_color=col_l, line_width=1.8,
-                    annotation_text=f"<b>{lbl}: {fmt_px(levels[key_l])}</b>",
-                    annotation_position="top left" if key_l in ("SH", "RH", "MID") else "bottom left",
-                    annotation_bgcolor=col_l, annotation_font=dict(size=10, color="#ffffff")
-                )
-
-            if live_price > 0:
-                fig.add_hline(
-                    y=live_price, line_dash="dashdot", line_color="#3b82f6", line_width=2,
-                    annotation_text=f"<b>LIVE: {fmt_px(live_price)}</b>",
-                    annotation_position="top right", annotation_bgcolor="#2563eb",
-                    annotation_font=dict(size=11, color="#ffffff")
-                )
-
-            if "BUY" in overlay_mode or "Both" in overlay_mode:
-                fig.add_hline(y=b_setup["entry"], line_color="#10b981", line_width=1.5, annotation_text=f"BUY E1: {fmt_px(b_setup['entry'])}", annotation_position="bottom right")
-                fig.add_hline(y=b_setup["stop_loss"], line_dash="dash", line_color="#ef4444", line_width=1.5, annotation_text=f"BUY SL: {fmt_px(b_setup['stop_loss'])}", annotation_position="bottom right")
-            if "SELL" in overlay_mode or "Both" in overlay_mode:
-                fig.add_hline(y=s_setup["entry"], line_color="#f43f5e", line_width=1.5, annotation_text=f"SELL E1: {fmt_px(s_setup['entry'])}", annotation_position="top right")
-                fig.add_hline(y=s_setup["stop_loss"], line_dash="dash", line_color="#f97316", line_width=1.5, annotation_text=f"SELL SL: {fmt_px(s_setup['stop_loss'])}", annotation_position="top right")
-
-            fig.update_layout(
-                height=480,
-                template="plotly_dark" if not is_light_theme else "plotly_white",
-                paper_bgcolor=plot_paper, plot_bgcolor=plot_bg, showlegend=False,
-                xaxis=dict(rangeslider=dict(visible=False), gridcolor=plot_grid, tickfont=dict(color=axis_font, size=10)),
-                yaxis=dict(gridcolor=plot_grid, side="right", tickfont=dict(color=axis_font, size=10)),
-                margin=dict(l=10, r=10, t=15, b=15),
-                hovermode="x unified"
+            # Build Strategy Trade Plans for the selected Chart Strategy
+            _box_buy = calculate_trade_setup_details("BUY", levels, _ch_ref_px, margin_inr, leverage, usd_inr, pair=selected_pair)
+            _box_sell = calculate_trade_setup_details("SELL", levels, _ch_ref_px, margin_inr, leverage, usd_inr, pair=selected_pair)
+            _ema50_plan = get_cached_strategy_plan("ema50_200", selected_pair, _ch_ref_px, float(margin_inr), int(leverage), float(usd_inr)) or {}
+            _ema9_21_plan = strategy_registry.compute_9_21_ema_crossover_plan(
+                selected_pair, df_chart, levels, _ch_ref_px, margin_inr=float(margin_inr), leverage=int(leverage), usd_inr=float(usd_inr)
             )
-            st.plotly_chart(fig, use_container_width=True)
+
+            # Detect active open Live CoinDCX position OR Staging/App Paper Trade Lock on this pair
+            _ch_live_positions = get_cached_positions() or []
+            _ch_live_pos = next((p for p in _ch_live_positions if p.get("pair") == selected_pair), None)
+            _ch_locks_map = coindcx_engine._get_active_locks_map()
+            _ch_paper_lock = _ch_locks_map.get(selected_pair)
+            _ch_has_open_pos = bool(_ch_live_pos or _ch_paper_lock)
+
+            # Two-column CoinDCX-style Workstation: execute right panel FIRST so level edits render on chart immediately!
+            ch_plot_col, ch_trade_col = st.columns([1.82, 1.0])
+
+            # Shared state for chart level overlays (populated inside ch_trade_col)
+            _ov_entry = 0.0
+            _ov_sl = 0.0
+            _ov_tp1 = 0.0
+            _ov_tp2 = 0.0
+            _ov_dir = "BUY"
+            _ov_tp1_pct = 50
+            _ov_is_pos = False
+
+            with ch_trade_col:
+                st.markdown("#### 🎯 Chart Trade Panel")
+                if _ch_has_open_pos:
+                    _ch_panel_mode = st.radio(
+                        "Panel Mode",
+                        ["📌 Manage Open Position", "➕ Plan New Order"],
+                        index=0,
+                        horizontal=True,
+                        key=f"ch_panel_mode_{selected_pair}",
+                        label_visibility="collapsed",
+                    )
+                else:
+                    _ch_panel_mode = "➕ Plan New Order"
+
+                _ch_step = 0.0001 if _ch_ref_px >= 0.001 else 0.000001
+                _ch_fmt = "%.4f" if _ch_ref_px >= 0.001 else "%.6f"
+
+                if _ch_panel_mode == "📌 Manage Open Position" and _ch_has_open_pos:
+                    _ov_is_pos = True
+                    _is_live_pos_ch = bool(_ch_live_pos)
+                    _pos_dir_raw = str((_ch_live_pos or _ch_paper_lock).get("direction", "LONG")).upper()
+                    _ov_dir = "BUY" if _pos_dir_raw in ("LONG", "BUY") else "SELL"
+                    _pos_entry = float((_ch_live_pos or {}).get("entry_price") or (_ch_paper_lock or {}).get("entry") or _ch_ref_px)
+                    _pos_lev = int(round(float((_ch_live_pos or {}).get("leverage") or (_ch_paper_lock or {}).get("leverage") or leverage)))
+                    _pos_qty = float((_ch_live_pos or {}).get("quantity") or (_ch_paper_lock or {}).get("qty1") or 0.0)
+                    _pos_margin = float((_ch_paper_lock or {}).get("margin_inr") or margin_inr)
+                    _pos_sl_def = float((_ch_live_pos or {}).get("stop_loss") or (_ch_paper_lock or {}).get("stop_loss") or (_pos_entry * (0.985 if _ov_dir == "BUY" else 1.015)))
+                    _pos_tp2_def = float((_ch_live_pos or {}).get("take_profit") or (_ch_paper_lock or {}).get("tp2") or (_pos_entry * (1.03 if _ov_dir == "BUY" else 0.97)))
+                    _pos_tp1_def = float((_ch_paper_lock or {}).get("tp1") or ((_pos_entry + _pos_tp2_def) / 2.0))
+                    _ov_tp1_pct = int(round(float((_ch_paper_lock or {}).get("tp1_book_frac", 0.50) or 0.50) * 100))
+
+                    # Live Unrealized PnL
+                    if _is_live_pos_ch and _ch_live_pos.get("pnl_inr") is not None:
+                        _pos_upnl_inr = float(_ch_live_pos.get("pnl_inr", 0.0) or 0.0)
+                        _pos_roe_pct = round((_pos_upnl_inr / max(1.0, _pos_margin)) * 100.0, 2)
+                    else:
+                        _raw_mv = ((_ch_ref_px - _pos_entry) / _pos_entry) if (_ov_dir == "BUY" and _pos_entry > 0) else (((_pos_entry - _ch_ref_px) / _pos_entry) if _pos_entry > 0 else 0.0)
+                        _pos_roe_pct = round(_raw_mv * _pos_lev * 100.0, 2)
+                        _pos_upnl_inr = round(_pos_margin * _raw_mv * _pos_lev, 2)
+
+                    _pos_badge_cls = "badge-buy" if _ov_dir == "BUY" else "badge-sell"
+                    _upnl_col = "#10b981" if _pos_upnl_inr >= 0 else "#ef4444"
+                    st.html(
+                        f"<div class='pro-card' style='padding:10px 12px;margin-bottom:8px;'>"
+                        f"<div style='display:flex;justify-content:space-between;align-items:center;'>"
+                        f"<span class='{_pos_badge_cls}'>OPEN {'LONG' if _ov_dir == 'BUY' else 'SHORT'} ({_pos_lev}x)</span>"
+                        f"<span style='font-size:0.76rem;color:{subtext_color};'>{'⚡ Live CoinDCX' if _is_live_pos_ch else '📝 Staging Paper'}</span></div>"
+                        f"<div style='margin-top:6px;display:flex;justify-content:space-between;font-size:0.86rem;'>"
+                        f"<span>Entry: <b>{fmt_px(_pos_entry)}</b></span>"
+                        f"<span style='color:{_upnl_col};font-weight:800;'>{'+' if _pos_upnl_inr >= 0 else ''}₹{_pos_upnl_inr:,.2f} ({_pos_roe_pct:+.1f}%)</span>"
+                        f"</div></div>"
+                    )
+
+                    _psl_k = f"ch_pos_sl_{selected_pair}"
+                    _ptp1_k = f"ch_pos_tp1_{selected_pair}"
+                    _ptp2_k = f"ch_pos_tp2_{selected_pair}"
+                    _psync_k = f"ch_pos_sync_{selected_pair}"
+                    _pos_sig_id = f"{_pos_entry:.6f}_{_pos_sl_def:.6f}_{_pos_tp2_def:.6f}"
+                    if st.session_state.get(_psync_k) != _pos_sig_id:
+                        st.session_state[_psync_k] = _pos_sig_id
+                        st.session_state[_psl_k] = float(_pos_sl_def)
+                        st.session_state[_ptp1_k] = float(_pos_tp1_def)
+                        st.session_state[_ptp2_k] = float(_pos_tp2_def)
+
+                    _ov_entry = _pos_entry
+                    _ov_sl = float(st.number_input("Adjust Stop Loss ($)", step=_ch_step, format=_ch_fmt, key=_psl_k))
+                    _ov_tp1 = float(st.number_input(f"Adjust TP1 ({_ov_tp1_pct}% Book) ($)", step=_ch_step, format=_ch_fmt, key=_ptp1_k))
+                    _ov_tp2 = float(st.number_input(f"Adjust TP2 ({100 - _ov_tp1_pct}% Runner) ($)", step=_ch_step, format=_ch_fmt, key=_ptp2_k))
+
+                    if st.button("✏️ Update SL / TP on Position", key=f"btn_ch_upd_pos_{selected_pair}", type="primary", use_container_width=True):
+                        if _is_live_pos_ch:
+                            _u_ok, _u_msg = update_coindcx_position_tpsl(
+                                _ch_live_pos["id"], tp_price=_ov_tp2, sl_price=_ov_sl, pair=selected_pair
+                            )
+                            if _u_ok:
+                                coindcx_engine.sync_full_2entry_runner_to_position(
+                                    pair=selected_pair,
+                                    direction=_pos_dir_raw,
+                                    entry1_px=_pos_entry,
+                                    entry2_px=0.0,
+                                    tp1_px=_ov_tp1,
+                                    tp2_px=_ov_tp2,
+                                    sl_px=_ov_sl,
+                                    total_margin_inr=_pos_margin,
+                                    leverage=_pos_lev,
+                                    usd_inr=float(usd_inr),
+                                    strategy_id=str((_ch_paper_lock or {}).get("strategy_id") or "box_theory"),
+                                    tp1_book_frac=_ov_tp1_pct / 100.0,
+                                )
+                                get_cached_positions.clear()
+                                get_cached_open_orders.clear()
+                                st.session_state["chart_trade_banner"] = ("success", f"✅ Updated Live {asset_name} SL/TP: SL {fmt_px(_ov_sl)} | TP1 {fmt_px(_ov_tp1)} | TP2 {fmt_px(_ov_tp2)}")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Update Failed: {_u_msg}")
+                        else:
+                            _u_ok, _u_msg = coindcx_engine.update_app_paper_position_levels(
+                                selected_pair, stop_loss=_ov_sl, tp1=_ov_tp1, tp2=_ov_tp2
+                            )
+                            st.session_state["chart_trade_banner"] = ("success" if _u_ok else "error", _u_msg)
+                            st.rerun()
+
+                    st.markdown("---")
+                    _confirm_ch_exit = st.checkbox(
+                        f"Confirm instant market exit of {asset_name} ({'LIVE' if _is_live_pos_ch else 'PAPER'})",
+                        key=f"ch_confirm_exit_{selected_pair}",
+                    )
+                    if st.button(
+                        f"🛑 Exit {asset_name} Position Now (Market Close)",
+                        key=f"btn_ch_exit_pos_{selected_pair}",
+                        disabled=not _confirm_ch_exit,
+                        use_container_width=True,
+                    ):
+                        if _is_live_pos_ch:
+                            _ex_ok, _ex_msg = exit_coindcx_position(_ch_live_pos["id"], pair=selected_pair)
+                            if _ex_ok:
+                                coindcx_engine.clear_autotrade_active_lock(pair=selected_pair)
+                                get_cached_positions.clear()
+                                get_cached_open_orders.clear()
+                                get_cached_balance.clear()
+                                st.session_state["chart_trade_banner"] = ("success", f"🛑 Exited Live {asset_name} Position: {_ex_msg}")
+                                st.rerun()
+                            else:
+                                st.error(f"❌ Exit Failed: {_ex_msg}")
+                        else:
+                            _ex_ok, _ex_msg, _ = coindcx_engine.close_app_paper_position(
+                                selected_pair, exit_price=_ch_ref_px, reason="Manual Chart Exit"
+                            )
+                            get_cached_balance.clear()
+                            st.session_state["chart_trade_banner"] = ("success" if _ex_ok else "error", _ex_msg)
+                            st.rerun()
+                else:
+                    # Plan & Execute New Order directly from Chart (CoinDCX Chart Trading style)
+                    _ch_dir_key = f"ch_new_dir_{selected_pair}"
+                    if _ch_dir_key not in st.session_state:
+                        _ir_dirs_c = _ch_ir_pol.get("allowed_dirs") or []
+                        if isinstance(_ch_pref_t, dict) and _ch_pref_t.get("pair") == selected_pair:
+                            st.session_state[_ch_dir_key] = "🟢 LONG" if str(_ch_pref_t.get("direction") or _ch_pref_t.get("signal", "LONG")).upper() in ("LONG", "BUY") else "🔴 SHORT"
+                        elif len(_ir_dirs_c) == 1:
+                            st.session_state[_ch_dir_key] = "🟢 LONG" if _ir_dirs_c[0] == "LONG" else "🔴 SHORT"
+                        elif _bias_name == "BEARISH":
+                            st.session_state[_ch_dir_key] = "🔴 SHORT"
+                        else:
+                            st.session_state[_ch_dir_key] = "🟢 LONG"
+
+                    _dc1, _dc2 = st.columns(2)
+                    with _dc1:
+                        _ch_dir_lbl = st.radio("Side", ["🟢 LONG", "🔴 SHORT"], horizontal=True, key=_ch_dir_key, label_visibility="collapsed")
+                    with _dc2:
+                        _ch_ord_type = st.radio("Order Type", ["📌 Limit", "⚡ Market"], horizontal=True, key=f"ch_ord_type_{selected_pair}", label_visibility="collapsed")
+                    _ov_dir = "BUY" if "LONG" in _ch_dir_lbl else "SELL"
+
+                    # Pick strategy default setup for the chosen Chart Strategy + Direction
+                    if chart_strategy == "📈 50/200 EMA Crossover":
+                        _strat_plan_obj = _ema50_plan.get(_ov_dir) or (_box_buy if _ov_dir == "BUY" else _box_sell)
+                        _ch_sid = "ema50_200"
+                    elif chart_strategy == "⚡ 9/21 EMA Crossover":
+                        _strat_plan_obj = _ema9_21_plan.get(_ov_dir) or (_box_buy if _ov_dir == "BUY" else _box_sell)
+                        _ch_sid = "ema9_21_cross"
+                    else:
+                        _strat_plan_obj = _box_buy if _ov_dir == "BUY" else _box_sell
+                        _ch_sid = "box_theory"
+
+                    _ch_def_ent = float((_strat_plan_obj or {}).get("entry") or _ch_ref_px)
+                    _ch_def_sl = float((_strat_plan_obj or {}).get("stop_loss") or (_ch_ref_px * (0.985 if _ov_dir == "BUY" else 1.015)))
+                    _ch_def_tp1 = float((_strat_plan_obj or {}).get("tp1") or (_ch_ref_px * (1.015 if _ov_dir == "BUY" else 0.985)))
+                    _ch_def_tp2 = float((_strat_plan_obj or {}).get("tp2") or (_ch_ref_px * (1.030 if _ov_dir == "BUY" else 0.970)))
+
+                    # If user jumped here from Signals with an explicit prefill ticket on this coin, seed those exact levels once
+                    _ch_sync_key = f"chart_ticket_sync_{selected_pair}"
+                    _ch_sync_sig = f"{chart_strategy}|{_ov_dir}|{_ch_def_ent:.6f}"
+                    _ce_k = f"ch_in_entry_{selected_pair}"
+                    _csl_k = f"ch_in_sl_{selected_pair}"
+                    _ctp1_k = f"ch_in_tp1_{selected_pair}"
+                    _ctp2_k = f"ch_in_tp2_{selected_pair}"
+                    _ctp1p_k = f"ch_in_tp1_pct_{selected_pair}"
+                    _cm_k = f"ch_in_margin_{selected_pair}"
+
+                    if isinstance(_ch_pref_t, dict) and _ch_pref_t.get("pair") == selected_pair and st.session_state.get(f"chart_prefill_applied_{selected_pair}") != str(_ch_pref_t.get("entry")):
+                        st.session_state[f"chart_prefill_applied_{selected_pair}"] = str(_ch_pref_t.get("entry"))
+                        st.session_state[_ch_sync_key] = _ch_sync_sig
+                        st.session_state[_ce_k] = float(_ch_pref_t["entry"])
+                        st.session_state[_csl_k] = float(_ch_pref_t["stop_loss"])
+                        st.session_state[_ctp1_k] = float(_ch_pref_t["tp1"])
+                        st.session_state[_ctp2_k] = float(_ch_pref_t["tp2"])
+                        st.session_state[_ctp1p_k] = 70 if float(_ch_pref_t.get("tp1_book_frac", 0.50) or 0.50) >= 0.65 else 50
+                        _pm_sugg = float(_ch_pref_t.get("suggested_margin_inr") or margin_inr)
+                        st.session_state[_cm_k] = max(500.0, round(_pm_sugg, 2))
+                    elif st.session_state.get(_ch_sync_key) != _ch_sync_sig or _ce_k not in st.session_state:
+                        st.session_state[_ch_sync_key] = _ch_sync_sig
+                        st.session_state[_ce_k] = float(_ch_def_ent)
+                        st.session_state[_csl_k] = float(_ch_def_sl)
+                        st.session_state[_ctp1_k] = float(_ch_def_tp1)
+                        st.session_state[_ctp2_k] = float(_ch_def_tp2)
+                        _rp_ch = coindcx_engine.resolve_direction_risk_profile(_ov_dir, _bias_name)
+                        st.session_state[_ctp1p_k] = 70 if _rp_ch["tp1_book_frac"] >= 0.65 else 50
+                        st.session_state[_cm_k] = max(500.0, round(float(margin_inr) * float(_rp_ch["size_mult"]), 2))
+
+                    if _cm_k not in st.session_state:
+                        st.session_state[_cm_k] = max(500.0, round(float(margin_inr), 2))
+                    if _ctp1p_k not in st.session_state:
+                        st.session_state[_ctp1p_k] = 50
+
+                    # Quick Level Nudge / Reset Controls
+                    _nb1, _nb2, _nb3, _nb4 = st.columns(4)
+                    if _nb1.button("🔄 Reset", key=f"btn_ch_rst_{selected_pair}", use_container_width=True, help="Reset to selected strategy's levels"):
+                        st.session_state[_ce_k] = float(_ch_def_ent)
+                        st.session_state[_csl_k] = float(_ch_def_sl)
+                        st.session_state[_ctp1_k] = float(_ch_def_tp1)
+                        st.session_state[_ctp2_k] = float(_ch_def_tp2)
+                        st.rerun()
+                    if _nb2.button("📍 Live", key=f"btn_ch_live_{selected_pair}", use_container_width=True, help="Snap Entry to current live price"):
+                        st.session_state[_ce_k] = float(round_asset_price(_ch_ref_px, _ch_ref_px))
+                        st.rerun()
+                    if _nb3.button("-0.25%", key=f"btn_ch_dn_{selected_pair}", use_container_width=True, help="Nudge Entry -0.25%"):
+                        st.session_state[_ce_k] = float(round_asset_price(float(st.session_state.get(_ce_k, _ch_ref_px)) * 0.9975, _ch_ref_px))
+                        st.rerun()
+                    if _nb4.button("+0.25%", key=f"btn_ch_up_{selected_pair}", use_container_width=True, help="Nudge Entry +0.25%"):
+                        st.session_state[_ce_k] = float(round_asset_price(float(st.session_state.get(_ce_k, _ch_ref_px)) * 1.0025, _ch_ref_px))
+                        st.rerun()
+
+                    _ov_entry = float(st.number_input("Entry Price ($)", step=_ch_step, format=_ch_fmt, key=_ce_k))
+                    if "Market" in _ch_ord_type and _ch_ref_px > 0:
+                        _ov_entry = float(round_asset_price(_ch_ref_px, _ch_ref_px))
+                    _lv_c1, _lv_c2 = st.columns(2)
+                    with _lv_c1:
+                        _ov_tp1 = float(st.number_input("TP1 ($)", step=_ch_step, format=_ch_fmt, key=_ctp1_k))
+                        _ov_sl = float(st.number_input("Stop Loss ($)", step=_ch_step, format=_ch_fmt, key=_csl_k))
+                    with _lv_c2:
+                        _ov_tp2 = float(st.number_input("TP2 Runner ($)", step=_ch_step, format=_ch_fmt, key=_ctp2_k))
+                        _ov_tp1_pct = int(st.selectbox("TP1 Book %", [50, 70], format_func=lambda v: f"{v}% Book", key=_ctp1p_k))
+
+                    _ml_c1, _ml_c2 = st.columns(2)
+                    with _ml_c1:
+                        _ch_margin = float(
+                            st.number_input(
+                                "Margin (₹)",
+                                min_value=500.0,
+                                max_value=max(float(autotrade_wallet_inr) * 2.0, float(wallet_data["total_inr"]) * 2.0, 1000000.0),
+                                step=500.0,
+                                format="%.2f",
+                                key=_cm_k,
+                            )
+                        )
+                    with _ml_c2:
+                        _ch_lev = int(st.number_input("Lev (x)", min_value=1, max_value=20, value=int(leverage), step=1, key=f"ch_in_lev_{selected_pair}"))
+
+                    # Live R:R & INR Risk/Reward calculation
+                    _ch_risk_d = abs(_ov_entry - _ov_sl)
+                    _ch_tp1_d = abs(_ov_tp1 - _ov_entry)
+                    _ch_tp2_d = abs(_ov_tp2 - _ov_entry)
+                    _ch_rr = round(_ch_tp2_d / _ch_risk_d, 2) if _ch_risk_d > 0 else 0.0
+                    _ch_qty = format_order_quantity(selected_pair, ((_ch_margin * _ch_lev) / float(usd_inr)) / _ov_entry) if _ov_entry > 0 else 0.0
+                    _ch_sl_inr = round(_ch_risk_d * _ch_qty * float(usd_inr), 0)
+                    _ch_tp1_inr = round(_ch_tp1_d * _ch_qty * float(usd_inr), 0)
+                    _ch_tp2_inr = round(_ch_tp2_d * _ch_qty * float(usd_inr), 0)
+                    _ch_sl_wallet_pct = round((_ch_sl_inr / max(1.0, float(autotrade_wallet_inr))) * 100.0, 2)
+                    _ch_blend_inr = round((_ov_tp1_pct / 100.0) * _ch_tp1_inr + (1.0 - _ov_tp1_pct / 100.0) * _ch_tp2_inr, 0)
+
+                    st.html(
+                        f"<div class='pro-card' style='padding:10px 12px;margin:6px 0 8px 0;font-size:0.82rem;'>"
+                        f"<div style='display:flex;justify-content:space-between;'><span>Risk (SL):</span><b style='color:#ef4444;'>-₹{_ch_sl_inr:,.0f} ({_ch_sl_wallet_pct:.2f}% Wallet)</b></div>"
+                        f"<div style='display:flex;justify-content:space-between;'><span>Reward ({_ov_tp1_pct}/{100 - _ov_tp1_pct}):</span><b style='color:#10b981;'>+₹{_ch_blend_inr:,.0f} (TP2 +₹{_ch_tp2_inr:,.0f})</b></div>"
+                        f"<div style='display:flex;justify-content:space-between;'><span>R:R (to TP2) / Qty:</span><b>1 : {_ch_rr:.2f} • {_ch_qty} {asset_name}</b></div>"
+                        f"</div>"
+                    )
+
+                    _ch_valid_lvls = (
+                        (_ov_sl < _ov_entry < _ov_tp1 <= _ov_tp2)
+                        if _ov_dir == "BUY"
+                        else (_ov_sl > _ov_entry > _ov_tp1 >= _ov_tp2 > 0)
+                    )
+                    if not _ch_valid_lvls:
+                        st.warning(
+                            "⚠️ Check price order: "
+                            + ("LONG requires `SL < Entry < TP1 <= TP2`." if _ov_dir == "BUY" else "SHORT requires `SL > Entry > TP1 >= TP2`.")
+                        )
+
+                    _ch_env_lbl = "PAPER" if (_is_staging_env or _is_experiment_env) else "LIVE"
+                    if st.button(
+                        f"🚀 Execute {'LONG' if _ov_dir == 'BUY' else 'SHORT'} {asset_name} from Chart ({_ch_env_lbl})",
+                        key=f"btn_ch_exec_{selected_pair}",
+                        type="primary",
+                        disabled=not _ch_valid_lvls,
+                        use_container_width=True,
+                    ):
+                        _ch_sig_payload = {
+                            "signal": "LONG" if _ov_dir == "BUY" else "SHORT",
+                            "direction": _ov_dir,
+                            "strategy_id": _ch_sid,
+                            "entry": _ov_entry,
+                            "stop_loss": _ov_sl,
+                            "tp1": _ov_tp1,
+                            "tp2": _ov_tp2,
+                            "tp1_book_frac": _ov_tp1_pct / 100.0,
+                            "order_type": "market_order" if "Market" in _ch_ord_type else "limit_order",
+                            "manual_override": True,
+                            "levels": levels,
+                            "trigger_reason": f"Chart Trade ({chart_strategy} • {_ch_ord_type})",
+                        }
+                        _ok_ch, _msg_ch, _ = coindcx_engine.execute_autotrade_two_entry_signal(
+                            pair=selected_pair,
+                            sig=_ch_sig_payload,
+                            single_trade_margin_inr=float(_ch_margin),
+                            leverage=int(_ch_lev),
+                            usd_inr=float(usd_inr),
+                        )
+                        if _ok_ch:
+                            get_cached_positions.clear()
+                            get_cached_open_orders.clear()
+                            get_cached_balance.clear()
+                            st.session_state["chart_trade_banner"] = ("success", f"🚀 **Chart Trade Executed ({asset_name}):** {_msg_ch}")
+                            st.rerun()
+                        else:
+                            st.error(f"❌ Chart Trade Failed: {_msg_ch}")
+
+            with ch_plot_col:
+                fig = go.Figure()
+
+                if show_box_levels:
+                    fig.add_hrect(y0=levels["RH"], y1=levels["SH"], fillcolor="rgba(239,68,68,0.08)", line_width=0, layer="below")
+                    fig.add_hrect(y0=levels["SL"], y1=levels["RL"], fillcolor="rgba(16,185,129,0.08)", line_width=0, layer="below")
+
+                # Risk & Reward shaded zones directly on chart (CoinDCX style)
+                if _ov_entry > 0 and _ov_tp2 > 0:
+                    fig.add_hrect(
+                        y0=min(_ov_entry, _ov_tp2), y1=max(_ov_entry, _ov_tp2),
+                        fillcolor="rgba(16,185,129,0.11)", line_width=0, layer="below",
+                    )
+                if _ov_entry > 0 and _ov_sl > 0:
+                    fig.add_hrect(
+                        y0=min(_ov_entry, _ov_sl), y1=max(_ov_entry, _ov_sl),
+                        fillcolor="rgba(239,68,68,0.12)", line_width=0, layer="below",
+                    )
+
+                fig.add_trace(go.Candlestick(
+                    x=ts_series, open=df_chart["open"], high=df_chart["high"], low=df_chart["low"], close=df_chart["close"],
+                    name=f"{asset_name} ({active_tf})",
+                    increasing_line_color=candle_up, increasing_fillcolor=candle_up,
+                    decreasing_line_color=candle_down, decreasing_fillcolor=candle_down,
+                ))
+
+                # Strategy-specific EMA & VWAP Curves + Crossover Markers
+                if chart_strategy == "⚡ 9/21 EMA Crossover":
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["EMA9_CALC"], mode="lines", name="9 EMA", line=dict(color="#06b6d4", width=2.0)))
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["EMA21_CALC"], mode="lines", name="21 EMA", line=dict(color="#f97316", width=2.0)))
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["EMA50_CALC"], mode="lines", name="50 EMA", line=dict(color="#8b5cf6", width=1.4, dash="dot")))
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["VWAP_CALC"], mode="lines", name="Session VWAP", line=dict(color="#14b8a6", width=1.4, dash="dash")))
+                    _c9_up = _ema9_21_plan.get("cross_up_idx") or []
+                    _c9_dn = _ema9_21_plan.get("cross_dn_idx") or []
+                    if _c9_up:
+                        fig.add_trace(go.Scatter(
+                            x=[ts_series.iloc[i] for i in _c9_up],
+                            y=[float(df_chart["low"].iloc[i]) * 0.996 for i in _c9_up],
+                            mode="markers", name="9>21 Bull Cross",
+                            marker=dict(symbol="triangle-up", size=11, color="#10b981", line=dict(color="#ffffff", width=1)),
+                        ))
+                    if _c9_dn:
+                        fig.add_trace(go.Scatter(
+                            x=[ts_series.iloc[i] for i in _c9_dn],
+                            y=[float(df_chart["high"].iloc[i]) * 1.004 for i in _c9_dn],
+                            mode="markers", name="9<21 Bear Cross",
+                            marker=dict(symbol="triangle-down", size=11, color="#ef4444", line=dict(color="#ffffff", width=1)),
+                        ))
+                elif chart_strategy == "📈 50/200 EMA Crossover":
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["EMA50_CALC"], mode="lines", name="50 EMA", line=dict(color="#8b5cf6", width=2.3)))
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["EMA200_CALC"], mode="lines", name="200 EMA", line=dict(color="#f59e0b", width=2.3)))
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["VWAP_CALC"], mode="lines", name="Session VWAP", line=dict(color="#14b8a6", width=1.3, dash="dot")))
+                    _e50_s = df_chart["EMA50_CALC"].tolist()
+                    _e200_s = df_chart["EMA200_CALC"].tolist()
+                    _g_idx = [i for i in range(1, len(_e50_s)) if _e50_s[i - 1] <= _e200_s[i - 1] and _e50_s[i] > _e200_s[i]]
+                    _d_idx = [i for i in range(1, len(_e50_s)) if _e50_s[i - 1] >= _e200_s[i - 1] and _e50_s[i] < _e200_s[i]]
+                    if _g_idx:
+                        fig.add_trace(go.Scatter(
+                            x=[ts_series.iloc[i] for i in _g_idx],
+                            y=[float(df_chart["low"].iloc[i]) * 0.995 for i in _g_idx],
+                            mode="markers", name="Golden Cross (50>200)",
+                            marker=dict(symbol="triangle-up", size=12, color="#10b981", line=dict(color="#ffffff", width=1)),
+                        ))
+                    if _d_idx:
+                        fig.add_trace(go.Scatter(
+                            x=[ts_series.iloc[i] for i in _d_idx],
+                            y=[float(df_chart["high"].iloc[i]) * 1.005 for i in _d_idx],
+                            mode="markers", name="Death Cross (50<200)",
+                            marker=dict(symbol="triangle-down", size=12, color="#ef4444", line=dict(color="#ffffff", width=1)),
+                        ))
+                else:
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["EMA50_CALC"], mode="lines", name="50 EMA", line=dict(color="#8b5cf6", width=1.8)))
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["EMA200_CALC"], mode="lines", name="200 EMA", line=dict(color="#f59e0b", width=1.8, dash="dot")))
+                    fig.add_trace(go.Scatter(x=ts_series, y=df_chart["VWAP_CALC"], mode="lines", name="Session VWAP", line=dict(color="#14b8a6", width=1.5, dash="dash")))
+
+                if show_box_levels:
+                    for lbl, key_l, col_l, dsh in [
+                        ("SH", "SH", "#ef4444", "dash"),
+                        ("RH", "RH", "#f97316", "solid"),
+                        ("MID", "MID", "#0284c7", "dot"),
+                        ("RL", "RL", "#10b981", "solid"),
+                        ("SL", "SL", "#059669", "dash"),
+                    ]:
+                        fig.add_hline(
+                            y=levels[key_l], line_dash=dsh, line_color=col_l, line_width=1.4, opacity=0.75,
+                            annotation_text=f"<b>{lbl}: {fmt_px(levels[key_l])}</b>",
+                            annotation_position="top left" if key_l in ("SH", "RH", "MID") else "bottom left",
+                            annotation_bgcolor=col_l, annotation_font=dict(size=9, color="#ffffff"),
+                        )
+
+                # Highlight Live Adjustable ENTRY, TP1, TP2, SL Lines on the right axis
+                if _ov_entry > 0:
+                    _ent_tag = "POS ENTRY" if _ov_is_pos else f"{'LONG' if _ov_dir == 'BUY' else 'SHORT'} ENTRY"
+                    fig.add_hline(
+                        y=_ov_entry, line_dash="solid", line_color="#3b82f6", line_width=2.4,
+                        annotation_text=f"<b>{_ent_tag}: {fmt_px(_ov_entry)}</b>",
+                        annotation_position="top right", annotation_bgcolor="#2563eb",
+                        annotation_font=dict(size=10, color="#ffffff"),
+                    )
+                if _ov_tp1 > 0:
+                    fig.add_hline(
+                        y=_ov_tp1, line_dash="dash", line_color="#0ea5e9", line_width=2.0,
+                        annotation_text=f"<b>TP1 ({_ov_tp1_pct}%): {fmt_px(_ov_tp1)}</b>",
+                        annotation_position="top right", annotation_bgcolor="#0284c7",
+                        annotation_font=dict(size=10, color="#ffffff"),
+                    )
+                if _ov_tp2 > 0:
+                    fig.add_hline(
+                        y=_ov_tp2, line_dash="solid", line_color="#10b981", line_width=2.2,
+                        annotation_text=f"<b>TP2 ({100 - _ov_tp1_pct}%): {fmt_px(_ov_tp2)}</b>",
+                        annotation_position="top right", annotation_bgcolor="#059669",
+                        annotation_font=dict(size=10, color="#ffffff"),
+                    )
+                if _ov_sl > 0:
+                    fig.add_hline(
+                        y=_ov_sl, line_dash="solid", line_color="#ef4444", line_width=2.2,
+                        annotation_text=f"<b>SL: {fmt_px(_ov_sl)}</b>",
+                        annotation_position="bottom right", annotation_bgcolor="#dc2626",
+                        annotation_font=dict(size=10, color="#ffffff"),
+                    )
+
+                if live_price > 0:
+                    fig.add_hline(
+                        y=live_price, line_dash="dot", line_color="#94a3b8", line_width=1.4,
+                        annotation_text=f"LIVE {fmt_px(live_price)}",
+                        annotation_position="bottom right", annotation_bgcolor="#475569",
+                        annotation_font=dict(size=9, color="#ffffff"),
+                    )
+
+                fig.update_layout(
+                    height=560,
+                    template="plotly_dark" if not is_light_theme else "plotly_white",
+                    paper_bgcolor=plot_paper, plot_bgcolor=plot_bg,
+                    showlegend=True,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0, font=dict(size=10)),
+                    xaxis=dict(rangeslider=dict(visible=False), gridcolor=plot_grid, tickfont=dict(color=axis_font, size=10)),
+                    yaxis=dict(gridcolor=plot_grid, side="right", tickfont=dict(color=axis_font, size=10)),
+                    margin=dict(l=8, r=12, t=28, b=12),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
+                if chart_strategy == "⚡ 9/21 EMA Crossover":
+                    st.caption(
+                        f"⚡ **9/21 EMA Status ({active_tf}):** **{_ema9_21_plan.get('trend', 'FLAT')}** • "
+                        f"9 EMA `{fmt_px(_ema9_21_plan.get('ema9'))}` | 21 EMA `{fmt_px(_ema9_21_plan.get('ema21'))}` | 50 EMA `{fmt_px(_ema9_21_plan.get('ema50'))}`"
+                    )
         else:
             st.error(f"Could not load {active_tf} candles for {selected_pair}.")
     else:
@@ -3432,7 +4334,7 @@ elif active_section == "🧪 Backtest":
         key="bt_multi_strat_mode",
     )
     bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days"], index=0, key="bt_multi_dur")
-    _default_bt_wallet = max(1000.0, round(float(wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
+    _default_bt_wallet = max(1000.0, round(float(autotrade_wallet_inr or wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
     bt_wallet_inr = bc2.number_input(
         "Starting Funds / Wallet (₹)",
         min_value=1000.0,
@@ -3508,6 +4410,7 @@ elif active_section == "🧪 Backtest":
                 daily_loss_stop_pct=float(bt_sl_threshold_pct),
                 enforce_free_margin_guard=bool(bt_free_margin_guard),
                 use_fixed_risk_sizing=bool(bt_fixed_risk_cap),
+                risk_per_trade_pct=float(risk_per_trade_pct),
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 

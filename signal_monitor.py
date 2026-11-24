@@ -370,27 +370,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     })
                     continue
 
-                # 3-Layer Intraday Trend Stack Box Guard (protects Box mean-reversion against intraday trends/CHoCH)
-                if s.id == "box_theory":
-                    try:
-                        _mkt_i_m = str((eng.compute_market_regime() or {}).get("intraday_regime", "CHOP_RANGE"))
-                        _p_st_m = eng.compute_pair_intraday_trend_stack(pair) or {}
-                        _coin_i_m = str(_p_st_m.get("regime", "CHOP_RANGE"))
-                        _ch_m = str(_p_st_m.get("s1_choch", "NONE"))
-                        _d_m = "LONG" if str(sig.get("signal", "")).upper() in ("LONG", "BUY") else "SHORT"
-                        if (
-                            (_d_m == "SHORT" and (_mkt_i_m == "CLEAN_UPTREND" or _coin_i_m == "CLEAN_UPTREND" or _ch_m == "BULLISH_CHOCH"))
-                            or (_d_m == "LONG" and (_mkt_i_m == "CLEAN_DOWNTREND" or _coin_i_m == "CLEAN_DOWNTREND" or _ch_m == "BEARISH_CHOCH"))
-                        ):
-                            results.append({
-                                **row,
-                                "signal": None,
-                                "message": f"blocked by 3-Layer Intraday Trend Guard (Mkt15m={_mkt_i_m}, Coin={_coin_i_m}, 1H CHoCH={_ch_m})",
-                            })
-                            continue
-                    except Exception:
-                        pass
-
                 # 1-Crypto-at-a-Time Guard: If any crypto is already active, do not alert/open another crypto
                 if portfolio_occupied and active_Slot_pair and _canon_pair(active_Slot_pair) != pair_base:
                     results.append({
@@ -584,3 +563,48 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         _LAST_SCAN_CACHE["results"] = list(results)
         _LAST_SCAN_CACHE["ts"] = time.time()
         return results
+
+
+def scan_manual_intraday_signals(
+    pairs: list[str],
+    margin_inr: float = 10000.0,
+    leverage: int = 10,
+    usd_inr: float = 85.0,
+) -> list[dict]:
+    """
+    Read-only manual trading scanner powered by `exp-staging-intraday-score-router`:
+    Evaluates every watchlist coin with per-coin intraday score (-4..+4) + ADX(14) + Daily risk weighting
+    (`1.0x / 0.8x / 0.6x` & `70%` Counter-Daily TP1) and tags whether each setup also passes strict v41
+    AutoTrade eligibility. Never places automated orders.
+    """
+    auto_cfg = eng.get_autotrade_config()
+    auto_mode = strat_registry.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
+    out = []
+    for pair in (pairs or []):
+        try:
+            info = strat_registry.evaluate_manual_intraday_setup(
+                pair=pair,
+                margin_inr=float(margin_inr or 10000.0),
+                leverage=int(leverage or 10),
+                usd_inr=float(usd_inr or 85.0),
+            )
+            lsig = info.get("live_signal")
+            strict_ok = False
+            if isinstance(lsig, dict) and lsig.get("signal") in ("LONG", "SHORT"):
+                d_b = str(info.get("daily_bias") or "NEUTRAL").upper()
+                d_dir = str(lsig["signal"]).upper()
+                bias_ok = not ((d_b == "BEARISH" and d_dir != "SHORT") or (d_b == "BULLISH" and d_dir != "LONG"))
+                strict_ok = bool(
+                    bias_ok
+                    and _autotrade_signal_eligible(
+                        str(lsig.get("strategy_id") or "box_theory"),
+                        d_dir,
+                        auto_mode,
+                        levels=info.get("levels"),
+                    )
+                )
+            info["strict_v41_autotrade_eligible"] = strict_ok
+            out.append(info)
+        except Exception as e:
+            out.append({"pair": pair, "error": str(e), "policy": {}, "live_signal": None, "prefill_ticket": None, "strict_v41_autotrade_eligible": False})
+    return out

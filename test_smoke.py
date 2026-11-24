@@ -2255,8 +2255,8 @@ def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
     print("  -> PASS: Daemon v37/v38/v39 (Concurrent Slots, Auto-Split, 00:00 UTC Reset, Unrealized SL Pause & E0b/E0 Sizing Toggle) verified!")
 
 
-def test_19_v41_3layer_box_guard_and_3_safety_fixes():
-    print("[19/19] Verifying v41 + 3-Layer Intraday Trend Stack Box Guard & 3 Live-Engine Safety Fixes...")
+def test_19_v41_strict_autotrade_and_3_safety_fixes():
+    print("[19/20] Verifying Strict v41 (main) AutoTrade Parity, 3-Layer Telemetry & 3 Live-Engine Safety Fixes...")
     import time
     import tempfile
     import pandas as pd
@@ -2264,7 +2264,7 @@ def test_19_v41_3layer_box_guard_and_3_safety_fixes():
     import coindcx_engine as eng
     import strategies as strat
 
-    # 1. Wilder ADX + 3-Layer Stack detects CLEAN_UPTREND on HH/HL rally & blocks counter-trend Box SHORT
+    # 1. Wilder ADX + 3-Layer Stack telemetry still computes CLEAN_UPTREND on HH/HL rally (for Manual Intraday Router)
     import math
     n_bars = 160
     t0 = 1795305600000
@@ -2284,15 +2284,14 @@ def test_19_v41_3layer_box_guard_and_3_safety_fixes():
     clean_ups = [x for x in st_up[-24:] if x["regime"] == "CLEAN_UPTREND"]
     assert clean_ups and clean_ups[-1]["s1_struct"] == "UP" and clean_ups[-1]["vwap_state"] == "BULL_VWAP" and clean_ups[-1]["adx"] > 20.0, st_up[-1]
 
-    # BoxPlusEma50200Strategy blocks Box SHORT during Chop when 3-Layer Intraday is CLEAN_UPTREND (or BULLISH_CHOCH),
-    # while leaving Strategy 4 (15m 50/200 EMA) in STRONG_UPTREND completely untouched!
+    # Strict v41 (main) AutoTrade Parity: BoxPlusEma50200Strategy MUST NOT block Box SHORT with 3-Layer Box Guard
+    # during RANGING_CHOP (3-Layer & Intraday Score Router are strictly for Manual Signals/Execute, not AutoTrade!)
     combo = strat.STRATEGY_REGISTRY["box_plus_ema50_200_regime"]
     fake_box_short = {"signal": "SHORT", "strategy_id": "box_theory", "entry": 100.0, "stop_loss": 101.5, "tp1": 98.5, "tp2": 97.0, "levels": {"daily_close": 95.0, "EMA50": 100.0}}
     with patch.object(combo.s1, "evaluate_signal", return_value=fake_box_short), \
-         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CLEAN_UPTREND"}), \
-         patch.object(eng, "compute_pair_intraday_trend_stack", return_value={"regime": "CHOP_RANGE", "s1_choch": "NONE"}):
-        res_blk = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
-        assert res_blk["signal"] == "NEUTRAL" and "3-Layer Intraday Trend Guard" in res_blk["trigger_reason"], res_blk
+         patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "intraday_regime": "CLEAN_UPTREND"}):
+        res_v41_box = combo.evaluate_signal("B-SOL_USDT", levels={"RH": 101.0, "RL": 97.0, "MID": 99.0, "SH": 102.0, "SL": 96.0})
+        assert res_v41_box["signal"] == "SHORT" and res_v41_box["strategy_id"] == "box_theory", res_v41_box
 
     fake_s4_long = {"signal": "LONG", "strategy_id": "ema50_200", "entry": 100.0, "stop_loss": 99.0, "tp1": 101.5, "tp2": 103.0}
     with patch.object(combo.s4, "evaluate_signal", return_value=fake_s4_long), \
@@ -2316,12 +2315,14 @@ def test_19_v41_3layer_box_guard_and_3_safety_fixes():
             with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[{
                 "id": "pos_btc_9h", "pair": "B-BTC_USDT", "direction": "SHORT", "quantity": 0.001,
                 "entry_price": 61271.1, "mark_price": 61300.0, "leverage": 10, "stop_loss": 62928.5, "take_profit": 58746.1,
-            }]), patch.object(eng, "fetch_live_ticker", return_value={"last_price": 61300.0}):
+            }]), patch.object(eng, "fetch_live_ticker", return_value={"last_price": 61300.0}), \
+                 patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)):
                 eng.get_active_portfolio_trade_status(manage_exchange=True)
                 assert "B-BTC_USDT" in eng._get_active_locks_map(), "9h-old open live position lock must NOT expire!"
             # API returns None (error): MUST also preserve lock (never wipe on transient error)!
             with patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=None), \
-                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 61300.0}):
+                 patch.object(eng, "fetch_live_ticker", return_value={"last_price": 61300.0}), \
+                 patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)):
                 eng.get_active_portfolio_trade_status(manage_exchange=True)
                 assert "B-BTC_USDT" in eng._get_active_locks_map(), "Live lock must NOT expire when API returns None!"
 
@@ -2346,7 +2347,134 @@ def test_19_v41_3layer_box_guard_and_3_safety_fixes():
         time.sleep(0.15)
         assert written_states and written_states[-1]["daily_loss_stop_hit"] == "2026-11-23" and written_states[-1]["active_trade_locks"] == {}, written_states
 
-    print("  -> PASS: v41 + 3-Layer Intraday Trend Stack Box Guard & All 3 Live-Engine Safety Fixes verified!")
+    print("  -> PASS: Strict v41 (main) AutoTrade Parity & All 3 Live-Engine Safety Fixes verified!")
+
+
+def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
+    print("[20/20] Verifying AutoTrade Wallet, Manual Intraday Score Router Prefill & CoinDCX-Style Chart Trading...")
+    import math
+    import time
+    import tempfile
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+
+    # 1. Verify UI controls & durable keys
+    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as fh:
+        app_src = fh.read()
+    assert '"💼 AutoTrade Wallet (INR)"' in app_src
+    assert '"Risk per Trade (% of AutoTrade Wallet)"' in app_src
+    assert "exp-staging-intraday-score-router" in app_src
+    assert '"📦 Box Theory Sweep"' in app_src
+    assert '"📈 50/200 EMA Crossover"' in app_src
+    assert '"⚡ 9/21 EMA Crossover"' in app_src
+    assert '"✏️ Update SL / TP on Position"' in app_src
+    assert "healthcheck" in app_src
+    assert "autotrade_wallet_inr" in eng._DURABLE_AUTOTRADE_KEYS
+    assert "risk_per_trade_pct" in eng._DURABLE_AUTOTRADE_KEYS
+
+    # 2. Verify AutoTrade Wallet drives Single-Trade Margin & is preserved across CoinDCX balance sync
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "_persist_autotrade_state_bg", return_value=None):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng.save_autotrade_config({
+                "wallet_balance_inr": 60000.0,
+                "autotrade_wallet_inr": 18000.0,
+                "max_concurrent_trades": 3,
+                "auto_split_wallet_by_slots": True,
+                "single_trade_margin_inr": 6000.0,
+            })
+            assert eng.get_effective_autotrade_wallet_inr() == 18000.0
+            # Exchange balance refreshes to Rs.75,000 -> Auto-Split MUST still divide AutoTrade Wallet Rs.18,000 / 3 = Rs.6,000!
+            def _fake_w75(method, url, payload=None, timeout=3.5):
+                return _MockResponse(200, [{"currency_short_name": "INR", "balance": "75000.0", "locked_balance": "0.0", "cross_user_margin": "0.0"}]), None
+            with patch.object(eng, "_send_coindcx_signed_request", side_effect=_fake_w75):
+                eng._fetch_coindcx_futures_balance_sync()
+            assert abs(float(eng.get_autotrade_config()["single_trade_margin_inr"]) - 6000.0) < 0.01
+
+            # 3. Verify Strict v41 AutoTrade blocks Counter-Daily LONG while Manual Override allows it with 70% TP1!
+            today_s = eng.get_crypto_trading_day_str()
+            bear_lvls = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72, "EMA50": 7.40, "EMA200": 7.80, "daily_close": 7.00}
+            counter_long_sig = {
+                "signal": "LONG", "strategy_id": "box_theory",
+                "entry": 6.85, "tp1": 7.15, "tp2": 7.45, "stop_loss": 6.68,
+                "levels": bear_lvls, "tp1_book_frac": 0.70, "size_mult": 0.60,
+            }
+            with patch.dict(os.environ, {"APP_ENV": "staging"}):
+                eng.save_autotrade_config({
+                    "paper_wallet_inr": 30000.0,
+                    "paper_starting_wallet_inr": 30000.0,
+                    "paper_daily_start_wallet": {"date": today_s, "inr": 30000.0},
+                    "autotrade_wallet_inr": 18000.0,
+                    "daily_loss_stop_hit": "",
+                    "active_trade_locks": {},
+                    "active_trade_lock": {},
+                    "max_concurrent_trades": 3,
+                    "auto_split_wallet_by_slots": True,
+                    "single_trade_margin_inr": 6000.0,
+                })
+                with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 6.85, "bid": 6.849, "ask": 6.851}), \
+                     patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+                     patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.5}), \
+                     patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
+                     patch.object(eng, "get_coindcx_live_usdt_inr_rate", return_value=95.0), \
+                     patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+                    # AutoTrade (no manual_override) MUST reject Counter-Daily LONG via Daily Bias Guard!
+                    ok_auto_blk, msg_auto_blk, _ = eng.execute_autotrade_two_entry_signal(
+                        pair="B-APT_USDT", sig=counter_long_sig, single_trade_margin_inr=6000.0, leverage=10,
+                    )
+                    assert (not ok_auto_blk) and "Daily Bias Guard" in msg_auto_blk, (ok_auto_blk, msg_auto_blk)
+
+                    # Manual Override (from Signals/Execute/Chart) MUST succeed & persist tp1_book_frac = 0.70!
+                    ok_man, msg_man, det_man = eng.execute_autotrade_two_entry_signal(
+                        pair="B-APT_USDT", sig={**counter_long_sig, "manual_override": True}, single_trade_margin_inr=3600.0, leverage=10,
+                    )
+                    assert ok_man, (ok_man, msg_man)
+                    lk_apt = eng._get_active_locks_map().get("B-APT_USDT")
+                    assert lk_apt and abs(float(lk_apt.get("tp1_book_frac", 0.0)) - 0.70) < 1e-4, lk_apt
+
+                    # 4. Chart Trading Paper Position Edit & Close
+                    ok_upd, _ = eng.update_app_paper_position_levels("B-APT_USDT", stop_loss=6.72, tp1=7.10, tp2=7.48)
+                    assert ok_upd
+                    lk_after_u = eng._get_active_locks_map().get("B-APT_USDT")
+                    assert abs(lk_after_u["stop_loss"] - 6.72) < 1e-4 and abs(lk_after_u["tp1"] - 7.10) < 1e-4
+                    ok_cls, _, cls_det = eng.close_app_paper_position("B-APT_USDT", exit_price=7.12, reason="Chart Test Exit")
+                    assert ok_cls and cls_det.get("net_pnl_inr", 0.0) > 0 and "B-APT_USDT" not in eng._get_active_locks_map(), cls_det
+
+    # 5. Manual Intraday Router (`evaluate_manual_intraday_setup` & `scan_manual_intraday_signals`)
+    # APT +4 Bullish Intraday vs Daily BEARISH -> Counter-Daily 0.60x size & 70% TP1 prefilled ticket!
+    fake_stack_bull4 = {"s4_struct": "UP", "s1_struct": "CHOP", "s1_choch": "BULLISH_CHOCH", "vwap_state": "BULL_VWAP", "ema_state": "BULL_EMA", "adx": 22.4}
+    fake_lvls_bear = {"trend_bias": "BEARISH", "RH": 1.15, "RL": 1.00, "MID": 1.075, "SH": 1.18, "SL": 0.97, "EMA50": 1.20, "EMA200": 1.35, "daily_close": 1.06}
+    with patch.object(eng, "compute_pair_intraday_trend_stack", return_value=fake_stack_bull4), \
+         patch.object(eng, "calculate_daily_box_levels", return_value=fake_lvls_bear), \
+         patch.object(strat.STRATEGY_REGISTRY["ema50_200"], "compute_levels", return_value=fake_lvls_bear), \
+         patch.object(strat.STRATEGY_REGISTRY["ema50_200"], "evaluate_signal", return_value={"signal": "NEUTRAL"}), \
+         patch.object(strat.STRATEGY_REGISTRY["box_theory"], "evaluate_signal", return_value={"signal": "NEUTRAL"}), \
+         patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.04}):
+        mi = strat.evaluate_manual_intraday_setup("B-APT_USDT", margin_inr=10000.0, leverage=10, usd_inr=90.0)
+        assert mi["policy"]["score"] == 4 and mi["policy"]["regime"] == "INTRADAY_UPTREND", mi["policy"]
+        assert abs(mi["policy"]["size_mult"] - 0.60) < 1e-4 and abs(mi["policy"]["tp1_book_frac"] - 0.70) < 1e-4
+        tk = mi["prefill_ticket"]
+        assert tk and tk["direction"] == "BUY" and abs(tk["suggested_margin_inr"] - 6000.0) < 1.0 and tk["entry"] > 0 and tk["stop_loss"] > 0 and tk["tp1"] > 0 and tk["tp2"] > 0, tk
+
+    # 6. 9/21 EMA Crossover Chart Plan
+    n_c = 60
+    t0 = 1795305600000
+    c_rows = []
+    for i in range(n_c):
+        val = 100.0 + 4.0 * math.sin(i / 6.0) + 0.1 * i
+        c_rows.append({"timestamp": t0 + i * 900_000, "open": val - 0.2, "high": val + 0.5, "low": val - 0.5, "close": val, "volume": 500.0})
+    df_c = pd.DataFrame(c_rows)
+    p921 = strat.compute_9_21_ema_crossover_plan("B-SOL_USDT", df_c, {"RH": 112.0, "RL": 95.0, "MID": 103.5, "SH": 114.0, "SL": 93.0}, live_price=105.0, margin_inr=6000.0, leverage=10, usd_inr=90.0)
+    assert p921["BUY"] and p921["SELL"], p921
+    assert p921["BUY"]["stop_loss"] < p921["BUY"]["entry"] < p921["BUY"]["tp1"] <= p921["BUY"]["tp2"], p921["BUY"]
+    assert p921["SELL"]["stop_loss"] > p921["SELL"]["entry"] > p921["SELL"]["tp1"] >= p921["SELL"]["tp2"], p921["SELL"]
+    assert (len(p921["cross_up_idx"]) + len(p921["cross_dn_idx"])) >= 1, p921
+
+    print("  -> PASS: AutoTrade Wallet, Manual Intraday Score Router Prefill & CoinDCX-Style Chart Trading verified!")
 
 
 if __name__ == "__main__":
@@ -2368,7 +2496,8 @@ if __name__ == "__main__":
     test_16_three_tier_main_staging_experiment_parity()
     test_17_v36_six_sl_reduction_fixes()
     test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
-    test_19_v41_3layer_box_guard_and_3_safety_fixes()
+    test_19_v41_strict_autotrade_and_3_safety_fixes()
+    test_20_autotrade_wallet_intraday_manual_and_chart_trading()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
