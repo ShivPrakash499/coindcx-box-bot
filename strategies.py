@@ -1869,11 +1869,14 @@ def _detect_ema50_200_setup(
     allow_bear: bool = True,
     allow_bull: bool = True,
     allowed_dirs: list[str] | None = None,
+    allow_box_extension: bool = False,
 ) -> dict | None:
     """
     Shared 15m 50/200 EMA Pullback detection (100% live <-> backtest parity):
-      - Strict v41 AutoTrade (`allowed_dirs=None`): follows Daily Bias (`BEARISH` -> SHORT, `BULLISH` -> LONG).
-      - Manual Intraday Score Router (`allowed_dirs` passed): evaluates requested intraday directions cleanly.
+      - Strict v41 AutoTrade (`allowed_dirs=None`, `allow_box_extension=False`): follows Daily Bias & strict Box Floor/Ceiling -> RL/RH.
+      - Manual Intraday Score Router (`allowed_dirs` passed, `allow_box_extension=True` when ADX >= 25):
+        also detects Breakdown Continuation (< SL) & Breakout Continuation (> SH) with 1.0R/2.0R targets (tagged `manual_only=True`,
+        STRICTLY excluded from Automated AutoTrade).
     """
     if idx < 6 or not box or len(prior_e50) < 4 or len(prior_e200) < 4:
         return None
@@ -1892,6 +1895,8 @@ def _detect_ema50_200_setup(
 
     rh = float(box.get("RH", 0.0) or 0.0)
     rl = float(box.get("RL", 0.0) or 0.0)
+    sh_edge = float(box.get("SH", 0.0) or 0.0)
+    sl_edge = float(box.get("SL", 0.0) or 0.0)
     e50 = float(ema50_val or 0.0)
     e200 = float(ema200_val or 0.0)
     if rh <= 0 or rl <= 0 or e50 <= 0 or e200 <= 0:
@@ -1925,21 +1930,57 @@ def _detect_ema50_200_setup(
                     and c_close < c_open
                     and ((c_close < p_close) or (c_rng > 0 and (u_wick / c_rng) >= 0.35))
                 )
-                if bear_rej and rl < c_close * 0.992:
+                in_box_short = bool(rl < c_close * 0.992)
+                ext_short = bool(allow_box_extension and (sl_edge > 0.0) and (c_close < sl_edge))
+                if bear_rej and (in_box_short or ext_short):
                     lb = min(idx, 12)
                     loc_low_3h = min(float(recs15[k]["low"]) for k in range(idx - lb, idx))
                     room_3h = c_close - loc_low_3h
                     box_w = max(1e-9, rh - rl)
                     z_pos = (c_close - rl) / box_w
-                    # 1. Bottom-of-Box Floor Guard (v34): never short in the extreme bottom 15% of the Daily Box [RL, RH],
-                    #    and in the bottom 35% require >=0.55% 3h structural room (prevents APT $0.4304 bottom-of-box traps).
-                    # 2. 3h Structure Guard: skip shorting directly into a 3h local double-bottom (<0.45% room).
-                    bottom_box_blocked = (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
+                    is_ext = (not in_box_short) and ext_short
+                    # 1. In-box Bottom-of-Box Floor Guard (v34): never short in extreme bottom 15% of [RL, RH];
+                    #    bypassed ONLY for confirmed Manual-Only Breakdown Continuation cleanly below SL (`c_close < SL`).
+                    # 2. 3h Structure Guard: always skip shorting directly into a 3h local double-bottom (<0.45% room).
+                    bottom_box_blocked = False if is_ext else (
+                        (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
+                    )
                     if not bottom_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = max(e200, reach_high) * 1.0025
                         # Minimum 0.65% SL floor (eliminates 0.40% routine altcoin wick stop-outs)
                         if ((stop_px - c_close) / c_close) < 0.0065:
                             stop_px = c_close * 1.0065
+                        sl_dist = stop_px - c_close
+                        if is_ext:
+                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
+                            tp1_src_lbl = "1.0R"
+                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
+                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
+                                tp1_src_lbl = "3h-SwingLow"
+                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
+                            tp2_px = c_close - rew_dist
+                            if tp2_px <= 0:
+                                return None
+                            tp1_px = c_close - tp1_dist
+                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            return {
+                                "direction": "SHORT",
+                                "entry": c_close,
+                                "entry2_sweep": 0.0,
+                                "stop": stop_px,
+                                "tp1": tp1_px,
+                                "tp2": tp2_px,
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
+                                "tp2_label": f"50% Runner @ 2.0R Breakdown (ref {tp2_roe:.0f}% ROE)",
+                                "reason": f"Bear 15m 50<200 EMA Breakdown Continuation (<SL) -> 1R/2R (TP1: {tp1_src_lbl})",
+                                "trigger_zone": "15m 50/200 EMA BREAKDOWN (<SL • Manual Only)",
+                                "strategy_tag": "Strategy 4 (15m 50/200 EMA Breakdown)",
+                                "ema50_15m": e50,
+                                "ema200_15m": e200,
+                                "is_box_extension": True,
+                                "manual_only": True,
+                            }
                         rew_dist = c_close - rl
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RL)"
@@ -1965,6 +2006,8 @@ def _detect_ema50_200_setup(
                                 "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
                                 "ema50_15m": e50,
                                 "ema200_15m": e200,
+                                "is_box_extension": False,
+                                "manual_only": False,
                             }
 
     if can_long and e50 > e200:
@@ -1982,21 +2025,52 @@ def _detect_ema50_200_setup(
                     and c_close > c_open
                     and ((c_close > p_close) or (c_rng > 0 and (l_wick / c_rng) >= 0.35))
                 )
-                if bull_rej and rh > c_close * 1.008:
+                in_box_long = bool(rh > c_close * 1.008)
+                ext_long = bool(allow_box_extension and (sh_edge > 0.0) and (c_close > sh_edge))
+                if bull_rej and (in_box_long or ext_long):
                     lb = min(idx, 12)
                     loc_high_3h = max(float(recs15[k]["high"]) for k in range(idx - lb, idx))
                     room_3h = loc_high_3h - c_close
                     box_w = max(1e-9, rh - rl)
                     z_top = (rh - c_close) / box_w
-                    # 1. Top-of-Box Ceiling Guard (v34): never buy in the extreme top 15% of the Daily Box [RL, RH],
-                    #    and in the top 35% require >=0.55% 3h structural room.
-                    # 2. 3h Structure Guard: skip longing directly into a 3h local double-top (<0.45% room).
-                    top_box_blocked = (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
+                    is_ext = (not in_box_long) and ext_long
+                    top_box_blocked = False if is_ext else (
+                        (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
+                    )
                     if not top_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = min(e200, reach_low) * 0.9975
                         # Minimum 0.65% SL floor (eliminates 0.40% routine altcoin wick stop-outs)
                         if ((c_close - stop_px) / c_close) < 0.0065:
                             stop_px = c_close * 0.9935
+                        sl_dist = c_close - stop_px
+                        if is_ext:
+                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
+                            tp1_src_lbl = "1.0R"
+                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
+                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
+                                tp1_src_lbl = "3h-SwingHigh"
+                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
+                            tp2_px = c_close + rew_dist
+                            tp1_px = c_close + tp1_dist
+                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            return {
+                                "direction": "LONG",
+                                "entry": c_close,
+                                "entry2_sweep": 0.0,
+                                "stop": stop_px,
+                                "tp1": tp1_px,
+                                "tp2": tp2_px,
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
+                                "tp2_label": f"50% Runner @ 2.0R Breakout (ref {tp2_roe:.0f}% ROE)",
+                                "reason": f"Bull 15m 50>200 EMA Breakout Continuation (>SH) -> 1R/2R (TP1: {tp1_src_lbl})",
+                                "trigger_zone": "15m 50/200 EMA BREAKOUT (>SH • Manual Only)",
+                                "strategy_tag": "Strategy 4 (15m 50/200 EMA Breakout)",
+                                "ema50_15m": e50,
+                                "ema200_15m": e200,
+                                "is_box_extension": True,
+                                "manual_only": True,
+                            }
                         rew_dist = rh - c_close
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RH)"
@@ -2022,6 +2096,8 @@ def _detect_ema50_200_setup(
                                 "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
                                 "ema50_15m": e50,
                                 "ema200_15m": e200,
+                                "is_box_extension": False,
+                                "manual_only": False,
                             }
 
     return None
@@ -2059,7 +2135,7 @@ class Ema50200PullbackStrategy(Strategy):
             lv["ema_15m_trend"] = "BEAR (50 < 200)" if e50 < e200 else ("BULL (50 > 200)" if e50 > e200 else "FLAT")
         return lv
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None, allow_box_extension=False):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
@@ -2100,19 +2176,23 @@ class Ema50200PullbackStrategy(Strategy):
         sig = _detect_ema50_200_setup(
             recs15, idx, levels, e50, e200, prior_e50, prior_e200,
             allow_bear=self.allow_bear, allow_bull=self.allow_bull,
-            allowed_dirs=allowed_dirs,
+            allowed_dirs=allowed_dirs, allow_box_extension=bool(allow_box_extension),
         )
         if sig:
             e_px = eng.round_asset_price(sig["entry"], ref_px)
             sl_px = eng.round_asset_price(sig["stop"], ref_px)
             tp1_px = eng.round_asset_price(sig["tp1"], ref_px)
             tp2_px = eng.round_asset_price(sig["tp2"], ref_px)
+            is_ext = bool(sig.get("is_box_extension", False))
             out.update({
                 "signal": sig["direction"],
                 "signal_kind": "EMA50_200",
                 "trigger_zone": sig["trigger_zone"],
                 "trigger_reason": sig["reason"],
-                "setup": f"{sig['direction']} 15m 50/200 EMA -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}",
+                "setup": (
+                    f"{sig['direction']} 15m 50/200 EMA {'Breakdown' if sig['direction'] == 'SHORT' else 'Breakout'} -> 1R/2R"
+                    if is_ext else f"{sig['direction']} 15m 50/200 EMA -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}"
+                ),
                 "entry": e_px,
                 "entry2_sweep": 0.0,
                 "stop_loss": sl_px,
@@ -2120,6 +2200,8 @@ class Ema50200PullbackStrategy(Strategy):
                 "tp2": tp2_px,
                 "tp1_label": sig["tp1_label"],
                 "tp2_label": sig["tp2_label"],
+                "is_box_extension": is_ext,
+                "manual_only": bool(sig.get("manual_only", False)),
             })
             out.update(position_metrics(pair, e_px, sl_px, tp1_px, tp2_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
         return self._stamp(out)
@@ -2141,28 +2223,47 @@ class Ema50200PullbackStrategy(Strategy):
             e200 = e50 * (1.012 if e50 < px else 0.988)
 
         rh, rl = float(levels["RH"]), float(levels["RL"])
+        sh_edge, sl_edge = float(levels.get("SH", 0.0) or 0.0), float(levels.get("SL", 0.0) or 0.0)
 
-        # SELL Limit Plan: entry near min(e50, live) / e50 ceiling, SL > e200, TP2 = RL
+        # SELL Limit Plan: entry near 15m 50 EMA ceiling, SL > 15m 200 EMA (>=0.65% floor); TP2 = RL in-box or 1R/2R on Breakdown (<SL)
         s_ent = eng.round_asset_price(e50, px)
-        s_sl = eng.round_asset_price(max(e200 * 1.0025, s_ent * 1.004), px)
-        s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
-        s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
-        s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
+        s_sl = eng.round_asset_price(max(e200 * 1.0025, s_ent * 1.0065), px)
+        s_is_ext = bool((sl_edge > 0.0) and (s_ent < sl_edge))
+        if s_is_ext:
+            s_sl_d = max(s_sl - s_ent, s_ent * 0.0065)
+            s_tp1 = eng.round_asset_price(s_ent - s_sl_d * 1.0, px)
+            s_tp2 = eng.round_asset_price(max(s_ent * 0.50, s_ent - s_sl_d * 2.0), px)
+            s_lbl = "SHORT 15m 50/200 EMA Breakdown -> 1R/2R (Manual Only)"
+        else:
+            s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
+            s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
+            s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
+            s_lbl = "SHORT at 15m 50 EMA -> RL"
         sell_setup = {
-            "direction": "SELL", "setup": "SHORT at 15m 50 EMA -> RL",
+            "direction": "SELL", "setup": s_lbl,
             "entry": s_ent, "entry2_sweep": 0.0, "stop_loss": s_sl, "tp1": s_tp1, "tp2": s_tp2,
+            "is_box_extension": s_is_ext, "manual_only": s_is_ext,
             **position_metrics(pair, s_ent, s_sl, s_tp1, s_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
         }
 
-        # BUY Limit Plan: entry near 15m 50 EMA floor, SL < 15m 200 EMA, TP2 = RH
+        # BUY Limit Plan: entry near 15m 50 EMA floor, SL < 15m 200 EMA (>=0.65% floor); TP2 = RH in-box or 1R/2R on Breakout (>SH)
         b_ent = eng.round_asset_price(e50, px)
-        b_sl = eng.round_asset_price(min(e200 * 0.9975, b_ent * 0.996), px)
-        b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
-        b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
-        b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
+        b_sl = eng.round_asset_price(min(e200 * 0.9975, b_ent * 0.9935), px)
+        b_is_ext = bool((sh_edge > 0.0) and (b_ent > sh_edge))
+        if b_is_ext:
+            b_sl_d = max(b_ent - b_sl, b_ent * 0.0065)
+            b_tp1 = eng.round_asset_price(b_ent + b_sl_d * 1.0, px)
+            b_tp2 = eng.round_asset_price(b_ent + b_sl_d * 2.0, px)
+            b_lbl = "LONG 15m 50/200 EMA Breakout -> 1R/2R (Manual Only)"
+        else:
+            b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
+            b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
+            b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
+            b_lbl = "LONG at 15m 50 EMA -> RH"
         buy_setup = {
-            "direction": "BUY", "setup": "LONG at 15m 50 EMA -> RH",
+            "direction": "BUY", "setup": b_lbl,
             "entry": b_ent, "entry2_sweep": 0.0, "stop_loss": b_sl, "tp1": b_tp1, "tp2": b_tp2,
+            "is_box_extension": b_is_ext, "manual_only": b_is_ext,
             **position_metrics(pair, b_ent, b_sl, b_tp1, b_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
         }
 
@@ -2259,6 +2360,7 @@ def _detect_ema21_pullback_setup(
     allow_bear: bool = True,
     allow_bull: bool = True,
     allowed_dirs: list[str] | None = None,
+    allow_box_extension: bool = False,
 ) -> dict | None:
     """
     Shared 15m 21 EMA Touch & Bounce detection (100% live <-> backtest parity, exact same guards as 50/200 EMA):
@@ -2267,9 +2369,11 @@ def _detect_ema21_pullback_setup(
       - Clean Trend Prior Guard: >= 3 of last 6 closes on trend side of 21 EMA and <= 1 close beyond 50 EMA wall.
       - Touch & Bounce / Rejection: current/prev candle touches 21 EMA without blowing through 50 EMA, then rejects
         back across 21 EMA with candle body & momentum/35% rejection wick.
-      - Bottom-of-Box Floor Guard (SHORT) / Top-of-Box Ceiling Guard (LONG) + 3h Structure Room Guard (>= 0.45%).
+      - Strict Mode (`allow_box_extension=False`): Bottom-of-Box Floor Guard / Top-of-Box Ceiling Guard -> RL / RH.
+      - Manual-Only Breakdown/Breakout Continuation (`allow_box_extension=True`, ADX >= 25): when price has cleanly
+        broken below `SL` (SHORT) or above `SH` (LONG) with >= 0.45% 3h room, uses 1.0R (3h-structure capped) / 2.0R
+        targets & tags `manual_only=True` (STRICTLY excluded from Automated AutoTrade).
       - SL Wall anchored beyond 15m 50 EMA with >= 0.65% minimum SL floor.
-      - 3h Structure-Capped TP1 (50% book, >= 0.60% min) -> TP2 Runner at opposite Daily Box edge (RL / RH).
     """
     if idx < 6 or not box or len(prior_e21) < 4 or len(prior_e50) < 4:
         return None
@@ -2288,6 +2392,8 @@ def _detect_ema21_pullback_setup(
 
     rh = float(box.get("RH", 0.0) or 0.0)
     rl = float(box.get("RL", 0.0) or 0.0)
+    sh_edge = float(box.get("SH", 0.0) or 0.0)
+    sl_edge = float(box.get("SL", 0.0) or 0.0)
     e9 = float(ema9_val or 0.0)
     e21 = float(ema21_val or 0.0)
     e50 = float(ema50_val or 0.0)
@@ -2322,17 +2428,54 @@ def _detect_ema21_pullback_setup(
                     and c_close < c_open
                     and ((c_close < p_close) or (c_rng > 0 and (u_wick / c_rng) >= 0.35))
                 )
-                if bear_rej and rl < c_close * 0.992:
+                in_box_short = bool(rl < c_close * 0.992)
+                ext_short = bool(allow_box_extension and (sl_edge > 0.0) and (c_close < sl_edge))
+                if bear_rej and (in_box_short or ext_short):
                     lb = min(idx, 12)
                     loc_low_3h = min(float(recs15[k]["low"]) for k in range(idx - lb, idx))
                     room_3h = c_close - loc_low_3h
                     box_w = max(1e-9, rh - rl)
                     z_pos = (c_close - rl) / box_w
-                    bottom_box_blocked = (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
+                    is_ext = (not in_box_short) and ext_short
+                    bottom_box_blocked = False if is_ext else (
+                        (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
+                    )
                     if not bottom_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = max(e50, reach_high) * 1.0025
                         if ((stop_px - c_close) / c_close) < 0.0065:
                             stop_px = c_close * 1.0065
+                        sl_dist = stop_px - c_close
+                        if is_ext:
+                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
+                            tp1_src_lbl = "1.0R"
+                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
+                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
+                                tp1_src_lbl = "3h-SwingLow"
+                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
+                            tp2_px = c_close - rew_dist
+                            if tp2_px <= 0:
+                                return None
+                            tp1_px = c_close - tp1_dist
+                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            return {
+                                "direction": "SHORT",
+                                "entry": c_close,
+                                "entry2_sweep": 0.0,
+                                "stop": stop_px,
+                                "tp1": tp1_px,
+                                "tp2": tp2_px,
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
+                                "tp2_label": f"50% Runner @ 2.0R Breakdown (ref {tp2_roe:.0f}% ROE)",
+                                "reason": f"Bear 15m 9<21<50 EMA Breakdown Continuation (<SL) -> 1R/2R (TP1: {tp1_src_lbl})",
+                                "trigger_zone": "15m 21 EMA BREAKDOWN (<SL • Manual Only)",
+                                "strategy_tag": "Strategy 5 (15m 21 EMA Breakdown)",
+                                "ema9_15m": e9,
+                                "ema21_15m": e21,
+                                "ema50_15m": e50,
+                                "is_box_extension": True,
+                                "manual_only": True,
+                            }
                         rew_dist = c_close - rl
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RL)"
@@ -2358,6 +2501,8 @@ def _detect_ema21_pullback_setup(
                                 "ema9_15m": e9,
                                 "ema21_15m": e21,
                                 "ema50_15m": e50,
+                                "is_box_extension": False,
+                                "manual_only": False,
                             }
 
     if can_long and e9 > e21 and e21 > e50:
@@ -2374,17 +2519,52 @@ def _detect_ema21_pullback_setup(
                     and c_close > c_open
                     and ((c_close > p_close) or (c_rng > 0 and (l_wick / c_rng) >= 0.35))
                 )
-                if bull_rej and rh > c_close * 1.008:
+                in_box_long = bool(rh > c_close * 1.008)
+                ext_long = bool(allow_box_extension and (sh_edge > 0.0) and (c_close > sh_edge))
+                if bull_rej and (in_box_long or ext_long):
                     lb = min(idx, 12)
                     loc_high_3h = max(float(recs15[k]["high"]) for k in range(idx - lb, idx))
                     room_3h = loc_high_3h - c_close
                     box_w = max(1e-9, rh - rl)
                     z_top = (rh - c_close) / box_w
-                    top_box_blocked = (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
+                    is_ext = (not in_box_long) and ext_long
+                    top_box_blocked = False if is_ext else (
+                        (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
+                    )
                     if not top_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = min(e50, reach_low) * 0.9975
                         if ((c_close - stop_px) / c_close) < 0.0065:
                             stop_px = c_close * 0.9935
+                        sl_dist = c_close - stop_px
+                        if is_ext:
+                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
+                            tp1_src_lbl = "1.0R"
+                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
+                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
+                                tp1_src_lbl = "3h-SwingHigh"
+                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
+                            tp2_px = c_close + rew_dist
+                            tp1_px = c_close + tp1_dist
+                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
+                            return {
+                                "direction": "LONG",
+                                "entry": c_close,
+                                "entry2_sweep": 0.0,
+                                "stop": stop_px,
+                                "tp1": tp1_px,
+                                "tp2": tp2_px,
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
+                                "tp2_label": f"50% Runner @ 2.0R Breakout (ref {tp2_roe:.0f}% ROE)",
+                                "reason": f"Bull 15m 9>21>50 EMA Breakout Continuation (>SH) -> 1R/2R (TP1: {tp1_src_lbl})",
+                                "trigger_zone": "15m 21 EMA BREAKOUT (>SH • Manual Only)",
+                                "strategy_tag": "Strategy 5 (15m 21 EMA Breakout)",
+                                "ema9_15m": e9,
+                                "ema21_15m": e21,
+                                "ema50_15m": e50,
+                                "is_box_extension": True,
+                                "manual_only": True,
+                            }
                         rew_dist = rh - c_close
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RH)"
@@ -2410,6 +2590,8 @@ def _detect_ema21_pullback_setup(
                                 "ema9_15m": e9,
                                 "ema21_15m": e21,
                                 "ema50_15m": e50,
+                                "is_box_extension": False,
+                                "manual_only": False,
                             }
 
     return None
@@ -2452,7 +2634,7 @@ class Ema21PullbackStrategy(Strategy):
             lv["ema_15m_trend"] = "BEAR (50 < 200)" if e50 < e200 else ("BULL (50 > 200)" if e50 > e200 else "FLAT")
         return lv
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None, allow_box_extension=False):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
@@ -2495,19 +2677,23 @@ class Ema21PullbackStrategy(Strategy):
         sig = _detect_ema21_pullback_setup(
             recs15, idx, levels, e9, e21, e50, prior_e21, prior_e50,
             allow_bear=self.allow_bear, allow_bull=self.allow_bull,
-            allowed_dirs=allowed_dirs,
+            allowed_dirs=allowed_dirs, allow_box_extension=bool(allow_box_extension),
         )
         if sig:
             e_px = eng.round_asset_price(sig["entry"], ref_px)
             sl_px = eng.round_asset_price(sig["stop"], ref_px)
             tp1_px = eng.round_asset_price(sig["tp1"], ref_px)
             tp2_px = eng.round_asset_price(sig["tp2"], ref_px)
+            is_ext = bool(sig.get("is_box_extension", False))
             out.update({
                 "signal": sig["direction"],
                 "signal_kind": "EMA21_PULLBACK",
                 "trigger_zone": sig["trigger_zone"],
                 "trigger_reason": sig["reason"],
-                "setup": f"{sig['direction']} 15m 21 EMA Bounce -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}",
+                "setup": (
+                    f"{sig['direction']} 15m 21 EMA {'Breakdown' if sig['direction'] == 'SHORT' else 'Breakout'} -> 1R/2R"
+                    if is_ext else f"{sig['direction']} 15m 21 EMA Bounce -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}"
+                ),
                 "entry": e_px,
                 "entry2_sweep": 0.0,
                 "stop_loss": sl_px,
@@ -2515,6 +2701,8 @@ class Ema21PullbackStrategy(Strategy):
                 "tp2": tp2_px,
                 "tp1_label": sig["tp1_label"],
                 "tp2_label": sig["tp2_label"],
+                "is_box_extension": is_ext,
+                "manual_only": bool(sig.get("manual_only", False)),
             })
             out.update(position_metrics(pair, e_px, sl_px, tp1_px, tp2_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
         return self._stamp(out)
@@ -2536,28 +2724,47 @@ class Ema21PullbackStrategy(Strategy):
             e50 = e21 * (1.010 if e21 < px else 0.990)
 
         rh, rl = float(levels["RH"]), float(levels["RL"])
+        sh_edge, sl_edge = float(levels.get("SH", 0.0) or 0.0), float(levels.get("SL", 0.0) or 0.0)
 
-        # SELL Limit Plan: entry near 15m 21 EMA ceiling, SL > 15m 50 EMA (>= 0.65% floor), TP2 = RL
+        # SELL Limit Plan: entry near 15m 21 EMA ceiling, SL > 15m 50 EMA (>= 0.65% floor); TP2 = RL in-box or 1R/2R on Breakdown (<SL)
         s_ent = eng.round_asset_price(e21, px)
         s_sl = eng.round_asset_price(max(e50 * 1.0025, s_ent * 1.0065), px)
-        s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
-        s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
-        s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
+        s_is_ext = bool((sl_edge > 0.0) and (s_ent < sl_edge))
+        if s_is_ext:
+            s_sl_d = max(s_sl - s_ent, s_ent * 0.0065)
+            s_tp1 = eng.round_asset_price(s_ent - s_sl_d * 1.0, px)
+            s_tp2 = eng.round_asset_price(max(s_ent * 0.50, s_ent - s_sl_d * 2.0), px)
+            s_lbl = "SHORT 15m 21 EMA Breakdown -> 1R/2R (SL 50 EMA • Manual Only)"
+        else:
+            s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
+            s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
+            s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
+            s_lbl = "SHORT at 15m 21 EMA -> RL (SL 50 EMA)"
         sell_setup = {
-            "direction": "SELL", "setup": "SHORT at 15m 21 EMA -> RL (SL 50 EMA)",
+            "direction": "SELL", "setup": s_lbl,
             "entry": s_ent, "entry2_sweep": 0.0, "stop_loss": s_sl, "tp1": s_tp1, "tp2": s_tp2,
+            "is_box_extension": s_is_ext, "manual_only": s_is_ext,
             **position_metrics(pair, s_ent, s_sl, s_tp1, s_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
         }
 
-        # BUY Limit Plan: entry near 15m 21 EMA floor, SL < 15m 50 EMA (>= 0.65% floor), TP2 = RH
+        # BUY Limit Plan: entry near 15m 21 EMA floor, SL < 15m 50 EMA (>= 0.65% floor); TP2 = RH in-box or 1R/2R on Breakout (>SH)
         b_ent = eng.round_asset_price(e21, px)
         b_sl = eng.round_asset_price(min(e50 * 0.9975, b_ent * 0.9935), px)
-        b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
-        b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
-        b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
+        b_is_ext = bool((sh_edge > 0.0) and (b_ent > sh_edge))
+        if b_is_ext:
+            b_sl_d = max(b_ent - b_sl, b_ent * 0.0065)
+            b_tp1 = eng.round_asset_price(b_ent + b_sl_d * 1.0, px)
+            b_tp2 = eng.round_asset_price(b_ent + b_sl_d * 2.0, px)
+            b_lbl = "LONG 15m 21 EMA Breakout -> 1R/2R (SL 50 EMA • Manual Only)"
+        else:
+            b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
+            b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
+            b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
+            b_lbl = "LONG at 15m 21 EMA -> RH (SL 50 EMA)"
         buy_setup = {
-            "direction": "BUY", "setup": "LONG at 15m 21 EMA -> RH (SL 50 EMA)",
+            "direction": "BUY", "setup": b_lbl,
             "entry": b_ent, "entry2_sweep": 0.0, "stop_loss": b_sl, "tp1": b_tp1, "tp2": b_tp2,
+            "is_box_extension": b_is_ext, "manual_only": b_is_ext,
             **position_metrics(pair, b_ent, b_sl, b_tp1, b_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
         }
 
@@ -2951,13 +3158,20 @@ def evaluate_manual_intraday_setup(
 
     live_sig = None
     two_sided = len(policy.get("allowed_dirs") or []) == 2
+    allow_manual_ext = bool(float(policy.get("adx", 0.0) or 0.0) >= 25.0)
     if policy["regime"] != "CONFLICT_WAIT" and policy["allowed_dirs"] and policy["strategies"]:
         for sid in policy["strategies"]:
             try:
                 if sid == "ema50_200":
-                    cand = s4.evaluate_signal(pair, lv, margin_inr, leverage, usd_inr, allowed_dirs=policy["allowed_dirs"])
+                    cand = s4.evaluate_signal(
+                        pair, lv, margin_inr, leverage, usd_inr,
+                        allowed_dirs=policy["allowed_dirs"], allow_box_extension=allow_manual_ext,
+                    )
                 elif sid == "ema21_pullback":
-                    cand = s5.evaluate_signal(pair, lv, margin_inr, leverage, usd_inr, allowed_dirs=policy["allowed_dirs"])
+                    cand = s5.evaluate_signal(
+                        pair, lv, margin_inr, leverage, usd_inr,
+                        allowed_dirs=policy["allowed_dirs"], allow_box_extension=allow_manual_ext,
+                    )
                 else:
                     cand = s1.evaluate_signal(pair, lv, margin_inr, leverage, usd_inr, allowed_dirs=policy["allowed_dirs"])
             except Exception:

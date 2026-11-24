@@ -596,8 +596,10 @@ def scan_manual_intraday_signals(
                 d_b = str(info.get("daily_bias") or "NEUTRAL").upper()
                 d_dir = str(lsig["signal"]).upper()
                 bias_ok = not ((d_b == "BEARISH" and d_dir != "SHORT") or (d_b == "BULLISH" and d_dir != "LONG"))
+                is_manual_ext = bool(lsig.get("is_box_extension") or lsig.get("manual_only"))
                 strict_ok = bool(
-                    bias_ok
+                    (not is_manual_ext)
+                    and bias_ok
                     and _autotrade_signal_eligible(
                         str(lsig.get("strategy_id") or "box_theory"),
                         d_dir,
@@ -684,11 +686,21 @@ def alert_manual_intraday_signals(
             tp1_pct = int(round(tp1_frac * 100))
             sugg_m = float(lsig.get("suggested_margin_inr") or max(500.0, float(margin_inr) * size_mult))
             base_sname = str(lsig.get("strategy_name") or strat_registry.get_strategy(sid).name)
-            strat_label = f"Manual Intraday ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
+            is_ext_sig = bool(lsig.get("is_box_extension") or lsig.get("manual_only"))
+            ext_lbl = ("Breakdown 1R/2R" if str(lsig.get("signal", "")).upper() == "SHORT" else "Breakout 1R/2R") if is_ext_sig else ""
+            strat_label = (
+                f"Manual {ext_lbl} ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
+                if is_ext_sig
+                else f"Manual Intraday ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
+            )
             strict_tag = (
-                "Also eligible under Strict v41 AutoTrade."
-                if item.get("strict_v41_autotrade_eligible")
-                else "Manual Only (Counter-Daily / Intraday Router — skipped by Strict v41 AutoTrade)."
+                "Manual Only — Breakdown/Breakout Continuation (1R/2R, excluded from AutoTrade)."
+                if is_ext_sig
+                else (
+                    "Also eligible under Strict v41 AutoTrade."
+                    if item.get("strict_v41_autotrade_eligible")
+                    else "Manual Only (Counter-Daily / Intraday Router — skipped by Strict v41 AutoTrade)."
+                )
             )
             note_txt = (
                 f"{strict_tag} Score {score_v:+d} | ADX {float(pol.get('adx', 0.0)):.1f} | "

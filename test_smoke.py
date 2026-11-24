@@ -2629,7 +2629,99 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
     assert "Directional Setups" not in app_src and "PREFILLED LIMIT PLAN" not in app_src
     assert "⚡ LIVE EXECUTABLE" in app_src
 
-    print("  -> PASS: AutoTrade Wallet, Margin Plan Deps, Manual Router, 24/7 Email Alerts, 15m 21 EMA Bounce, Tab Auth & Live-Only Signals verified!")
+    # 11. Option 2: Manual-Only Breakdown (<SL) & Breakout (>SH) Continuation (1R/2R) — Signals/Execute/Email ONLY, NEVER AutoTrade!
+    inj_box = {"RH": 7.024, "RL": 6.076, "SH": 7.121, "SL": 5.987, "MID": 6.550, "trend_bias": "BEARISH", "daily_close": 6.292, "EMA50": 7.274, "EMA200": 6.322}
+    inj_recs = [
+        {"open": 5.93, "high": 5.95, "low": 5.841, "close": 5.90},
+        {"open": 5.90, "high": 5.94, "low": 5.86, "close": 5.92},
+        {"open": 5.92, "high": 5.95, "low": 5.88, "close": 5.91},
+        {"open": 5.91, "high": 5.95, "low": 5.89, "close": 5.93},
+        {"open": 5.93, "high": 5.96, "low": 5.90, "close": 5.94},
+        {"open": 5.94, "high": 5.963, "low": 5.917, "close": 5.927},
+        {"open": 5.930, "high": 5.955, "low": 5.899, "close": 5.911},  # cleanly below SL=5.987, touches 21 EMA (5.949) & rejects red
+    ]
+    # 11A: Default / AutoTrade (`allow_box_extension=False`) MUST STILL BLOCK below SL!
+    assert strat._detect_ema21_pullback_setup(
+        inj_recs, 6, inj_box, ema9_val=5.926, ema21_val=5.949, ema50_val=6.040,
+        prior_e21=[5.955] * 6, prior_e50=[6.050] * 6, allow_bear=True, allow_bull=False,
+        allow_box_extension=False,
+    ) is None, "Strict AutoTrade mode must keep blocking EMA SHORT below SL"
+    # 11B: Manual Continuation (`allow_box_extension=True`) MUST TRIGGER cleanly below SL with 1R/2R & `manual_only=True`!
+    ext_s = strat._detect_ema21_pullback_setup(
+        inj_recs, 6, inj_box, ema9_val=5.926, ema21_val=5.949, ema50_val=6.040,
+        prior_e21=[5.955] * 6, prior_e50=[6.050] * 6, allow_bear=True, allow_bull=False,
+        allow_box_extension=True,
+    )
+    assert ext_s is not None and ext_s["direction"] == "SHORT", f"Expected breakdown continuation SHORT, got {ext_s}"
+    assert ext_s["is_box_extension"] is True and ext_s["manual_only"] is True
+    assert ext_s["stop"] > 6.040 and ext_s["tp1"] < ext_s["entry"] and ext_s["tp2"] < ext_s["tp1"]
+    # 11C: Inside the [SL, RL] sweep trap (`5.987 <= close <= 6.076`), MUST STILL BE BLOCKED even with `allow_box_extension=True`!
+    trap_recs = [dict(r, open=6.03, high=6.06, low=5.98, close=6.02) for r in inj_recs[:-1]] + [
+        {"open": 6.04, "high": 6.06, "low": 5.99, "close": 6.01}
+    ]
+    assert strat._detect_ema21_pullback_setup(
+        trap_recs, 6, inj_box, ema9_val=6.03, ema21_val=6.05, ema50_val=6.12,
+        prior_e21=[6.06] * 6, prior_e50=[6.13] * 6, allow_bear=True, allow_bull=False,
+        allow_box_extension=True,
+    ) is None, "Must block SHORT inside [SL, RL] sweep trap even when allow_box_extension=True"
+    # 11D: Mirror LONG Breakout Continuation cleanly above SH (`> 7.121`)
+    bull_box_ext = {"RH": 7.024, "RL": 6.076, "SH": 7.121, "SL": 5.987, "MID": 6.550, "trend_bias": "BULLISH"}
+    bull_ext_recs = [
+        {"open": 7.20, "high": 7.36, "low": 7.18, "close": 7.28},
+        {"open": 7.28, "high": 7.32, "low": 7.22, "close": 7.26},
+        {"open": 7.26, "high": 7.30, "low": 7.21, "close": 7.27},
+        {"open": 7.27, "high": 7.31, "low": 7.23, "close": 7.29},
+        {"open": 7.29, "high": 7.32, "low": 7.24, "close": 7.28},
+        {"open": 7.28, "high": 7.30, "low": 7.22, "close": 7.25},
+        {"open": 7.25, "high": 7.31, "low": 7.22, "close": 7.29},  # touches 21 EMA (7.23) & bounces green above SH (7.121)
+    ]
+    assert strat._detect_ema21_pullback_setup(
+        bull_ext_recs, 6, bull_box_ext, ema9_val=7.27, ema21_val=7.23, ema50_val=7.14,
+        prior_e21=[7.22] * 6, prior_e50=[7.13] * 6, allow_bear=False, allow_bull=True,
+        allow_box_extension=False,
+    ) is None
+    ext_l = strat._detect_ema21_pullback_setup(
+        bull_ext_recs, 6, bull_box_ext, ema9_val=7.27, ema21_val=7.23, ema50_val=7.14,
+        prior_e21=[7.22] * 6, prior_e50=[7.13] * 6, allow_bear=False, allow_bull=True,
+        allow_box_extension=True,
+    )
+    assert ext_l is not None and ext_l["direction"] == "LONG" and ext_l["is_box_extension"] is True and ext_l["manual_only"] is True
+    assert ext_l["stop"] < 7.14 and ext_l["tp1"] > ext_l["entry"] and ext_l["tp2"] > ext_l["tp1"]
+    # 11E: `execute_autotrade_two_entry_signal` HARD-BLOCKS `is_box_extension/manual_only` for AutoTrade (`manual_override=False`)
+    #      even if Sidebar mode is explicitly set to `ema21_pullback`!
+    ext_live_sig = {
+        "signal": "SHORT", "strategy_id": "ema21_pullback",
+        "entry": 5.911, "stop_loss": 6.055, "tp1": 5.845, "tp2": 5.623,
+        "levels": inj_box, "is_box_extension": True, "manual_only": True,
+    }
+    with patch.object(eng, "is_staging_environment", return_value=True), \
+         patch.object(eng, "is_experiment_environment", return_value=False), \
+         patch.object(eng, "get_autotrade_config", return_value={
+             "enabled": True, "paper_autotrade_enabled": True, "autotrade_strategy_mode": "ema21_pullback",
+             "autotrade_wallet_inr": 10000.0, "single_trade_margin_inr": 5000.0, "max_concurrent_trades": 2,
+             "active_trade_locks": {},
+         }), \
+         patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 18000.0, "available_inr": 18000.0}), \
+         patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
+         patch.object(eng, "fetch_coindcx_open_orders", return_value=[]), \
+         patch.object(eng, "fetch_live_ticker", return_value={"last_price": 5.911, "best_bid": 5.910, "best_ask": 5.912}), \
+         patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+         patch.object(eng, "check_unrealized_pnl_daily_sl_pause", return_value=(False, "", {})), \
+         patch.object(eng, "register_app_trade_lock", return_value={"pair": "B-INJ_USDT"}):
+        ok_at_ext, msg_at_ext, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-INJ_USDT", sig=ext_live_sig, single_trade_margin_inr=5000.0, leverage=10, usd_inr=90.0,
+        )
+        assert (not ok_at_ext) and ("Manual-Only Continuation Guard" in msg_at_ext), f"AutoTrade must block extension: {ok_at_ext} {msg_at_ext}"
+        ok_man_ext, msg_man_ext, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-INJ_USDT", sig={**ext_live_sig, "manual_override": True}, single_trade_margin_inr=5000.0, leverage=10, usd_inr=90.0,
+        )
+        assert ok_man_ext, f"Manual override must allow Breakdown Continuation execution: {msg_man_ext}"
+    # 11F: `plan_setups` on Execute tab outputs 1R/2R Breakdown plan when 21 EMA < SL
+    pl21_ext = s21.plan_setups("B-INJ_USDT", {**inj_box, "EMA21_15m": 5.949, "EMA50_15m": 6.040}, 5.911, 6000.0, 10, 90.0)
+    assert pl21_ext["SELL"]["is_box_extension"] is True and pl21_ext["SELL"]["manual_only"] is True
+    assert pl21_ext["SELL"]["tp2"] < pl21_ext["SELL"]["tp1"] < pl21_ext["SELL"]["entry"] < pl21_ext["SELL"]["stop_loss"]
+
+    print("  -> PASS: AutoTrade Wallet, Margin Plan Deps, Manual Router, 24/7 Email Alerts, 15m 21 EMA Bounce, Breakdown Continuation (Manual-Only), Tab Auth & Live-Only Signals verified!")
 
 
 if __name__ == "__main__":

@@ -2491,10 +2491,15 @@ if active_section == "⚡ Signals":
                 _mtp1_pct = int(round(_mtp1_frac * 100))
                 _msugg_m = round(max(500.0, float(_mtk.get("suggested_margin_inr") or (margin_inr * _msmult))), 2)
                 _m_counter = bool(_mtk.get("is_counter_daily", _mpol.get("is_counter_daily", False)))
+                _m_is_ext = bool(_mtk.get("is_box_extension") or _mtk.get("manual_only"))
                 _m_v41_tag = (
-                    "🤖 AutoTrade-Eligible (v41)"
-                    if _mi.get("strict_v41_autotrade_eligible")
-                    else ("✋ Manual Counter-Daily Relief Rally" if _m_counter else "✋ Manual Intraday Setup")
+                    f"✋ Manual {'Breakdown' if _mdir == 'SHORT' else 'Breakout'} Continuation (1R/2R • No AutoTrade)"
+                    if _m_is_ext
+                    else (
+                        "🤖 AutoTrade-Eligible (v41)"
+                        if _mi.get("strict_v41_autotrade_eligible")
+                        else ("✋ Manual Counter-Daily Relief Rally" if _m_counter else "✋ Manual Intraday Setup")
+                    )
                 )
                 _m_trig_txt = str(_mtk.get("trigger_reason") or _mtk.get("trigger_zone") or "").replace("$", "&#36;")
                 with st.container(border=True):
@@ -3132,7 +3137,7 @@ elif active_section == "🎯 Execute":
                     <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else f'{_tp1_eff_pct}% Limit Order -> SL Ratchet'}):</span>
                     <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
 
-                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else ('RL / RH Structural Target' if _sig_sid in ('ema50_200', 'ema21_pullback') else f'{_tp2_eff_pct}% Position TP Runner')}):</span>
+                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else (('2.0R Breakdown/Breakout Runner' if bool(active_trade.get('is_box_extension')) else 'RL / RH Structural Target') if _sig_sid in ('ema50_200', 'ema21_pullback') else f'{_tp2_eff_pct}% Position TP Runner')}):</span>
                     <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(_disp_trade['tp2'])} (+{_disp_trade['roe_tp2']}% ROE)</span>
 
                     <span style="color:{subtext_color};">{'Stop Loss (15m 200 EMA)' if _sig_sid == 'ema50_200' else ('Stop Loss (15m 50 EMA)' if _sig_sid == 'ema21_pullback' else 'Catastrophe Stop Loss (Position SL)')}:</span>
