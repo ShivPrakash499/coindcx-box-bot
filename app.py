@@ -736,6 +736,7 @@ else:
     st.sidebar.success("🟢 **MAIN LIVE** (`main` branch) — Production CoinDCX Live Trading → logs to **`Live_Trades`** / **`Closed_Trades`**.")
 
 wallet_data = dict(get_cached_balance() or {})
+_exchange_wallet_data = dict(wallet_data)
 _auto_cfg = coindcx_engine.get_autotrade_config()
 
 # Auto-mirror Main's exact Funds, Margin-per-Trade, Leverage & Strategy Mode ONCE on fresh Staging/Experiment boot
@@ -746,7 +747,8 @@ if (_is_staging_env or _is_experiment_env) and not st.session_state.get("_main_m
         or (_is_experiment_env and not _auto_cfg.get("synced_from_main_at"))
     )
     if _need_sync:
-        _ok_ms, _, _synced_cfg = coindcx_engine.sync_setup_from_main(reset_paper_wallet=False)
+        _boot_live_ov = float(_exchange_wallet_data.get("total_inr", 0.0) or 0.0) if _exchange_wallet_data.get("is_live_api") else 0.0
+        _ok_ms, _, _synced_cfg = coindcx_engine.sync_setup_from_main(reset_paper_wallet=False, live_wallet_override=_boot_live_ov)
         if _ok_ms and isinstance(_synced_cfg, dict):
             _auto_cfg = _synced_cfg
 
@@ -765,27 +767,46 @@ wallet_data["total_inr"] = _init_wallet_inr
 if float(wallet_data.get("available_inr", 0.0) or 0.0) in (0.0, 30000.0, 250000.0, 40569.80) and not wallet_data.get("is_paper_wallet"):
     wallet_data["available_inr"] = _init_wallet_inr
 
+_has_live_ex_wallet = bool(_exchange_wallet_data.get("is_live_api") and float(_exchange_wallet_data.get("total_inr", 0.0) or 0.0) > 0)
+_live_ex_wallet_inr = round(float(_exchange_wallet_data.get("total_inr", 0.0) or 0.0), 2) if _has_live_ex_wallet else round(float(wallet_data["total_inr"]), 2)
+
+if _is_staging_env and _has_live_ex_wallet:
+    st.sidebar.metric(
+        "🏦 Live CoinDCX Futures Wallet",
+        f"₹{_live_ex_wallet_inr:,.2f}",
+        f"Free: ₹{float(_exchange_wallet_data.get('available_inr', _live_ex_wallet_inr)):,.2f} (Real Exchange)",
+    )
+
 _wallet_lbl = (
-    "📝 Paper Wallet (Mirrors Main)"
+    "📝 Staging Paper Wallet"
     if _is_staging_env
     else ("🧪 Backtest Wallet (Mirrors Main)" if _is_experiment_env else "Futures Wallet")
 )
 _wallet_delta = (
-    f"Free: ₹{wallet_data['available_inr']:,.2f} | PnL: {'+' if float(wallet_data.get('net_pnl_inr', 0.0)) >= 0 else ''}₹{float(wallet_data.get('net_pnl_inr', 0.0)):,.2f}"
+    f"Free: ₹{wallet_data['available_inr']:,.2f} | Paper PnL: {'+' if float(wallet_data.get('net_pnl_inr', 0.0)) >= 0 else ''}₹{float(wallet_data.get('net_pnl_inr', 0.0)):,.2f}"
     if _is_staging_env
     else f"Free: ₹{wallet_data['available_inr']:,.2f}"
 )
 st.sidebar.metric(_wallet_lbl, f"₹{wallet_data['total_inr']:,.2f}", _wallet_delta)
 
 if _is_staging_env or _is_experiment_env:
-    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, AutoTrade Wallet, Margin, Leverage, Concurrent Trades & Strategy Mode from Google Sheet."):
-        _ok_s, _msg_s, _ = coindcx_engine.sync_setup_from_main(reset_paper_wallet=_is_staging_env)
+    def _on_sync_setup_from_main():
+        _fresh_live = coindcx_engine.fetch_coindcx_futures_balance(force_refresh=True) or {}
+        _live_ov = float(_fresh_live.get("total_inr", 0.0) or 0.0) if _fresh_live.get("is_live_api") else 0.0
+        _ok_s, _msg_s, _ = coindcx_engine.sync_setup_from_main(reset_paper_wallet=_is_staging_env, live_wallet_override=_live_ov)
         st.session_state["_sb_main_sync_msg"] = (_ok_s, _msg_s)
         for _k_clr in ("sidebar_autotrade_wallet_input", "sidebar_single_trade_margin_input", "sidebar_autotrade_strategy_mode", "sidebar_max_concurrent_trades", "sidebar_auto_split_wallet", "sidebar_fixed_risk_cap_toggle", "sidebar_risk_per_trade_pct"):
             st.session_state.pop(_k_clr, None)
         get_cached_signals_scan.clear()
         get_cached_manual_intraday_scan.clear()
-        st.rerun()
+
+    st.sidebar.button(
+        "🔄 Sync Setup & Funds from Main",
+        key="btn_sync_setup_from_main",
+        on_click=_on_sync_setup_from_main,
+        use_container_width=True,
+        help="Resets Staging Paper Wallet & AutoTrade Wallet to your live CoinDCX balance (and mirrors Main's Margin, Leverage, Slots & Strategy Mode).",
+    )
     if st.session_state.get("_sb_main_sync_msg"):
         _sm_ok, _sm_txt = st.session_state.pop("_sb_main_sync_msg")
         (st.sidebar.success if _sm_ok else st.sidebar.warning)(_sm_txt)
@@ -823,7 +844,7 @@ def _on_sidebar_autotrade_wallet_change():
     cur_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
     upd = {
         "autotrade_wallet_inr": new_at_w,
-        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+        "wallet_balance_inr": _live_ex_wallet_inr,
     }
     if cur_auto_split and new_at_w > 0:
         auto_m = round(new_at_w / cur_slots, 2)
@@ -847,8 +868,15 @@ autotrade_wallet_inr = float(
         help="Dedicated AutoTrade capital budget in INR. Single-Trade Margin (Auto-Split = AutoTrade Wallet ÷ Concurrent Trades) and Risk-Based Sizing read strictly from this wallet.",
     )
 )
+_match_target_inr = _live_ex_wallet_inr if (_has_live_ex_wallet or not _is_staging_env) else round(float(wallet_data["total_inr"]), 2)
+_match_target_lbl = (
+    "Live CoinDCX"
+    if (_is_staging_env and _has_live_ex_wallet)
+    else ("Paper Wallet" if _is_staging_env else "Futures Wallet")
+)
+
 def _on_match_autotrade_wallet_exchange():
-    _ex_w = round(float(wallet_data["total_inr"]), 2)
+    _ex_w = round(float(_match_target_inr), 2)
     st.session_state["sidebar_autotrade_wallet_input"] = float(_ex_w)
     _cur_s = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
     _upd_m = {"autotrade_wallet_inr": _ex_w}
@@ -860,9 +888,9 @@ def _on_match_autotrade_wallet_exchange():
     get_cached_manual_intraday_scan.clear()
 
 
-if abs(autotrade_wallet_inr - float(wallet_data["total_inr"])) >= 1.0:
+if abs(autotrade_wallet_inr - float(_match_target_inr)) >= 1.0:
     st.sidebar.button(
-        f"🔄 Match AutoTrade Wallet to Exchange (₹{float(wallet_data['total_inr']):,.0f})",
+        f"🔄 Match AutoTrade Wallet to {_match_target_lbl} (₹{float(_match_target_inr):,.0f})",
         key="btn_match_autotrade_wallet_exchange",
         on_click=_on_match_autotrade_wallet_exchange,
         use_container_width=True,
@@ -873,13 +901,12 @@ def _on_sidebar_slots_or_split_change():
     new_slots = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
     new_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
     at_w_tot = round(max(500.0, float(st.session_state.get("sidebar_autotrade_wallet_input", autotrade_wallet_inr) or autotrade_wallet_inr)), 2)
-    w_tot = round(float(wallet_data["total_inr"]), 2)
     upd = {
         "max_concurrent_trades": new_slots,
         "auto_split_wallet_by_slots": new_auto_split,
         "user_custom_margin": not new_auto_split,
         "autotrade_wallet_inr": at_w_tot,
-        "wallet_balance_inr": w_tot,
+        "wallet_balance_inr": _live_ex_wallet_inr,
     }
     if new_auto_split and at_w_tot > 0:
         auto_m = round(at_w_tot / new_slots, 2)
@@ -934,7 +961,7 @@ def _on_sidebar_margin_change():
         coindcx_engine.save_autotrade_config({
             "single_trade_margin_inr": fallback_m,
             "autotrade_wallet_inr": at_w_cur,
-            "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+            "wallet_balance_inr": _live_ex_wallet_inr,
             "auto_split_wallet_by_slots": True,
             "user_custom_margin": False,
         })
@@ -943,7 +970,7 @@ def _on_sidebar_margin_change():
         coindcx_engine.save_autotrade_config({
             "single_trade_margin_inr": new_m,
             "autotrade_wallet_inr": at_w_cur,
-            "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+            "wallet_balance_inr": _live_ex_wallet_inr,
             "auto_split_wallet_by_slots": False,
             "user_custom_margin": True,
         })
@@ -1014,9 +1041,15 @@ if auto_split_wallet:
 else:
     st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (Custom Margin • AutoTrade Wallet ₹{autotrade_wallet_inr:,.0f}, max {max_concurrent_trades} slots) @ {leverage}x *({_sizing_badge})*")
 if autotrade_wallet_inr > float(wallet_data["total_inr"]) + 1.0:
-    st.sidebar.warning(
-        f"⚠️ AutoTrade Wallet (`₹{autotrade_wallet_inr:,.0f}`) exceeds Futures Wallet (`₹{float(wallet_data['total_inr']):,.0f}`); live trades will cap at actual exchange funds."
-    )
+    if _is_staging_env:
+        st.sidebar.warning(
+            f"⚠️ AutoTrade Wallet (`₹{autotrade_wallet_inr:,.0f}`) exceeds Staging Paper Wallet (`₹{float(wallet_data['total_inr']):,.0f}`). "
+            f"Click **Sync Setup & Funds from Main** above to reset Paper Wallet to your live balance."
+        )
+    else:
+        st.sidebar.warning(
+            f"⚠️ AutoTrade Wallet (`₹{autotrade_wallet_inr:,.0f}`) exceeds Futures Wallet (`₹{float(wallet_data['total_inr']):,.0f}`); live trades will cap at actual exchange funds."
+        )
 try:
     _at_wallet_snap = {
         **wallet_data,
@@ -1167,7 +1200,7 @@ if (
     _auto_cfg = coindcx_engine.save_autotrade_config({
         "single_trade_margin_inr": round(float(margin_inr), 2),
         "autotrade_wallet_inr": round(float(autotrade_wallet_inr), 2),
-        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+        "wallet_balance_inr": _live_ex_wallet_inr,
         "leverage": int(leverage),
         "max_concurrent_trades": int(max_concurrent_trades),
         "auto_split_wallet_by_slots": bool(auto_split_wallet),

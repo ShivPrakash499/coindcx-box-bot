@@ -5078,20 +5078,26 @@ def get_paper_wallet_snapshot(cfg: dict | None = None, live_wallet: dict | None 
     }
 
 
-def sync_setup_from_main(reset_paper_wallet: bool = False) -> tuple[bool, str, dict]:
+def sync_setup_from_main(reset_paper_wallet: bool = False, live_wallet_override: float = 0.0) -> tuple[bool, str, dict]:
     """
     Mirrors Main's exact live setup (Funds/Wallet Balance, Single-Trade Margin, Leverage, and
     Strategy Mode) from the shared Google Sheet into Staging (Paper Trading) or Experiment (Backtest Lab).
+    When `live_wallet_override > 0` (fresh live CoinDCX API balance), prefers that exact real-time balance
+    over any potentially stale Sheet snapshot so Staging immediately reflects deposits/withdrawals/PnL.
     """
     try:
         import sheets_logger as _sl
         main_setup = _sl.load_main_live_setup_from_sheet(force_refresh=True)
+        live_ov = round(float(live_wallet_override or 0.0), 2)
         if not isinstance(main_setup, dict):
-            return False, "Could not load Main live setup from Google Sheet (`_AutoTrade_State` / `_Live_Account_Sync`).", {}
+            if live_ov <= 0:
+                return False, "Could not load Main live setup from Google Sheet (`_AutoTrade_State` / `_Live_Account_Sync`).", {}
+            main_setup = {}
         cfg = get_autotrade_config()
         today = get_crypto_trading_day_str()
         now_s = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST")
-        m_wallet = float(main_setup.get("wallet_balance_inr", 0.0) or 0.0)
+        sheet_wallet = float(main_setup.get("wallet_balance_inr", 0.0) or 0.0)
+        m_wallet = live_ov if live_ov > 0 else sheet_wallet
         m_margin = float(main_setup.get("single_trade_margin_inr", 0.0) or 0.0)
         m_custom = bool(main_setup.get("user_custom_margin", False))
         m_slots = max(1, min(10, int(main_setup.get("max_concurrent_trades", MAX_CONCURRENT_TRADES) or MAX_CONCURRENT_TRADES)))

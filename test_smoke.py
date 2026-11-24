@@ -254,6 +254,8 @@ def test_5_daily_bias_enforcement():
     }
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+         patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+         patch.object(eng, "check_unrealized_pnl_daily_sl_pause", return_value=(False, "", {})), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
          patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")):
         bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
@@ -292,6 +294,8 @@ def test_5_daily_bias_enforcement():
             assert ok_r and "Daily Bias Guard" not in msg_r, f"Expected RANGE mode trade allowed, got: {ok_r} {msg_r}"
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+         patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+         patch.object(eng, "check_unrealized_pnl_daily_sl_pause", return_value=(False, "", {})), \
          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
              {"pair": "B-INJ_USDT", "direction": "SHORT", "id": "pos_inj"},
              {"pair": "B-NEAR_USDT", "direction": "LONG", "id": "pos_near"},
@@ -2371,6 +2375,7 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
     assert '"⚡ 9/21 EMA Crossover"' in app_src
     assert '"✏️ Update SL / TP on Position"' in app_src
     assert '"📧 Manual Intraday Router Alerts (24/7)"' in app_src
+    assert '"🏦 Live CoinDCX Futures Wallet"' in app_src
     assert "_send_trade_email_async(" in app_src
     assert "healthcheck" in app_src
     assert "autotrade_wallet_inr" in eng._DURABLE_AUTOTRADE_KEYS
