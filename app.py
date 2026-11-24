@@ -284,6 +284,79 @@ def get_security_pin():
         pass
     return os.getenv("APP_PIN", "1234").strip()
 
+def _unlock_current_tab_session(required_pin: str, scrub_url_pin: bool = False) -> str:
+    """Issues an opaque per-tab auth token, marks session authenticated, and persists `?sid=` in URL."""
+    new_tok = coindcx_engine.issue_tab_auth_token(required_pin)
+    st.session_state.authenticated = True
+    st.session_state["_auth_sid"] = new_tok
+    st.session_state["_auth_unlocked_via_pin"] = True
+    try:
+        st.query_params["sid"] = new_tok
+        if scrub_url_pin and "pin" in st.query_params:
+            del st.query_params["pin"]
+    except Exception:
+        pass
+    return new_tok
+
+
+def _lock_current_tab_session() -> None:
+    """Revokes the current tab's opaque auth token, strips `?sid=`, and marks tab sessionStorage for clearing."""
+    try:
+        _cur_sid = str(st.session_state.pop("_auth_sid", "") or st.query_params.get("sid", "") or "").strip()
+        if _cur_sid:
+            coindcx_engine.revoke_tab_auth_token(_cur_sid)
+        if "sid" in st.query_params:
+            del st.query_params["sid"]
+    except Exception:
+        pass
+    st.session_state.authenticated = False
+    st.session_state["_auth_unlocked_via_pin"] = False
+    st.session_state["_auth_clear_tab_storage"] = True
+
+
+def _sync_tab_auth_guard() -> None:
+    """
+    Binds the opaque `?sid=` unlock token to this specific browser tab via `window.parent.sessionStorage`:
+      - Switching windows/tabs, background sleep, or WebSocket reconnects keep the same open tab unlocked.
+      - Closing the tab/browser destroys `sessionStorage`, so even reopening an old `?sid=` link from browser
+        history strips `sid` and locks immediately.
+    """
+    tok = str(st.session_state.get("_auth_sid", "") or "").strip()
+    if not tok:
+        return
+    unlocked_via_pin = bool(st.session_state.get("_auth_unlocked_via_pin", False))
+    try:
+        import json as _json_auth
+        import streamlit.components.v1 as _st_auth_comp
+        tok_js = _json_auth.dumps(tok)
+        if unlocked_via_pin:
+            _st_auth_comp.html(
+                f"""<script>(function(){{try{{window.parent.sessionStorage.setItem("ctp_tab_sid",{tok_js});}}catch(e){{}}}})();</script>""",
+                height=0,
+            )
+        else:
+            _st_auth_comp.html(
+                f"""<script>(function(){{
+                    try {{
+                        var s = window.parent.sessionStorage;
+                        s.setItem("__ctp_ss_chk", "1");
+                        var ok = (s.getItem("__ctp_ss_chk") === "1");
+                        s.removeItem("__ctp_ss_chk");
+                        if (ok && s.getItem("ctp_tab_sid") !== {tok_js}) {{
+                            var u = new URL(window.parent.location.href);
+                            if (u.searchParams.has("sid")) {{
+                                u.searchParams.delete("sid");
+                                window.parent.location.replace(u.toString());
+                            }}
+                        }}
+                    }} catch (e) {{}}
+                }})();</script>""",
+                height=0,
+            )
+    except Exception:
+        pass
+
+
 def check_authentication():
     required_pin = get_security_pin()
     # Allow iPhone Air Shortcut (?coindcx_alert=...) to record the notification BEFORE the PIN gate
@@ -308,12 +381,35 @@ def check_authentication():
             except Exception:
                 pass
         _url_pin = str(_pre_qp.get("pin", "")).strip()
-        if _url_pin and _url_pin == required_pin:
-            st.session_state.authenticated = True
+        _url_sid = str(_pre_qp.get("sid", "")).strip()
+        if not st.session_state.get("authenticated", False):
+            if _url_pin and _url_pin == required_pin:
+                _unlock_current_tab_session(required_pin, scrub_url_pin=True)
+            elif _url_sid and coindcx_engine.verify_tab_auth_token(_url_sid, required_pin):
+                # Restore unlock seamlessly when Chrome/Streamlit reconnects WebSocket on the same open tab
+                st.session_state.authenticated = True
+                st.session_state["_auth_sid"] = _url_sid
+                st.session_state["_auth_unlocked_via_pin"] = False
+            elif _url_sid:
+                try:
+                    if "sid" in st.query_params:
+                        del st.query_params["sid"]
+                except Exception:
+                    pass
     except Exception:
         pass
 
     if st.session_state.get("authenticated", False):
+        _active_sid = str(st.session_state.get("_auth_sid", "") or "").strip()
+        if not _active_sid:
+            _active_sid = coindcx_engine.issue_tab_auth_token(required_pin)
+            st.session_state["_auth_sid"] = _active_sid
+            st.session_state["_auth_unlocked_via_pin"] = True
+        try:
+            if str(st.query_params.get("sid", "") or "").strip() != _active_sid:
+                st.query_params["sid"] = _active_sid
+        except Exception:
+            pass
         return True
     _pre_bal = fetch_coindcx_futures_balance(force_refresh=False) or {}
     _pre_pos = fetch_coindcx_active_positions(force_refresh=False) or []
@@ -330,6 +426,16 @@ def check_authentication():
         _err_str = _pre_bal.get("api_error") or coindcx_engine._PERSIST.get("last_auth_error") or "Connecting..."
         _api_pill = f"🔄 CoinDCX Status: {_err_str} (Key: {_k_tag}/{_s_tag} | Seen IPs: {_ip_tag} | Pos: {len(_pre_pos)})"
         _pill_col = "#f59e0b"
+
+    if st.session_state.pop("_auth_clear_tab_storage", False):
+        try:
+            import streamlit.components.v1 as _st_clr_comp
+            _st_clr_comp.html(
+                """<script>(function(){try{window.parent.sessionStorage.removeItem("ctp_tab_sid");}catch(e){}})();</script>""",
+                height=0,
+            )
+        except Exception:
+            pass
 
     pin_slot = st.empty()
     with pin_slot.container():
@@ -357,7 +463,7 @@ def check_authentication():
                 unlock_clicked = st.form_submit_button("🔓 Unlock Terminal", use_container_width=True, type="primary")
                 if unlock_clicked:
                     if entered_pin.strip() == required_pin:
-                        st.session_state.authenticated = True
+                        _unlock_current_tab_session(required_pin)
                         pin_slot.empty()
                         st.rerun()
                     else:
@@ -591,7 +697,7 @@ else:
 _url_tab = _qp.get("tab", "").lower()
 is_execution_link = _url_tab in ("execute", "execution", "trade")
 
-_url_sig = str(sorted(_qp.to_dict().items())) if is_execution_link else ""
+_url_sig = str(sorted((k, v) for k, v in _qp.to_dict().items() if k != "sid")) if is_execution_link else ""
 if is_execution_link and st.session_state.get("_url_applied") != _url_sig:
     st.session_state["_url_applied"] = _url_sig
     st.session_state.active_nav_section = "🎯 Execute"
@@ -1374,8 +1480,9 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
     st.caption(f"🌐 **Server Outbound IP(s) (for CoinDCX API):** `{_pinned_ip_str}` ({_verified_badge})")
     st.caption("🛡️ **Permanent Static IP Proxy:** `35.230.95.39` (Auto-Active)")
     if st.button("🔒 Lock Session", use_container_width=True):
-        st.session_state.authenticated = False
+        _lock_current_tab_session()
         st.rerun()
+    _sync_tab_auth_guard()
 
 is_light_theme = "Light" in chart_theme
 
@@ -2353,34 +2460,26 @@ if active_section == "⚡ Signals":
                         else:
                             st.error(msg_a)
 
-        # 🧭 Manual Trading Signals & Ready Prefilled Setups (`exp-staging-intraday-score-router`)
+        # 🧭 Executable Manual Intraday Setups (`exp-staging-intraday-score-router` — ONLY live-triggered setups, never stale non-triggered directional plans)
         _intraday_live_sigs = [
             _mi for _mi in (_manual_intraday_list or [])
             if isinstance(_mi, dict) and isinstance(_mi.get("live_signal"), dict)
             and _mi["live_signal"].get("signal") in ("LONG", "SHORT")
         ]
-        _intraday_ready_setups = [
-            _mi for _mi in (_manual_intraday_list or [])
-            if isinstance(_mi, dict) and not _mi.get("live_signal")
-            and isinstance(_mi.get("prefill_ticket"), dict)
-            and abs(int((_mi.get("policy") or {}).get("score", 0) or 0)) >= 3
-        ]
-        if _intraday_live_sigs or _intraday_ready_setups:
-            _m_title = (
-                f"#### 🧭 Manual Intraday Score Router Signals ({len(_intraday_live_sigs)} Live • {len(_intraday_ready_setups)} Directional Setups)"
+        if _intraday_live_sigs:
+            st.markdown(
+                f"#### 🧭 Executable Manual Intraday Signals ({len(_intraday_live_sigs)} Live)"
             )
-            st.markdown(_m_title)
             st.caption(
-                "Powered by **`exp-staging-intraday-score-router`** (`-4..+4` Intraday Score + ADX + Daily `1.0× / 0.8× / 0.6×` sizing & `70%` Counter-Daily TP1). "
-                "Automated AutoTrade remains strictly locked to **`v41 (main)`** rules — use the buttons below to manually load prefilled Entry/SL/TP1/TP2 or trigger trades."
+                "Live confirmed 15m setups powered by **`exp-staging-intraday-score-router`** (`1.0× / 0.8× / 0.6×` sizing & `50%/70%` TP1). "
+                "Only currently executable setups are shown — non-triggered directional trends are hidden."
             )
-            _manual_cards = [(_mi, True) for _mi in _intraday_live_sigs] + [(_mi, False) for _mi in _intraday_ready_setups[:6]]
-            for _mc_idx, (_mi, _is_live_m) in enumerate(_manual_cards):
+            for _mc_idx, _mi in enumerate(_intraday_live_sigs):
                 _mp = _mi["pair"]
                 _msym = clean_sym(_mp)
                 _mpol = _mi.get("policy") or {}
                 _mst = _mi.get("stack") or {}
-                _mtk = _mi.get("live_signal") if _is_live_m else _mi.get("prefill_ticket")
+                _mtk = _mi.get("live_signal")
                 if not isinstance(_mtk, dict):
                     continue
                 _mdir = "LONG" if str(_mtk.get("signal") or _mtk.get("direction", "LONG")).upper() in ("LONG", "BUY") else "SHORT"
@@ -2394,15 +2493,16 @@ if active_section == "⚡ Signals":
                 _m_counter = bool(_mtk.get("is_counter_daily", _mpol.get("is_counter_daily", False)))
                 _m_v41_tag = (
                     "🤖 AutoTrade-Eligible (v41)"
-                    if (_is_live_m and _mi.get("strict_v41_autotrade_eligible"))
+                    if _mi.get("strict_v41_autotrade_eligible")
                     else ("✋ Manual Counter-Daily Relief Rally" if _m_counter else "✋ Manual Intraday Setup")
                 )
-                _m_status_tag = "⚡ LIVE TRIGGERED" if _is_live_m else "📋 PREFILLED LIMIT PLAN"
+                _m_trig_txt = str(_mtk.get("trigger_reason") or _mtk.get("trigger_zone") or "").replace("$", "&#36;")
                 with st.container(border=True):
                     st.markdown(
                         f"<span class='{_mbadge}'>{_mdir} {_msym}/USDT</span> &nbsp; "
-                        f"**{_m_status_tag}** • `{_mpol.get('badge', '')}` • **{_msname}** • {_m_v41_tag}<br>"
+                        f"**⚡ LIVE EXECUTABLE** • `{_mpol.get('badge', '')}` • **{_msname}** • {_m_v41_tag}<br>"
                         f"<span style='font-size:0.80rem;opacity:0.85;'>"
+                        f"{(_m_trig_txt + ' • ') if _m_trig_txt else ''}"
                         f"4H: <b>{_mst.get('s4_struct', 'CHOP')}</b> | 1H: <b>{_mst.get('s1_struct', 'CHOP')}</b> "
                         f"(CHoCH: <b>{_mst.get('s1_choch', 'NONE')}</b>) | VWAP: <b>{_mst.get('vwap_state', 'CHOP')}</b> | "
                         f"15m EMA: <b>{_mst.get('ema_state', 'CHOP')}</b> | ADX: <b>{float(_mpol.get('adx', 0.0)):.1f}</b> | "
@@ -2411,7 +2511,7 @@ if active_section == "⚡ Signals":
                         unsafe_allow_html=True,
                     )
                     mm1, mm2, mm3, mm4 = st.columns(4)
-                    mm1.metric("Prefilled Entry", fmt_px(_mtk.get("entry")))
+                    mm1.metric("Entry (Live Limit)", fmt_px(_mtk.get("entry")))
                     mm2.metric(f"TP1 ({_mtp1_pct}% Book)", fmt_px(_mtk.get("tp1")), f"+{float(_mtk.get('roe_tp1', 0.0)):.1f}% ROE")
                     mm3.metric(f"TP2 ({100 - _mtp1_pct}% Runner)", fmt_px(_mtk.get("tp2")), f"+{float(_mtk.get('roe_tp2', 0.0)):.1f}% ROE")
                     _m_sl_lbl = "SL (15m 200 EMA)" if _msid == "ema50_200" else ("SL (15m 50 EMA)" if _msid == "ema21_pullback" else "Stop Loss")
@@ -2448,7 +2548,7 @@ if active_section == "⚡ Signals":
                     if mb3.button(
                         f"🚀 Trigger Manual {_mdir} (₹{_msugg_m:,.0f} @ {leverage}x)",
                         key=f"btn_manual_trig_{_mc_idx}_{_mp}",
-                        type="primary" if _is_live_m else "secondary",
+                        type="primary",
                         use_container_width=True,
                     ):
                         ok_m, msg_m, _ = coindcx_engine.execute_autotrade_two_entry_signal(
@@ -2477,6 +2577,11 @@ if active_section == "⚡ Signals":
                             st.rerun()
                         else:
                             st.error(msg_m)
+        elif not active_signals:
+            st.info(
+                "⏳ **No live executable setups right now** across the 12 watchlist coins — "
+                "watching for a confirmed 15m Box Sweep, 50/200 EMA Pullback, or 21 EMA Touch & Bounce."
+            )
 
         st.markdown("#### 📡 High-Volatility Watchlist Matrix")
         matrix_rows = []

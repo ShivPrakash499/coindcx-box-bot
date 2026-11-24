@@ -5,3 +5,7 @@ backgroundColor = "#0b0f17"
 secondaryBackgroundColor = "#111827"
 textColor = "#f8fafc"
 font = "sans serif"
+
+[server]
+websocketPingInterval = 30
+disconnectedSessionTTL = 86400

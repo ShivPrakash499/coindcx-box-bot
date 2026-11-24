@@ -16,6 +16,73 @@ load_dotenv()
 IST = pytz.timezone('Asia/Kolkata')
 
 
+TAB_AUTH_SESSION_TTL_SEC = 48 * 3600
+
+
+def _get_revoked_tab_auth_tokens() -> set[str]:
+    """Process-persistent set of explicitly locked/revoked tab auth tokens."""
+    import sys as _sys_auth
+    return _sys_auth.__dict__.setdefault("_ctp_revoked_tab_auth_tokens", set())
+
+
+def issue_tab_auth_token(required_pin: str, now_ts: float | None = None) -> str:
+    """
+    Generates a per-tab opaque HMAC-signed session token (`<ts_hex>.<nonce>.<sig>`)
+    so switching windows/tabs or WebSocket reconnects NEVER lock an open browser tab,
+    without ever exposing the raw PIN in the URL or browser history.
+    """
+    import secrets as _sec_auth
+    pin_str = str(required_pin or "").strip()
+    ts_int = int(time.time() if now_ts is None else now_ts)
+    ts_hex = format(max(0, ts_int), "x")
+    nonce = _sec_auth.token_hex(8)
+    payload = f"{ts_hex}.{nonce}"
+    key = f"ctp_tab_auth_v1:{pin_str}".encode("utf-8")
+    sig = hmac.new(key, payload.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    return f"{payload}.{sig}"
+
+
+def verify_tab_auth_token(
+    token: str,
+    required_pin: str,
+    max_age_sec: int = TAB_AUTH_SESSION_TTL_SEC,
+    now_ts: float | None = None,
+) -> bool:
+    """Validates an opaque tab auth token against the current PIN, TTL, and revocation list."""
+    tok = str(token or "").strip()
+    if not tok or tok in _get_revoked_tab_auth_tokens():
+        return False
+    parts = tok.split(".")
+    if len(parts) != 3:
+        return False
+    ts_hex, nonce, sig = parts
+    if not ts_hex or len(nonce) < 8 or len(sig) != 16:
+        return False
+    try:
+        issued_ts = int(ts_hex, 16)
+    except Exception:
+        return False
+    cur_ts = int(time.time() if now_ts is None else now_ts)
+    age = cur_ts - issued_ts
+    if age < -60 or age > int(max_age_sec or TAB_AUTH_SESSION_TTL_SEC):
+        return False
+    pin_str = str(required_pin or "").strip()
+    key = f"ctp_tab_auth_v1:{pin_str}".encode("utf-8")
+    expected_sig = hmac.new(key, f"{ts_hex}.{nonce}".encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+    return hmac.compare_digest(expected_sig, sig)
+
+
+def revoke_tab_auth_token(token: str) -> None:
+    """Immediately revokes a tab auth token (called on explicit `🔒 Lock Session`)."""
+    tok = str(token or "").strip()
+    if not tok:
+        return
+    rev = _get_revoked_tab_auth_tokens()
+    if len(rev) >= 500:
+        rev.clear()
+    rev.add(tok)
+
+
 def get_crypto_trading_day_str(dt=None) -> str:
     """
     Returns the Crypto Daily Candle date key (`YYYY-MM-DD`, UTC day = resets at 00:00 UTC / 05:30 AM IST)
@@ -8743,6 +8810,9 @@ def _upgrade_all_in_memory_functions_and_disarm():
             "get_open_entry_limit_orders": get_open_entry_limit_orders,
             "compute_wallet_capped_margin": compute_wallet_capped_margin,
             "evaluate_autotrade_margin_plan": evaluate_autotrade_margin_plan,
+            "issue_tab_auth_token": issue_tab_auth_token,
+            "verify_tab_auth_token": verify_tab_auth_token,
+            "revoke_tab_auth_token": revoke_tab_auth_token,
             "save_autotrade_config": save_autotrade_config,
             "clear_autotrade_active_lock": clear_autotrade_active_lock,
             "register_app_trade_lock": register_app_trade_lock,

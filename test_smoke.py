@@ -2609,7 +2609,27 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
     pl21 = s21.plan_setups("B-SOL_USDT", {**bear_box_21, "EMA21_15m": 7.10, "EMA50_15m": 7.20}, 7.08, 6000.0, 10, 90.0)
     assert pl21["BUY"] and pl21["SELL"] and pl21["SELL"]["stop_loss"] > pl21["SELL"]["entry"] > pl21["SELL"]["tp1"] >= pl21["SELL"]["tp2"], pl21
 
-    print("  -> PASS: AutoTrade Wallet, Margin Plan Deps, Manual Router, 24/7 Email Alerts, 15m 21 EMA Bounce & Chart Trading verified!")
+    # 10. Tab-scoped Auth Persistence (no re-lock on window switch; lock on tab close / Lock Session) & Live-Only Signals tab
+    now_auth = 1795540000
+    tok_ok = eng.issue_tab_auth_token("7890", now_ts=now_auth)
+    assert "7890" not in tok_ok, "Raw PIN must never appear inside opaque tab auth token!"
+    assert eng.verify_tab_auth_token(tok_ok, "7890", now_ts=now_auth + 600) is True
+    assert eng.verify_tab_auth_token(tok_ok, "9999", now_ts=now_auth + 600) is False
+    assert eng.verify_tab_auth_token(tok_ok, "7890", now_ts=now_auth + eng.TAB_AUTH_SESSION_TTL_SEC + 10) is False
+    assert eng.verify_tab_auth_token("bad.token", "7890", now_ts=now_auth) is False
+    eng.revoke_tab_auth_token(tok_ok)
+    assert eng.verify_tab_auth_token(tok_ok, "7890", now_ts=now_auth + 10) is False
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".streamlit", "config.toml"), "r", encoding="utf-8") as _cf:
+        cfg_toml_src = _cf.read()
+    assert "disconnectedSessionTTL" in cfg_toml_src and "websocketPingInterval" in cfg_toml_src
+    assert "_sync_tab_auth_guard()" in app_src and "_lock_current_tab_session()" in app_src
+    assert 'if k != "sid"' in app_src and 'ctp_tab_sid' in app_src
+    # Signals tab must ONLY show current live executable setups (no stale Directional Setups / PREFILLED LIMIT PLAN cards)
+    assert "_intraday_ready_setups" not in app_src, "Stale non-triggered directional setup cards must not appear on Signals tab!"
+    assert "Directional Setups" not in app_src and "PREFILLED LIMIT PLAN" not in app_src
+    assert "⚡ LIVE EXECUTABLE" in app_src
+
+    print("  -> PASS: AutoTrade Wallet, Margin Plan Deps, Manual Router, 24/7 Email Alerts, 15m 21 EMA Bounce, Tab Auth & Live-Only Signals verified!")
 
 
 if __name__ == "__main__":
