@@ -2370,9 +2370,12 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
     assert '"📈 50/200 EMA Crossover"' in app_src
     assert '"⚡ 9/21 EMA Crossover"' in app_src
     assert '"✏️ Update SL / TP on Position"' in app_src
+    assert '"📧 Manual Intraday Router Alerts (24/7)"' in app_src
+    assert "_send_trade_email_async(" in app_src
     assert "healthcheck" in app_src
     assert "autotrade_wallet_inr" in eng._DURABLE_AUTOTRADE_KEYS
     assert "risk_per_trade_pct" in eng._DURABLE_AUTOTRADE_KEYS
+    assert "manual_intraday_email_alerts_enabled" in eng._DURABLE_AUTOTRADE_KEYS
 
     # 2. Verify AutoTrade Wallet drives Single-Trade Margin & is preserved across CoinDCX balance sync
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2474,7 +2477,49 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
     assert p921["SELL"]["stop_loss"] > p921["SELL"]["entry"] > p921["SELL"]["tp1"] >= p921["SELL"]["tp2"], p921["SELL"]
     assert (len(p921["cross_up_idx"]) + len(p921["cross_dn_idx"])) >= 1, p921
 
-    print("  -> PASS: AutoTrade Wallet, Manual Intraday Score Router Prefill & CoinDCX-Style Chart Trading verified!")
+    # 7. Manual Intraday Router 24/7 Email Alerter (dedup vs strict v41 + tp1_pct=70 & manual_router=1 action URL)
+    import email_notifier as em
+    captured_emails = []
+    def _fake_smtp_send(subject, html, text):
+        captured_emails.append({"subject": subject, "html": html, "text": text})
+        return True, "mocked ok"
+
+    fake_live_manual = [{
+        "pair": "B-APT_USDT",
+        "daily_bias": "BEARISH",
+        "levels": fake_lvls_bear,
+        "policy": {"score": 4, "adx": 23.5, "regime": "INTRADAY_UPTREND", "size_mult": 0.60, "tp1_book_frac": 0.70},
+        "live_signal": {
+            "signal": "LONG", "strategy_id": "box_theory", "strategy_name": "Box Theory Sweep",
+            "entry": 1.02, "stop_loss": 0.96, "tp1": 1.075, "tp2": 1.15, "candle_ts": 1795309900000,
+            "size_mult": 0.60, "tp1_book_frac": 0.70, "suggested_margin_inr": 3600.0,
+            "trigger_zone": "Buy Zone RL-SL", "trigger_reason": "Intraday +4 Counter-Daily Relief Rally",
+        },
+        "strict_v41_autotrade_eligible": False,
+    }]
+    with tempfile.TemporaryDirectory() as tmpdir_em:
+        em_state_f = os.path.join(tmpdir_em, "signal_state.json")
+        em_cfg_f = os.path.join(tmpdir_em, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", em_cfg_f), \
+             patch.object(eng, "_persist_autotrade_state_bg", return_value=None), \
+             patch.object(sm, "STATE_FILE", em_state_f), \
+             patch.object(sm, "scan_manual_intraday_signals", return_value=fake_live_manual), \
+             patch.object(em, "_send", side_effect=_fake_smtp_send):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng.save_autotrade_config({"manual_intraday_email_alerts_enabled": True})
+            # Skips coin if already emailed by Strict v41 this cycle!
+            r_skip = sm.alert_manual_intraday_signals(["B-APT_USDT"], margin_inr=6000.0, leverage=10, usd_inr=90.0, send=True, already_alerted_pairs={"B-APT_USDT"})
+            assert not r_skip[0].get("manual_emailed") and len(captured_emails) == 0, (r_skip, captured_emails)
+            # Fires email with scaled margin 3600, tp1_pct=70, size_mult=0.60, manual_router=1!
+            r_sent = sm.alert_manual_intraday_signals(["B-APT_USDT"], margin_inr=6000.0, leverage=10, usd_inr=90.0, send=True, already_alerted_pairs=set())
+            assert r_sent[0].get("manual_emailed") and len(captured_emails) == 1, (r_sent, captured_emails)
+            assert "tp1_pct=70" in captured_emails[0]["text"] and "manual_router=1" in captured_emails[0]["text"] and "margin=3600" in captured_emails[0]["text"], captured_emails[0]["text"]
+            assert "TP1 — Close 70%" in captured_emails[0]["text"] and "TP2 — Hold 30%" in captured_emails[0]["text"]
+            # Second call on same candle MUST be deduplicated (still 1 email total!)
+            r_dup = sm.alert_manual_intraday_signals(["B-APT_USDT"], margin_inr=6000.0, leverage=10, usd_inr=90.0, send=True, already_alerted_pairs=set())
+            assert not r_dup[0].get("manual_emailed") and len(captured_emails) == 1, (r_dup, captured_emails)
+
+    print("  -> PASS: AutoTrade Wallet, Manual Intraday Score Router Prefill, 24/7 Email Alerts & CoinDCX-Style Chart Trading verified!")
 
 
 if __name__ == "__main__":

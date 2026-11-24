@@ -608,3 +608,123 @@ def scan_manual_intraday_signals(
         except Exception as e:
             out.append({"pair": pair, "error": str(e), "policy": {}, "live_signal": None, "prefill_ticket": None, "strict_v41_autotrade_eligible": False})
     return out
+
+
+def alert_manual_intraday_signals(
+    pairs: list[str],
+    margin_inr: float = 10000.0,
+    leverage: int = 10,
+    usd_inr: float = 85.0,
+    send: bool = True,
+    already_alerted_pairs: set[str] | list[str] | None = None,
+) -> list[dict]:
+    """
+    24/7 Background Email Alerter for Manual Intraday Score Router (`exp-staging-intraday-score-router`):
+      - Read-only / Manual-alert ONLY (NEVER places automated AutoTrade orders; AutoTrade stays strictly v41!).
+      - Honors `manual_intraday_email_alerts_enabled` (defaults False on Staging/Experiment, True on Main).
+      - Deduplicates against `already_alerted_pairs` (pairs already emailed by strict v41 in this cycle),
+        same candle timestamp, per-pair cooldown (`COOLDOWN_MIN`), and daily cap (`MAX_DAILY_ALERTS_PER_PAIR`).
+      - Sends Gmail alert with scaled AutoTrade Wallet margin (`1.0x/0.8x/0.6x`), `50%/70%` TP1 split, and a
+        1-click Execute link that pre-fills Entry, SL, TP1, TP2, scaled Margin, Leverage, and TP1 Book %.
+    """
+    auto_cfg = eng.get_autotrade_config()
+    _non_live_env = eng.is_staging_environment() or eng.is_experiment_environment()
+    manual_email_on = bool(auto_cfg.get("manual_intraday_email_alerts_enabled", False if _non_live_env else True))
+    eff_send = bool(send) and manual_email_on
+    skip_pairs = set(already_alerted_pairs or [])
+
+    scanned = scan_manual_intraday_signals(
+        pairs=pairs,
+        margin_inr=float(margin_inr or 10000.0),
+        leverage=int(leverage or 10),
+        usd_inr=float(usd_inr or 85.0),
+    )
+    if not eff_send:
+        return scanned
+
+    with _SCAN_LOCK:
+        state = _load()
+        now_ts = time.time()
+        today_str = eng.get_crypto_trading_day_str()
+
+        for item in scanned:
+            item["manual_emailed"] = False
+            item["manual_email_msg"] = ""
+            lsig = item.get("live_signal")
+            pair = str(item.get("pair") or "")
+            if not pair or not isinstance(lsig, dict) or lsig.get("signal") not in ("LONG", "SHORT"):
+                continue
+            if pair in skip_pairs:
+                item["manual_email_msg"] = "Skipped (already emailed by Strict v41 this cycle)"
+                continue
+
+            sid = str(lsig.get("strategy_id") or "box_theory")
+            key = f"{pair}::manual_intraday::{sid}"
+            pair_lock_key = f"{pair}::manual_intraday_pair_lock"
+            daily_key = f"{pair}::manual_intraday_daily::{today_str}"
+            last = state.get(key, {})
+            pair_last = state.get(pair_lock_key, {})
+            daily_cnt = int(state.get(daily_key, 0) or 0)
+
+            c_ts = int(lsig.get("candle_ts", 0) or 0)
+            is_new_candle = (c_ts <= 0) or (last.get("candle_ts") != c_ts)
+            cooled = (now_ts - float(last.get("sent_at", 0.0) or 0.0)) >= COOLDOWN_MIN * 60
+            pair_cooled = (now_ts - float(pair_last.get("sent_at", 0.0) or 0.0)) >= COOLDOWN_MIN * 60
+
+            if not (is_new_candle and cooled and pair_cooled and daily_cnt < MAX_DAILY_ALERTS_PER_PAIR):
+                item["manual_email_msg"] = "Cooldown / duplicate candle / daily cap"
+                continue
+
+            pol = item.get("policy") or {}
+            score_v = int(pol.get("score", 0) or 0)
+            size_mult = float(lsig.get("size_mult", pol.get("size_mult", 1.0)) or 1.0)
+            tp1_frac = float(lsig.get("tp1_book_frac", pol.get("tp1_book_frac", 0.50)) or 0.50)
+            tp1_pct = int(round(tp1_frac * 100))
+            sugg_m = float(lsig.get("suggested_margin_inr") or max(500.0, float(margin_inr) * size_mult))
+            base_sname = str(lsig.get("strategy_name") or strat_registry.get_strategy(sid).name)
+            strat_label = f"Manual Intraday ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
+            strict_tag = (
+                "Also eligible under Strict v41 AutoTrade."
+                if item.get("strict_v41_autotrade_eligible")
+                else "Manual Only (Counter-Daily / Intraday Router — skipped by Strict v41 AutoTrade)."
+            )
+            note_txt = (
+                f"{strict_tag} Score {score_v:+d} | ADX {float(pol.get('adx', 0.0)):.1f} | "
+                f"Regime {pol.get('regime', 'INTRADAY')} | Scaled Margin ₹{sugg_m:,.0f} ({size_mult:.2g}x) | "
+                f"Book {tp1_pct}% at TP1 & move SL to breakeven."
+            )
+            emailed, msg = email_notifier.send_trade_email(
+                pair=pair,
+                direction=lsig["signal"],
+                entry=float(lsig["entry"]),
+                stop_loss=float(lsig["stop_loss"]),
+                tp1=float(lsig["tp1"]),
+                tp2=float(lsig["tp2"]),
+                margin_inr=sugg_m,
+                leverage=int(leverage),
+                zone=str(lsig.get("trigger_zone") or pol.get("regime") or ""),
+                kind="SIGNAL",
+                note=note_txt,
+                strategy_name=strat_label,
+                strategy_id=sid,
+                trigger_reason=str(lsig.get("trigger_reason") or ""),
+                levels=item.get("levels"),
+                entry2_sweep=0.0,
+                tp1_book_frac=tp1_frac,
+                size_mult=size_mult,
+                is_manual_router=True,
+            )
+            item["manual_emailed"] = bool(emailed)
+            item["manual_email_msg"] = msg
+            if emailed:
+                sent_t = time.time()
+                state[key] = {
+                    "candle_ts": c_ts,
+                    "sent_at": sent_t,
+                    "direction": lsig["signal"],
+                    "entry": float(lsig["entry"]),
+                }
+                state[pair_lock_key] = {"candle_ts": c_ts, "sent_at": sent_t, "strategy_id": sid}
+                state[daily_key] = daily_cnt + 1
+                _save(state)
+    return scanned

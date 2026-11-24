@@ -477,7 +477,7 @@ def _get_coindcx_credentials() -> tuple[str, str]:
     return api_key, api_secret
 
 
-_REQUIRED_DAEMON_VERSION = 44
+_REQUIRED_DAEMON_VERSION = 45
 ENTRY1_LIMIT_EXPIRY_SEC = 45 * 60  # Auto-cancel unfilled AutoTrade Entry 1 limit orders after 45 mins (3 x 15m candles)
 MAX_EMA_CONCURRENT_TRADES = 2      # Cap 15m 50/200 EMA to max 2 of 3 slots so >=1 slot stays open for Box Theory Sweep
 MAX_SAME_DIRECTION_TRADES = 2      # Cap correlated same-direction exposure (max 2 LONGs or max 2 SHORTs across 3 slots)
@@ -4906,6 +4906,7 @@ _DURABLE_AUTOTRADE_KEYS = (
     "enabled",
     "paper_autotrade_enabled",
     "email_alerts_enabled",
+    "manual_intraday_email_alerts_enabled",
     "autotrade_strategy_mode",
     "regime_mode_migrated_v33",
     "autotrade_wallet_inr",
@@ -5231,6 +5232,7 @@ def get_autotrade_config() -> dict:
         "enabled": False,
         "paper_autotrade_enabled": True if _is_stg else False,
         "email_alerts_enabled": False if (_is_stg or _is_exp) else True,
+        "manual_intraday_email_alerts_enabled": False if (_is_stg or _is_exp) else True,
         "paper_only": (_is_stg or _is_exp),
         "autotrade_strategy_mode": "box_plus_ema50_200_regime",
         "wallet_balance_inr": 47287.18,

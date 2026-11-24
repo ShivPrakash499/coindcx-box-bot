@@ -195,8 +195,17 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 44
+_DAEMON_VERSION = 45
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
+
+def _send_trade_email_async(**kwargs):
+    """Fires a trade confirmation email on a background thread so Chart/Signals clicks never lag."""
+    def _w():
+        try:
+            send_trade_email(**kwargs)
+        except Exception:
+            pass
+    threading.Thread(target=_w, daemon=True, name="ManualTradeEmail").start()
 
 @st.cache_resource
 def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
@@ -232,8 +241,9 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
                         else bool(auto_cfg.get("enabled", False))
                     )
                     _send_flag = bool(auto_cfg.get("email_alerts_enabled", False if _is_stg_worker else True))
+                    _manual_email_flag = bool(auto_cfg.get("manual_intraday_email_alerts_enabled", False if _is_stg_worker else True))
                     _auto_mode_w = strategy_registry.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
-                    _safe_scan_and_alert(
+                    _scan_res_w = _safe_scan_and_alert(
                         pairs=watch_pairs,
                         margin_inr=m_inr,
                         leverage=lev,
@@ -242,6 +252,19 @@ def _ensure_background_monitor(daemon_version: int = _DAEMON_VERSION):
                         strategy_ids=strategy_registry.autotrade_mode_strategy_ids(_auto_mode_w),
                         autotrade=_auto_flag,
                     )
+                    if _manual_email_flag and hasattr(signal_monitor, "alert_manual_intraday_signals"):
+                        _v41_emailed_pairs = {
+                            str(r.get("pair")) for r in (_scan_res_w or [])
+                            if isinstance(r, dict) and r.get("emailed") and r.get("pair")
+                        }
+                        signal_monitor.alert_manual_intraday_signals(
+                            pairs=watch_pairs,
+                            margin_inr=m_inr,
+                            leverage=lev,
+                            usd_inr=u_inr,
+                            send=True,
+                            already_alerted_pairs=_v41_emailed_pairs,
+                        )
             except Exception as e:
                 print(f"[Crypto Trade Assistant Background Monitor Error]: {e}")
             time.sleep(60)
@@ -583,6 +606,19 @@ if is_execution_link and st.session_state.get("_url_applied") != _url_sig:
             st.session_state[f"exec_leverage_{_p}"] = int(_qp["lev"])
         except Exception:
             pass
+    _url_tp1_pct = 50
+    if "tp1_pct" in _qp:
+        try:
+            _url_tp1_pct = 70 if int(float(_qp["tp1_pct"])) >= 65 else 50
+            st.session_state[f"exec_tp1_book_pct_{_p}"] = _url_tp1_pct
+        except Exception:
+            pass
+    _url_size_mult = 1.0
+    if "size_mult" in _qp:
+        try:
+            _url_size_mult = float(_qp["size_mult"])
+        except Exception:
+            pass
     _url_sid = _qp.get("strategy", strategy_registry.DEFAULT_STRATEGY_ID)
     if _url_sid not in strategy_registry.STRATEGY_REGISTRY:
         _url_sid = strategy_registry.DEFAULT_STRATEGY_ID
@@ -598,6 +634,9 @@ if is_execution_link and st.session_state.get("_url_applied") != _url_sig:
                 "stop_loss": float(_qp["sl"]),
                 "tp1": float(_qp.get("tp1", _qp["entry"])),
                 "tp2": float(_qp.get("tp2", _qp["entry"])),
+                "tp1_book_frac": _url_tp1_pct / 100.0,
+                "size_mult": _url_size_mult,
+                "is_manual_router": str(_qp.get("manual_router", "")).lower() in ("1", "true", "yes"),
             }
     except Exception:
         pass
@@ -1227,7 +1266,22 @@ with st.sidebar.expander("⚙️ Watchlist, Theme & Tools", expanded=False):
         value=_saved_email_on,
         key="monitor_on",
         on_change=_on_monitor_email_toggle_change,
-        help="Persisted across logins & restarts. Defaults to OFF on Staging so Staging never sends duplicate emails alongside Main.",
+        help="Strict v41 AutoTrade & Signal 24/7 Gmail alerts. Defaults to OFF on Staging so Staging never sends duplicate emails alongside Main.",
+    )
+    _saved_manual_email_on = bool(_auto_cfg.get("manual_intraday_email_alerts_enabled", False if (_is_staging_env or _is_experiment_env) else True))
+    if "manual_intraday_email_on" not in st.session_state:
+        st.session_state["manual_intraday_email_on"] = _saved_manual_email_on
+
+    def _on_manual_intraday_email_toggle_change():
+        new_me_val = bool(st.session_state.get("manual_intraday_email_on", False))
+        coindcx_engine.save_autotrade_config({"manual_intraday_email_alerts_enabled": new_me_val})
+
+    manual_intraday_email_on = st.toggle(
+        "📧 Manual Intraday Router Alerts (24/7)",
+        value=_saved_manual_email_on,
+        key="manual_intraday_email_on",
+        on_change=_on_manual_intraday_email_toggle_change,
+        help="Sends 24/7 Gmail alerts for live `exp-staging-intraday-score-router` manual setups (including Counter-Daily 0.6× / 70% TP1 relief rallies) with a 1-click prefilled Execute link. Never places automated AutoTrade orders.",
     )
     _strategy_names = [s.name for s in strategy_registry.list_strategies()]
     _default_strat_names = [strategy_registry.get_strategy(sid).name for sid in _active_mode_strats if strategy_registry.get_strategy(sid).name in _strategy_names]
@@ -2147,6 +2201,14 @@ if active_section == "⚡ Signals":
                                 usd_inr=float(usd_inr),
                             )
                             if _ok_p:
+                                _send_trade_email_async(
+                                    pair=_p_pair, direction=_p_sig, entry=float(_item_p["entry"]),
+                                    stop_loss=float(_item_p["stop_loss"]), tp1=float(_item_p["tp1"]), tp2=float(_item_p["tp2"]),
+                                    margin_inr=float(margin_inr), leverage=int(leverage), kind="EXECUTED",
+                                    note=f"Executed from CoinDCX Push Alert: {_msg_p}",
+                                    strategy_name="Box Theory Sweep (Push Alert)", strategy_id="box_theory",
+                                    trigger_reason=str(_item_p.get("trigger_reason", "iPhone CoinDCX Push Alert")),
+                                )
                                 st.session_state["last_autotrade_banner"] = f"🚀 **Executed CoinDCX Push Alert ({_p_sym}):** {_msg_p}"
                                 get_cached_positions.clear()
                                 get_cached_balance.clear()
@@ -2221,6 +2283,15 @@ if active_section == "⚡ Signals":
                             pair=pair_r, sig={**sig, "manual_override": True}, single_trade_margin_inr=margin_inr, leverage=leverage, usd_inr=usd_inr
                         )
                         if ok_a:
+                            _send_trade_email_async(
+                                pair=pair_r, direction=sig["signal"], entry=float(sig["entry"]),
+                                stop_loss=float(sig["stop_loss"]), tp1=float(sig["tp1"]), tp2=float(sig["tp2"]),
+                                margin_inr=float(margin_inr), leverage=int(leverage), kind="EXECUTED",
+                                note=f"Executed from Signals Tab: {msg_a}",
+                                strategy_name=r["strategy_name"], strategy_id=str(sig.get("strategy_id") or r["strategy_id"]),
+                                trigger_reason=str(sig.get("trigger_reason") or ""),
+                                levels=sig.get("levels"),
+                            )
                             st.session_state["last_autotrade_banner"] = f"🚀 **Executed ({name_r}):** {msg_a}"
                             get_cached_signals_scan.clear()
                             get_cached_positions.clear()
@@ -2334,6 +2405,16 @@ if active_section == "⚡ Signals":
                             usd_inr=float(usd_inr),
                         )
                         if ok_m:
+                            _send_trade_email_async(
+                                pair=_mp, direction=_mdir, entry=float(_prefill_payload["entry"]),
+                                stop_loss=float(_prefill_payload["stop_loss"]), tp1=float(_prefill_payload["tp1"]), tp2=float(_prefill_payload["tp2"]),
+                                margin_inr=float(_msugg_m), leverage=int(leverage), kind="EXECUTED",
+                                note=f"Manual Intraday Router Trigger ({_mpol.get('badge', '')}): {msg_m}",
+                                strategy_name=f"Manual Intraday Router — {_msname}", strategy_id=_msid,
+                                trigger_reason=str(_prefill_payload.get("trigger_reason") or ""),
+                                levels=_mi.get("levels"),
+                                tp1_book_frac=_mtp1_frac, size_mult=_msmult, is_manual_router=True,
+                            )
                             st.session_state["last_autotrade_banner"] = f"🚀 **Manual Intraday Trade ({_msym}):** {msg_m}"
                             get_cached_signals_scan.clear()
                             get_cached_manual_intraday_scan.clear()
@@ -2558,7 +2639,10 @@ elif active_section == "🎯 Execute":
                     "direction": _pref["direction"], "setup": f"{_ps.name}: Alert Ticket",
                     "entry": _pref["entry"], "stop_loss": _pref["stop_loss"],
                     "tp1": _pref["tp1"], "tp2": _pref["tp2"], **_pm,
-                    "strategy_id": _ps.id, "strategy_name": _ps.name, "trigger_reason": "Email Alert Link"
+                    "strategy_id": _ps.id, "strategy_name": _ps.name,
+                    "trigger_reason": "Manual Intraday Router Email Link" if _pref.get("is_manual_router") else "Email Alert Link",
+                    "tp1_book_frac": float(_pref.get("tp1_book_frac", 0.50) or 0.50),
+                    "size_mult": float(_pref.get("size_mult", 1.0) or 1.0),
                 }
                 choices.append((f"📧 Alert {_pref['direction']} ({fmt_px(_pref['entry'])})", _pset, strategy_registry.setup_tag(_ps.id, "EMAIL"), _ps))
 
@@ -2682,7 +2766,7 @@ elif active_section == "🎯 Execute":
                 direction=trade_dir,
                 entry1_px=float(active_trade["entry"]),
                 entry2_px=None,
-                tp1_px=None if (_is_box_strat and not (setup_tag.endswith("INTRADAY_PREFILL") or setup_tag.endswith("INTRADAY_ROUTER"))) else float(active_trade["tp1"]),
+                tp1_px=None if (_is_box_strat and not (setup_tag.endswith("EMAIL") or setup_tag.endswith("INTRADAY_PREFILL") or setup_tag.endswith("INTRADAY_ROUTER"))) else float(active_trade["tp1"]),
                 tp2_px=float(active_trade["tp2"]),
                 sl_px=float(active_trade["stop_loss"]),
                 live_px=float(active_trade["entry"]),
@@ -3120,7 +3204,9 @@ elif active_section == "🎯 Execute":
                             leverage=trade_leverage, kind="EXECUTED",
                             note="Live order submitted." if is_live else "Paper order filled.",
                             strategy_name=_sig_strat_obj.name, strategy_id=_sig_sid,
-                            trigger_reason=active_trade.get("trigger_reason", "")
+                            trigger_reason=active_trade.get("trigger_reason", ""),
+                            tp1_book_frac=_tp1_eff_frac if _tp1_eff_frac > 0 else 0.50,
+                            size_mult=_exec_size_mult,
                         )
                         msg_out = f"✅ {trade_dir} {active_trade['crypto_qty']} {cur_asset} @ {fmt_px(limit_entry_px)} ({live_api_msg or 'Filled'})"
                     else:
@@ -3961,6 +4047,15 @@ elif active_section == "📈 Chart & Levels":
                             _ex_ok, _ex_msg = exit_coindcx_position(_ch_live_pos["id"], pair=selected_pair)
                             if _ex_ok:
                                 coindcx_engine.clear_autotrade_active_lock(pair=selected_pair)
+                                _send_trade_email_async(
+                                    pair=selected_pair, direction=_pos_dir_raw, entry=_pos_entry,
+                                    stop_loss=_ov_sl, tp1=_ov_tp1, tp2=_ov_tp2,
+                                    margin_inr=_pos_margin, leverage=_pos_lev, kind="CLOSED",
+                                    note=f"Manual Chart Market Exit (Live CoinDCX @ {fmt_px(_ch_ref_px)}): {_ex_msg}",
+                                    strategy_name=f"Chart Trading ({chart_strategy})",
+                                    strategy_id=str((_ch_paper_lock or {}).get("strategy_id") or "box_theory"),
+                                    tp1_book_frac=_ov_tp1_pct / 100.0,
+                                )
                                 get_cached_positions.clear()
                                 get_cached_open_orders.clear()
                                 get_cached_balance.clear()
@@ -3972,6 +4067,16 @@ elif active_section == "📈 Chart & Levels":
                             _ex_ok, _ex_msg, _ = coindcx_engine.close_app_paper_position(
                                 selected_pair, exit_price=_ch_ref_px, reason="Manual Chart Exit"
                             )
+                            if _ex_ok:
+                                _send_trade_email_async(
+                                    pair=selected_pair, direction=_pos_dir_raw, entry=_pos_entry,
+                                    stop_loss=_ov_sl, tp1=_ov_tp1, tp2=_ov_tp2,
+                                    margin_inr=_pos_margin, leverage=_pos_lev, kind="CLOSED",
+                                    note=f"Manual Chart Market Exit (Staging Paper @ {fmt_px(_ch_ref_px)}): {_ex_msg}",
+                                    strategy_name=f"Chart Trading ({chart_strategy})",
+                                    strategy_id=str((_ch_paper_lock or {}).get("strategy_id") or "box_theory"),
+                                    tp1_book_frac=_ov_tp1_pct / 100.0,
+                                )
                             get_cached_balance.clear()
                             st.session_state["chart_trade_banner"] = ("success" if _ex_ok else "error", _ex_msg)
                             st.rerun()
@@ -4152,6 +4257,15 @@ elif active_section == "📈 Chart & Levels":
                             usd_inr=float(usd_inr),
                         )
                         if _ok_ch:
+                            _send_trade_email_async(
+                                pair=selected_pair, direction="LONG" if _ov_dir == "BUY" else "SHORT",
+                                entry=_ov_entry, stop_loss=_ov_sl, tp1=_ov_tp1, tp2=_ov_tp2,
+                                margin_inr=float(_ch_margin), leverage=int(_ch_lev), kind="EXECUTED",
+                                note=f"Executed from Interactive Chart Trading ({chart_strategy} • {_ch_ord_type}): {_msg_ch}",
+                                strategy_name=f"Chart Trading — {chart_strategy}", strategy_id=_ch_sid,
+                                trigger_reason=f"Chart Trade ({chart_strategy} • {_ch_ord_type})",
+                                levels=levels, tp1_book_frac=_ov_tp1_pct / 100.0,
+                            )
                             get_cached_positions.clear()
                             get_cached_open_orders.clear()
                             get_cached_balance.clear()
