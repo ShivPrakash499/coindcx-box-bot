@@ -7565,9 +7565,9 @@ def execute_autotrade_two_entry_signal(
     import strategies as _strat_mod
     auto_mode = _strat_mod.resolve_autotrade_mode(cfg.get("autotrade_strategy_mode"))
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
-    if (not allow_mode_override) and (bool(sig.get("is_box_extension")) or bool(sig.get("manual_only"))):
+    if (not allow_mode_override) and (bool(sig.get("is_box_extension")) or bool(sig.get("is_box_flip")) or bool(sig.get("manual_only"))):
         return False, (
-            f"Manual-Only Continuation Guard: {sig_strat_id} breakdown/breakout continuation on {pair} "
+            f"Manual-Only Continuation/Flip Guard: {sig_strat_id} breakdown/breakout or shifted-box flip on {pair} "
             f"is restricted to Manual Trading (Signals / Execute / Email) and excluded from AutoTrade."
         ), {"strategy_id": sig_strat_id, "manual_only": True}
     if (not allow_mode_override) and sig_strat_id not in ("box_theory", "ema50_200", "ema21_pullback"):

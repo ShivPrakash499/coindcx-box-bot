@@ -2703,7 +2703,11 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
          }), \
          patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 18000.0, "available_inr": 18000.0}), \
          patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
          patch.object(eng, "fetch_coindcx_open_orders", return_value=[]), \
+         patch.object(eng, "get_active_portfolio_trade_status", return_value={"has_active_trade": False, "active_pairs": [], "active_count": 0, "max_slots": 2, "slots_full": False, "active_map": {}}), \
+         patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
+         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
          patch.object(eng, "fetch_live_ticker", return_value={"last_price": 5.911, "best_bid": 5.910, "best_ask": 5.912}), \
          patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
          patch.object(eng, "check_unrealized_pnl_daily_sl_pause", return_value=(False, "", {})), \
@@ -2711,7 +2715,7 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
         ok_at_ext, msg_at_ext, _ = eng.execute_autotrade_two_entry_signal(
             pair="B-INJ_USDT", sig=ext_live_sig, single_trade_margin_inr=5000.0, leverage=10, usd_inr=90.0,
         )
-        assert (not ok_at_ext) and ("Manual-Only Continuation Guard" in msg_at_ext), f"AutoTrade must block extension: {ok_at_ext} {msg_at_ext}"
+        assert (not ok_at_ext) and ("Manual-Only Continuation/Flip Guard" in msg_at_ext), f"AutoTrade must block extension: {ok_at_ext} {msg_at_ext}"
         ok_man_ext, msg_man_ext, _ = eng.execute_autotrade_two_entry_signal(
             pair="B-INJ_USDT", sig={**ext_live_sig, "manual_override": True}, single_trade_margin_inr=5000.0, leverage=10, usd_inr=90.0,
         )
@@ -2721,7 +2725,122 @@ def test_20_autotrade_wallet_intraday_manual_and_chart_trading():
     assert pl21_ext["SELL"]["is_box_extension"] is True and pl21_ext["SELL"]["manual_only"] is True
     assert pl21_ext["SELL"]["tp2"] < pl21_ext["SELL"]["tp1"] < pl21_ext["SELL"]["entry"] < pl21_ext["SELL"]["stop_loss"]
 
-    print("  -> PASS: AutoTrade Wallet, Margin Plan Deps, Manual Router, 24/7 Email Alerts, 15m 21 EMA Bounce, Breakdown Continuation (Manual-Only), Tab Auth & Live-Only Signals verified!")
+    # 12. Broken-Box Acceptance Guard (Variant A AutoTrade) + Manual-Only Shifted-Box Polarity Flip (Option 2)
+    # 12A: SOL/DOGE scenario — >=4 consecutive closes > RH (even with 0 closes > SH) marks upper_box_broken=True & blocks bad SHORT!
+    s1_box_opt2 = strat.BoxTheorySweep()
+    doge_box = {
+        "RH": 0.0563, "RL": 0.0531, "MID": 0.0547, "SH": 0.0572, "SL": 0.0522,
+        "EMA50": 0.0585, "EMA200": 0.0610, "daily_close": 0.0550, "ATR": 0.0032,
+        "bias": "BEARISH", "trend_bias": "BEARISH",
+    }
+    doge_recs = [
+        {"open": 0.0564, "high": 0.0569, "low": 0.0563, "close": 0.0567, "EMA9": 0.0566, "EMA50": 0.0559, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(6)
+    ]
+    # 7th bar dips slightly below RH (0.0563) after 6 straight closes > RH -> MUST NOT SHORT!
+    doge_recs.append({"open": 0.0567, "high": 0.0568, "low": 0.0561, "close": 0.0562, "EMA9": 0.0565, "EMA50": 0.0559, "date_str": "2026-11-26", "timestamp": 1795600000000 + 6 * 900000})
+    brk_doge = strat._check_box_breakout_state(doge_recs, 6, doge_box["RH"], doge_box["RL"], doge_box["SH"], doge_box["SL"], 0.0559)
+    assert brk_doge["upper_box_broken"] is True and brk_doge["rh_accepted"] is True and brk_doge["sh_broken"] is False
+    doge_ctx = {"boxes": {"2026-11-26": doge_box}, "ema50_15m": [0.0559] * len(doge_recs), "ema9_15m": [0.0565] * len(doge_recs)}
+    assert s1_box_opt2.backtest_entry(6, doge_recs[6], doge_ctx, doge_recs) is None, "Acceptance guard must block broken-box SHORT on DOGE/SOL"
+
+    # Symmetric lower-box acceptance: >=4 consecutive closes < RL blocks bad LONG fade!
+    dn_box = {**doge_box, "bias": "BULLISH", "trend_bias": "BULLISH", "EMA50": 0.0510, "EMA200": 0.0490}
+    dn_recs = [
+        {"open": 0.0530, "high": 0.05305, "low": 0.0525, "close": 0.0527, "EMA9": 0.0528, "EMA50": 0.0536, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(5)
+    ]
+    dn_recs.append({"open": 0.0527, "high": 0.0533, "low": 0.0526, "close": 0.0532, "EMA9": 0.0529, "EMA50": 0.0536, "date_str": "2026-11-26", "timestamp": 1795600000000 + 5 * 900000})
+    brk_dn = strat._check_box_breakout_state(dn_recs, 5, dn_box["RH"], dn_box["RL"], dn_box["SH"], dn_box["SL"], 0.0536)
+    assert brk_dn["lower_box_broken"] is True and brk_dn["rl_accepted"] is True and brk_dn["sl_broken"] is False
+    dn_ctx = {"boxes": {"2026-11-26": dn_box}, "ema50_15m": [0.0536] * len(dn_recs), "ema9_15m": [0.0529] * len(dn_recs)}
+    assert s1_box_opt2.backtest_entry(5, dn_recs[5], dn_ctx, dn_recs) is None, "Acceptance guard must block broken-box LONG"
+
+    # 12B: Genuine 1-bar liquidity sweep above RH from inside the box keeps upper_box_broken=False so valid sweeps still fire
+    sweep_recs = [
+        {"open": 0.0550, "high": 0.0556, "low": 0.0548, "close": 0.0554, "EMA9": 0.0552, "EMA50": 0.0550, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(5)
+    ]
+    sweep_recs.append({"open": 0.0554, "high": 0.0567, "low": 0.0553, "close": 0.0564, "EMA9": 0.0556, "EMA50": 0.0551, "date_str": "2026-11-26", "timestamp": 1795600000000 + 5 * 900000})
+    sweep_recs.append({"open": 0.0564, "high": 0.0566, "low": 0.0558, "close": 0.0559, "EMA9": 0.0557, "EMA50": 0.0551, "date_str": "2026-11-26", "timestamp": 1795600000000 + 6 * 900000})
+    brk_sw = strat._check_box_breakout_state(sweep_recs, 6, doge_box["RH"], doge_box["RL"], doge_box["SH"], doge_box["SL"], 0.0551)
+    assert brk_sw["upper_box_broken"] is False and brk_sw["reconfig"] is None
+    sw_ctx = {"boxes": {"2026-11-26": doge_box}, "ema50_15m": [0.0551] * len(sweep_recs), "ema9_15m": [0.0556] * len(sweep_recs)}
+    sw_bt = s1_box_opt2.backtest_entry(6, sweep_recs[6], sw_ctx, sweep_recs)
+    assert sw_bt is not None and sw_bt["direction"] == "SHORT", f"Valid 1-bar RH sweep must still fire SHORT, got {sw_bt}"
+
+    # 12C: Hybrid reconfig math for SHIFTED_UP (RH accepted vs SH broken) & SHIFTED_DOWN (RL accepted vs SL broken)
+    rc_up_rh = brk_doge["reconfig"]
+    assert rc_up_rh is not None and rc_up_rh["state"] == "SHIFTED_UP"
+    assert abs(rc_up_rh["RL"] - doge_box["RH"]) < 1e-6 and rc_up_rh["SL"] < rc_up_rh["RL"] < rc_up_rh["MID"] < rc_up_rh["RH"] < rc_up_rh["SH"]
+    sh_recs = [
+        {"open": 0.0573, "high": 0.0578, "low": 0.0572, "close": 0.0576, "EMA9": 0.0574, "EMA50": 0.0562, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(4)
+    ]
+    brk_sh = strat._check_box_breakout_state(sh_recs, 3, doge_box["RH"], doge_box["RL"], doge_box["SH"], doge_box["SL"], 0.0562)
+    assert brk_sh["sh_broken"] is True and brk_sh["reconfig"]["state"] == "SHIFTED_UP"
+    assert abs(brk_sh["reconfig"]["RL"] - doge_box["SH"]) < 1e-6 and abs(brk_sh["reconfig"]["SL"] - doge_box["RH"]) < 1e-6
+    rc_dn_rl = brk_dn["reconfig"]
+    assert rc_dn_rl is not None and rc_dn_rl["state"] == "SHIFTED_DOWN"
+    assert abs(rc_dn_rl["RH"] - dn_box["RL"]) < 1e-6 and rc_dn_rl["SH"] > rc_dn_rl["RH"] > rc_dn_rl["MID"] > rc_dn_rl["RL"] > rc_dn_rl["SL"]
+
+    # 12D: evaluate_signal allow_box_flip=False stays NEUTRAL (AutoTrade safe); allow_box_flip=True emits Manual-Only BOX_FLIP;
+    #      and execute_autotrade_two_entry_signal hard-blocks `is_box_flip` for AutoTrade while allowing manual_override=True!
+    flip_df_recs = [
+        {"open": 0.0565, "high": 0.0570, "low": 0.0564, "close": 0.0568, "EMA50": 0.0558, "timestamp": 1795600000000 + i * 900000}
+        for i in range(6)
+    ]
+    # Retest old RH (0.0563) and bounce green above it -> Shifted-Box Flip LONG!
+    flip_df_recs.append({"open": 0.0568, "high": 0.0569, "low": 0.05625, "close": 0.0564, "EMA50": 0.0559, "timestamp": 1795600000000 + 6 * 900000})
+    flip_df_recs.append({"open": 0.0564, "high": 0.0568, "low": 0.05628, "close": 0.05675, "EMA50": 0.0559, "timestamp": 1795600000000 + 7 * 900000})
+    import pandas as _pd_opt2
+    flip_df = _pd_opt2.DataFrame(flip_df_recs)
+    with patch.object(strat, "_closed_15m", return_value=flip_df):
+        sig_at_off = s1_box_opt2.evaluate_signal("B-DOGE_USDT", doge_box, 10000.0, 10, 90.0, allowed_dirs=["LONG", "SHORT"], allow_box_flip=False)
+        assert sig_at_off["signal"] == "NEUTRAL" and sig_at_off.get("shifted_box", {}).get("state") == "SHIFTED_UP"
+        sig_man_flip = s1_box_opt2.evaluate_signal("B-DOGE_USDT", doge_box, 10000.0, 10, 90.0, allowed_dirs=["LONG", "SHORT"], allow_box_flip=True)
+        assert sig_man_flip["signal"] == "LONG" and sig_man_flip.get("signal_kind") == "BOX_FLIP"
+        assert sig_man_flip.get("is_box_flip") is True and sig_man_flip.get("manual_only") is True
+        assert sig_man_flip["stop_loss"] < sig_man_flip["entry"] < sig_man_flip["tp1"] <= sig_man_flip["tp2"]
+        # 12E: plan_setups returns Shifted Box BUY plan (`is_box_flip=True`, `manual_only=True`) and warns on broken SELL plan
+        pl_flip = s1_box_opt2.plan_setups("B-DOGE_USDT", doge_box, 0.05675, 10000.0, 10, 90.0)
+        assert pl_flip["BUY"]["is_box_flip"] is True and pl_flip["BUY"]["manual_only"] is True
+        assert pl_flip["SELL"].get("box_broken_warning") is True
+        assert pl_flip.get("shifted_box", {}).get("state") == "SHIFTED_UP"
+
+    with patch.object(eng, "is_staging_environment", return_value=True), \
+         patch.object(eng, "is_experiment_environment", return_value=False), \
+         patch.object(eng, "get_autotrade_config", return_value={
+             "enabled": True, "paper_autotrade_enabled": True, "autotrade_strategy_mode": "box_theory",
+             "autotrade_wallet_inr": 10000.0, "single_trade_margin_inr": 5000.0, "max_concurrent_trades": 2,
+             "active_trade_locks": {},
+         }), \
+         patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 18000.0, "available_inr": 18000.0}), \
+         patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+         patch.object(eng, "fetch_coindcx_open_orders", return_value=[]), \
+         patch.object(eng, "get_active_portfolio_trade_status", return_value={"has_active_trade": False, "active_pairs": [], "active_count": 0, "max_slots": 2, "slots_full": False, "active_map": {}}), \
+         patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL"}), \
+         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
+         patch.object(eng, "fetch_live_ticker", return_value={"last_price": 0.05675, "best_bid": 0.05674, "best_ask": 0.05676}), \
+         patch.object(eng, "check_live_daily_loss_stop", return_value=(False, "", {})), \
+         patch.object(eng, "check_unrealized_pnl_daily_sl_pause", return_value=(False, "", {})), \
+         patch.object(eng, "register_app_trade_lock", return_value={"pair": "B-DOGE_USDT"}):
+        ok_at_flip, msg_at_flip, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-DOGE_USDT", sig=sig_man_flip, single_trade_margin_inr=5000.0, leverage=10, usd_inr=90.0,
+        )
+        assert (not ok_at_flip) and ("Manual-Only Continuation/Flip Guard" in msg_at_flip), f"AutoTrade must block box flip: {ok_at_flip} {msg_at_flip}"
+        ok_man_flip, msg_man_flip, _ = eng.execute_autotrade_two_entry_signal(
+            pair="B-DOGE_USDT", sig={**sig_man_flip, "manual_override": True}, single_trade_margin_inr=5000.0, leverage=10, usd_inr=90.0,
+        )
+        assert ok_man_flip, f"Manual override must allow Shifted-Box Flip execution: {msg_man_flip}"
+
+    assert "get_cached_shifted_box_state" in app_src and "Manual Shifted-Box Flip" in app_src and "Flip RL (New Buy)" in app_src
+    with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "signal_monitor.py"), "r", encoding="utf-8") as _f_sm_opt2:
+        _sm_src_opt2 = _f_sm_opt2.read()
+    assert "is_box_flip" in _sm_src_opt2 and "Shifted-Box Polarity Flip" in _sm_src_opt2
+
+    print("  -> PASS: AutoTrade Wallet, Margin Plan Deps, Manual Router, 24/7 Email Alerts, 15m 21 EMA Bounce, Breakdown Continuation, Broken-Box Acceptance Guard & Manual Shifted-Box Flip verified!")
 
 
 if __name__ == "__main__":

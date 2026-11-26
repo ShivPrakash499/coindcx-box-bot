@@ -596,7 +596,7 @@ def scan_manual_intraday_signals(
                 d_b = str(info.get("daily_bias") or "NEUTRAL").upper()
                 d_dir = str(lsig["signal"]).upper()
                 bias_ok = not ((d_b == "BEARISH" and d_dir != "SHORT") or (d_b == "BULLISH" and d_dir != "LONG"))
-                is_manual_ext = bool(lsig.get("is_box_extension") or lsig.get("manual_only"))
+                is_manual_ext = bool(lsig.get("is_box_extension") or lsig.get("is_box_flip") or lsig.get("manual_only"))
                 strict_ok = bool(
                     (not is_manual_ext)
                     and bias_ok
@@ -686,22 +686,23 @@ def alert_manual_intraday_signals(
             tp1_pct = int(round(tp1_frac * 100))
             sugg_m = float(lsig.get("suggested_margin_inr") or max(500.0, float(margin_inr) * size_mult))
             base_sname = str(lsig.get("strategy_name") or strat_registry.get_strategy(sid).name)
+            is_flip_sig = bool(lsig.get("is_box_flip"))
             is_ext_sig = bool(lsig.get("is_box_extension") or lsig.get("manual_only"))
-            ext_lbl = ("Breakdown 1R/2R" if str(lsig.get("signal", "")).upper() == "SHORT" else "Breakout 1R/2R") if is_ext_sig else ""
-            strat_label = (
-                f"Manual {ext_lbl} ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
-                if is_ext_sig
-                else f"Manual Intraday ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
-            )
-            strict_tag = (
-                "Manual Only — Breakdown/Breakout Continuation (1R/2R, excluded from AutoTrade)."
-                if is_ext_sig
-                else (
+            if is_flip_sig:
+                flip_lbl = "Shifted-Box Flip (RH->RL)" if str(lsig.get("signal", "")).upper() == "LONG" else "Shifted-Box Flip (RL->RH)"
+                strat_label = f"Manual {flip_lbl} ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
+                strict_tag = "Manual Only — Shifted-Box Polarity Flip (excluded from AutoTrade)."
+            elif is_ext_sig:
+                ext_lbl = "Breakdown 1R/2R" if str(lsig.get("signal", "")).upper() == "SHORT" else "Breakout 1R/2R"
+                strat_label = f"Manual {ext_lbl} ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
+                strict_tag = "Manual Only — Breakdown/Breakout Continuation (1R/2R, excluded from AutoTrade)."
+            else:
+                strat_label = f"Manual Intraday ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
+                strict_tag = (
                     "Also eligible under Strict v41 AutoTrade."
                     if item.get("strict_v41_autotrade_eligible")
                     else "Manual Only (Counter-Daily / Intraday Router — skipped by Strict v41 AutoTrade)."
                 )
-            )
             note_txt = (
                 f"{strict_tag} Score {score_v:+d} | ADX {float(pol.get('adx', 0.0)):.1f} | "
                 f"Regime {pol.get('regime', 'INTRADAY')} | Scaled Margin ₹{sugg_m:,.0f} ({size_mult:.2g}x) | "

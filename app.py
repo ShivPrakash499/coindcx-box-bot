@@ -511,6 +511,13 @@ def get_cached_strategy_levels(strategy_id, pair):
     return strategy_registry.get_strategy(strategy_id).compute_levels(pair)
 
 @st.cache_data(ttl=45)
+def get_cached_shifted_box_state(pair: str):
+    """Canonical live broken-box / shifted polarity-flip box state for Chart, Execute & Signals."""
+    if hasattr(strategy_registry, "get_live_shifted_box_state"):
+        return strategy_registry.get_live_shifted_box_state(pair, get_cached_strategy_levels("box_theory", pair))
+    return {"upper_box_broken": False, "lower_box_broken": False, "reconfig": None}
+
+@st.cache_data(ttl=45)
 def get_cached_strategy_signal(strategy_id, pair, m_inr, lev, u_inr):
     s = strategy_registry.get_strategy(strategy_id)
     return s.evaluate_signal(pair, get_cached_strategy_levels(strategy_id, pair), m_inr, lev, u_inr)
@@ -2491,14 +2498,19 @@ if active_section == "⚡ Signals":
                 _mtp1_pct = int(round(_mtp1_frac * 100))
                 _msugg_m = round(max(500.0, float(_mtk.get("suggested_margin_inr") or (margin_inr * _msmult))), 2)
                 _m_counter = bool(_mtk.get("is_counter_daily", _mpol.get("is_counter_daily", False)))
-                _m_is_ext = bool(_mtk.get("is_box_extension") or _mtk.get("manual_only"))
+                _m_is_flip = bool(_mtk.get("is_box_flip"))
+                _m_is_ext = bool(_mtk.get("is_box_extension") or (_mtk.get("manual_only") and not _m_is_flip))
                 _m_v41_tag = (
-                    f"✋ Manual {'Breakdown' if _mdir == 'SHORT' else 'Breakout'} Continuation (1R/2R • No AutoTrade)"
-                    if _m_is_ext
+                    f"✋ Manual Shifted-Box Flip ({'Old RH→RL' if _mdir == 'LONG' else 'Old RL→RH'} • No AutoTrade)"
+                    if _m_is_flip
                     else (
-                        "🤖 AutoTrade-Eligible (v41)"
-                        if _mi.get("strict_v41_autotrade_eligible")
-                        else ("✋ Manual Counter-Daily Relief Rally" if _m_counter else "✋ Manual Intraday Setup")
+                        f"✋ Manual {'Breakdown' if _mdir == 'SHORT' else 'Breakout'} Continuation (1R/2R • No AutoTrade)"
+                        if _m_is_ext
+                        else (
+                            "🤖 AutoTrade-Eligible (v41)"
+                            if _mi.get("strict_v41_autotrade_eligible")
+                            else ("✋ Manual Counter-Daily Relief Rally" if _m_counter else "✋ Manual Intraday Setup")
+                        )
                     )
                 )
                 _m_trig_txt = str(_mtk.get("trigger_reason") or _mtk.get("trigger_zone") or "").replace("$", "&#36;")
@@ -2744,6 +2756,24 @@ elif active_section == "🎯 Execute":
                 f"15m `{_exec_ir_stk.get('ema_state', 'CHOP')}` | ADX `{float(_exec_ir_pol.get('adx', 0.0)):.1f}` • "
                 f"Daily `{_exec_intraday_info.get('daily_bias', 'NEUTRAL')}` → **{_ir_sm_disp:.2g}× (₹{_ir_sugg_m_disp:,.0f}) / {_ir_tp1_disp}% TP1**"
             )
+        _exec_brk = get_cached_shifted_box_state(selected_pair) or {}
+        _exec_reconfig = _exec_brk.get("reconfig")
+        if isinstance(_exec_reconfig, dict):
+            if _exec_reconfig.get("state") == "SHIFTED_UP":
+                _rc_banner = (
+                    f"🔄 **Broken Upper Box ({_exec_reconfig['trigger']} — Manual Shifted-Box Flip):** "
+                    f"AutoTrade RH/SH short fades are **BLOCKED**. Old Resistance flipped to New Buy Zone "
+                    f"**RL {fmt_px(_exec_reconfig['RL'])} / SL {fmt_px(_exec_reconfig['SL'])}** → "
+                    f"MID **{fmt_px(_exec_reconfig['MID'])}** → New RH **{fmt_px(_exec_reconfig['RH'])}** (Manual Only — No AutoTrade)."
+                )
+            else:
+                _rc_banner = (
+                    f"🔄 **Broken Lower Box ({_exec_reconfig['trigger']} — Manual Shifted-Box Flip):** "
+                    f"AutoTrade RL/SL long fades are **BLOCKED**. Old Support flipped to New Sell Zone "
+                    f"**RH {fmt_px(_exec_reconfig['RH'])} / SH {fmt_px(_exec_reconfig['SH'])}** → "
+                    f"MID **{fmt_px(_exec_reconfig['MID'])}** → New RL **{fmt_px(_exec_reconfig['RL'])}** (Manual Only — No AutoTrade)."
+                )
+            st.info(_rc_banner.replace("$", "\\$"))
 
         avail_margin_int = max(1000, int(max(float(wallet.get("available_inr", 0.0) or 0.0), float(autotrade_wallet_inr))))
         _exec_m_max = max(avail_margin_int, 1000000)
@@ -2892,8 +2922,9 @@ elif active_section == "🎯 Execute":
                 _st = _plan.get(_d)
                 if not _st or _st.get("signal_kind"):
                     continue
+                _p_lbl_prefix = f"🔄 {_d} Flip Plan" if _st.get("is_box_flip") else f"{_ico} {_d} Plan"
                 choices.append((
-                    f"{_ico} {_d} Plan{_plan_sfx} ({fmt_px(_st['entry'])})",
+                    f"{_p_lbl_prefix}{_plan_sfx} ({fmt_px(_st['entry'])})",
                     {**_st, "strategy_id": _st.get("strategy_id") or _s.id},
                     strategy_registry.setup_tag(_s.id, _d),
                     _s
@@ -2928,6 +2959,12 @@ elif active_section == "🎯 Execute":
 
             _sig_sid = str(active_trade.get("strategy_id") or active_strategy.id)
             _is_box_strat = (_sig_sid == "box_theory")
+            _is_box_flip_trade = bool(active_trade.get("is_box_flip"))
+            _eff_box_lvls = (
+                active_trade.get("shifted_box")
+                if (_is_box_flip_trade and isinstance(active_trade.get("shifted_box"), dict))
+                else levels
+            )
             _strat_has_e2 = False  # Entry 2 removed: 100% Single-Slot Maker Limit sizing across all strategies
             _raw_e2_default = 0.0
             _init_norm = coindcx_engine.normalize_two_entry_runner_levels(
@@ -2935,11 +2972,11 @@ elif active_section == "🎯 Execute":
                 direction=trade_dir,
                 entry1_px=float(active_trade["entry"]),
                 entry2_px=None,
-                tp1_px=None if (_is_box_strat and not (setup_tag.endswith("EMAIL") or setup_tag.endswith("INTRADAY_PREFILL") or setup_tag.endswith("INTRADAY_ROUTER"))) else float(active_trade["tp1"]),
+                tp1_px=None if (_is_box_strat and not (_is_box_flip_trade or setup_tag.endswith("EMAIL") or setup_tag.endswith("INTRADAY_PREFILL") or setup_tag.endswith("INTRADAY_ROUTER"))) else float(active_trade["tp1"]),
                 tp2_px=float(active_trade["tp2"]),
                 sl_px=float(active_trade["stop_loss"]),
                 live_px=float(active_trade["entry"]),
-                levels=levels if _is_box_strat else None,
+                levels=_eff_box_lvls if _is_box_strat else None,
             )
             _init_norm["entry2_sweep"] = 0.0
 
@@ -2970,11 +3007,11 @@ elif active_section == "🎯 Execute":
                 direction=trade_dir,
                 entry1_px=_pending_e1,
                 entry2_px=None,
-                tp1_px=None if _is_box_strat else float(active_trade["tp1"]),
+                tp1_px=None if (_is_box_strat and not _is_box_flip_trade) else float(active_trade["tp1"]),
                 tp2_px=float(st.session_state.get(tp2_key, _init_norm["tp2"])),
                 sl_px=float(st.session_state.get(sl_key, _init_norm["stop_loss"])),
                 live_px=_pending_e1,
-                levels=levels if _is_box_strat else None,
+                levels=_eff_box_lvls if _is_box_strat else None,
             )
             if abs(_pending_e1 - float(st.session_state.get(custom_e1_tracker_key, _init_norm["entry"]))) > 1e-6:
                 st.session_state[custom_e1_tracker_key] = _pending_e1
@@ -3025,7 +3062,7 @@ elif active_section == "🎯 Execute":
                 tp2_px=custom_tp2,
                 sl_px=custom_sl,
                 live_px=custom_entry,
-                levels=levels if _is_box_strat else None,
+                levels=_eff_box_lvls if _is_box_strat else None,
             )
             _is_buy_t = (trade_dir == "BUY")
             if _strat_has_e2:
@@ -3086,11 +3123,11 @@ elif active_section == "🎯 Execute":
                     direction=trade_dir,
                     entry1_px=float(cur_price),
                     entry2_px=None,
-                    tp1_px=float(active_trade["tp1"]) if _user_custom_tp1 else None,
+                    tp1_px=float(active_trade["tp1"]) if (_user_custom_tp1 or _is_box_flip_trade) else None,
                     tp2_px=float(active_trade["tp2"]),
                     sl_px=float(active_trade["stop_loss"]),
                     live_px=float(cur_price),
-                    levels=levels if _is_box_strat else None,
+                    levels=_eff_box_lvls if _is_box_strat else None,
                 )
                 _m_e1 = float(_mkt_norm["entry"])
                 _m_tp1 = float(_mkt_norm["tp1"])
@@ -3137,7 +3174,7 @@ elif active_section == "🎯 Execute":
                     <span style="color:{subtext_color};">TP1 ({'SL Ratchet Trigger' if _is_full_runner else f'{_tp1_eff_pct}% Limit Order -> SL Ratchet'}):</span>
                     <span style="text-align:right; color:#38bdf8; font-weight:700;">{_tp1_display}</span>
 
-                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else (('2.0R Breakdown/Breakout Runner' if bool(active_trade.get('is_box_extension')) else 'RL / RH Structural Target') if _sig_sid in ('ema50_200', 'ema21_pullback') else f'{_tp2_eff_pct}% Position TP Runner')}):</span>
+                    <span style="color:{subtext_color};">TP2 ({'100% Full Runner' if _is_full_runner else (('Shifted Box Target (New RH/RL)' if bool(active_trade.get('is_box_flip')) else (('2.0R Breakdown/Breakout Runner' if bool(active_trade.get('is_box_extension')) else 'RL / RH Structural Target') if _sig_sid in ('ema50_200', 'ema21_pullback') else f'{_tp2_eff_pct}% Position TP Runner')))}):</span>
                     <span style="text-align:right; color:#10b981; font-weight:700;">{fmt_px(_disp_trade['tp2'])} (+{_disp_trade['roe_tp2']}% ROE)</span>
 
                     <span style="color:{subtext_color};">{'Stop Loss (15m 200 EMA)' if _sig_sid == 'ema50_200' else ('Stop Loss (15m 50 EMA)' if _sig_sid == 'ema21_pullback' else 'Catastrophe Stop Loss (Position SL)')}:</span>
@@ -3256,11 +3293,11 @@ elif active_section == "🎯 Execute":
                             direction=trade_dir,
                             entry1_px=_ref_e1_px,
                             entry2_px=None,
-                            tp1_px=None if (not _user_edited_tp1 and _is_box_strat) else float(active_trade["tp1"]),
+                            tp1_px=None if (not _user_edited_tp1 and _is_box_strat and not _is_box_flip_trade) else float(active_trade["tp1"]),
                             tp2_px=float(active_trade["tp2"]),
                             sl_px=float(active_trade["stop_loss"]),
                             live_px=(shield_live_px if (_use_market_e1 and shield_live_px > 0) else _ref_e1_px),
-                            levels=levels if _is_box_strat else None,
+                            levels=_eff_box_lvls if _is_box_strat else None,
                         )
                         _is_buy_e = (trade_dir == "BUY")
                         _maker_px = float(_ref_e1_px) if not _use_market_e1 else _exec_norm["entry"]
@@ -4078,9 +4115,29 @@ elif active_section == "📈 Chart & Levels":
             ts_series = pd.to_datetime(df_chart["timestamp"], unit="ms")
             _ch_ref_px = float(live_price if live_price > 0 else df_chart["close"].iloc[-1])
 
-            # Build Strategy Trade Plans for the selected Chart Strategy
+            # Build Strategy Trade Plans for the selected Chart Strategy (including Shifted Polarity-Flip Box when broken)
+            _ch_brk = get_cached_shifted_box_state(selected_pair) or {}
+            _ch_reconfig = _ch_brk.get("reconfig")
             _box_buy = calculate_trade_setup_details("BUY", levels, _ch_ref_px, margin_inr, leverage, usd_inr, pair=selected_pair)
             _box_sell = calculate_trade_setup_details("SELL", levels, _ch_ref_px, margin_inr, leverage, usd_inr, pair=selected_pair)
+            if isinstance(_ch_reconfig, dict):
+                _ch_shift_lv = {
+                    **levels,
+                    "RL": _ch_reconfig["RL"], "SL": _ch_reconfig["SL"],
+                    "MID": _ch_reconfig["MID"], "RH": _ch_reconfig["RH"], "SH": _ch_reconfig["SH"],
+                }
+                if _ch_reconfig.get("state") == "SHIFTED_UP":
+                    _bf = calculate_trade_setup_details("BUY", _ch_shift_lv, _ch_ref_px, margin_inr, leverage, usd_inr, pair=selected_pair)
+                    if _bf:
+                        _bf["is_box_flip"] = True
+                        _bf["manual_only"] = True
+                        _box_buy = _bf
+                elif _ch_reconfig.get("state") == "SHIFTED_DOWN":
+                    _sf = calculate_trade_setup_details("SELL", _ch_shift_lv, _ch_ref_px, margin_inr, leverage, usd_inr, pair=selected_pair)
+                    if _sf:
+                        _sf["is_box_flip"] = True
+                        _sf["manual_only"] = True
+                        _box_sell = _sf
             _ema50_plan = get_cached_strategy_plan("ema50_200", selected_pair, _ch_ref_px, float(margin_inr), int(leverage), float(usd_inr)) or {}
             _ema9_21_plan = strategy_registry.compute_9_21_ema_crossover_plan(
                 selected_pair, df_chart, levels, _ch_ref_px, margin_inr=float(margin_inr), leverage=int(leverage), usd_inr=float(usd_inr)
@@ -4457,6 +4514,11 @@ elif active_section == "📈 Chart & Levels":
                 if show_box_levels:
                     fig.add_hrect(y0=levels["RH"], y1=levels["SH"], fillcolor="rgba(239,68,68,0.08)", line_width=0, layer="below")
                     fig.add_hrect(y0=levels["SL"], y1=levels["RL"], fillcolor="rgba(16,185,129,0.08)", line_width=0, layer="below")
+                    if isinstance(_ch_reconfig, dict):
+                        if _ch_reconfig.get("state") == "SHIFTED_UP":
+                            fig.add_hrect(y0=_ch_reconfig["SL"], y1=_ch_reconfig["RL"], fillcolor="rgba(6,182,212,0.12)", line_width=0, layer="below")
+                        elif _ch_reconfig.get("state") == "SHIFTED_DOWN":
+                            fig.add_hrect(y0=_ch_reconfig["RH"], y1=_ch_reconfig["SH"], fillcolor="rgba(245,158,11,0.12)", line_width=0, layer="below")
 
                 # Risk & Reward shaded zones directly on chart (CoinDCX style)
                 if _ov_entry > 0 and _ov_tp2 > 0:
@@ -4540,6 +4602,30 @@ elif active_section == "📈 Chart & Levels":
                             annotation_position="top left" if key_l in ("SH", "RH", "MID") else "bottom left",
                             annotation_bgcolor=col_l, annotation_font=dict(size=9, color="#ffffff"),
                         )
+                    if isinstance(_ch_reconfig, dict):
+                        _rc_up = (_ch_reconfig.get("state") == "SHIFTED_UP")
+                        _flip_lines = (
+                            [
+                                ("Flip RH", "RH", "#06b6d4", "dashdot"),
+                                ("Flip MID", "MID", "#0ea5e9", "dot"),
+                                ("Flip RL (New Buy)", "RL", "#14b8a6", "dashdot"),
+                                ("Flip SL", "SL", "#0d9488", "dash"),
+                            ]
+                            if _rc_up
+                            else [
+                                ("Flip SH", "SH", "#d97706", "dash"),
+                                ("Flip RH (New Sell)", "RH", "#f59e0b", "dashdot"),
+                                ("Flip MID", "MID", "#0ea5e9", "dot"),
+                                ("Flip RL", "RL", "#fbbf24", "dashdot"),
+                            ]
+                        )
+                        for _flbl, _fkl, _fcol, _fdsh in _flip_lines:
+                            fig.add_hline(
+                                y=_ch_reconfig[_fkl], line_dash=_fdsh, line_color=_fcol, line_width=1.7, opacity=0.92,
+                                annotation_text=f"<b>🔄 {_flbl}: {fmt_px(_ch_reconfig[_fkl])}</b>",
+                                annotation_position="top left" if _fkl in ("SH", "RH", "MID") else "bottom left",
+                                annotation_bgcolor=_fcol, annotation_font=dict(size=9, color="#0f172a" if _fcol == "#fbbf24" else "#ffffff"),
+                            )
 
                 # Highlight Live Adjustable ENTRY, TP1, TP2, SL Lines on the right axis
                 if _ov_entry > 0:
@@ -4592,6 +4678,22 @@ elif active_section == "📈 Chart & Levels":
                     hovermode="x unified",
                 )
                 st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True, "displaylogo": False})
+                if isinstance(_ch_reconfig, dict):
+                    if _ch_reconfig.get("state") == "SHIFTED_UP":
+                        _ch_rc_txt = (
+                            f"🔄 **Broken Upper Box ({_ch_reconfig['trigger']} — Manual Shifted-Box Flip):** "
+                            f"AutoTrade RH/SH short fades are **BLOCKED**. Old resistance flipped to Support: "
+                            f"Flip RL `{fmt_px(_ch_reconfig['RL'])}` / Flip SL `{fmt_px(_ch_reconfig['SL'])}` → "
+                            f"Flip MID `{fmt_px(_ch_reconfig['MID'])}` → Flip RH `{fmt_px(_ch_reconfig['RH'])}` (Manual Only)."
+                        )
+                    else:
+                        _ch_rc_txt = (
+                            f"🔄 **Broken Lower Box ({_ch_reconfig['trigger']} — Manual Shifted-Box Flip):** "
+                            f"AutoTrade RL/SL long fades are **BLOCKED**. Old support flipped to Resistance: "
+                            f"Flip RH `{fmt_px(_ch_reconfig['RH'])}` / Flip SH `{fmt_px(_ch_reconfig['SH'])}` → "
+                            f"Flip MID `{fmt_px(_ch_reconfig['MID'])}` → Flip RL `{fmt_px(_ch_reconfig['RL'])}` (Manual Only)."
+                        )
+                    st.info(_ch_rc_txt.replace("$", "\\$"))
                 if chart_strategy == "⚡ 9/21 EMA Crossover":
                     st.caption(
                         f"⚡ **9/21 EMA Status ({active_tf}):** **{_ema9_21_plan.get('trend', 'FLAT')}** • "
