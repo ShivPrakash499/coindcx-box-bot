@@ -6,6 +6,7 @@ import hmac
 import hashlib
 import requests
 import pandas as pd
+import numpy as np
 import pytz
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -2661,8 +2662,8 @@ def fetch_historical_candles_paginated(
     }
     m = intv_minutes.get(interval.lower(), 15)
     total_candles_needed = int((duration_days * 24 * 60) / m) + 50
-    # Safety cap: up to 40,000 candles
-    total_candles_needed = min(total_candles_needed, 40000)
+    # Safety cap: up to 80,000 candles (~2.25 years of 15m data for 2-year backtests)
+    total_candles_needed = min(total_candles_needed, 80000)
 
     all_candles = []
     end_time = None
@@ -3257,20 +3258,21 @@ def run_strategy_backtest(
     if df_daily.empty or len(df_daily) < 5:
         return {"error": f"Insufficient daily candle data for {pair}."}
 
-    # 3. Fetch 5m candles for Strategy 3 (5m 9 EMA confirmed cross & >=20% ATR 30% pullback exit / retest entry)
-    df_5m = fetch_historical_candles_paginated(
-        pair=pair,
-        interval="5m",
-        duration_days=duration_days + 2
-    )
+    # 3. Fetch 5m candles only for Strategy 3 (`ema9_retest` / `strategy3_full`) to keep multi-year 15m backtests fast
     sub5_by_15m_ts = {}
-    if df_5m is not None and not df_5m.empty:
-        df_5m = df_5m.copy().reset_index(drop=True)
-        df_5m["EMA9"] = df_5m["close"].ewm(span=9, adjust=False).mean()
-        for r5 in df_5m.to_dict("records"):
-            bucket = (int(r5["timestamp"]) // 900000) * 900000
-            sub5_by_15m_ts.setdefault(bucket, []).append(r5)
-        df.attrs["df_5m"] = df_5m
+    if strategy_id == "ema9_retest" or exit_mode == "strategy3_full":
+        df_5m = fetch_historical_candles_paginated(
+            pair=pair,
+            interval="5m",
+            duration_days=duration_days + 2
+        )
+        if df_5m is not None and not df_5m.empty:
+            df_5m = df_5m.copy().reset_index(drop=True)
+            df_5m["EMA9"] = df_5m["close"].ewm(span=9, adjust=False).mean()
+            for r5 in df_5m.to_dict("records"):
+                bucket = (int(r5["timestamp"]) // 900000) * 900000
+                sub5_by_15m_ts.setdefault(bucket, []).append(r5)
+            df.attrs["df_5m"] = df_5m
 
     df['dt_ist'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert(IST)
     df['date_str'] = df['dt_ist'].dt.strftime('%Y-%m-%d')
@@ -3283,14 +3285,25 @@ def run_strategy_backtest(
     df_records = df.to_dict('records')
     trades = []
     active_trade = None
+    pending_breakout = None
     last_exit_idx = -999
     initial_capital = margin_inr
     current_equity = initial_capital
     first_candle_time = df['dt_ist'].iloc[0].strftime("%Y-%m-%d %H:%M")
     equity_curve = [{"timestamp": first_candle_time, "equity_inr": initial_capital, "pnl_inr": 0.0}]
 
-    taker_fee_rate = 0.0005 * 1.18  # 0.05% + 18% GST (Stop Loss / Market exit)
-    maker_fee_rate = 0.0002 * 1.18  # 0.02% + 18% GST (Maker Limit Entry 1 & TP1 Limit Order)
+    # Precompute warmed 15m 200 EMA aligned to `df` for trailing SL in `ema200_trail_roe15` mode
+    _full15_bt = df.attrs.get("df_full_15m")
+    if isinstance(_full15_bt, pd.DataFrame) and len(_full15_bt) >= len(df):
+        _e200_full = _full15_bt["close"].ewm(span=200, adjust=False).mean().to_numpy(dtype=float)
+        _ts_full = _full15_bt["timestamp"].to_numpy()
+        _e200_map = dict(zip(_ts_full.tolist(), _e200_full.tolist()))
+        _e200_15m_arr = [float(_e200_map.get(int(r["timestamp"]), r["close"])) for r in df_records]
+    else:
+        _e200_15m_arr = df["close"].ewm(span=200, adjust=False).mean().tolist()
+
+    taker_fee_rate = 0.0005 * 1.18  # 0.05% + 18% GST (Stop Loss / Market / Stop-Breakout fill)
+    maker_fee_rate = 0.0002 * 1.18  # 0.02% + 18% GST (Maker Limit Entry / TP Limit Order)
     day_trade_count = {}
     day_realized_pnl = {}
     day_locked = set()
@@ -3306,6 +3319,69 @@ def run_strategy_backtest(
 
         if not strat.backtest_has_context(candle, strat_ctx):
             continue
+
+        # Check pending breakout entry order (Confirmation candle Low for SHORT / High for LONG)
+        if not active_trade and pending_breakout is not None:
+            pb_dir = pending_breakout["direction"]
+            pb_ent = float(pending_breakout["entry"])
+            pb_sl = float(pending_breakout["stop"])
+            pb_age = idx - int(pending_breakout["signal_idx"])
+            pb_max_wait = int(pending_breakout.get("max_wait_bars", 3))
+            if c_date in day_locked or pb_age > pb_max_wait:
+                pending_breakout = None
+            else:
+                # Cancel if price invalidated SL before triggering breakout entry
+                sl_before = (pb_dir == "SHORT" and c_high >= pb_sl and c_low > pb_ent) or (
+                    pb_dir == "LONG" and c_low <= pb_sl and c_high < pb_ent
+                )
+                triggered = (pb_dir == "SHORT" and c_low <= pb_ent) or (pb_dir == "LONG" and c_high >= pb_ent)
+                if sl_before:
+                    pending_breakout = None
+                elif triggered:
+                    fill_p = pb_ent
+                    if pb_dir == "SHORT" and c_open < pb_ent:
+                        fill_p = c_open
+                    elif pb_dir == "LONG" and c_open > pb_ent:
+                        fill_p = c_open
+                    margin_usd = margin_inr / usd_inr
+                    pos_usd = margin_usd * leverage
+                    qty = format_order_quantity(pair, pos_usd / fill_p) if fill_p > 0 else 0.0
+                    notional_inr = margin_inr * leverage
+                    # Recalculate TP relative to actual fill if RL/RH > 15% ROE else +15% ROE
+                    roe15_px = fill_p * (1.0 - 0.15 / leverage) if pb_dir == "SHORT" else fill_p * (1.0 + 0.15 / leverage)
+                    raw_tp = float(pending_breakout.get("tp2") or pending_breakout.get("tp1") or roe15_px)
+                    if pb_dir == "SHORT":
+                        final_tp = raw_tp if (0 < raw_tp < roe15_px) else roe15_px
+                    else:
+                        final_tp = raw_tp if (raw_tp > roe15_px) else roe15_px
+                    active_trade = {
+                        "direction": pb_dir,
+                        "entry_time": c_time.strftime("%Y-%m-%d %H:%M"),
+                        "entry_date": c_date,
+                        "entry_idx": idx,
+                        "entry_price": fill_p,
+                        "entry2_sweep": 0.0,
+                        "entry2_filled": False,
+                        "stop_loss": pb_sl,
+                        "tp1": final_tp,
+                        "tp2": final_tp,
+                        "quantity": qty,
+                        "notional_inr": notional_inr,
+                        "deployed_margin_inr": margin_inr,
+                        "session": _strategies.backtest_session_name(c_time),
+                        "tp1_hit": False,
+                        "ema9_armed": False,
+                        "wrong_ema9_streak": 0,
+                        "atr20_pb_armed": False,
+                        "exit_style": pending_breakout.get("exit_style", ""),
+                        "is_breakout_entry": True,
+                        "tp1_label": pending_breakout.get("tp1_label", "100% Exit TP"),
+                        "tp2_label": pending_breakout.get("tp2_label", "Trailing 15m 200 EMA SL"),
+                        "reason": pending_breakout.get("reason", ""),
+                        "strategy_tag": pending_breakout.get("strategy_tag", strat.name),
+                    }
+                    day_trade_count[c_date] = day_trade_count.get(c_date, 0) + 1
+                    pending_breakout = None
 
         daily_atr = (
             float((strat_ctx.get("boxes", {}).get(c_date) or {}).get("ATR", 0.0))
@@ -3330,6 +3406,22 @@ def run_strategy_backtest(
                 or strategy_id == "ema9_retest"
             )
             use_full_s3_mode = (exit_mode == "strategy3_full") or (exit_mode == "smart_hybrid" and is_s3_active)
+            is_ema200_trail_mode = (active_trade.get("exit_style") == "ema200_trail_roe15")
+
+            # Experiment 15m 50/200 EMA Trailing SL: dynamically ratchet SL just beyond 15m 200 EMA (strictly in trade's favor)
+            if is_ema200_trail_mode and idx > active_trade["entry_idx"]:
+                prev_e200 = float(_e200_15m_arr[idx - 1])
+                if prev_e200 > 0:
+                    if pos_dir == "SHORT":
+                        cand_trail_sl = prev_e200 * 1.0025
+                        if cand_trail_sl < sl_p:
+                            sl_p = cand_trail_sl
+                            active_trade["stop_loss"] = sl_p
+                    else:
+                        cand_trail_sl = prev_e200 * 0.9975
+                        if cand_trail_sl > sl_p:
+                            sl_p = cand_trail_sl
+                            active_trade["stop_loss"] = sl_p
 
             # Trailing 15m Candle High/Low Stop Loss is used only in Strategy 3 full-runner mode;
             # Strategy 1 & 2 use Profit-Locked SL + Halfway-to-TP2 SL Ratchet + Fixed TP2 (no early runner choke).
@@ -3395,7 +3487,20 @@ def run_strategy_backtest(
                     or strategy_id == "ema9_retest"
                 )
                 use_full_s3_runner = (exit_mode == "strategy3_full") or (exit_mode == "smart_hybrid" and is_s3_trade)
-                if use_full_s3_runner:
+                if is_ema200_trail_mode:
+                    # Experiment 15m 50/200 EMA: 100% Complete Exit at TP (RL/RH if >15% ROE else +15% ROE) or Trailing 15m 200 EMA SL
+                    if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
+                        exit_triggered = True
+                        exit_price = sl_p
+                        exit_reason = "100% Trailing 15m 200 EMA SL"
+                        break
+                    if (pos_dir == "LONG" and tp2_p > 0 and s5_high >= tp2_p) or (pos_dir == "SHORT" and tp2_p > 0 and s5_low <= tp2_p):
+                        exit_triggered = True
+                        exit_price = tp2_p
+                        active_trade["tp2_hit"] = True
+                        exit_reason = f"100% Exit: TP Hit ({active_trade.get('tp1_label', 'RL/RH or +15% ROE')})"
+                        break
+                elif use_full_s3_runner:
                     # Variant 1: 100% of trade managed by Trailing 15m SL + Strategy 3 (20% ATR 30% Pullback / Confirmed 9 EMA Cross)
                     if (pos_dir == "LONG" and s5_low <= sl_p) or (pos_dir == "SHORT" and s5_high >= sl_p):
                         exit_triggered = True
@@ -3538,9 +3643,12 @@ def run_strategy_backtest(
                     gross_pnl_usd = (entry_p - exit_price) * qty
 
                 gross_pnl_inr = gross_pnl_usd * usd_inr
-                entry_fee_inr = notional_inr * maker_fee_rate
+                entry_fee_rate_used = taker_fee_rate if active_trade.get("is_breakout_entry") else maker_fee_rate
+                entry_fee_inr = notional_inr * entry_fee_rate_used
                 exit_notional_inr = (qty * exit_price) * usd_inr
-                if active_trade.get("tp1_hit", False) and not use_full_s3_mode:
+                if is_ema200_trail_mode:
+                    exit_fee_inr = exit_notional_inr * (maker_fee_rate if active_trade.get("tp2_hit") else taker_fee_rate)
+                elif active_trade.get("tp1_hit", False) and not use_full_s3_mode:
                     tp1_notional_inr = (0.5 * qty * tp1_p) * usd_inr
                     exit_fee_inr = (tp1_notional_inr * maker_fee_rate) + (max(0.0, exit_notional_inr - tp1_notional_inr) * taker_fee_rate)
                 else:
@@ -3599,9 +3707,13 @@ def run_strategy_backtest(
             continue
 
         # If no active trade, ask the strategy whether this closed candle is an entry
-        if not active_trade and (idx - last_exit_idx >= 1):
+        if not active_trade and pending_breakout is None and (idx - last_exit_idx >= 1):
             entry_sig = strat.backtest_entry(idx, candle, strat_ctx, df_records)
             if entry_sig:
+                if entry_sig.get("pending_breakout"):
+                    pending_breakout = dict(entry_sig)
+                    pending_breakout["signal_idx"] = idx
+                    continue
                 trade_dir = entry_sig["direction"]
                 entry_p = entry_sig["entry"]
                 entry2_p = float(entry_sig.get("entry2_sweep", 0.0) or 0.0)
@@ -3636,6 +3748,7 @@ def run_strategy_backtest(
                     "ema9_armed": False,
                     "wrong_ema9_streak": 0,
                     "atr20_pb_armed": False,
+                    "exit_style": entry_sig.get("exit_style", ""),
                     "tp1_label": entry_sig.get("tp1_label", "50% Book"),
                     "tp2_label": entry_sig.get("tp2_label", "50% Runner"),
                     "reason": entry_sig.get("reason", ""),
@@ -3905,6 +4018,330 @@ def get_high_volatility_watchlist(top_n: int = 12) -> list[str]:
 
 
 _MARKET_REGIME_CACHE = _PERSIST.setdefault("market_regime_cache", {"ts": 0.0, "data": None})
+
+
+_PAIR_INTRADAY_STACK_CACHE: dict[str, dict] = {}
+
+
+def compute_wilder_adx(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int = 14,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Computes strictly causal Wilder ADX(14), +DI, -DI using pure NumPy."""
+    n = len(close)
+    adx = np.zeros(n, dtype=float)
+    plus_di = np.zeros(n, dtype=float)
+    minus_di = np.zeros(n, dtype=float)
+    if n < period * 2 + 1:
+        return adx, plus_di, minus_di
+
+    tr = np.zeros(n, dtype=float)
+    pdm = np.zeros(n, dtype=float)
+    mdm = np.zeros(n, dtype=float)
+    for i in range(1, n):
+        up = float(high[i]) - float(high[i - 1])
+        dn = float(low[i - 1]) - float(low[i])
+        pdm[i] = up if (up > dn and up > 0.0) else 0.0
+        mdm[i] = dn if (dn > up and dn > 0.0) else 0.0
+        tr[i] = max(
+            float(high[i]) - float(low[i]),
+            abs(float(high[i]) - float(close[i - 1])),
+            abs(float(low[i]) - float(close[i - 1])),
+        )
+    atr_s = float(np.sum(tr[1 : period + 1]))
+    pdm_s = float(np.sum(pdm[1 : period + 1]))
+    mdm_s = float(np.sum(mdm[1 : period + 1]))
+    dx = np.zeros(n, dtype=float)
+    for i in range(period, n):
+        if i > period:
+            atr_s = atr_s - (atr_s / period) + tr[i]
+            pdm_s = pdm_s - (pdm_s / period) + pdm[i]
+            mdm_s = mdm_s - (mdm_s / period) + mdm[i]
+        pdi = (100.0 * pdm_s / atr_s) if atr_s > 0 else 0.0
+        mdi = (100.0 * mdm_s / atr_s) if atr_s > 0 else 0.0
+        plus_di[i] = pdi
+        minus_di[i] = mdi
+        denom = pdi + mdi
+        dx[i] = (100.0 * abs(pdi - mdi) / denom) if denom > 0 else 0.0
+    s0 = period * 2 - 1
+    adx[s0] = float(np.mean(dx[period : s0 + 1]))
+    for i in range(s0 + 1, n):
+        adx[i] = (adx[i - 1] * (period - 1) + dx[i]) / period
+    return adx, plus_di, minus_di
+
+
+def compute_htf_market_structure_from_15m(
+    ts_ms: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    tf_ms: int = 3_600_000,
+    pivot_k: int = 2,
+) -> list[dict]:
+    """
+    Layer 1 of the Intraday Trend Decision Matrix: 1H / 4H Market Structure (strictly causal).
+      - UP   : Higher Highs & Higher Lows (no BEARISH_CHOCH)
+      - DOWN : Lower Highs & Lower Lows (no BULLISH_CHOCH)
+      - CHOP : Overlapping swings or active CHoCH
+    """
+    n = len(ts_ms)
+    if n == 0:
+        return []
+    buckets: list[tuple[int, float, float, float]] = []
+    cur_b = -1
+    bh = bl = bc = 0.0
+    for i in range(n):
+        b = int(ts_ms[i] // tf_ms)
+        if b != cur_b:
+            if cur_b >= 0:
+                buckets.append(((cur_b + 1) * tf_ms, bh, bl, bc))
+            cur_b = b
+            bh, bl, bc = float(high[i]), float(low[i]), float(close[i])
+        else:
+            if high[i] > bh:
+                bh = float(high[i])
+            if low[i] < bl:
+                bl = float(low[i])
+            bc = float(close[i])
+    if cur_b >= 0:
+        buckets.append(((cur_b + 1) * tf_ms, bh, bl, bc))
+
+    m = len(buckets)
+    h_a = [x[1] for x in buckets]
+    l_a = [x[2] for x in buckets]
+    c_a = [x[3] for x in buckets]
+    e_a = [x[0] for x in buckets]
+
+    htf_states: list[dict] = []
+    sh: list[float] = []
+    sl: list[float] = []
+    prev_tr = "CHOP"
+    for j in range(m):
+        p = j - pivot_k
+        if p >= pivot_k:
+            if all(h_a[p] > h_a[p - d] for d in range(1, pivot_k + 1)) and all(h_a[p] >= h_a[p + d] for d in range(1, pivot_k + 1)):
+                sh.append(h_a[p])
+            if all(l_a[p] < l_a[p - d] for d in range(1, pivot_k + 1)) and all(l_a[p] <= l_a[p + d] for d in range(1, pivot_k + 1)):
+                sl.append(l_a[p])
+        st = "CHOP"
+        choch = "NONE"
+        cn = c_a[j]
+        last_hl = sl[-1] if sl else 0.0
+        last_lh = sh[-1] if sh else 0.0
+        if len(sh) >= 2 and len(sl) >= 2:
+            hh = sh[-1] > sh[-2]
+            hl = sl[-1] > sl[-2]
+            lh = sh[-1] < sh[-2]
+            ll = sl[-1] < sl[-2]
+            if hh and hl:
+                if cn < sl[-1]:
+                    choch = "BEARISH_CHOCH"
+                    st = "CHOP"
+                else:
+                    st = "UP"
+                    prev_tr = "UP"
+            elif lh and ll:
+                if cn > sh[-1]:
+                    choch = "BULLISH_CHOCH"
+                    st = "CHOP"
+                else:
+                    st = "DOWN"
+                    prev_tr = "DOWN"
+            else:
+                if prev_tr == "UP" and cn < sl[-1]:
+                    choch = "BEARISH_CHOCH"
+                elif prev_tr == "DOWN" and cn > sh[-1]:
+                    choch = "BULLISH_CHOCH"
+        htf_states.append({"struct": st, "choch": choch, "last_hl": last_hl, "last_lh": last_lh})
+
+    out: list[dict] = []
+    ptr = -1
+    for i in range(n):
+        bar_end = int(ts_ms[i]) + 900_000
+        while ptr + 1 < m and e_a[ptr + 1] <= bar_end:
+            ptr += 1
+        out.append(htf_states[ptr] if ptr >= 0 else {"struct": "CHOP", "choch": "NONE", "last_hl": 0.0, "last_lh": 0.0})
+    return out
+
+
+def compute_intraday_3layer_series(df_15m: pd.DataFrame) -> list[dict]:
+    """
+    Exact Intraday Trend Decision Matrix (zero lookahead, 100% Live <-> Backtest parity):
+      - Clean Uptrend  : 1H/4H HH & HL (no BEARISH_CHOCH) + Price above rising Session VWAP
+                         + 15m (9>21>50 OR 50>200) sloping up + ADX(14) > 25  -> LONG ONLY
+      - Clean Downtrend: 1H/4H LH & LL (no BULLISH_CHOCH) + Price below falling Session VWAP
+                         + 15m (9<21<50 OR 50<200) sloping down + ADX(14) > 25 -> SHORT ONLY
+      - Chop / Range   : Overlapping swings, repeated VWAP crosses, tangled EMAs, or ADX <= 25
+                         -> NO TRADE (all AutoTrade blocked on CHOP_RANGE)
+    """
+    if df_15m is None or df_15m.empty:
+        return []
+    n = len(df_15m)
+    cl = df_15m["close"].to_numpy(dtype=float)
+    hi = df_15m["high"].to_numpy(dtype=float) if "high" in df_15m.columns else cl.copy()
+    lo = df_15m["low"].to_numpy(dtype=float) if "low" in df_15m.columns else cl.copy()
+    ts_ms = (
+        df_15m["timestamp"].to_numpy(dtype=np.int64)
+        if "timestamp" in df_15m.columns
+        else np.arange(n, dtype=np.int64) * 900_000
+    )
+    vol = df_15m["volume"].to_numpy(dtype=float) if "volume" in df_15m.columns else np.ones(n, dtype=float)
+
+    # Layer 1: 1H & 4H Market Structure
+    s1h = compute_htf_market_structure_from_15m(ts_ms, hi, lo, cl, tf_ms=3_600_000, pivot_k=2)
+    s4h = compute_htf_market_structure_from_15m(ts_ms, hi, lo, cl, tf_ms=14_400_000, pivot_k=2)
+
+    # Layer 2: Session VWAP (resets daily at 00:00 UTC)
+    vwap = np.zeros(n, dtype=float)
+    vwap_state = ["CHOP_VWAP"] * n
+    vwap_slope = np.zeros(n, dtype=float)
+    vwap_x = np.zeros(n, dtype=int)
+    cur_d = -1
+    cpv = 0.0
+    cv = 0.0
+    s0 = 0
+    for i in range(n):
+        d = int(ts_ms[i] // 86_400_000)
+        if d != cur_d:
+            cur_d = d
+            cpv = 0.0
+            cv = 0.0
+            s0 = i
+        tp = (hi[i] + lo[i] + cl[i]) / 3.0
+        vi = max(0.0, vol[i])
+        cpv += tp * vi
+        cv += vi
+        vwap[i] = (cpv / cv) if cv > 0 else tp
+        vr = vwap[max(s0, i - 4)]
+        slp = ((vwap[i] - vr) / vr * 100.0) if vr > 0 else 0.0
+        vwap_slope[i] = slp
+        w0 = max(s0, i - 7)
+        crosses = 0
+        ps = 0
+        for k in range(w0, i + 1):
+            s = 1 if cl[k] > vwap[k] else (-1 if cl[k] < vwap[k] else 0)
+            if s != 0 and ps != 0 and s != ps:
+                crosses += 1
+            if s != 0:
+                ps = s
+        vwap_x[i] = crosses
+        if crosses >= 3 or (crosses >= 2 and abs(slp) < 0.08):
+            vwap_state[i] = "CHOP_VWAP"
+        elif cl[i] > vwap[i] and slp >= 0.02:
+            vwap_state[i] = "BULL_VWAP"
+        elif cl[i] < vwap[i] and slp <= -0.02:
+            vwap_state[i] = "BEAR_VWAP"
+        else:
+            vwap_state[i] = "CHOP_VWAP"
+
+    # Layer 3: 15m EMAs (9/21/50/200) & Wilder ADX(14)
+    sc = pd.Series(cl)
+    e9 = sc.ewm(span=9, adjust=False).mean().to_numpy()
+    e21 = sc.ewm(span=21, adjust=False).mean().to_numpy()
+    e50 = sc.ewm(span=50, adjust=False).mean().to_numpy()
+    e200 = sc.ewm(span=200, adjust=False).mean().to_numpy()
+    adx, plus_di, minus_di = compute_wilder_adx(hi, lo, cl, period=14)
+
+    out: list[dict] = []
+    for i in range(n):
+        ci = float(cl[i])
+        e50p = float(e50[max(0, i - 3)])
+        e21p = float(e21[max(0, i - 3)])
+        e50_bull = (ci > 0) and (e50[i] > e200[i]) and (e50[i] > e50p)
+        e50_bear = (ci > 0) and (e50[i] < e200[i]) and (e50[i] < e50p)
+        e921_bull = (ci > 0) and (e9[i] > e21[i] > e50[i]) and (e21[i] > e21p)
+        e921_bear = (ci > 0) and (e9[i] < e21[i] < e50[i]) and (e21[i] < e21p)
+        ema_st = "BULL_EMA" if (e50_bull or e921_bull) else ("BEAR_EMA" if (e50_bear or e921_bear) else "CHOP_EMA")
+
+        adxi = float(adx[i])
+        adx_pass = adxi > 25.0
+        adx_tier = "STRONG" if adxi > 25.0 else ("MODERATE" if adxi >= 20.0 else "CHOP")
+
+        s1 = s1h[i]
+        s4 = s4h[i]
+        htf_up = (s1["struct"] == "UP" or (s1["struct"] == "CHOP" and s4["struct"] == "UP")) and (s1["choch"] != "BEARISH_CHOCH") and (s4["choch"] != "BEARISH_CHOCH")
+        htf_dn = (s1["struct"] == "DOWN" or (s1["struct"] == "CHOP" and s4["struct"] == "DOWN")) and (s1["choch"] != "BULLISH_CHOCH") and (s4["choch"] != "BULLISH_CHOCH")
+
+        if htf_up and vwap_state[i] == "BULL_VWAP" and ema_st == "BULL_EMA" and adx_pass:
+            reg = "CLEAN_UPTREND"
+        elif htf_dn and vwap_state[i] == "BEAR_VWAP" and ema_st == "BEAR_EMA" and adx_pass:
+            reg = "CLEAN_DOWNTREND"
+        else:
+            reg = "CHOP_RANGE"
+
+        out.append({
+            "timestamp": int(ts_ms[i]),
+            "regime": reg,
+            "s1_struct": s1["struct"],
+            "s1_choch": s1["choch"],
+            "s4_struct": s4["struct"],
+            "s4_choch": s4["choch"],
+            "vwap": float(vwap[i]),
+            "vwap_state": vwap_state[i],
+            "vwap_slope_pct": round(float(vwap_slope[i]), 3),
+            "vwap_crosses": int(vwap_x[i]),
+            "ema_state": ema_st,
+            "ema9": float(e9[i]),
+            "ema21": float(e21[i]),
+            "ema50": float(e50[i]),
+            "ema200": float(e200[i]),
+            "adx": round(adxi, 1),
+            "adx_tier": adx_tier,
+            "plus_di": round(float(plus_di[i]), 1),
+            "minus_di": round(float(minus_di[i]), 1),
+        })
+    return out
+
+
+def compute_pair_intraday_trend_stack(pair: str, df_15m: pd.DataFrame = None, force_refresh: bool = False) -> dict:
+    """Computes the live Intraday Trend Decision Matrix state for `pair` using strictly closed 15m candles (cached 45s)."""
+    now = time.time()
+    if df_15m is None and not force_refresh:
+        ent = _PAIR_INTRADAY_STACK_CACHE.get(pair)
+        if isinstance(ent, dict) and (now - float(ent.get("ts", 0.0))) < 45.0 and isinstance(ent.get("data"), dict):
+            return dict(ent["data"])
+
+    neutral = {
+        "pair": pair, "regime": "CHOP_RANGE",
+        "s1_struct": "CHOP", "s1_choch": "NONE", "s4_struct": "CHOP", "s4_choch": "NONE",
+        "vwap": 0.0, "vwap_state": "CHOP_VWAP", "vwap_slope_pct": 0.0, "vwap_crosses": 0,
+        "ema_state": "CHOP_EMA", "ema9": 0.0, "ema21": 0.0, "ema50": 0.0, "ema200": 0.0,
+        "adx": 0.0, "adx_tier": "CHOP", "plus_di": 0.0, "minus_di": 0.0,
+        "summary": "🟡 CHOP / RANGE (No Trade)",
+    }
+    try:
+        df = df_15m
+        if df is None:
+            raw = fetch_coindcx_candles(pair=pair, interval="15m", limit=420, sync_live_price=False)
+            if raw is None or raw.empty or len(raw) < 40:
+                return neutral
+            now_ms = int(now * 1000)
+            df = raw[raw["timestamp"] + 900_000 <= now_ms].reset_index(drop=True)
+            if len(df) < 35:
+                df = raw.iloc[:-1].reset_index(drop=True)
+        if df is None or df.empty or len(df) < 30:
+            return neutral
+        series = compute_intraday_3layer_series(df)
+        if not series:
+            return neutral
+        last = dict(series[-1])
+        last["pair"] = pair
+        reg_lbl = (
+            "🟢 CLEAN UPTREND" if last["regime"] == "CLEAN_UPTREND"
+            else ("🔴 CLEAN DOWNTREND" if last["regime"] == "CLEAN_DOWNTREND" else "🟡 CHOP / RANGE")
+        )
+        last["summary"] = (
+            f"{reg_lbl} | 1H:{last['s1_struct']} 4H:{last['s4_struct']} | "
+            f"VWAP:{last['vwap_state']} ({last['vwap_slope_pct']:+.2f}%) | "
+            f"EMA:{last['ema_state']} | ADX:{last['adx']:.1f}"
+        )
+        if df_15m is None:
+            _PAIR_INTRADAY_STACK_CACHE[pair] = {"ts": now, "data": dict(last)}
+        return last
+    except Exception:
+        return neutral
 
 
 def classify_universe_regime_from_stats(
@@ -6236,27 +6673,22 @@ def execute_autotrade_two_entry_signal(
     direction = str(sig.get("signal") or sig.get("direction", "LONG")).upper()
     norm_dir = "LONG" if direction in ("LONG", "BUY") else "SHORT"
 
-    # Hard Daily 50 & 200 EMA Bias Guard before placing any AutoTrade order
-    # Always verify against fresh compute_market_bias(pair) if sig_levels is missing or to prevent stale signals
-    sig_levels = sig.get("levels") if isinstance(sig.get("levels"), dict) else {}
-    daily_bias = str(sig_levels.get("trend_bias") or sig_levels.get("bias") or "").upper()
-    try:
-        mb = compute_market_bias(pair)
-        live_mb_bias = str(mb.get("bias", "")).upper()
-        if live_mb_bias:
-            daily_bias = live_mb_bias
-    except Exception:
-        pass
-
-    if "BULLISH" in daily_bias:
-        daily_bias = "BULLISH"
-    elif "BEARISH" in daily_bias:
-        daily_bias = "BEARISH"
-    else:
-        daily_bias = "NEUTRAL"
+    # Guardrail #6 (Experiment): Replace Daily Bias & Daily Regime with the Intraday Trend Decision Matrix!
+    #   - CLEAN_UPTREND   -> LONG only
+    #   - CLEAN_DOWNTREND -> SHORT only
+    #   - CHOP_RANGE      -> NO TRADE (do not execute any trade on CHOP/RANGE)
+    intraday_regime = str(sig.get("intraday_regime") or "").upper()
+    intraday_summary = ""
+    if intraday_regime not in ("CLEAN_UPTREND", "CLEAN_DOWNTREND", "CHOP_RANGE"):
+        try:
+            _istk = compute_pair_intraday_trend_stack(pair)
+            intraday_regime = str(_istk.get("regime", "CHOP_RANGE")).upper()
+            intraday_summary = str(_istk.get("summary", ""))
+        except Exception:
+            intraday_regime = "CHOP_RANGE"
 
     # AutoTrade Strategy Enforcement: supports `box_theory` (Strategy 1) and `ema50_200` (Strategy 4)
-    # per the configured `autotrade_strategy_mode` (default: `box_plus_ema50_200_bear`)
+    # Guardrail #5 (MAX_EMA_CONCURRENT_TRADES = 2 cap) removed on Experiment — all 3 slots open to Box & EMA.
     import strategies as _strat_mod
     auto_mode = _strat_mod.resolve_autotrade_mode(cfg.get("autotrade_strategy_mode"))
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
@@ -6277,41 +6709,16 @@ def execute_autotrade_two_entry_signal(
             ), {"strategy_id": sig_strat_id, "mode": auto_mode}
         if auto_mode == "box_plus_ema50_200_bear" and sig_strat_id == "ema50_200" and norm_dir != "SHORT":
             return False, (
-                f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
-                f"(switch to Combo: Regime-Adaptive or Bull & Bear EMA to enable Bullish EMA Longs)."
+                f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair}."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
-        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "ema50_200":
-            reg_info = compute_market_regime()
-            cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
-            if cur_reg == "RANGING_CHOP":
-                return False, (
-                    f"Market Regime Guard ({reg_info.get('label', 'RANGING / CHOP')}): Market is ranging "
-                    f"(2d median {reg_info.get('median_2d_pct', 0.0):+.2f}%), auto-pausing 15m 50/200 EMA on {pair} "
-                    f"and trading Box Theory Sweep only."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-            if cur_reg == "STRONG_DOWNTREND" and norm_dir != "SHORT":
-                return False, (
-                    f"Market Regime Guard (STRONG DOWNTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-            if cur_reg == "STRONG_UPTREND" and norm_dir != "LONG":
-                return False, (
-                    f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-        if sig_strat_id == "ema50_200":
-            open_ema_cnt = count_open_ema50_200_slots(
-                live_positions=live_ex_pos if live_ex_pos is not None else [],
-                cfg=cfg,
-                open_orders=open_entry_orders,
-            )
-            if open_ema_cnt >= MAX_EMA_CONCURRENT_TRADES:
-                return False, (
-                    f"EMA Slot Cap ({open_ema_cnt}/{MAX_EMA_CONCURRENT_TRADES} EMA slots active): "
-                    f"Reserving final portfolio slot for Box Theory Sweep; skipping correlated EMA trade on {pair}."
-                ), {"strategy_id": sig_strat_id, "open_ema_slots": open_ema_cnt}
-    if (daily_bias == "BEARISH" and norm_dir != "SHORT") or (daily_bias == "BULLISH" and norm_dir != "LONG"):
+    if intraday_regime == "CHOP_RANGE":
         return False, (
-            f"Daily Bias Guard: {pair} Daily Bias is {daily_bias}, blocking counter-trend {norm_dir} AutoTrade."
-        ), {"daily_bias": daily_bias, "direction": norm_dir}
+            f"Intraday Trend Matrix Guard (CHOP / RANGE): Blocking {norm_dir} AutoTrade on {pair} ({intraday_summary or 'CHOP_RANGE'})."
+        ), {"intraday_regime": intraday_regime, "direction": norm_dir}
+    if (intraday_regime == "CLEAN_DOWNTREND" and norm_dir != "SHORT") or (intraday_regime == "CLEAN_UPTREND" and norm_dir != "LONG"):
+        return False, (
+            f"Intraday Trend Matrix Guard ({intraday_regime}): Blocking counter-trend {norm_dir} AutoTrade on {pair}."
+        ), {"intraday_regime": intraday_regime, "direction": norm_dir}
 
     side = "BUY" if norm_dir == "LONG" else "SELL"
     opp_side = "SELL" if side == "BUY" else "BUY"
@@ -6585,8 +6992,6 @@ def run_portfolio_single_slot_backtest(
     )
 
     universe = list(pairs or HIGH_VOL_FUTURES_UNIVERSE)
-    if strategy_id == "box_plus_ema50_200_regime":
-        build_historical_regime_map(pairs=universe, duration_days=duration_days)
     all_candidates = []
     standalone_rows = []
     for rank, p in enumerate(universe):
@@ -6743,10 +7148,7 @@ def run_portfolio_single_slot_backtest(
                 continue
         is_ema_tr = "50/200 EMA" in str(tr.get("strategy", ""))
         if is_ema_tr:
-            open_ema_bt = sum(1 for t in active_open_trades if "50/200 EMA" in str(t.get("strategy", "")))
-            if open_ema_bt >= MAX_EMA_CONCURRENT_TRADES:
-                blocked_ema += 1
-                continue
+            # Guardrail #5 (Max 2 EMA slots) removed on Experiment — all max_slots (3) open to Box & EMA
             prev_z = last_ema_zone_by_pair.get(str(tr["pair"]))
             cur_ep = float(tr.get("entry_price", 0.0) or 0.0)
             cur_dt = pd.to_datetime(ent_t)
