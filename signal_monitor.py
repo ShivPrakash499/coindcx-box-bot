@@ -22,7 +22,6 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", 
 DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
 COOLDOWN_MIN = 60          # per strategy + pair + direction, plus pair-level anti-spam guard
 SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zone in the same direction
-POST_SL_LOCK_MIN = 240     # 4h unified cross-strategy lock on (pair, direction) after any SL hit
 MAX_DAILY_ALERTS_PER_PAIR = 3
 MAX_DAILY_PORTFOLIO_TRADES = 999
 MAX_CONCURRENT_PORTFOLIO_TRADES = int(getattr(eng, "MAX_CONCURRENT_TRADES", 3) or 3)  # 3-slot wallet
@@ -92,8 +91,6 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str)
     """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
     m = strat_registry.resolve_autotrade_mode(auto_mode)
     d = str(direction or "").upper()
-    if m == "ema9_21_stack":
-        return strategy_id == "ema9_21_stack"
     if m == "box_theory":
         return strategy_id == "box_theory"
     if m == "ema50_200":
@@ -123,43 +120,6 @@ def scan_pair(pair: str, margin_inr: float, leverage: int, usd_inr: float, strat
 def _state_key(strategy_id: str, pair: str, sig: dict) -> str:
     base = f"{pair}|{sig['signal_kind']}|{sig['signal']}"
     return base if strategy_id == strat_registry.DEFAULT_STRATEGY_ID else f"{strategy_id}|{base}"
-
-
-def record_post_sl_lock(pair: str, direction: str, reason: str = "SL Hit") -> None:
-    """
-    Records a 4-hour unified cross-strategy lock on `(pair_base, direction)` whenever any trade
-    stops out (Live or Staging Paper). Prevents Box Theory and 15m 50/200 EMA from immediately
-    re-entering the exact same losing direction on a coin that just hit SL.
-    """
-    pair_base = _canon_pair(pair)
-    if not pair_base:
-        return
-    norm_dir = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
-    state = _load()
-    state[f"POST_SL_LOCK|{pair_base}|{norm_dir}"] = {
-        "locked_at": time.time(),
-        "pair": pair,
-        "direction": norm_dir,
-        "reason": str(reason or "SL Hit"),
-    }
-    _save(state)
-
-
-def is_post_sl_locked(pair: str, direction: str, state: dict | None = None) -> tuple[bool, float]:
-    """Returns `(is_locked, remaining_minutes)` for a `(pair, direction)` post-SL cooldown."""
-    pair_base = _canon_pair(pair)
-    if not pair_base:
-        return False, 0.0
-    norm_dir = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
-    st = state if isinstance(state, dict) else _load()
-    rec = st.get(f"POST_SL_LOCK|{pair_base}|{norm_dir}")
-    if not isinstance(rec, dict):
-        return False, 0.0
-    elapsed = time.time() - float(rec.get("locked_at", 0.0) or 0.0)
-    limit_sec = POST_SL_LOCK_MIN * 60.0
-    if 0.0 <= elapsed < limit_sec:
-        return True, round((limit_sec - elapsed) / 60.0, 1)
-    return False, 0.0
 
 
 def _note(strategy_id: str, sig: dict) -> str:
@@ -236,8 +196,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         autotrade_daily_key = f"AUTOTRADE_DAILY_COUNT|{today_ist}"
         autotrade_daily_count = int(state.get(autotrade_daily_key, 0))
 
-        eff_max_slots = int(eng.get_configured_max_slots(auto_cfg) if hasattr(eng, "get_configured_max_slots") else MAX_CONCURRENT_PORTFOLIO_TRADES)
-
         # Collect all pairs currently in a Live CoinDCX position, resting Entry Limit order, or active App Trade Lock
         # (normalized by base symbol via `_canon_pair` so `B-INJ_USDT` == `I-INJ_INR` == `INJUSDT`)
         open_live_pairs = set()
@@ -246,13 +204,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
             if _ap:
                 open_live_pairs.add(_ap)
                 open_live_bases.add(_canon_pair(_ap))
-        if len(open_live_bases) >= eff_max_slots:
+        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
             portfolio_occupied = True
             if not active_Slot_pair:
                 active_Slot_pair = next(iter(open_live_pairs), None)
 
         live_pos_verified = False
-        live_pos_list = []
         try:
             if is_daemon_thread or send:
                 # Whenever `send=True` (email alerts enabled), ALWAYS perform a synchronous live check
@@ -273,11 +230,11 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     p_raw = pos["pair"]
                     open_live_pairs.add(p_raw)
                     open_live_bases.add(_canon_pair(p_raw))
-                    if len(open_live_bases) >= eff_max_slots:
+                    if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                         portfolio_occupied = True
                         active_Slot_pair = p_raw
 
-            # Also count unfilled resting Entry Limit Orders on CoinDCX toward the slot cap
+            # Also count unfilled resting Entry Limit Orders on CoinDCX toward the 3-slot cap (prevents 4th concurrent trade race)
             if (is_daemon_thread or autotrade) and hasattr(eng, "get_open_entry_limit_orders"):
                 _w_chk = eng.fetch_coindcx_futures_balance(force_refresh=False) or {}
                 if _w_chk.get("is_live_api"):
@@ -286,27 +243,18 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         if _ep_pair:
                             open_live_pairs.add(_ep_pair)
                             open_live_bases.add(_canon_pair(_ep_pair))
-                            if len(open_live_bases) >= eff_max_slots:
+                            if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                                 portfolio_occupied = True
                                 active_Slot_pair = _ep_pair
         except Exception:
             pass
 
-        # Live & Staging-Paper 5% Daily Loss Stop + Unrealized PnL Daily SL Pause:
-        #   - Realized daily loss >= 5% -> lock AutoTrade for the IST day.
-        #   - Open unrealized loss >= 5% Daily SL -> pause new trades until open live positions close!
+        # Live & Staging-Paper 5% Daily Loss Stop (SL Threshold): if hit, keep scanning/alerting but lock new AutoTrades for the IST day!
         daily_stop_hit, daily_stop_msg = False, ""
         if autotrade and not eng.is_experiment_environment():
             try:
                 _dl_w = eng.get_paper_wallet_snapshot(auto_cfg) if eng.is_staging_environment() else None
                 daily_stop_hit, daily_stop_msg, _ = eng.check_live_daily_loss_stop(_dl_w)
-                if not daily_stop_hit and hasattr(eng, "check_unrealized_pnl_daily_sl_pause"):
-                    _unr_pos_arg = None if eng.is_staging_environment() else live_pos_list
-                    _unr_hit, _unr_msg, _ = eng.check_unrealized_pnl_daily_sl_pause(
-                        _dl_w, positions=_unr_pos_arg, allow_live_ticker=True
-                    )
-                    if _unr_hit:
-                        daily_stop_hit, daily_stop_msg = True, _unr_msg
             except Exception as e:
                 print(f"[Daily Loss Stop Check Notice]: {e}")
 
@@ -377,17 +325,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 key = _state_key(s.id, pair, sig)
                 last = state.get(key, {})
                 now_ts = time.time()
-                norm_sig_dir = "LONG" if str(sig.get("signal", "")).upper() in ("LONG", "BUY") else "SHORT"
-
-                # Unified Cross-Strategy Post-SL 4h Lock: if ANY strategy hit SL on (pair, direction) within 4h, block ALL strategies!
-                post_sl_lk, post_sl_rem = is_post_sl_locked(pair, norm_sig_dir, state=state)
-                if post_sl_lk:
-                    results.append({
-                        **row,
-                        "message": f"post-SL 4h cross-strategy lock active on {pair_base} {norm_sig_dir} ({post_sl_rem:.0f}m left)"
-                    })
-                    continue
-
                 is_new_candle = last.get("candle_ts") != sig["candle_ts"]
                 cooled = (now_ts - last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
                 pair_cooled = (now_ts - pair_last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
@@ -403,28 +340,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 )
                 same_setup_locked = same_price_zone and ((now_ts - last.get("sent_at", 0)) < SAME_SETUP_LOCK_MIN * 60)
 
-                # Unified Cross-Strategy Re-Entry Lock on (pair_base, direction):
-                # Blocks Box <-> EMA flip-flop re-entries on the same breaking coin for 4h (1h only if previous trade won TP1).
-                cross_key = f"CROSS_STRAT_LOCK|{pair_base}|{norm_sig_dir}"
-                cross_last = state.get(cross_key, {}) if isinstance(state.get(cross_key), dict) else {}
-                cross_at = float(cross_last.get("autotraded_at", 0.0) or 0.0)
-                _cross_prev_tp1_won = any(
-                    isinstance(_h, dict)
-                    and _canon_pair(_h.get("pair", "")) == pair_base
-                    and str(_h.get("direction", "")).upper() == norm_sig_dir
-                    and bool(_h.get("tp1_hit", False))
-                    and float(_h.get("opened_ts", 0.0) or 0.0) >= (cross_at - 15.0)
-                    for _h in (auto_cfg.get("history") or [])[:15]
-                )
-                _cross_lock_sec = (COOLDOWN_MIN * 60) if _cross_prev_tp1_won else (SAME_SETUP_LOCK_MIN * 60)
-                cross_strat_locked = cross_at > 0 and ((now_ts - cross_at) < _cross_lock_sec)
-
                 if not is_new_candle:
                     msg = "already alerted for this candle"
                 elif same_setup_locked:
                     msg = "already alerted for this setup zone"
-                elif cross_strat_locked:
-                    msg = f"cross-strategy 4h lock on {pair_base} {norm_sig_dir}"
                 elif not (cooled and pair_cooled):
                     msg = "on cooldown"
                 else:
@@ -446,12 +365,9 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 )
                 _zone_lock_sec = (COOLDOWN_MIN * 60) if _prev_hist_tp1_won else (SAME_SETUP_LOCK_MIN * 60)
                 already_autotraded_setup = (
-                    (
-                        bool(last.get("autotraded", False))
-                        and same_price_zone
-                        and ((now_ts - last_autotraded_at) < _zone_lock_sec)
-                    )
-                    or cross_strat_locked
+                    bool(last.get("autotraded", False))
+                    and same_price_zone
+                    and ((now_ts - last_autotraded_at) < _zone_lock_sec)
                 )
 
                 if (
@@ -514,7 +430,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     if ok_auto:
                         open_live_pairs.add(pair)
                         open_live_bases.add(pair_base)
-                        if len(open_live_bases) >= eff_max_slots:
+                        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                             portfolio_occupied = True
                             active_Slot_pair = pair
                         state[key] = {
@@ -525,13 +441,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             "tp1": float(sig.get("tp1", 0.0) or 0.0),
                             "autotraded": True,
                             "autotraded_at": now_exec,
-                        }
-                        state[cross_key] = {
-                            "autotraded_at": now_exec,
-                            "strategy_id": s.id,
-                            "entry": cur_entry,
-                            "direction": norm_sig_dir,
-                            "pair": pair,
                         }
                         autotrade_daily_count += 1
                         state[autotrade_daily_key] = autotrade_daily_count

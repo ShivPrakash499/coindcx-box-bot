@@ -101,6 +101,7 @@ def test_2_simulated_200_ok_wallet_and_positions_no_recursion():
         try:
             sys.setrecursionlimit(120)
             with patch.object(eng, "AUTOTRADE_CONFIG_FILE", temp_cfg_file), \
+                 patch.object(eng, "_get_coindcx_credentials", return_value=("smoke_test_key_123456", "smoke_test_secret_123456")), \
                  patch.object(eng, "_send_coindcx_signed_request", side_effect=_fake_signed_request):
                 eng._WALLET_BALANCE_CACHE["data"] = None
                 eng._WALLET_BALANCE_CACHE["ts"] = 0.0
@@ -200,7 +201,7 @@ def test_4_strategy_and_two_entry_levels():
         f"Expected 4-decimal manual Execute levels preserved without rounding off, got: {manual_4d}"
     )
 
-    # Verify build_two_entry_runner_plan uses 100% Single Entry (entry2_sweep == 0.0) while anchoring structural Catastrophe SL beyond SH (> $7.43)
+    # Verify build_two_entry_runner_plan uses 100% Single Entry (entry2_sweep == 0.0) while anchoring Catastrophe SL beyond SH (> $7.43)
     inj_plan = strat.build_two_entry_runner_plan("SHORT", entry=7.30, sweep_level=7.43, struct_tp1=7.10, struct_tp2=6.89, leverage=10)
     assert inj_plan is not None
     assert inj_plan["entry2_sweep"] == 0.0, f"Expected Entry 2 removed (0.0), got {inj_plan['entry2_sweep']}"
@@ -254,8 +255,7 @@ def test_5_daily_bias_enforcement():
     }
 
     with patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
-         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")):
+         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]):
         bear_levels = {**neutral_levels, "EMA50": 1.73, "EMA200": 1.72, "daily_close": 1.51, "trend_bias": "BEARISH"}
         with patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
             ok_b, msg_b, _ = eng.execute_autotrade_two_entry_signal(
@@ -343,7 +343,7 @@ def test_5_daily_bias_enforcement():
     assert unv_m == 20000.0 and unv_note == ""
 
     # Live 5% daily loss stop: day-start Rs.5,500 -> Rs.5,200 (-Rs.300 >= Rs.275 limit) blocks; Rs.5,300 does not
-    today_s = eng.get_crypto_trading_day_str()
+    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
     cfg_ds = {"enabled": True, "daily_start_wallet": {"date": today_s, "inr": 5500.0}}
     with patch.object(eng, "get_autotrade_config", return_value=dict(cfg_ds)), \
          patch.object(eng, "save_autotrade_config", return_value={}):
@@ -395,16 +395,15 @@ def test_6_deployment_regression_guards():
     assert 'st.markdown(f"""\n<style>' not in app_src, "app.py must use st.html() for <style> blocks, never st.markdown()"
     assert "on_change=_on_sidebar_autotrade_toggle_change" in app_src
 
-    # Fix 5: Post-TP1 SL moves to fee-covered breakeven (+/- 0.20%) instead of choking runner at 50% TP1 / prev 15m wick
     sl_short_base = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10)
-    assert abs(sl_short_base - eng.format_order_price("B-INJ_USDT", 7.30 * 0.9980)) < 1e-4, sl_short_base
+    assert abs(sl_short_base - 7.20) < 1e-4
     sl_short_prev15m = eng.compute_tp1_profit_lock_sl("B-INJ_USDT", "SHORT", entry_px=7.30, tp1_px=7.10, prev_candle_high=7.16)
-    assert abs(sl_short_prev15m - eng.format_order_price("B-INJ_USDT", 7.30 * 0.9980)) < 1e-4, sl_short_prev15m
+    assert abs(sl_short_prev15m - 7.16) < 1e-4
 
     sl_long_base = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00)
-    assert abs(sl_long_base - eng.format_order_price("B-NEAR_USDT", 3.80 * 1.0020)) < 1e-4, sl_long_base
+    assert abs(sl_long_base - 3.90) < 1e-4
     sl_long_prev15m = eng.compute_tp1_profit_lock_sl("B-NEAR_USDT", "LONG", entry_px=3.80, tp1_px=4.00, prev_candle_low=3.94)
-    assert abs(sl_long_prev15m - eng.format_order_price("B-NEAR_USDT", 3.80 * 1.0020)) < 1e-4, sl_long_prev15m
+    assert abs(sl_long_prev15m - 3.94) < 1e-4
 
     assert sm._canon_pair("B-INJ_USDT") == sm._canon_pair("I-INJ_INR") == sm._canon_pair("INJUSDT") == "INJ"
     fake_sig = {
@@ -510,99 +509,10 @@ def test_7_ui_render_and_navigation_tabs_integrity():
         assert stale_ui_label not in app_src, f"Stale UI label '{stale_ui_label}' found in app.py!"
     assert "#### 🎫 Trade Execution Ticket" in app_src
 
-    # 7. Full scope-aware AST undefined-name (NameError) audit across all 7 core modules
-    import builtins as _builtins
-    _bi_names = set(dir(_builtins)) | {"__file__", "__name__", "__doc__", "__package__", "__spec__", "__cached__", "__annotations__"}
-
-    def _scan_undefined_names(src_txt: str, fname: str) -> list[tuple[int, str]]:
-        _tr = ast.parse(src_txt, filename=fname)
-        _bad: list[tuple[int, str]] = []
-
-        def _walk_scope(node, parent_defs):
-            local_defs = set(parent_defs)
-
-            def _collect(n):
-                for ch in ast.iter_child_nodes(n):
-                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                        local_defs.add(ch.name)
-                    elif isinstance(ch, (ast.Import, ast.ImportFrom)):
-                        for al in ch.names:
-                            local_defs.add(al.asname or al.name.split(".")[0])
-                    elif isinstance(ch, ast.Name) and isinstance(ch.ctx, (ast.Store, ast.Del)):
-                        local_defs.add(ch.id)
-                    elif isinstance(ch, ast.ExceptHandler):
-                        if ch.name:
-                            local_defs.add(ch.name)
-                        _collect(ch)
-                    elif isinstance(ch, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.Lambda)):
-                        continue
-                    else:
-                        _collect(ch)
-
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                for ag in node.args.posonlyargs + node.args.args + node.args.kwonlyargs:
-                    local_defs.add(ag.arg)
-                if node.args.vararg:
-                    local_defs.add(node.args.vararg.arg)
-                if node.args.kwarg:
-                    local_defs.add(node.args.kwarg.arg)
-            _collect(node)
-
-            def _check(n, defs):
-                for ch in ast.iter_child_nodes(n):
-                    if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        for d_node in ch.decorator_list + ch.args.defaults + [x for x in ch.args.kw_defaults if x]:
-                            _check(d_node, defs)
-                        _walk_scope(ch, defs)
-                    elif isinstance(ch, ast.ClassDef):
-                        for b_node in ch.bases + ch.decorator_list:
-                            _check(b_node, defs)
-                        _walk_scope(ch, defs)
-                    elif isinstance(ch, ast.Lambda):
-                        l_defs = set(defs) | {ag.arg for ag in ch.args.args + ch.args.posonlyargs + ch.args.kwonlyargs}
-                        if ch.args.vararg:
-                            l_defs.add(ch.args.vararg.arg)
-                        if ch.args.kwarg:
-                            l_defs.add(ch.args.kwarg.arg)
-                        _check(ch.body, l_defs)
-                    elif isinstance(ch, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
-                        c_defs = set(defs)
-                        for gen in ch.generators:
-                            _check(gen.iter, c_defs)
-                            for tgt in ast.walk(gen.target):
-                                if isinstance(tgt, ast.Name):
-                                    c_defs.add(tgt.id)
-                            for iff in gen.ifs:
-                                _check(iff, c_defs)
-                        if isinstance(ch, ast.DictComp):
-                            _check(ch.key, c_defs)
-                            _check(ch.value, c_defs)
-                        else:
-                            _check(ch.elt, c_defs)
-                    elif isinstance(ch, ast.NamedExpr):
-                        _check(ch.value, defs)
-                        if isinstance(ch.target, ast.Name):
-                            defs.add(ch.target.id)
-                    elif isinstance(ch, ast.Name) and isinstance(ch.ctx, ast.Load):
-                        if ch.id not in defs and ch.id not in _bi_names:
-                            _bad.append((ch.lineno, ch.id))
-                    else:
-                        _check(ch, defs)
-
-            _check(node, local_defs)
-
-        _walk_scope(_tr, set())
-        return _bad
-
+    # 7. Parse AST of app.py to ensure clean top-level structure
     tree = ast.parse(app_src, filename="app.py")
     assert len(tree.body) > 20
-    for _mod_fn in ("app.py", "coindcx_engine.py", "strategies.py", "signal_monitor.py", "sheets_logger.py", "gemini_advisor.py", "email_notifier.py"):
-        _mod_p = os.path.join(ROOT_DIR, _mod_fn)
-        if os.path.exists(_mod_p):
-            with open(_mod_p, "r", encoding="utf-8") as _mf:
-                _undef = _scan_undefined_names(_mf.read(), _mod_fn)
-            assert not _undef, f"CRITICAL NameError risk in {_mod_fn}: undefined names {_undef[:10]}"
-    print(f"  -> PASS: All 7 UI tabs ({', '.join(expected_tabs)}), fragment guards & 0-NameError AST audit across all 7 modules verified.")
+    print(f"  -> PASS: All 7 UI tabs ({', '.join(expected_tabs)}) & fragment non-loop invariants verified.")
 
 
 def test_8_stale_cache_expiry_and_nat_pinner():
@@ -1028,7 +938,7 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
     )
     assert sig_ok_long["tp1"] <= 87.21, f"Expected TP1 capped inside 15m 50 EMA ($87.21), got: {sig_ok_long['tp1']}"
 
-    # Fix 5: Verify Pre-TP1 80% breakeven choke is REMOVED (SL stays untouched at 93% of TP1, ratchets only once TP1 hits!)
+    # Improvement 4B: Early 80% TP1 Breakeven SL Ratchet in get_active_portfolio_trade_status
     fake_lock = {
         "pair": "B-XRP_USDT",
         "direction": "SHORT",
@@ -1044,35 +954,15 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
         "mode": "Staging Paper AutoTrade (Live Market)",
     }
     saved_locks = []
-    # Price reaches $1.0760 (93% of distance to TP1, shy of TP1 by $0.0011) -> SL MUST remain untouched at $1.1020!
-    with patch.object(eng, "get_autotrade_config", return_value={"active_trade_lock": dict(fake_lock)}), \
-         patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.0760}), \
-         patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)), \
-         patch.object(eng, "save_autotrade_config", side_effect=lambda d: saved_locks.append(d) or {}):
+    # Price reaches $1.0760 (93% of distance from 1.0905 to 1.0749, shy of TP1 by $0.0011)
+    with patch.object(eng, "get_autotrade_config", return_value={"active_trade_lock": dict(fake_lock)}),          patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.0760}),          patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)),          patch.object(eng, "save_autotrade_config", side_effect=lambda d, **kw: saved_locks.append(d) or {}):
         st_res = eng.get_active_portfolio_trade_status(manage_exchange=True)
-        assert abs(st_res["stop_loss"] - 1.1020) < 1e-4, (
-            f"Expected SL untouched at $1.1020 prior to TP1 (80% choke removed), got: {st_res['stop_loss']}"
-        )
-    # Price hits TP1 ($1.0745 <= $1.0749) -> SL ratchets cleanly to fee-covered breakeven (entry * 0.9980)!
-    with patch.object(eng, "get_autotrade_config", return_value={"active_trade_lock": dict(fake_lock)}), \
-         patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.0745}), \
-         patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)), \
-         patch.object(eng, "save_autotrade_config", side_effect=lambda d: saved_locks.append(d) or {}):
-        st_res_tp1 = eng.get_active_portfolio_trade_status(manage_exchange=True)
-        exp_be = eng.round_asset_price(1.0905 * 0.9980, 1.0905)
-        assert st_res_tp1["tp1_hit"] is True and abs(st_res_tp1["stop_loss"] - exp_be) <= 0.0002, (
-            f"Expected TP1 fee-covered breakeven ratchet {exp_be}, got: {st_res_tp1}"
+        assert st_res["stop_loss"] < 1.0905 and abs(st_res["stop_loss"] - round(1.0905 * 0.9982, 4)) <= 0.0002, (
+            f"Expected 80% TP1 breakeven ratchet below entry 1.0905, got: {st_res['stop_loss']}"
         )
 
     # Staging Paper-Only AutoTrade Guard: verify place_coindcx_futures_order is NEVER called on staging
-    with patch.object(eng, "is_staging_environment", return_value=True), \
-         patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-         patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
-         patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
-         patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
-         patch.object(eng, "place_coindcx_futures_order") as mock_live_order, \
-         patch.object(eng, "save_autotrade_config", return_value={}), \
-         patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+    with patch.object(eng, "is_staging_environment", return_value=True),          patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}),          patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]),          patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}),          patch.object(eng, "place_coindcx_futures_order") as mock_live_order,          patch.object(eng, "save_autotrade_config", return_value={}),          patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
         ok_stg, msg_stg, meta_stg = eng.execute_autotrade_two_entry_signal(
             pair="B-AVAX_USDT",
             sig={
@@ -1196,7 +1086,6 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
              patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 60000.0, "available_inr": 60000.0}), \
              patch.object(eng, "_get_coindcx_credentials", return_value=("k1", "s1")), \
-             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.300, "bid": 7.299, "ask": 7.301}), \
              patch.object(eng, "place_coindcx_futures_order", side_effect=_fake_place_limit), \
@@ -1222,13 +1111,8 @@ def test_10_strategy3_four_improvements_and_staging_paper_autotrade():
             assert ok_lim, f"Expected Live Maker Limit AutoTrade success, got: {ok_lim} {msg_lim}"
             assert len(placed_orders) == 1, f"Expected strictly 1 Single-Slot Maker Limit Entry 1 order (Entry 2 removed), got: {placed_orders}"
             assert placed_orders[0]["order_type"] == "limit_order", f"Expected strictly limit_order, got: {placed_orders}"
-            assert placed_orders[0]["post_only"] is True, f"Expected Post-Only Maker limit order, got: {placed_orders[0]}"
             assert placed_orders[0]["price"] >= 7.301, f"Expected Maker SELL price >= 7.301, got {placed_orders[0]}"
-            # Fixed 1.5% Wallet Risk Sizing: on Rs.60,000 wallet with ~2.59% SL @ 10x, max risk = Rs.900 -> ~Rs.3,476 margin!
-            assert 0 < meta_lim["lock"]["margin_inr"] <= 4000.0, (
-                f"Expected Fixed 1.5% Risk Sizing to cap wide-SL margin to <= Rs.4,000, got {meta_lim['lock']['margin_inr']}"
-            )
-            assert placed_orders[0]["quantity"] > 0, f"Expected positive risk-sized INJ quantity, got {placed_orders[0]['quantity']}"
+            assert placed_orders[0]["quantity"] >= 25.0, f"Expected 100% slot margin sizing (~32 INJ at 10x), got {placed_orders[0]['quantity']}"
             assert meta_lim["lock"]["entry2_sweep"] == 0.0 and meta_lim["lock"]["qty2"] == 0.0
             assert meta_lim["lock"]["entry1_pending"] is True and meta_lim["lock"]["entry1_order_id"] == "oid_1"
 
@@ -1356,7 +1240,6 @@ def test_11_ema50_200_pullback_and_combo_modes():
              patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
              patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.090}), \
              patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
             eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
@@ -1389,7 +1272,7 @@ def test_12_sidebar_unlock_autotrade():
         app_src = f_app.read()
     assert '"🔓 Unlock AutoTrade"' in app_src and "unlock_autotrade_daily_loss_stop" in app_src
 
-    today_s = eng.get_crypto_trading_day_str()
+    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
     with tempfile.TemporaryDirectory() as tmpdir:
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
         with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg):
@@ -1470,7 +1353,6 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
              patch.object(eng, "is_staging_environment", return_value=True), \
              patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
              patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
              patch.object(eng, "fetch_live_ticker", return_value={"last_price": 7.090}), \
              patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
              patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
@@ -1638,7 +1520,6 @@ def test_14_v34_three_fixes_slot_margin_and_apt_box_floor():
                  patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
                  patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
                  patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
-                 patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
                  patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}), \
                  patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.0}), \
                  patch.object(eng, "fetch_live_ticker", return_value={"last_price": 1.4079, "bid": 1.4078, "ask": 1.4080}):
@@ -1795,11 +1676,14 @@ def test_16_three_tier_main_staging_experiment_parity():
     assert sl._is_staging_paper_record({"exit_reason": "[STAGING PAPER] Stop Loss Hit"}) is True
     assert sl._is_staging_paper_record({"status": "LOGGED_PENDING", "strategy_name": "Box Theory Sweep (App Live Order)"}) is False
 
-    today_s = eng.get_crypto_trading_day_str()
+    today_s = eng.datetime.now(eng.IST).strftime("%Y-%m-%d")
     with tempfile.TemporaryDirectory() as tmpdir:
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
         with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
-             patch.dict(os.environ, {"APP_ENV": "staging"}):
+             patch.dict(os.environ, {"APP_ENV": "staging"}), \
+             patch.object(sl, "save_autotrade_state_to_sheet", return_value=True), \
+             patch.object(sl, "log_trade_to_google_sheet", return_value=True), \
+             patch.object(sl, "log_trade_closed", return_value=True):
             eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
             fake_main_setup = {
                 "wallet_balance_inr": 24423.86,
@@ -1867,8 +1751,7 @@ def test_16_three_tier_main_staging_experiment_parity():
         sub = synth_trades[synth_trades["pair"] == pair].copy()
         return {"total_trades": len(sub), "win_count": int((sub["is_win"] == True).sum()), "loss_count": int((sub["is_win"] == False).sum()), "win_rate_pct": 50.0, "net_profit_inr": float(sub["net_pnl_inr"].sum()), "profit_factor": 1.0, "trades_df": sub}
 
-    with patch.object(eng, "run_strategy_backtest", side_effect=_mock_bt), \
-         patch.object(eng, "fetch_historical_candles_paginated", return_value=pd.DataFrame()):
+    with patch.object(eng, "run_strategy_backtest", side_effect=_mock_bt):
         bt_res = eng.run_portfolio_single_slot_backtest(
             pairs=["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT"],
             duration_days=30,
@@ -1888,410 +1771,136 @@ def test_16_three_tier_main_staging_experiment_parity():
     print("  -> PASS: 3-Tier Architecture (Main Live / Staging Paper + Staging_Trades / Experiment Parity Backtest) verified!")
 
 
-def test_17_v36_six_sl_reduction_fixes():
-    print("[17/17] Verifying Daemon v36 SL-Reduction & Drawdown-Control Upgrades (EMA Sep/SL Floor, Cross-Strat Post-SL/BTC/Same-Dir, 1.5% Fixed Risk, Fee-BE/60% Runner, Multi-Slot & Post-Only)...")
-    import pandas as pd
+def test_17_paper_trading_journal_fixes():
+    print("[17/17] Verifying Paper Trading Journal Fixes (Multi-Slot Monitor, No 8h Silent Eviction, Strict Row Match, v35 Tag)...")
+    import tempfile
     import coindcx_engine as eng
-    import strategies as strat
-    import signal_monitor as sm
+    import sheets_logger as sl
 
-    # --- FIX 1: Ema50200PullbackStrategy tangled-EMA filter (<0.20%) & 0.65% minimum SL floor ---
-    bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
-    recs_base = [
-        {"open": 7.04, "high": 7.06, "low": 7.01, "close": 7.03},
-        {"open": 7.03, "high": 7.05, "low": 7.02, "close": 7.04},
-        {"open": 7.04, "high": 7.07, "low": 7.03, "close": 7.05},
-        {"open": 7.05, "high": 7.08, "low": 7.04, "close": 7.06},
-        {"open": 7.06, "high": 7.10, "low": 7.05, "close": 7.08},
-        {"open": 7.08, "high": 7.14, "low": 7.07, "close": 7.11},
-        {"open": 7.11, "high": 7.14, "low": 7.07, "close": 7.09},
+    assert eng._REQUIRED_DAEMON_VERSION == 35, f"Expected v35, got {eng._REQUIRED_DAEMON_VERSION}"
+
+    # 1. Strict Staging_Trades row matching in log_trade_closed (direction + entry_time guard)
+    fake_rows = [
+        list(sl.STAGING_TRADES_HEADERS),
+        ["2026-11-26 06:01:07 IST", "B-APT_USDT", "SHORT", "0.376", "0.3883", "0.3679", "0.3484", "200", "802.47", "10x", "", "", "PAPER_AUTOTRADE_OPEN", "Strategy 1", "[v35] open", "", "", "", "", "18499.48", ""],
     ]
-    # 1A: Dead-flat tangled EMAs (<0.20% spread) must be blocked
-    assert strat._detect_ema50_200_setup(
-        recs_base, 6, bear_box, ema50_val=7.12, ema200_val=7.13, prior_e50=[7.12] * 6, prior_e200=[7.13] * 6,
-        allow_bear=True, allow_bull=False,
-    ) is None, "Expected dead-flat tangled EMA (<0.20% spread) blocked"
-    # 1B: Tight EMA200 (0.25% spread, raw SL ~0.50%) must be floored at >= 0.65% (no 0.40% noise stop-out!)
-    sig_floored = strat._detect_ema50_200_setup(
-        recs_base, 6, bear_box, ema50_val=7.10, ema200_val=7.12, prior_e50=[7.12] * 6, prior_e200=[7.12] * 6,
-        allow_bear=True, allow_bull=False,
-    )
-    assert sig_floored is not None and ((sig_floored["stop"] - sig_floored["entry"]) / sig_floored["entry"]) >= 0.00649, (
-        f"Expected EMA SL floored >= 0.65%, got {sig_floored}"
-    )
+    updated_cells = []
+    appended_rows = []
 
-    # --- FIX 2: normalize_two_entry_runner_levels preserves explicit single-entry SL (never silently inflates to SH*1.005!) ---
-    wide_sh_box = {"RH": 7.30, "RL": 6.80, "MID": 7.05, "SH": 7.60, "SL": 6.60, "trend_bias": "BEARISH"}
-    norm_capped = eng.normalize_two_entry_runner_levels(
-        pair="B-INJ_USDT", direction="SHORT", entry1_px=7.30, entry2_px=None,
-        tp1_px=7.15, tp2_px=6.80, sl_px=7.41, live_px=7.30, levels=wide_sh_box,
-    )
-    assert abs(norm_capped["stop_loss"] - 7.41) < 1e-4, f"Expected explicit SL $7.41 preserved, got {norm_capped}"
+    class _FakeWS:
+        def get_all_values(self):
+            return [list(r) for r in fake_rows]
+        def update_cell(self, r, c, val):
+            updated_cells.append((r, c, val))
+        def update(self, rng, vals):
+            updated_cells.append((rng, vals))
+        def append_row(self, row):
+            appended_rows.append(row)
 
-    # --- FIX 4: Cross-Strategy Post-SL 4h Lock, Max 2 Same-Direction Guard & BTC 15m Impulse Veto ---
+    class _FakeBook:
+        def worksheet(self, name):
+            return _FakeWS()
+
+    class _FakeClient:
+        def open(self, name):
+            return _FakeBook()
+
+    with patch.object(sl, "_client", return_value=_FakeClient()):
+        # A LONG close on B-APT_USDT must NEVER overwrite an open SHORT row!
+        ok_mism, _ = sl.log_trade_closed({
+            "entry_time": "2026-11-26 22:15:48 IST",
+            "exit_time": "2026-11-26 22:15:48 IST",
+            "pair": "B-APT_USDT",
+            "direction": "LONG",
+            "entry_price": 6.849,
+            "exit_price": 7.12,
+            "net_pnl_inr": 1382.04,
+            "roe_pct": 38.39,
+            "is_staging_paper": True,
+            "exit_reason": "[STAGING PAPER | v35] Test",
+        }, return_details=True)
+        assert ok_mism and len(updated_cells) == 0 and len(appended_rows) == 1, (updated_cells, appended_rows)
+
+        # Matching SHORT close with exact entry_time MUST update row 2 cleanly!
+        ok_match, _ = sl.log_trade_closed({
+            "entry_time": "2026-11-26 06:01:07 IST",
+            "exit_time": "2026-11-26 09:00:00 IST",
+            "pair": "B-APT_USDT",
+            "direction": "SHORT",
+            "entry_price": 0.376,
+            "exit_price": 0.365,
+            "net_pnl_inr": 200.0,
+            "roe_pct": 24.9,
+            "is_staging_paper": True,
+            "exit_reason": "[STAGING PAPER | v35] TP2 Target Hit",
+        }, return_details=True)
+        assert ok_match and len(updated_cells) == 2 and updated_cells[0][0] == 2, updated_cells
+
+    # 2. Multi-slot paper monitor + No 8h silent eviction for filled paper trades + v35 tagging (all sheet calls mocked)
     with tempfile.TemporaryDirectory() as tmpdir:
-        temp_st = os.path.join(tmpdir, "alert_state.json")
         t_cfg = os.path.join(tmpdir, "autotrade_config.json")
-        with patch.object(sm, "STATE_FILE", temp_st), patch.dict(sm._MEM_STATE, {}, clear=True):
-            sm.record_post_sl_lock("B-RENDER_USDT", "SHORT", reason="Stop Loss Hit")
-            is_lk, rem_m = sm.is_post_sl_locked("B-RENDER_USDT", "SHORT")
-            assert is_lk and rem_m > 200.0, (is_lk, rem_m)
-            # Both box_theory AND ema50_200 must be blocked on B-RENDER_USDT SHORT!
-            fake_ren_sig = {
-                "signal": "SHORT", "signal_kind": "EMA50_200", "strategy_id": "ema50_200",
-                "entry": 1.45, "entry2_sweep": 0.0, "tp1": 1.42, "tp2": 1.38, "stop_loss": 1.47,
-                "roe_tp1": 20.0, "candle_ts": int(time.time() * 1000), "margin_inr": 8000.0, "leverage": 10,
-                "trigger_zone": "EMA", "trigger_reason": "Test", "levels": bear_box,
-            }
-            with patch.object(sm, "scan_pair", return_value=fake_ren_sig), \
-                 patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND"}), \
-                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": []}), \
-                 patch.object(eng, "fetch_coindcx_active_positions", return_value=[]), \
-                 patch.object(eng, "execute_autotrade_two_entry_signal") as mock_ex_sl:
-                sm._LAST_SCAN_CACHE["results"] = []
-                res_psl = sm.scan_and_alert(pairs=["B-RENDER_USDT"], send=False, strategy_ids=["ema50_200"], autotrade=True)
-                assert not mock_ex_sl.called and "post-SL 4h cross-strategy lock" in res_psl[0]["message"], res_psl
-
-        # Max 2 Same-Direction Guard blocks 3rd SHORT while allowing opposite LONG
+        closed_payloads = []
+        opened_payloads = []
         with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
-             patch.object(eng, "is_staging_environment", return_value=True), \
-             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
-             patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-NEAR_USDT", "B-RENDER_USDT"]}), \
-             patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
-                 {"pair": "B-NEAR_USDT", "direction": "SHORT", "id": "p1"},
-                 {"pair": "B-RENDER_USDT", "direction": "SHORT", "id": "p2"},
-             ]), \
-             patch.object(eng, "check_btc_impulse_veto", return_value=(False, "")), \
-             patch.object(eng, "compute_market_bias", return_value={"bias": "BEARISH"}):
+             patch.dict(os.environ, {"APP_ENV": "staging"}), \
+             patch.object(sl, "save_autotrade_state_to_sheet", return_value=True), \
+             patch.object(sl, "log_trade_to_google_sheet", side_effect=lambda d, **kw: opened_payloads.append(d) or True), \
+             patch.object(sl, "log_trade_closed", side_effect=lambda d, **kw: closed_payloads.append(d) or True):
             eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
-            ok_3s, msg_3s, _ = eng.execute_autotrade_two_entry_signal(
-                pair="B-SUI_USDT",
-                sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 0.90, "tp1": 0.88, "tp2": 0.85, "stop_loss": 0.915, "levels": bear_box},
-                single_trade_margin_inr=8000.0, leverage=10,
-            )
-            assert not ok_3s and "Same-Direction Risk Guard (2/2 SHORT" in msg_3s, (ok_3s, msg_3s)
-
-        # BTC 15m Impulse Veto blocks altcoin SHORT when BTC jumped +0.95% on last closed 15m candle
-        eng._BTC_IMPULSE_CACHE["ts"] = 0.0
-        now_ms_t = int(time.time() * 1000)
-        btc_pump_df = pd.DataFrame([
-            {"timestamp": now_ms_t - 2700000, "open": 60000.0, "high": 60100.0, "low": 59950.0, "close": 60050.0, "volume": 100.0},
-            {"timestamp": now_ms_t - 1800000, "open": 60050.0, "high": 60680.0, "low": 60020.0, "close": 60620.0, "volume": 300.0},  # +0.95% closed
-            {"timestamp": now_ms_t - 60000, "open": 60620.0, "high": 60650.0, "low": 60580.0, "close": 60610.0, "volume": 50.0},     # forming
-        ])
-        with patch.object(eng, "fetch_coindcx_candles", return_value=btc_pump_df):
-            veto_s, v_msg_s = eng.check_btc_impulse_veto("B-RENDER_USDT", "SHORT")
-            assert veto_s is True and "BTC 15m Impulse Veto" in v_msg_s, (veto_s, v_msg_s)
-            veto_l, _ = eng.check_btc_impulse_veto("B-RENDER_USDT", "LONG")
-            assert veto_l is False, "BTC pump should NOT block altcoin LONG"
-            veto_btc, _ = eng.check_btc_impulse_veto("B-BTC_USDT", "SHORT")
-            assert veto_btc is False, "BTC impulse veto must not self-veto B-BTC_USDT"
-        eng._BTC_IMPULSE_CACHE["ts"] = 0.0
-
-        # --- FIX 5: Fixed 1.5% Risk Sizing + Multi-Slot Independent Management Loop + Post-Only Flag ---
-        m_15, _ = eng.compute_risk_based_margin_inr(wallet_inr=24670.0, entry_px=10.0, sl_px=10.18, leverage=10, max_margin_inr=8000.0, risk_pct=1.5)
-        # 1.5% of 24670 = Rs.370.05; (1.8% SL + 0.12% fee cushion) @ 10x = 19.2% ROE -> 370.05 / 0.192 = Rs.1,927.34
-        assert abs(m_15 - 1927.34) < 1.0, f"Expected 1.5% risk margin ~Rs.1,927.34, got {m_15}"
-
-        # Multi-slot management loop manages BOTH Slot 1 (hits SL -> triggers POST_SL_LOCK) and Slot 2 (hits TP1 -> ratchets to Fee-BE) in ONE tick!
-        eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
-        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
-             patch.object(sm, "STATE_FILE", temp_st), \
-             patch.dict(sm._MEM_STATE, {}, clear=True), \
-             patch("sheets_logger.log_trade_closed", return_value=True):
-            now_m = time.time() - 120.0
             eng.save_autotrade_config({
-                "paper_wallet_inr": 24670.0,
-                "active_trade_locks": {
-                    "B-NEAR_USDT": {
-                        "pair": "B-NEAR_USDT", "direction": "SHORT", "strategy_id": "box_theory",
-                        "entry": 3.00, "tp1": 2.94, "tp2": 2.85, "stop_loss": 3.05, "tp1_hit": False,
-                        "margin_inr": 2000.0, "leverage": 10, "opened_ts": now_m, "is_live_exchange": False,
-                        "mode": "Staging Paper AutoTrade (Live Market)",
-                    },
-                    "B-INJ_USDT": {
-                        "pair": "B-INJ_USDT", "direction": "SHORT", "strategy_id": "box_theory",
-                        "entry": 7.30, "tp1": 7.15, "tp2": 6.90, "stop_loss": 7.42, "tp1_hit": False,
-                        "margin_inr": 2000.0, "leverage": 10, "opened_ts": now_m - 30.0, "is_live_exchange": False,
-                        "mode": "Staging Paper AutoTrade (Live Market)",
-                    },
-                },
+                "paper_wallet_inr": 20000.0,
+                "paper_starting_wallet_inr": 20000.0,
+                "paper_realized_pnl_inr": 0.0,
+                "active_trade_locks": {},
+                "active_trade_lock": None,
             })
-            def _multi_tk(pair):
-                if pair == "B-NEAR_USDT":
-                    return {"last_price": 3.06}  # Hits SL!
-                return {"last_price": 7.14}      # Hits TP1!
-            with patch.object(eng, "fetch_live_ticker", side_effect=_multi_tk), \
+
+            # Open 2 paper trades via register_app_trade_lock -> verify [v35] tag stamped
+            eng.register_app_trade_lock(
+                pair="B-ETH_USDT", direction="SHORT", entry=1700.0, tp1=1680.0, tp2=1650.0, stop_loss=1750.0,
+                margin_inr=5000.0, leverage=10, qty1=0.3, mode="Staging Paper AutoTrade (Live Market)",
+                is_live_exchange=False, strategy_id="box_theory",
+            )
+            eng.register_app_trade_lock(
+                pair="B-NEAR_USDT", direction="SHORT", entry=3.00, tp1=2.95, tp2=2.85, stop_loss=3.10,
+                margin_inr=5000.0, leverage=10, qty1=160.0, mode="Staging Paper AutoTrade (Live Market)",
+                is_live_exchange=False, strategy_id="ema50_200",
+            )
+            assert len(opened_payloads) == 2 and all("[v35]" in p.get("trigger_reason", "") for p in opened_payloads), opened_payloads
+
+            # Age BOTH filled paper locks to 10 hours old (> 8h) -> MUST NOT be silently evicted!
+            cfg_now = eng.get_autotrade_config()
+            locks_now = eng._get_active_locks_map(cfg_now)
+            for lk in locks_now.values():
+                lk["opened_ts"] = time.time() - 10 * 3600
+            eng.save_autotrade_config({"active_trade_locks": locks_now, "active_trade_lock": locks_now["B-NEAR_USDT"]})
+
+            # Neutral prices (neither TP1/TP2/SL hit) -> both must stay open!
+            def _neutral_tk(pair):
+                return {"last_price": 1705.0 if pair == "B-ETH_USDT" else 3.01}
+
+            with patch.object(eng, "fetch_live_ticker", side_effect=_neutral_tk), \
                  patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)):
-                st_multi = eng.get_active_portfolio_trade_status(manage_exchange=True)
-                locks_after = eng._get_active_locks_map()
-                assert "B-NEAR_USDT" not in locks_after, f"Expected Slot 1 (NEAR) closed on SL, got {locks_after}"
-                assert "B-INJ_USDT" in locks_after and locks_after["B-INJ_USDT"]["tp1_hit"] is True, (
-                    f"Expected Slot 2 (INJ) independently managed & TP1 ratcheted in same tick, got {locks_after}"
-                )
-                assert abs(locks_after["B-INJ_USDT"]["stop_loss"] - eng.format_order_price("B-INJ_USDT", 7.30 * 0.9980)) < 1e-4
-                assert sm.is_post_sl_locked("B-NEAR_USDT", "SHORT")[0] is True, "Expected POST_SL_LOCK set on NEAR SHORT after SL hit"
-                assert st_multi["active_pair"] == "B-INJ_USDT"
+                mon1 = eng.get_active_portfolio_trade_status(manage_exchange=True)
+            assert mon1.get("has_active_trade") and len(eng._get_active_locks_map()) == 2, (mon1, eng._get_active_locks_map())
 
-    print("  -> PASS: All 6 Daemon v36 SL-Reduction Fixes (EMA/Box/OpenBlackout/CrossStrat/BTC/SameDir/1.5%Risk/MultiSlot/PostOnly) verified!")
+            # Now ETH hits SL (1760) AND NEAR hits TP2 (2.80) in the SAME daemon pass -> BOTH must close & settle!
+            def _exit_tk(pair):
+                return {"last_price": 1760.0 if pair == "B-ETH_USDT" else 2.80}
 
+            with patch.object(eng, "fetch_live_ticker", side_effect=_exit_tk), \
+                 patch.object(eng, "_check_recent_15m_tp1_touch_and_prev_hl", return_value=(False, None, None)):
+                mon2 = eng.get_active_portfolio_trade_status(manage_exchange=True)
+            assert not mon2.get("is_occupied") and len(eng._get_active_locks_map()) == 0, (mon2, eng._get_active_locks_map())
+            assert len(closed_payloads) == 2, closed_payloads
+            assert all("[STAGING PAPER | v35]" in cp.get("exit_reason", "") for cp in closed_payloads), closed_payloads
+            # Verify paper_wallet_inr settled BOTH trades accurately!
+            expected_net = round(sum(float(cp["net_pnl_inr"]) for cp in closed_payloads), 2)
+            cfg_end = eng.get_autotrade_config()
+            assert abs(float(cfg_end["paper_realized_pnl_inr"]) - expected_net) < 0.05, (cfg_end["paper_realized_pnl_inr"], expected_net)
+            assert abs(float(cfg_end["paper_wallet_inr"]) - round(20000.0 + expected_net, 2)) < 0.05, cfg_end["paper_wallet_inr"]
 
-def test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause():
-    print("[18/18] Verifying Daemon v37: Configurable Concurrent Trades, Auto-Split Wallet Toggle & Unrealized PnL Daily SL Pause...")
-    import coindcx_engine as eng
-    import signal_monitor as sm
-
-    # 1. Verify Sidebar UI controls & durable keys exist
-    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as fh:
-        app_src = fh.read()
-    assert '"Number of Concurrent Trades"' in app_src
-    assert '"⚖️ Auto-Split Wallet by Concurrent Trades"' in app_src
-    assert "Unrealized SL Guard" in app_src
-    assert "max_concurrent_trades" in eng._DURABLE_AUTOTRADE_KEYS
-    assert "auto_split_wallet_by_slots" in eng._DURABLE_AUTOTRADE_KEYS
-
-    today_s = eng.get_crypto_trading_day_str()
-    # Verify Crypto Day reset clock aligns strictly to 00:00 UTC (05:30 AM IST), NOT 00:00 IST!
-    assert eng.get_crypto_trading_day_str("2026-11-22 21:00") == "2026-11-22"
-    assert eng.get_crypto_trading_day_str("2026-11-23 00:15") == "2026-11-22", "00:15 IST must still belong to prior Crypto Day (until 05:30 IST)"
-    assert eng.get_crypto_trading_day_str("2026-11-23 05:29") == "2026-11-22", "05:29 IST must still belong to prior Crypto Day"
-    assert eng.get_crypto_trading_day_str("2026-11-23 05:30") == "2026-11-23", "05:30 IST (00:00 UTC) must open the new Crypto Day"
-    bear_box = {"trend_bias": "BEARISH", "RH": 7.50, "RL": 6.80, "MID": 7.15, "SH": 7.60, "SL": 6.72}
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
-        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg):
-            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
-
-            # 2. Configurable Concurrent Trades + Auto-Split Wallet (Rs.24,000 / 4 = Rs.6,000, then / 2 = Rs.12,000)
-            eng.save_autotrade_config({
-                "wallet_balance_inr": 24000.0,
-                "max_concurrent_trades": 4,
-                "auto_split_wallet_by_slots": True,
-                "single_trade_margin_inr": 6000.0,
-            })
-            cfg4 = eng.get_autotrade_config()
-            assert eng.get_configured_max_slots(cfg4) == 4 and eng.is_auto_split_enabled(cfg4) is True
-            assert abs(float(cfg4["single_trade_margin_inr"]) - 6000.0) < 0.01, cfg4
-
-            # Balance refresh auto-recalculates margin to Wallet / 4 when Auto-Split is ON!
-            def _fake_w32(method, url, payload=None, timeout=3.5):
-                return _MockResponse(200, [{"currency_short_name": "INR", "balance": "32000.0", "locked_balance": "0.0", "cross_user_margin": "0.0"}]), None
-            with patch.object(eng, "_send_coindcx_signed_request", side_effect=_fake_w32):
-                eng._fetch_coindcx_futures_balance_sync()
-            assert abs(float(eng.get_autotrade_config()["single_trade_margin_inr"]) - 8000.0) < 0.01
-
-            # Setting max_concurrent_trades = 2 enforces 2-Slot cap (blocks 3rd trade!)
-            eng.save_autotrade_config({
-                "max_concurrent_trades": 2,
-                "auto_split_wallet_by_slots": True,
-                "wallet_balance_inr": 32000.0,
-                "daily_start_wallet": {"date": today_s, "inr": 32000.0},
-                "daily_loss_stop_hit": "",
-            })
-            with patch.object(eng, "is_staging_environment", return_value=False), \
-                 patch.object(eng, "is_experiment_environment", return_value=False), \
-                 patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": True, "total_inr": 32000.0, "available_inr": 32000.0}), \
-                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[
-                     {"pair": "B-NEAR_USDT", "direction": "SHORT", "pnl_inr": 100.0},
-                     {"pair": "B-INJ_USDT", "direction": "LONG", "pnl_inr": 50.0},
-                 ]), \
-                 patch.object(eng, "fetch_coindcx_open_orders", return_value=[]), \
-                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-NEAR_USDT", "B-INJ_USDT"]}):
-                ok_2cap, msg_2cap, _ = eng.execute_autotrade_two_entry_signal(
-                    pair="B-SOL_USDT",
-                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 70.0, "tp1": 69.0, "tp2": 67.5, "stop_loss": 71.5, "levels": bear_box},
-                    single_trade_margin_inr=None, leverage=10,
-                )
-                assert not ok_2cap and "2-Slot Wallet Guard (2/2" in msg_2cap, (ok_2cap, msg_2cap)
-
-            # 3. Unrealized PnL Daily SL Pause (Live):
-            # Day-start Rs.24,000 -> 5% Daily SL = Rs.1,200. Open position has unrealized PnL = -Rs.1,450 -> PAUSE!
-            eng.save_autotrade_config({
-                "max_concurrent_trades": 3,
-                "daily_start_wallet": {"date": today_s, "inr": 24000.0},
-                "daily_loss_stop_hit": "",
-            })
-            w_live24 = {"is_live_api": True, "total_inr": 24000.0, "available_inr": 16000.0}
-            losing_open_pos = [{"pair": "B-RENDER_USDT", "direction": "SHORT", "pnl_inr": -1450.0}]
-            paused, p_msg, p_info = eng.check_unrealized_pnl_daily_sl_pause(w_live24, positions=losing_open_pos)
-            assert paused and "Unrealized PnL Daily SL Pause" in p_msg, (paused, p_msg)
-            assert p_info["unrealized_loss_inr"] == 1450.0 and p_info["limit_inr"] == 1200.0
-            # Must NOT permanently lock daily_loss_stop_hit!
-            assert eng.get_autotrade_config().get("daily_loss_stop_hit", "") == ""
-
-            # execute_autotrade_two_entry_signal MUST block new trades while open unrealized loss >= Daily SL!
-            with patch.object(eng, "is_staging_environment", return_value=False), \
-                 patch.object(eng, "is_experiment_environment", return_value=False), \
-                 patch.object(eng, "fetch_coindcx_futures_balance", return_value=w_live24), \
-                 patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=losing_open_pos), \
-                 patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False, "active_pairs": ["B-RENDER_USDT"]}):
-                ok_unr, msg_unr, _ = eng.execute_autotrade_two_entry_signal(
-                    pair="B-INJ_USDT",
-                    sig={"signal": "SHORT", "strategy_id": "box_theory", "entry": 7.30, "tp1": 7.15, "tp2": 6.89, "stop_loss": 7.45, "levels": bear_box},
-                    single_trade_margin_inr=8000.0, leverage=10,
-                )
-                assert not ok_unr and "Unrealized PnL Daily SL Pause" in msg_unr, (ok_unr, msg_unr)
-
-            # Combined loss check: realized loss -Rs.700 + open unrealized loss -Rs.600 = -Rs.1,300 >= Rs.1,200 -> PAUSE!
-            w_live_part = {"is_live_api": True, "total_inr": 23300.0, "available_inr": 15300.0}
-            p_comb, _, p_cinfo = eng.check_unrealized_pnl_daily_sl_pause(
-                w_live_part, positions=[{"pair": "B-SOL_USDT", "direction": "SHORT", "pnl_inr": -600.0}]
-            )
-            assert p_comb and p_cinfo["combined_loss_inr"] == 1300.0, (p_comb, p_cinfo)
-
-            # Once all live positions close (positions=[]) with realized loss < 5% -> Pause AUTOMATICALLY lifts!
-            p_closed, _, _ = eng.check_unrealized_pnl_daily_sl_pause(w_live_part, positions=[])
-            assert p_closed is False, "Expected unrealized PnL pause to lift automatically once open positions close!"
-
-            # Staging Paper Unrealized PnL Pause: open paper lock down -Rs.1,600 on live ticker -> PAUSE!
-            with patch.dict(os.environ, {"APP_ENV": "staging"}):
-                eng.save_autotrade_config({
-                    "paper_wallet_inr": 24000.0,
-                    "paper_daily_start_wallet": {"date": today_s, "inr": 24000.0},
-                    "daily_loss_stop_hit": "",
-                    "active_trade_locks": {
-                        "B-NEAR_USDT": {
-                            "pair": "B-NEAR_USDT", "direction": "SHORT", "strategy_id": "box_theory",
-                            "entry": 3.00, "margin_inr": 8000.0, "leverage": 10, "tp1_hit": False,
-                            "entry1_pending": False, "is_live_exchange": False, "opened_ts": time.time(),
-                        }
-                    },
-                })
-                # Price moved +2% against SHORT ($3.00 -> $3.06) -> -20% ROE on Rs.8,000 = -Rs.1,600 >= Rs.1,200!
-                with patch.object(eng, "fetch_live_ticker", return_value={"last_price": 3.06}):
-                    p_stg, msg_stg_u, info_stg_u = eng.check_unrealized_pnl_daily_sl_pause(
-                        eng.get_paper_wallet_snapshot(), allow_live_ticker=True
-                    )
-                    assert p_stg and "Unrealized PnL Daily SL Pause" in msg_stg_u, (p_stg, msg_stg_u, info_stg_u)
-                    assert abs(info_stg_u["unrealized_loss_inr"] - 1600.0) < 1.0, info_stg_u
-
-    print("  -> PASS: Daemon v37 Configurable Concurrent Trades, Auto-Split Wallet Toggle & Unrealized PnL Daily SL Pause verified!")
-
-
-def test_19_ema9_21_stack_standalone_and_dynamic_allocation():
-    print("[19/19] Verifying Standalone 4-EMA Stack (9/21 Pullback) Strategy Isolation, 3 Chop Filters, 0.5% SL Budget & Dynamic Wallet Compounding...")
-    import pandas as pd
-    import coindcx_engine as eng
-    import strategies as strat
-    import signal_monitor as sm
-
-    # 1. Complete Standalone Isolation (never mixes with existing Box / 50-200 EMA strategies)
-    assert "ema9_21_stack" in strat.STRATEGY_REGISTRY
-    assert strat.resolve_autotrade_mode("ema9_21_stack") == "ema9_21_stack"
-    assert strat.autotrade_mode_strategy_ids("ema9_21_stack") == ["ema9_21_stack"]
-    assert sm._autotrade_signal_eligible("ema9_21_stack", "LONG", "ema9_21_stack") is True
-    assert sm._autotrade_signal_eligible("box_theory", "LONG", "ema9_21_stack") is False
-    assert sm._autotrade_signal_eligible("ema50_200", "LONG", "ema9_21_stack") is False
-    assert sm._autotrade_signal_eligible("ema9_21_stack", "LONG", "box_plus_ema50_200_regime") is False
-    assert sm._autotrade_signal_eligible("ema9_21_stack", "SHORT", "box_theory") is False
-
-    # 2. Verify Step 1-4 Detector Rules on Synthetic 15m Candles (ETH ~$3,000)
-    n = 25
-    recs = [{"open": 3006.0, "high": 3010.0, "low": 3004.0, "close": 3008.0, "volume": 100.0} for _ in range(n)]
-    # Bar 23 = clean red pullback candle touching 9/21 EMA zone without heavy close below 21 EMA
-    recs[23] = {"open": 3010.0, "high": 3011.0, "low": 3002.0, "close": 3004.0, "volume": 110.0}
-    # Bar 24 = strong solid green confirmation candle closing above 9 EMA (3008.6) & above prior red high (3011) with high volume
-    recs[24] = {"open": 3004.0, "high": 3013.5, "low": 3003.5, "close": 3012.5, "volume": 180.0}
-
-    def _base_ind():
-        return {
-            "ema9": [3005.0 + 0.15 * i for i in range(n)],
-            "ema21": [2999.0 + 0.10 * i for i in range(n)],
-            "ema50": [2990.0] * n,
-            "ema200": [2970.0] * n,
-            "vol_sma20": [100.0] * n,
-            "rsi14": [58.0] * n,
-            "atr14": [6.0] * n,
-            "cross50_20": [0] * n,
-            "bars_since_cross": [10] * n,
-            "last2_clean": [True] * n,
-            "h1_bias": [1] * n,
-            "h4_bias": [1] * n,
-        }
-
-    # 2A. Valid setup passes cleanly with SL <= 0.50% asset move and 1:1.5R TP1
-    ind_ok = _base_ind()
-    sig_ok = strat._detect_ema9_21_stack_setup(recs, 24, ind_ok)
-    assert sig_ok is not None and sig_ok["direction"] == "LONG", f"Expected valid LONG setup, got {sig_ok}"
-    assert sig_ok["sl_dist_pct"] <= 0.50, f"Expected SL <= 0.50%, got {sig_ok['sl_dist_pct']}"
-    assert abs((sig_ok["tp1"] - sig_ok["entry"]) - 1.5 * (sig_ok["entry"] - sig_ok["stop"])) < 1e-6
-
-    # 2B. Filter 1 (HTF Misalignment): 4H neutral/bearish blocks LONG
-    ind_htf = _base_ind()
-    ind_htf["h4_bias"][24] = -1
-    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_htf) is None
-
-    # 2C. Filter 1b (50 EMA Chop >= 3 crosses in 20 bars) blocks entry
-    ind_c50 = _base_ind()
-    ind_c50["cross50_20"][24] = 3
-    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_c50) is None
-
-    # 2D. Filter 2 (Last 2 Crossovers failed) blocks entry
-    ind_l2 = _base_ind()
-    ind_l2["last2_clean"][24] = False
-    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_l2) is None
-
-    # 2E. Step 2 (Initial Cross < 4 bars) blocks entry
-    ind_ic = _base_ind()
-    ind_ic["bars_since_cross"][24] = 2
-    assert strat._detect_ema9_21_stack_setup(recs, 24, ind_ic) is None
-
-    # 2F. Step 3 (Weak volume <= 20-SMA) blocks entry
-    recs_lowv = [dict(r) for r in recs]
-    recs_lowv[24]["volume"] = 80.0
-    assert strat._detect_ema9_21_stack_setup(recs_lowv, 24, _base_ind()) is None
-
-    # 2G. Step 4 (SL > 0.50% asset move) blocks entry
-    recs_widesl = [dict(r) for r in recs]
-    recs_widesl[23]["low"] = 2992.0  # > 0.65% away from 3012.5
-    assert strat._detect_ema9_21_stack_setup(recs_widesl, 24, _base_ind()) is None
-
-    # 3. Verify Dynamic Allocation ON compounds margin with gains & losses + 5% Daily SL Stop
-    synth_comp = pd.DataFrame([
-        # Trade 1 on Day 1: +30% ROE on 1/3 of Rs.3,00,000 (Rs.1,00,000 margin) -> +Rs.30,000 => Wallet becomes Rs.3,30,000!
-        {"pair": "B-BTC_USDT", "strategy": "4-EMA Stack (9/21 Pullback)", "direction": "LONG",
-         "entry_time": "2026-11-10 08:00", "exit_time": "2026-11-10 10:00",
-         "entry_price": 60000.0, "exit_price": 61800.0, "initial_stop_loss": 59750.0,
-         "roe_pct": 30.0, "net_pnl_inr": 30000.0, "fees_inr": 500.0, "is_win": True, "exit_reason": "50% TP1 Maker + 50% 21 EMA Close Exit"},
-        # Trade 2 on Day 2: base PnL +Rs.10,000 at Rs.1,00,000 -> with Dynamic Alloc on Rs.3,30,000 wallet (slot=Rs.1,10,000),
-        # MUST scale by 1.10x to +Rs.11,000 => Wallet becomes Rs.3,41,000!
-        {"pair": "B-ETH_USDT", "strategy": "4-EMA Stack (9/21 Pullback)", "direction": "LONG",
-         "entry_time": "2026-11-11 08:00", "exit_time": "2026-11-11 10:00",
-         "entry_price": 3000.0, "exit_price": 3030.0, "initial_stop_loss": 2988.0,
-         "roe_pct": 10.0, "net_pnl_inr": 10000.0, "fees_inr": 500.0, "is_win": True, "exit_reason": "50% TP1 Maker + 50% 21 EMA Close Exit"},
-    ])
-    def _mock_bt_dyn(pair, **kwargs):
-        sub = synth_comp[synth_comp["pair"] == pair].copy()
-        return {
-            "total_trades": len(sub), "win_count": int((sub["is_win"] == True).sum()),
-            "loss_count": 0, "win_rate_pct": 100.0 if len(sub) else 0.0,
-            "net_profit_inr": float(sub["net_pnl_inr"].sum()), "profit_factor": 99.0, "trades_df": sub,
-        }
-
-    with patch.object(eng, "run_strategy_backtest", side_effect=_mock_bt_dyn):
-        res_dyn = eng.run_portfolio_single_slot_backtest(
-            pairs=["B-BTC_USDT", "B-ETH_USDT"],
-            duration_days=30,
-            margin_inr=100000.0,
-            leverage=10,
-            strategy_id="ema9_21_stack",
-            wallet_inr=300000.0,
-            exit_mode="stack_half_1.5_trail21",
-            max_concurrent_trades=3,
-            daily_loss_stop_pct=5.0,
-            enforce_free_margin_guard=True,
-            enforce_same_dir_guard=False,
-            enforce_post_sl_lock=False,
-            enforce_btc_impulse_veto=False,
-            use_fixed_risk_sizing=False,
-            dynamic_allocation=True,
-        )
-        assert res_dyn["total_trades"] == 2
-        assert res_dyn["guards_audit"]["dynamic_allocation"] is True
-        assert abs(res_dyn["ending_wallet_inr"] - 341000.0) < 0.05, f"Expected dynamic compounding Rs.3,41,000, got {res_dyn['ending_wallet_inr']}"
-
-    print("  -> PASS: Standalone 4-EMA Stack (9/21 Pullback), 3 Chop Filters, <=0.5% SL Budget & Dynamic Compounding Wallet verified!")
+    print("  -> PASS: Paper Trading Journal Fixes verified (Multi-Slot Monitor, No 8h Silent Eviction, Strict Row Match, v35 Tag)!")
 
 
 if __name__ == "__main__":
@@ -2311,9 +1920,7 @@ if __name__ == "__main__":
     test_14_v34_three_fixes_slot_margin_and_apt_box_floor()
     test_15_v35_funds_section_and_wallet_ledger()
     test_16_three_tier_main_staging_experiment_parity()
-    test_17_v36_six_sl_reduction_fixes()
-    test_18_v37_concurrent_slots_autosplit_and_unrealized_pnl_pause()
-    test_19_ema9_21_stack_standalone_and_dynamic_allocation()
+    test_17_paper_trading_journal_fixes()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")

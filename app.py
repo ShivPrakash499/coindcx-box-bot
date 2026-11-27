@@ -195,7 +195,7 @@ def _safe_scan_and_alert(pairs, margin_inr, leverage, usd_inr, send=True, strate
             )
 
 # ----------------- 24/7 BACKGROUND SIGNAL MONITOR DAEMON (STARTS BEFORE PIN GATE) -----------------
-_DAEMON_VERSION = 38
+_DAEMON_VERSION = 35
 sys.__dict__["_active_daemon_version"] = _DAEMON_VERSION
 
 @st.cache_resource
@@ -700,11 +700,11 @@ _wallet_delta = (
 st.sidebar.metric(_wallet_lbl, f"₹{wallet_data['total_inr']:,.2f}", _wallet_delta)
 
 if _is_staging_env or _is_experiment_env:
-    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, Margin, Leverage, Concurrent Trades & Strategy Mode from Google Sheet."):
+    if st.sidebar.button("🔄 Sync Setup & Funds from Main", key="btn_sync_setup_from_main", use_container_width=True, help="Mirrors Main's exact Funds, Margin, Leverage & Strategy Mode from Google Sheet."):
         _ok_s, _msg_s, _ = coindcx_engine.sync_setup_from_main(reset_paper_wallet=_is_staging_env)
         st.session_state["_sb_main_sync_msg"] = (_ok_s, _msg_s)
-        for _k_clr in ("sidebar_single_trade_margin_input", "sidebar_autotrade_strategy_mode", "sidebar_max_concurrent_trades", "sidebar_auto_split_wallet"):
-            st.session_state.pop(_k_clr, None)
+        st.session_state.pop("sidebar_single_trade_margin_input", None)
+        st.session_state.pop("sidebar_autotrade_strategy_mode", None)
         get_cached_signals_scan.clear()
         st.rerun()
     if st.session_state.get("_sb_main_sync_msg"):
@@ -727,117 +727,54 @@ if not wallet_data.get("is_live_api"):
         _auto_cfg = coindcx_engine.save_autotrade_config({"wallet_balance_inr": round(_manual_wallet_inr, 2)})
         get_cached_balance.clear()
 
-_saved_max_slots = coindcx_engine.get_configured_max_slots(_auto_cfg)
-_saved_auto_split = coindcx_engine.is_auto_split_enabled(_auto_cfg)
-if "sidebar_max_concurrent_trades" not in st.session_state:
-    st.session_state["sidebar_max_concurrent_trades"] = int(_saved_max_slots)
-if "sidebar_auto_split_wallet" not in st.session_state:
-    st.session_state["sidebar_auto_split_wallet"] = bool(_saved_auto_split)
-
-
-def _on_sidebar_slots_or_split_change():
-    new_slots = max(1, min(6, int(st.session_state.get("sidebar_max_concurrent_trades", _saved_max_slots) or 3)))
-    new_auto_split = bool(st.session_state.get("sidebar_auto_split_wallet", True))
-    w_tot = round(float(wallet_data["total_inr"]), 2)
-    upd = {
-        "max_concurrent_trades": new_slots,
-        "auto_split_wallet_by_slots": new_auto_split,
-        "user_custom_margin": not new_auto_split,
-        "wallet_balance_inr": w_tot,
-    }
-    if new_auto_split and w_tot > 0:
-        auto_m = round(w_tot / new_slots, 2)
-        upd["single_trade_margin_inr"] = auto_m
-        st.session_state["sidebar_single_trade_margin_input"] = float(auto_m)
-    coindcx_engine.save_autotrade_config(upd)
-    get_cached_signals_scan.clear()
-    get_cached_positions.clear()
-
-
-max_concurrent_trades = int(
-    st.sidebar.number_input(
-        "Number of Concurrent Trades",
-        min_value=1,
-        max_value=6,
-        step=1,
-        key="sidebar_max_concurrent_trades",
-        on_change=_on_sidebar_slots_or_split_change,
-        help="Maximum simultaneous open positions + resting entry orders AutoTrade can hold at once (default 3).",
-    )
-)
-auto_split_wallet = bool(
-    st.sidebar.toggle(
-        "⚖️ Auto-Split Wallet by Concurrent Trades",
-        key="sidebar_auto_split_wallet",
-        on_change=_on_sidebar_slots_or_split_change,
-        help="When ON, automatically divides your Futures Wallet evenly by Number of Concurrent Trades (Wallet ÷ N) and updates whenever your wallet changes. Turn OFF to type a custom Single-Trade Margin.",
-    )
-)
-
-_auto_split_margin = round(float(wallet_data["total_inr"]) / max(1, max_concurrent_trades), 2)
+_one_third_wallet = round(float(wallet_data["total_inr"]) * coindcx_engine.TRADE_ALLOCATION_FRACTION, 2)
 _saved_margin = float(_auto_cfg.get("single_trade_margin_inr") or 0.0)
-if auto_split_wallet or _saved_margin <= 0 or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0):
-    default_margin = _auto_split_margin
+if (
+    _saved_margin <= 0
+    or _saved_margin in (15762.39, 30000.0, 250000.0, 100000.0)
+    or not _auto_cfg.get("user_custom_margin")
+):
+    default_margin = _one_third_wallet
 else:
     default_margin = _saved_margin
 
-# Keep Streamlit widget state synced to (Wallet ÷ Concurrent Trades) whenever Auto-Split is ON
-if auto_split_wallet:
-    if st.session_state.get("_last_synced_split_margin") != (_auto_split_margin, max_concurrent_trades):
-        st.session_state["_last_synced_split_margin"] = (_auto_split_margin, max_concurrent_trades)
-        st.session_state["sidebar_single_trade_margin_input"] = float(_auto_split_margin)
+# Keep Streamlit widget state synced to 1/3 of live wallet whenever wallet updates and user hasn't set custom margin
+if not _auto_cfg.get("user_custom_margin"):
+    if st.session_state.get("_last_synced_one_third_margin") != _one_third_wallet:
+        st.session_state["_last_synced_one_third_margin"] = _one_third_wallet
+        st.session_state["sidebar_single_trade_margin_input"] = float(_one_third_wallet)
 
 
 def _on_sidebar_margin_change():
-    raw_in = st.session_state.get("sidebar_single_trade_margin_input")
-    if raw_in is None or float(raw_in or 0.0) <= 0.0:
-        # Blank / cleared margin -> seamlessly fall back to Wallet ÷ Concurrent Trades
-        fallback_m = round(float(wallet_data["total_inr"]) / max(1, max_concurrent_trades), 2)
-        coindcx_engine.save_autotrade_config({
-            "single_trade_margin_inr": fallback_m,
-            "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
-            "auto_split_wallet_by_slots": True,
-            "user_custom_margin": False,
-        })
-    else:
-        new_m = round(float(raw_in), 2)
-        coindcx_engine.save_autotrade_config({
-            "single_trade_margin_inr": new_m,
-            "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
-            "auto_split_wallet_by_slots": False,
-            "user_custom_margin": True,
-        })
+    new_m = round(float(st.session_state.get("sidebar_single_trade_margin_input", _one_third_wallet)), 2)
+    coindcx_engine.save_autotrade_config({
+        "single_trade_margin_inr": new_m,
+        "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
+        "user_custom_margin": True,
+    })
     get_cached_signals_scan.clear()
 
 
-_margin_widget_val = st.sidebar.number_input(
+margin_inr = st.sidebar.number_input(
     "Single-Trade Margin (INR)",
     min_value=500.0,
     max_value=max(float(wallet_data["total_inr"]) * 2.0, 1000000.0),
     value=float(default_margin),
     step=500.0,
     format="%.2f",
-    disabled=auto_split_wallet,
     key="sidebar_single_trade_margin_input",
     on_change=_on_sidebar_margin_change,
-    help="Per-trade margin ceiling used by AutoTrade & Execute. Auto-calculated as (Wallet ÷ Concurrent Trades) when Auto-Split is ON, or when left blank.",
+    help="Exact per-trade margin used by AutoTrade & Execute (defaults to 1/3rd of Futures Wallet until customized; never downsized into dust trades)."
 )
-margin_inr = float(_auto_split_margin if (auto_split_wallet or _margin_widget_val is None or float(_margin_widget_val) <= 0) else _margin_widget_val)
 default_lev = int(_auto_cfg.get("leverage") or int(os.getenv("LEVERAGE", 10)))
 leverage = st.sidebar.slider("Leverage (x)", min_value=1, max_value=20, value=default_lev)
-if auto_split_wallet:
-    st.sidebar.caption(
-        f"⚖️ **Auto-Split:** `₹{wallet_data['total_inr']:,.2f} ÷ {max_concurrent_trades}` = **₹{margin_inr:,.2f}/trade** @ {leverage}x *(1.5% Risk Sizing active)*"
-    )
-else:
-    st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (Custom Margin, max {max_concurrent_trades} concurrent) @ {leverage}x")
+st.sidebar.caption(f"Allocation: **₹{margin_inr:,.2f}** (100% Single-Slot Maker Limit) @ {leverage}x")
 try:
     _eff_margin, _eff_note = coindcx_engine.compute_wallet_capped_margin(
         float(margin_inr),
         int(leverage),
         wallet_data,
-        max_slots=max_concurrent_trades,
-        honor_custom_margin=not auto_split_wallet,
+        honor_custom_margin=bool(_auto_cfg.get("user_custom_margin", False)),
     )
     if _eff_note:
         st.sidebar.warning(f"⚠️ AutoTrade will use **₹{_eff_margin:,.2f}** per trade. {_eff_note}")
@@ -848,7 +785,7 @@ live_crypto_rate = get_coindcx_live_usdt_inr_rate()
 usd_inr = float(live_crypto_rate)
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"### 🤖 AutoTrade ({max_concurrent_trades}-Slot)")
+st.sidebar.markdown("### 🤖 AutoTrade (3-Slot)")
 
 if _is_experiment_env:
     if _auto_cfg.get("enabled") or _auto_cfg.get("paper_autotrade_enabled"):
@@ -948,27 +885,22 @@ st.sidebar.caption(
 if (
     round(float(margin_inr), 2) != round(float(_auto_cfg.get("single_trade_margin_inr", 0.0)), 2)
     or int(leverage) != int(_auto_cfg.get("leverage", 10))
-    or int(max_concurrent_trades) != int(_auto_cfg.get("max_concurrent_trades", 3) or 3)
-    or bool(auto_split_wallet) != coindcx_engine.is_auto_split_enabled(_auto_cfg)
 ):
     _auto_cfg = coindcx_engine.save_autotrade_config({
         "single_trade_margin_inr": round(float(margin_inr), 2),
         "wallet_balance_inr": round(float(wallet_data["total_inr"]), 2),
         "leverage": int(leverage),
-        "max_concurrent_trades": int(max_concurrent_trades),
-        "auto_split_wallet_by_slots": bool(auto_split_wallet),
-        "user_custom_margin": not bool(auto_split_wallet),
     })
     get_cached_signals_scan.clear()
     get_cached_positions.clear()
 
 _slot_status = coindcx_engine.get_active_portfolio_trade_status(manage_exchange=False)
 _slot_cnt = int(_slot_status.get("count", 0) or 0)
-_slot_max = int(_slot_status.get("max_slots", max_concurrent_trades) or max_concurrent_trades)
+_slot_max = int(_slot_status.get("max_slots", 3) or 3)
 _slot_pairs_list = _slot_status.get("active_pairs") or ([_slot_status.get("active_pair")] if _slot_status.get("active_pair") else [])
 _slot_pairs_str = ", ".join(clean_sym(p) for p in _slot_pairs_list if p)
 if _slot_status.get("is_occupied"):
-    st.sidebar.warning(f"🔒 **{_slot_max}-Slot Full ({_slot_cnt}/{_slot_max}):** `{_slot_pairs_str}`")
+    st.sidebar.warning(f"🔒 **3-Slot Full ({_slot_cnt}/{_slot_max}):** `{_slot_pairs_str}`")
     if st.sidebar.button("🔓 Release App Trade Lock", key="btn_clear_autotrade_lock", use_container_width=True):
         coindcx_engine.clear_autotrade_active_lock()
         st.rerun()
@@ -984,20 +916,10 @@ if st.session_state.get("_sb_autotrade_unlocked_msg"):
     st.sidebar.success(st.session_state.pop("_sb_autotrade_unlocked_msg"))
 
 _dl_blocked_sb, _dl_msg_sb, _dl_info_sb = coindcx_engine.check_live_daily_loss_stop(wallet_data)
-_unr_paused_sb, _unr_msg_sb, _unr_info_sb = coindcx_engine.check_unrealized_pnl_daily_sl_pause(wallet_data, allow_live_ticker=False)
 if _dl_blocked_sb:
     st.sidebar.warning(
-        f"🛑 **AutoTrade Locked (5% Stop — resets 05:30 IST / 00:00 UTC):** "
-        f"₹{float(_dl_info_sb.get('day_start_inr', 0.0)):,.0f} → "
+        f"🛑 **AutoTrade Locked (5% Stop):** ₹{float(_dl_info_sb.get('day_start_inr', 0.0)):,.0f} → "
         f"₹{float(_dl_info_sb.get('current_inr', 0.0)):,.0f}"
-    )
-elif _unr_paused_sb:
-    st.sidebar.warning(
-        f"⏸️ **New Trades Paused (Unrealized SL Guard):** Open unrealized loss "
-        f"`₹{float(_unr_info_sb.get('unrealized_loss_inr', 0.0)):,.0f}` "
-        f"(combined `₹{float(_unr_info_sb.get('combined_loss_inr', 0.0)):,.0f}`) ≥ Daily SL "
-        f"`₹{float(_unr_info_sb.get('limit_inr', 0.0)):,.0f}`. Waiting for "
-        f"{int(_unr_info_sb.get('open_positions', 0))} live position(s) to close."
     )
 if st.sidebar.button(
     "🔓 Unlock AutoTrade",
@@ -3383,8 +3305,7 @@ elif active_section == "🧪 Backtest":
         format_func=lambda k: _bt_mode_labels.get(k, k),
         key="bt_multi_strat_mode",
     )
-    _is_stack_bt = (bt_strat_mode == "ema9_21_stack")
-    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days", "1825 Days"], index=5 if _is_stack_bt else 0, key="bt_multi_dur")
+    bt_dur_label = bc1.selectbox("Duration", ["30 Days", "60 Days", "90 Days", "180 Days", "365 Days", "730 Days"], index=0, key="bt_multi_dur")
     _default_bt_wallet = max(1000.0, round(float(wallet_data.get("total_inr", 24423.86) or 24423.86), 2))
     bt_wallet_inr = bc2.number_input(
         "Starting Funds / Wallet (₹)",
@@ -3403,131 +3324,52 @@ elif active_section == "🧪 Backtest":
         value=max(1000, int(round(margin_inr))),
         step=1000,
         key="bt_multi_cap",
-        help="Base Single-Trade Margin per slot when Dynamic Allocation is OFF (auto-recalculated as Running Wallet ÷ Slots when Dynamic Allocation is ON).",
+        help="Mirrors Main's exact Single-Trade Margin per slot.",
     )
 
-    bg1, bg2, bg3, bg4, bg5, bg6, bg7 = st.columns([0.8, 0.85, 0.65, 1.85, 1.0, 1.0, 1.0])
+    bg1, bg2, bg3, bg4 = st.columns([1.0, 1.1, 0.9, 1.4])
     bt_lev = bg1.slider("Leverage (x)", 1, 20, int(leverage), key="bt_multi_lev")
     bt_sl_threshold_pct = bg2.number_input(
-        "Daily Loss Stop (%)",
+        "Daily Loss Stop / SL Threshold (%)",
         min_value=0.0,
         max_value=25.0,
         value=float(getattr(strategy_registry, "DAILY_WALLET_LOSS_STOP_PCT", 5.0)),
         step=0.5,
         format="%.1f",
         key="bt_daily_loss_stop_pct",
-        help="Locks new trades until the next Crypto Day reset (00:00 UTC / 05:30 AM IST) when realized daily loss reaches this % of day-start wallet (Main = 5.0%; set 0.0 to A/B test without guard).",
+        help="Locks new trades for the rest of the IST day when realized daily loss reaches this % of day-start wallet (Main = 5.0%; set 0.0 to A/B test without guard).",
     )
-    _bt_slot_opts = [1, 2, 3, 4, 5, 6]
-    _bt_slot_def_idx = _bt_slot_opts.index(max_concurrent_trades) if max_concurrent_trades in _bt_slot_opts else 2
-    bt_max_slots = bg3.selectbox("Max Slots", _bt_slot_opts, index=_bt_slot_def_idx, key="bt_max_slots")
-    if _is_stack_bt:
-        _bt_exit_modes = {
-            "stack_half_1.5_trail21": "⭐ 50% @ 1:1.5R Maker + 50% Trail 21 EMA Close (Default)",
-            "stack_pure_trail21": "100% Trend Runner: Trail 21 EMA Close / 9x21 Cross (+1R Arm)",
-            "stack_half_2.0_trail21": "50% @ 1:2.0R Maker + 50% Trail 21 EMA Close",
-            "stack_fixed_1.5": "Fixed 100% Target: 1:1.5R Maker Limit",
-            "stack_fixed_2.0": "Fixed 100% Target: 1:2.0R Maker Limit",
-        }
-        _bt_exit_key = "bt_exit_mode_stack_sel"
-        _bt_exit_def_idx = 0
-    else:
-        _bt_exit_modes = {
-            "smart_hybrid": "Baseline: v36/v38 Structural Runner (50% TP1 + Fee-BE -> TP2)",
-            "box_ema31_1to3_no_reentry": "⭐ HYB-A (NO Re-Entry): Box=31 EMA(8t)+1:3 | EMA=v36 (OOS Verified)",
-            "box_ema31_1to3_reentry": "HYB-A (+Re-Entry 2c): Box=31 EMA(8t)+1:3+21EMA ReEntry | EMA=v36",
-            "ema31_1to3_reentry_all": "Uniform V10: All=31 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
-            "ema21_1to3_reentry_all": "Uniform V4: All=21 EMA(8t) Trail + 1:3 TP + 21EMA ReEntry(2c)",
-            "ema21_v36tp_reentry_all": "Uniform V1: All=21 EMA(8t) Trail + v36 TP2 + 21EMA ReEntry(2c)",
-        }
-        _bt_exit_key = "bt_exit_mode_sel"
-        _bt_exit_def_idx = 1 if _is_experiment_env else 0
-    bt_exit_mode = bg4.selectbox(
-        "Exit Mode",
-        options=list(_bt_exit_modes.keys()),
-        format_func=lambda k: _bt_exit_modes.get(k, k),
-        index=_bt_exit_def_idx,
-        key=_bt_exit_key,
-        help="Dedicated Step-4 exit management for 4-EMA Stack, or Baseline / HYB-A exit comparison for existing strategies.",
-    )
-    with bg5:
-        st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
-        bt_dynamic_alloc = st.checkbox(
-            "⚖️ Dynamic Alloc",
-            value=bool(auto_split_wallet or _is_stack_bt),
-            key="bt_dynamic_alloc",
-            help="ON = Dynamically splits live updated Futures Wallet (with gains & losses) across Max Slots on every trade (compounding).",
-        )
-    with bg6:
+    bt_max_slots = bg3.selectbox("Max Slots", [1, 2, 3, 4], index=2, key="bt_max_slots")
+    with bg4:
         st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
         bt_free_margin_guard = st.checkbox(
-            "<90% Free-Margin",
+            "Enforce Main <90% Free-Margin Guard",
             value=True,
             key="bt_free_margin_guard",
             help="Skips new entries when remaining free wallet equity is below 90% of Single-Trade Margin (identical to Main).",
         )
-    with bg7:
-        st.markdown("<div style='height:26px;'></div>", unsafe_allow_html=True)
-        bt_fixed_risk_cap = st.checkbox(
-            "1.5% Risk Cap (E0)",
-            value=False,
-            key="bt_fixed_risk_cap",
-            help="OFF = E0b (Full Slot Margin). ON = E0 (1.5% Fixed Wallet Risk Cap).",
-        )
 
-    _bt_universe_pairs = list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE)
-    _bt_universe_lbl = f"All {len(_bt_universe_pairs)} High-Vol Movers"
-    if _is_stack_bt:
-        _stack_u_choice = st.radio(
-            "4-EMA Stack Universe",
-            [
-                "All 12 High-Vol Movers",
-                "Top-4 Majors (BTC, ETH, SOL, XRP)",
-                "BTC + ETH Majors Only",
-            ],
-            index=0,
-            horizontal=True,
-            key="bt_stack_universe_sel",
-        )
-        if _stack_u_choice.startswith("Top-4"):
-            _bt_universe_pairs = ["B-BTC_USDT", "B-ETH_USDT", "B-SOL_USDT", "B-XRP_USDT"]
-            _bt_universe_lbl = "Top-4 Majors"
-        elif _stack_u_choice.startswith("BTC + ETH"):
-            _bt_universe_pairs = ["B-BTC_USDT", "B-ETH_USDT"]
-            _bt_universe_lbl = "BTC + ETH Majors"
-
-    _eff_bt_cap_disp = (float(bt_wallet_inr) / int(bt_max_slots)) if bt_dynamic_alloc else float(bt_capital)
     st.caption(
         f"🎯 **Selected Mode:** `{_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)}` • "
-        f"**Allocation:** `{'Dynamic Wallet÷Slots (Compounding)' if bt_dynamic_alloc else 'Fixed Slot Margin'}` • "
-        f"**Sizing:** `{'E0 (1.5% Risk Cap)' if bt_fixed_risk_cap else 'E0b (Full Slot Margin)'}` • "
-        f"**Exit:** `{_bt_exit_modes.get(bt_exit_mode, bt_exit_mode)}` • "
-        f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Start Margin/Slot:** `₹{_eff_bt_cap_disp:,.0f}` @ `{bt_lev}x` | "
+        f"**Funds:** `₹{bt_wallet_inr:,.2f}` | **Margin/Trade:** `₹{bt_capital:,.0f}` @ `{bt_lev}x` | "
         f"**SL Threshold Lock:** `{bt_sl_threshold_pct:.1f}%/day` (`₹{bt_wallet_inr * bt_sl_threshold_pct / 100.0:,.0f}`) | "
-        f"**Slots:** `{bt_max_slots}`. *Backtest results use historical Spot/CoinDCX data and are hypothetical.*"
+        f"**Slots:** `{bt_max_slots}` (Max 2 EMA + 4h Zone Lock). *Backtest results use historical CoinDCX data and are hypothetical.*"
     )
 
-    if st.button(f"🏆 Run Main-Parity Portfolio Backtest ({_bt_universe_lbl})", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
+    if st.button("🏆 Run Main-Parity Portfolio Backtest (All 12 High-Vol Movers)", key="btn_run_portfolio_1slot", type="primary", use_container_width=True):
         days_p = int(bt_dur_label.split()[0])
-        _run_base_margin = float(bt_wallet_inr) / int(bt_max_slots) if bt_dynamic_alloc else float(bt_capital)
-        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} [{bt_exit_mode}] across {len(_bt_universe_pairs)} pairs ({bt_dur_label} @ {bt_lev}x)..."):
+        with st.spinner(f"Simulating {_bt_mode_labels.get(bt_strat_mode, bt_strat_mode)} across 12 High-Vol pairs ({bt_dur_label} @ {bt_lev}x, {bt_sl_threshold_pct:.1f}% SL stop)..."):
             port_res = coindcx_engine.run_portfolio_single_slot_backtest(
-                pairs=_bt_universe_pairs,
+                pairs=list(coindcx_engine.HIGH_VOL_FUTURES_UNIVERSE),
                 duration_days=days_p,
-                margin_inr=float(_run_base_margin),
+                margin_inr=float(bt_capital),
                 leverage=bt_lev,
                 usd_inr=usd_inr,
                 strategy_id=bt_strat_mode,
                 wallet_inr=float(bt_wallet_inr),
-                exit_mode=bt_exit_mode,
                 max_concurrent_trades=int(bt_max_slots),
                 daily_loss_stop_pct=float(bt_sl_threshold_pct),
                 enforce_free_margin_guard=bool(bt_free_margin_guard),
-                enforce_same_dir_guard=(not _is_stack_bt),
-                enforce_post_sl_lock=(not _is_stack_bt),
-                enforce_btc_impulse_veto=(not _is_stack_bt),
-                use_fixed_risk_sizing=bool(bt_fixed_risk_cap),
-                dynamic_allocation=bool(bt_dynamic_alloc),
             )
             st.session_state["bt_portfolio_1slot"] = port_res
 
@@ -3556,7 +3398,7 @@ elif active_section == "🧪 Backtest":
         pk4.metric("Win Rate", f"{_tot_wr}%", f"{_tot_w}W / {_tot_l}L")
         pk5.metric("Profit Factor", f"{_tot_pf}", f"Margin ROI {_tot_roi:+.1f}%")
 
-        # Main-Parity Guard Audit Strip (SL Threshold Locks, Slot Cap, Same-Dir, Post-SL, BTC Veto, EMA Cap, Free-Margin & 4h Lock)
+        # Main-Parity Guard Audit Strip (SL Threshold Locks, Slot Cap, EMA Cap, Free-Margin & 4h Lock)
         if _ga:
             _lk_days = int(_ga.get("days_locked_by_sl_threshold", 0) or 0)
             _blk_sl = int(_ga.get("blocked_by_sl_threshold", 0) or 0)
@@ -3564,19 +3406,12 @@ elif active_section == "🧪 Backtest":
             _blk_ema = int(_ga.get("blocked_by_ema_cap", 0) or 0)
             _blk_fm = int(_ga.get("blocked_by_free_margin", 0) or 0)
             _blk_z4 = int(_ga.get("blocked_by_4h_zone_lock", 0) or 0)
-            _blk_sd = int(_ga.get("blocked_by_same_dir", 0) or 0)
-            _blk_psl = int(_ga.get("blocked_by_post_sl_lock", 0) or 0)
-            _blk_btc = int(_ga.get("blocked_by_btc_veto", 0) or 0)
             _lk_dates_s = ", ".join((_ga.get("locked_dates") or [])[:8])
-            _sz_lbl_ga = "1.5% Fixed Risk Sizing (E0)" if _ga.get("use_fixed_risk_sizing") else "Full Slot Margin (E0b)"
-            _re_t_ga = int(_ga.get("reentry_trades", 0) or 0)
-            _re_pnl_ga = float(_ga.get("reentry_net_pnl_inr", 0.0) or 0.0)
-            _re_str_ga = f" • Re-Entries: `{_re_t_ga}` (`{'+' if _re_pnl_ga >= 0 else ''}₹{_re_pnl_ga:,.0f}`)" if _re_t_ga > 0 else ""
             st.info(
-                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold | {_sz_lbl_ga}):** "
+                f"🛡️ **Main-Parity Guards Audit (`{_ga.get('daily_loss_stop_pct', 5.0):.1f}%` SL Threshold):** "
                 f"**{_lk_days} day(s)** hit Daily Loss Stop (`{_blk_sl}` trades blocked{f': {_lk_dates_s}' if _lk_dates_s else ''}) • "
-                f"Same-Dir (>2) Blocked: `{_blk_sd}` • Post-SL 4h Lock: `{_blk_psl}` • BTC Impulse Veto: `{_blk_btc}` • "
-                f"Slot Cap: `{_blk_slot}` • Max 2 EMA: `{_blk_ema}` • <90% Free-Margin: `{_blk_fm}` • 4h Zone: `{_blk_z4}`{_re_str_ga}"
+                f"Slot Cap Blocked: `{_blk_slot}` • Max 2 EMA Cap Blocked: `{_blk_ema}` • "
+                f"<90% Free-Margin Blocked: `{_blk_fm}` • 4h Zone Lock Blocked: `{_blk_z4}`"
             )
 
         _eq_curve = port_out.get("equity_curve") or []
@@ -3871,7 +3706,17 @@ elif active_section == "🤖 AI Advisor":
             )
         staging_list = sheet_data.get("staging_trades", [])
         if staging_list:
+            _stg_tot = int(sheet_data.get("staging_total_logged", len(staging_list)))
+            _stg_cls = int(sheet_data.get("staging_total_closed", 0))
+            _stg_w = int(sheet_data.get("staging_win_count", 0))
+            _stg_l = int(sheet_data.get("staging_loss_count", 0))
+            _stg_wr = round((_stg_w / _stg_cls) * 100.0, 1) if _stg_cls > 0 else 0.0
+            _stg_net = float(sheet_data.get("staging_net_realized_pnl_inr", 0.0))
             st.markdown("#### 3. `Staging_Trades` Worksheet (Staging Live-Market Paper Trading Ledger)")
+            st.caption(
+                f"Logged: **{_stg_tot}** | Closed: **{_stg_cls}** ({_stg_w}W / {_stg_l}L • **{_stg_wr}% WR**) | "
+                f"Net Realized PnL: **{'+' if _stg_net >= 0 else ''}₹{_stg_net:,.2f}**"
+            )
             _st_rows = []
             for idx_st, r_st in enumerate(reversed(staging_list), 1):
                 _sp_raw = str(r_st.get("Net PnL (INR)", "")).replace(",", "").replace("₹", "").replace("Rs.", "").strip()
@@ -3879,8 +3724,13 @@ elif active_section == "🤖 AI Advisor":
                     _sp_f = float(_sp_raw) if _sp_raw else None
                 except Exception:
                     _sp_f = None
-                _sp_col = ("#10b981" if _sp_f >= 0 else "#ef4444") if _sp_f is not None else "#3b82f6"
-                _sp_txt = (f"{'+' if _sp_f >= 0 else ''}₹{_sp_f:,.2f}") if _sp_f is not None else "Open"
+                _st_status = str(r_st.get("Status", ""))
+                _sp_col = ("#10b981" if _sp_f >= 0 else "#ef4444") if _sp_f is not None else ("#f59e0b" if "ORPHAN" in _st_status.upper() else "#3b82f6")
+                _sp_txt = (f"{'+' if _sp_f >= 0 else ''}₹{_sp_f:,.2f}") if _sp_f is not None else ("Orphaned" if "ORPHAN" in _st_status.upper() else "Open")
+                _roe_raw = str(r_st.get("ROE (%)", "")).strip()
+                _roe_txt = f"{_roe_raw}%" if _roe_raw else "—"
+                _w_after = str(r_st.get("Paper Wallet After (INR)", "")).strip()
+                _w_txt = f"₹{_w_after}" if _w_after else "—"
                 _dir_st = str(r_st.get("Direction", ""))
                 _b_cls = "badge-buy" if _dir_st in ("LONG", "BUY") else "badge-sell"
                 _st_rows.append(
@@ -3889,17 +3739,21 @@ elif active_section == "🤖 AI Advisor":
                     f"<td>{r_st.get('Timestamp (IST)', '')}</td>"
                     f"<td style='font-weight:800;'>{r_st.get('Pair', '')}</td>"
                     f"<td><span class='{_b_cls}'>{_dir_st}</span></td>"
+                    f"<td>{r_st.get('Strategy', '')}</td>"
                     f"<td>${r_st.get('Entry ($)', '')}</td>"
                     f"<td>{('$' + str(r_st.get('Exit Price ($)', ''))) if r_st.get('Exit Price ($)') else '—'}</td>"
                     f"<td>₹{r_st.get('Margin (INR)', '')} ({r_st.get('Leverage', '')})</td>"
+                    f"<td>{_roe_txt}</td>"
                     f"<td style='color:{_sp_col};font-weight:800;'>{_sp_txt}</td>"
-                    f"<td>{r_st.get('Status', '')}</td>"
+                    f"<td>{_w_txt}</td>"
+                    f"<td>{_st_status}</td>"
+                    f"<td>{r_st.get('Exit Reason', '') or r_st.get('Trigger Reason', '')}</td>"
                     f"</tr>"
                 )
             st.html(
                 f"<div class='pro-table-wrap'><table class='pro-table'>"
-                f"<thead><tr><th>#</th><th>Timestamp (IST)</th><th>Pair</th><th>Side</th><th>Entry ($)</th>"
-                f"<th>Exit ($)</th><th>Margin (Lev)</th><th>Net PnL (₹)</th><th>Status</th></tr></thead>"
+                f"<thead><tr><th>#</th><th>Entry Time (IST)</th><th>Pair</th><th>Side</th><th>Strategy</th><th>Entry ($)</th>"
+                f"<th>Exit ($)</th><th>Margin (Lev)</th><th>ROE</th><th>Net PnL (₹)</th><th>Wallet After</th><th>Status</th><th>Exit / Trigger Notes</th></tr></thead>"
                 f"<tbody>{''.join(_st_rows)}</tbody></table></div>"
             )
 
