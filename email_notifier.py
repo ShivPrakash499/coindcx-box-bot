@@ -109,12 +109,11 @@ def _send(subject: str, html: str, text: str) -> tuple[bool, str]:
 def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2: float,
                      margin_inr: float, leverage: int = 5, zone: str = "", kind: str = "SIGNAL",
                      note: str = "", app_url: str = "", strategy_name: str = "", trigger_reason: str = "",
-                     strategy_id: str = "", levels: dict | None = None, entry2_sweep: float = 0.0,
-                     tp1_book_frac: float = 0.50, size_mult: float = 1.0, is_manual_router: bool = False) -> tuple[bool, str]:
+                     strategy_id: str = "", levels: dict | None = None, entry2_sweep: float = 0.0) -> tuple[bool, str]:
     """
     Sends structured trade email notification with a 1-click action link
-    that opens the Trade Execution tab with all values pre-filled (Entry, SL, TP1, TP2, Margin, Leverage, TP1%),
-    plus a visual Daily Trend Bias card and the Single-Slot + Runner breakdown.
+    that opens the Trade Execution tab with all values pre-filled, plus a visual Daily Trend Bias card
+    and the 2-Entry Sweep + Runner breakdown.
     """
     direction = direction.upper()
     is_long = direction in ("LONG", "BUY")
@@ -128,28 +127,15 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     has_e2 = float(entry2_sweep or 0.0) > 0.0
     avg_entry_2x = (entry + entry2_sweep) / 2.0 if has_e2 else entry
     tranche_margin_inr = margin_inr * 0.5 if has_e2 else margin_inr
-    tp1_frac_clean = max(0.10, min(0.90, float(tp1_book_frac or 0.50)))
-    tp1_pct = int(round(tp1_frac_clean * 100))
-    tp2_pct = 100 - tp1_pct
-    size_mult_clean = float(size_mult or 1.0)
 
-    # Action URL with pre-filled parameters to open execution tab (including TP1 book split & Manual Router flag)
-    _extra_q = f"&tp1_pct={tp1_pct}"
-    if abs(size_mult_clean - 1.0) > 1e-3:
-        _extra_q += f"&size_mult={size_mult_clean:.2f}"
-    if is_manual_router:
-        _extra_q += "&manual_router=1"
+    # Action URL with pre-filled parameters to open execution tab
     action_url = (
         f"{base_url}/?tab=execute{f'&strategy={strategy_id}' if strategy_id else ''}&pair={pair}&direction={direction}&entry={entry:.4f}"
-        f"&sl={stop_loss:.4f}&tp1={tp1:.4f}&tp2={tp2:.4f}&margin={int(round(margin_inr))}&lev={leverage}{_extra_q}"
+        f"&sl={stop_loss:.4f}&tp1={tp1:.4f}&tp2={tp2:.4f}&margin={int(margin_inr)}&lev={leverage}"
     )
 
     colour = "#16a34a" if is_long else "#dc2626"
-    heading = (
-        "Manual Intraday Signal Alert"
-        if (kind == "SIGNAL" and is_manual_router)
-        else {"SIGNAL": "Trade Signal Alert", "EXECUTED": "Order Executed", "CLOSED": "Position Closed"}.get(kind, kind)
-    )
+    heading = {"SIGNAL": "Trade Signal Alert", "EXECUTED": "Order Executed", "CLOSED": "Position Closed"}.get(kind, kind)
 
     tp1_roe = round((abs(tp1 - entry) / entry) * leverage * 100.0, 2) if entry > 0 else 0.0
     tp2_roe = round((abs(tp2 - entry) / entry) * leverage * 100.0, 2) if entry > 0 else 0.0
@@ -218,17 +204,10 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
         ]
     else:
         rows.append(("Entry (100% Slot — Maker Limit Order)", f"${entry:,.4f}  (₹{margin_inr:,.0f})"))
-    if is_manual_router or tp1_pct != 50 or abs(size_mult_clean - 1.0) > 1e-3:
-        rows.append(("Risk Sizing & Split", f"{size_mult_clean:.2g}× Margin • {tp1_pct}% TP1 / {tp2_pct}% Runner"))
-    _sl_lbl_email = (
-        "Stop Loss (Beyond 15m 200 EMA)"
-        if strategy_id == "ema50_200"
-        else ("Stop Loss (Beyond 15m 50 EMA)" if strategy_id == "ema21_pullback" else f"Catastrophe SL (Beyond {'SL' if is_long else 'SH'} Sweep)")
-    )
     rows += [
-        (f"TP1 — Close {tp1_pct}% (Book Profit & Lock Runner SL)", f"${tp1:,.4f}  (+{tp1_roe:.2f}% ROE)"),
-        (f"TP2 — Hold {tp2_pct}% Structural Runner (Halfway Ratchet -> TP2)", f"${tp2:,.4f}  (+{tp2_roe:.2f}% ROE)"),
-        (_sl_lbl_email, f"${stop_loss:,.4f}  (-{sl_roe:.2f}% ROE)"),
+        ("TP1 — Close 50% (Book Profit & Lock Runner SL)", f"${tp1:,.4f}  (+{tp1_roe:.2f}% ROE)"),
+        ("TP2 — Hold 50% Structural Runner (Halfway Ratchet -> TP2)", f"${tp2:,.4f}  (+{tp2_roe:.2f}% ROE)"),
+        (f"Catastrophe SL (Beyond {'SL' if is_long else 'SH'} Sweep)", f"${stop_loss:,.4f}  (-{sl_roe:.2f}% ROE)"),
         ("Single-Trade Margin", f"₹{margin_inr:,.0f} INR  (100% Slot)" if not has_e2 else f"₹{margin_inr:,.0f} INR  (2 x ₹{tranche_margin_inr:,.0f})"),
         ("Leverage", f"{leverage}x"),
         ("Timestamp (IST)", now),

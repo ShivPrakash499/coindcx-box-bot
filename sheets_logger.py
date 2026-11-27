@@ -246,17 +246,40 @@ def log_trade_closed(trade: dict, return_details: bool = False):
             exit_r = str(trade.get("exit_reason", ""))
 
             updated_row = False
-            pair_target = str(trade.get("pair", ""))
-            for r_idx in range(len(rows_stg), 1, -1):
-                r = rows_stg[r_idx - 1]
-                if len(r) >= 13 and r[1] == pair_target and str(r[12]).startswith(("PAPER_AUTOTRADE_OPEN", "LOGGED_PENDING")):
-                    ws_stg.update_cell(r_idx, 13, status_txt)
-                    ws_stg.update(
-                        f"P{r_idx}:U{r_idx}",
-                        [[exit_t, exit_p, net_p, roe_p, wallet_after, exit_r]],
-                    )
-                    updated_row = True
-                    break
+            pair_target = str(trade.get("pair", "")).strip()
+            dir_target = str(trade.get("direction", "")).strip().upper()
+            entry_t_target = str(trade.get("entry_time", "")).strip()
+
+            def _row_matches_open(r_vals: list, require_exact_ts: bool = False) -> bool:
+                if len(r_vals) < 13 or str(r_vals[1]).strip() != pair_target:
+                    return False
+                if not str(r_vals[12]).strip().startswith(("PAPER_AUTOTRADE_OPEN", "LOGGED_PENDING")):
+                    return False
+                if dir_target and str(r_vals[2]).strip().upper() != dir_target:
+                    return False
+                if require_exact_ts:
+                    return bool(entry_t_target) and str(r_vals[0]).strip() == entry_t_target
+                return True
+
+            match_idx = None
+            if entry_t_target:
+                for r_idx in range(len(rows_stg), 1, -1):
+                    if _row_matches_open(rows_stg[r_idx - 1], require_exact_ts=True):
+                        match_idx = r_idx
+                        break
+            if match_idx is None:
+                for r_idx in range(len(rows_stg), 1, -1):
+                    if _row_matches_open(rows_stg[r_idx - 1], require_exact_ts=False):
+                        match_idx = r_idx
+                        break
+
+            if match_idx is not None:
+                ws_stg.update_cell(match_idx, 13, status_txt)
+                ws_stg.update(
+                    f"P{match_idx}:U{match_idx}",
+                    [[exit_t, exit_p, net_p, roe_p, wallet_after, exit_r]],
+                )
+                updated_row = True
 
             if not updated_row:
                 ws_stg.append_row([
@@ -949,19 +972,9 @@ def load_main_live_setup_from_sheet(force_refresh: bool = False) -> dict | None:
 
         setup = {
             "wallet_balance_inr": main_wallet_inr,
-            "autotrade_wallet_inr": round(float(main_state.get("autotrade_wallet_inr", 0.0) or 0.0), 2),
             "wallet_updated_ist": main_wallet_ts,
             "single_trade_margin_inr": round(float(main_state.get("single_trade_margin_inr", 0.0) or 0.0), 2),
             "user_custom_margin": bool(main_state.get("user_custom_margin", False)),
-            "max_concurrent_trades": int(main_state.get("max_concurrent_trades", 3) or 3),
-            "auto_split_wallet_by_slots": (
-                bool(main_state["auto_split_wallet_by_slots"])
-                if "auto_split_wallet_by_slots" in main_state
-                else (not bool(main_state.get("user_custom_margin", False)))
-            ),
-            "fixed_risk_sizing_enabled": bool(main_state.get("fixed_risk_sizing_enabled", False)),
-            "risk_per_trade_pct": round(float(main_state.get("risk_per_trade_pct", 1.5) or 1.5), 2),
-            "manual_intraday_email_alerts_enabled": bool(main_state.get("manual_intraday_email_alerts_enabled", True)),
             "leverage": int(main_state.get("leverage", 10) or 10),
             "autotrade_strategy_mode": str(main_state.get("autotrade_strategy_mode") or "box_plus_ema50_200_regime"),
             "source": "Main Live Sheet Sync",

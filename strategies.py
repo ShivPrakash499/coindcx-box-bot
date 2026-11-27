@@ -105,7 +105,6 @@ def _closed_15m(pair: str, limit: int) -> pd.DataFrame:
         closed = df.iloc[:-1].reset_index(drop=True)
     if not closed.empty:
         closed["EMA9"] = closed["close"].ewm(span=9, adjust=False).mean()
-        closed["EMA21"] = closed["close"].ewm(span=21, adjust=False).mean()
         closed["EMA50"] = closed["close"].ewm(span=50, adjust=False).mean()
         closed["EMA200"] = closed["close"].ewm(span=200, adjust=False).mean()
     return closed.iloc[-limit:].reset_index(drop=True) if len(closed) > limit else closed
@@ -121,7 +120,6 @@ def _closed_5m(pair: str, limit: int) -> pd.DataFrame:
         closed = df.iloc[:-1].reset_index(drop=True)
     if not closed.empty:
         closed["EMA9"] = closed["close"].ewm(span=9, adjust=False).mean()
-        closed["EMA21"] = closed["close"].ewm(span=21, adjust=False).mean()
         closed["EMA50"] = closed["close"].ewm(span=50, adjust=False).mean()
         closed["EMA200"] = closed["close"].ewm(span=200, adjust=False).mean()
     return closed.iloc[-limit:].reset_index(drop=True) if len(closed) > limit else closed
@@ -267,11 +265,11 @@ def build_two_entry_runner_plan(
     tp1_roe = round((tp1_dist / entry) * lev * 100.0, 1)
     tp2_roe = round((tp2_dist / entry) * lev * 100.0, 1)
     tp1_label = (
-        f"50% Book ({tp1_roe:.0f}% ROE -> Fee-BE SL)"
+        f"50% Book ({tp1_roe:.0f}% ROE -> Profit-Lock SL)"
         if tp1_dist < struct_tp1_dist
-        else f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> Fee-BE SL)"
+        else f"50% Book {tp1_ref_name} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)"
     )
-    tp2_label = f"50% Structural Runner (60% Ratchet -> TP2, ref {tp2_roe:.0f}% ROE)"
+    tp2_label = f"50% Structural Runner (Halfway Ratchet -> TP2, ref {tp2_roe:.0f}% ROE)"
 
     return {
         "entry": entry,
@@ -442,13 +440,10 @@ def _check_box_breakout_state(
 ) -> dict:
     """
     Inspects the prior `lookback` closed 15m candles (default 16 candles = 4 hours) before `idx` to
-    distinguish a brief Liquidity Sweep (1-2 candles) from genuine Acceptance / Broken Box:
-      - `sh_broken` / `sl_broken`: >= 2 consecutive closes (or >= 3 total) beyond outer `SH` / `SL`.
-      - `rh_accepted` / `rl_accepted`: >= 4 consecutive closes (1 full hour) or >= 6 of last 8 closes
-        beyond `RH` / `RL` (prevents shorting `RH` after sustained acceptance above it, e.g. SOL/DOGE).
-      - Computes a Hybrid Reconfigured Box (`reconfig`: `SHIFTED_UP` / `SHIFTED_DOWN`) using Polarity
-        Zone Flip + Measured Move for Manual Chart / Execute / Signals / Email ONLY (AutoTrade stays
-        strictly on Acceptance Guard Only — never takes flip trades).
+    detect whether the upper box (`RH`/`SH`) or lower box (`RL`/`SL`) has already been broken out
+    (`upper_box_broken` / `lower_box_broken`), preventing active breakouts from being faded prematurely.
+    Setup 0 (Box Breakout-Retest Continuation buying at SH / selling at SL) is disabled so broken
+    boxes stay flat rather than entering at exhausted extremes or against the Daily 50/200 EMA bias.
     """
     cur = recs_15m[idx]
     prior = recs_15m[max(0, idx - lookback):idx]
@@ -456,88 +451,32 @@ def _check_box_breakout_state(
     c_high = float(cur["high"])
     c_low = float(cur["low"])
     c_close = float(cur["close"])
+    ema9_15m = float(cur.get("EMA9", c_close) or c_close)
 
     max_prior_high = max((float(x["high"]) for x in prior), default=c_high)
     min_prior_low = min((float(x["low"]) for x in prior), default=c_low)
-    closes_above_sh = sum(1 for x in prior if sh > 0 and float(x["close"]) > sh)
+    closes_above_sh = sum(1 for x in prior if float(x["close"]) > sh)
     closes_below_sl = sum(1 for x in prior if sl > 0 and float(x["close"]) < sl)
 
-    def _max_consec(seq, pred):
-        best = run = 0
-        for x in seq:
-            if pred(x):
-                run += 1
-                if run > best:
-                    best = run
-            else:
-                run = 0
-        return best
-
-    consec_above_sh = _max_consec(prior, lambda x: sh > 0 and float(x["close"]) > sh)
-    consec_below_sl = _max_consec(prior, lambda x: sl > 0 and float(x["close"]) < sl)
-    consec_above_rh = _max_consec(prior, lambda x: rh > 0 and float(x["close"]) > rh)
-    consec_below_rl = _max_consec(prior, lambda x: rl > 0 and float(x["close"]) < rl)
-    recent8 = prior[-8:] if len(prior) >= 8 else prior
-    above_rh_8 = sum(1 for x in recent8 if rh > 0 and float(x["close"]) > rh)
-    below_rl_8 = sum(1 for x in recent8 if rl > 0 and float(x["close"]) < rl)
-
-    sh_broken = bool(sh > 0 and (consec_above_sh >= 2 or closes_above_sh >= 3))
-    sl_broken = bool(sl > 0 and (consec_below_sl >= 2 or closes_below_sl >= 3))
-    rh_accepted = bool(rh > 0 and (consec_above_rh >= 4 or above_rh_8 >= 6))
-    rl_accepted = bool(rl > 0 and (consec_below_rl >= 4 or below_rl_8 >= 6))
-
-    upper_box_broken = bool(sh_broken or rh_accepted)
-    lower_box_broken = bool(sl_broken or rl_accepted)
-
-    # Hybrid Reconfigured Box Levels (Polarity Zone Flip + Measured Move — Manual Only)
-    reconfig = None
-    if rh > 0 and rl > 0 and rh > rl:
-        box_h = max(rh - rl, rh * 0.020)
-        up_band = min(max((sh - rh) if sh > rh else rh * 0.012, rh * 0.008), rh * 0.020)
-        dn_band = min(max((rl - sl) if rl > sl > 0 else rl * 0.012, rl * 0.008), rl * 0.020)
-        if upper_box_broken and not lower_box_broken:
-            new_rl = sh if sh_broken else rh
-            new_sl = rh if sh_broken else max(rl, rh - up_band)
-            new_rh = new_rl + box_h
-            new_mid = (new_rl + new_rh) / 2.0
-            new_sh = new_rh + up_band
-            reconfig = {
-                "state": "SHIFTED_UP",
-                "trigger": "SH Broken" if sh_broken else f"RH Accepted ({max(consec_above_rh, above_rh_8)} bars > RH)",
-                "RL": eng.round_asset_price(new_rl, rh),
-                "SL": eng.round_asset_price(new_sl, rh),
-                "MID": eng.round_asset_price(new_mid, rh),
-                "RH": eng.round_asset_price(new_rh, rh),
-                "SH": eng.round_asset_price(new_sh, rh),
-                "old_RH": rh,
-                "old_SH": sh,
-            }
-        elif lower_box_broken and not upper_box_broken:
-            new_rh = sl if sl_broken else rl
-            new_sh = rl if sl_broken else min(rh, rl + dn_band)
-            new_rl = max(new_rh * 0.50, new_rh - box_h)
-            new_mid = (new_rl + new_rh) / 2.0
-            new_sl = max(new_rl * 0.50, new_rl - dn_band)
-            reconfig = {
-                "state": "SHIFTED_DOWN",
-                "trigger": "SL Broken" if sl_broken else f"RL Accepted ({max(consec_below_rl, below_rl_8)} bars < RL)",
-                "RL": eng.round_asset_price(new_rl, rl),
-                "SL": eng.round_asset_price(new_sl, rl),
-                "MID": eng.round_asset_price(new_mid, rl),
-                "RH": eng.round_asset_price(new_rh, rl),
-                "SH": eng.round_asset_price(new_sh, rl),
-                "old_RL": rl,
-                "old_SL": sl,
-            }
+    # Outer Box [SL, SH] is only broken when price decisively breaks beyond the outer SH/SL boundary
+    # (>= 3 closed 15m candles beyond SH/SL + >= 0.8% extension + 15m EMA9/EMA50 alignment).
+    # Trading inside [RH, SH] (Sell Zone) or [SL, RL] (Buy Zone) is normal zone activity, NOT a broken box.
+    upper_box_broken = bool(
+        sh > 0
+        and closes_above_sh >= 3
+        and max_prior_high >= sh * 1.008
+        and ema9_15m > ema50_15m
+    )
+    lower_box_broken = bool(
+        sl > 0
+        and closes_below_sl >= 3
+        and min_prior_low <= sl * 0.992
+        and ema9_15m < ema50_15m
+    )
 
     return {
         "upper_box_broken": upper_box_broken,
         "lower_box_broken": lower_box_broken,
-        "sh_broken": sh_broken,
-        "sl_broken": sl_broken,
-        "rh_accepted": rh_accepted,
-        "rl_accepted": rl_accepted,
-        "reconfig": reconfig,
         "bull_breakout_retest": False,
         "bear_breakdown_retest": False,
         "max_prior_high": max_prior_high,
@@ -545,29 +484,6 @@ def _check_box_breakout_state(
         "retest_low": c_low,
         "retest_high": c_high,
     }
-
-
-def get_live_shifted_box_state(pair: str, levels: dict | None = None) -> dict:
-    """
-    Canonical live broken-box / shifted-box state for Chart & Levels, Execute, and Signals tabs.
-    Uses closed 15m candles (identical to `BoxTheorySweep.evaluate_signal`).
-    """
-    lv = levels or eng.calculate_daily_box_levels(pair)
-    if not lv:
-        return {"upper_box_broken": False, "lower_box_broken": False, "reconfig": None}
-    try:
-        df_15m = _closed_15m(pair, 40)
-        if df_15m is None or df_15m.empty or len(df_15m) < 3:
-            return {"upper_box_broken": False, "lower_box_broken": False, "reconfig": None}
-        recs = df_15m.to_dict("records")
-        ema50_15m = float(recs[-1].get("EMA50", lv.get("MID", 0.0)) or lv.get("MID", 0.0))
-        return _check_box_breakout_state(
-            recs, len(recs) - 1,
-            float(lv["RH"]), float(lv["RL"]), float(lv["SH"]), float(lv["SL"]),
-            ema50_15m,
-        )
-    except Exception:
-        return {"upper_box_broken": False, "lower_box_broken": False, "reconfig": None}
 
 
 class BoxTheorySweep(Strategy):
@@ -594,16 +510,7 @@ class BoxTheorySweep(Strategy):
     def _reason(sig: dict) -> str:
         return sig.get("trigger_reason", "")
 
-    def evaluate_signal(
-        self,
-        pair,
-        levels=None,
-        margin_inr=100000,
-        leverage=DEFAULT_LEVERAGE,
-        usd_inr=85.0,
-        allowed_dirs=None,
-        allow_box_flip: bool = False,
-    ):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
@@ -618,11 +525,6 @@ class BoxTheorySweep(Strategy):
         daily_ema200 = float(levels.get("EMA200", rh))
         daily_close = float(levels.get("daily_close", mid))
         trend_bias = levels.get("trend_bias") or classify_daily_ema_bias(daily_close, daily_ema50, daily_ema200)
-        norm_allowed = {str(x).upper() for x in allowed_dirs} if allowed_dirs is not None else None
-        allow_short_box = ("SHORT" in norm_allowed) if norm_allowed is not None else (trend_bias in ("BEARISH", "NEUTRAL"))
-        allow_long_box = ("LONG" in norm_allowed) if norm_allowed is not None else (trend_bias in ("BULLISH", "NEUTRAL"))
-        allow_short_d50 = (("SHORT" in norm_allowed) and trend_bias == "BEARISH") if norm_allowed is not None else (trend_bias == "BEARISH")
-        allow_long_d50 = (("LONG" in norm_allowed) and trend_bias == "BULLISH") if norm_allowed is not None else (trend_bias == "BULLISH")
 
         session = eng.get_current_session_info(datetime.now(IST))
 
@@ -671,8 +573,6 @@ class BoxTheorySweep(Strategy):
         brk_state = _check_box_breakout_state(recs_15m, len(recs_15m) - 1, rh, rl, sh, sl, ema50_15m)
         upper_box_broken = brk_state["upper_box_broken"]
         lower_box_broken = brk_state["lower_box_broken"]
-        out["box_breakout_state"] = brk_state
-        out["shifted_box"] = brk_state.get("reconfig")
 
         # ------------------------------------------------------------------
         # 1. SHORT SETUPS (Strictly 15m Confirmation, only when Upper Box is NOT already broken):
@@ -686,8 +586,8 @@ class BoxTheorySweep(Strategy):
         swept_rh_15m = (not upper_box_broken) and (prev_c15_high >= rh or c15_high >= rh) and (c15_close < rh) and (max(prev_c15_high, c15_high) <= sh * 1.005)
         swept_sh_15m = (not upper_box_broken) and (prev_c15_high >= sh or c15_high >= sh) and (c15_close < sh) and (c15_close <= rh * 1.001) and (max(prev_c15_high, c15_high) <= sh * 1.012)
 
-        rejected_rh_15m = allow_short_box and swept_rh_15m and has_bear_confirm_15m
-        rejected_sh_15m = allow_short_box and swept_sh_15m and has_bear_confirm_15m
+        rejected_rh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_rh_15m and has_bear_confirm_15m
+        rejected_sh_15m = (trend_bias in ("BEARISH", "NEUTRAL")) and swept_sh_15m and has_bear_confirm_15m
 
         if rejected_rh_15m or rejected_sh_15m:
             entry = eng.round_asset_price(c15_close, rh)
@@ -716,7 +616,7 @@ class BoxTheorySweep(Strategy):
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                 return self._stamp(out)
 
-        if allow_short_d50:
+        if trend_bias == "BEARISH":
             touched_daily_ema50 = (
                 (daily_close < daily_ema50)
                 and (
@@ -769,8 +669,8 @@ class BoxTheorySweep(Strategy):
         swept_rl_15m = (not lower_box_broken) and (prev_c15_low <= rl or c15_low <= rl) and (c15_close > rl) and (min(prev_c15_low, c15_low) >= sl * 0.995)
         swept_sl_15m = (not lower_box_broken) and (prev_c15_low <= sl or c15_low <= sl) and (c15_close > sl) and (c15_close >= rl * 0.999) and (min(prev_c15_low, c15_low) >= sl * 0.988)
 
-        rejected_rl_15m = allow_long_box and swept_rl_15m and has_bull_confirm_15m
-        rejected_sl_15m = allow_long_box and swept_sl_15m and has_bull_confirm_15m
+        rejected_rl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_rl_15m and has_bull_confirm_15m
+        rejected_sl_15m = (trend_bias in ("BULLISH", "NEUTRAL")) and swept_sl_15m and has_bull_confirm_15m
 
         if rejected_rl_15m or rejected_sl_15m:
             entry = eng.round_asset_price(c15_close, rl)
@@ -799,7 +699,7 @@ class BoxTheorySweep(Strategy):
                 out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                 return self._stamp(out)
 
-        if allow_long_d50:
+        if trend_bias == "BULLISH":
             touched_daily_ema50 = (
                 (daily_close > daily_ema50)
                 and (
@@ -840,114 +740,6 @@ class BoxTheorySweep(Strategy):
                         out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
                         return self._stamp(out)
 
-        # ------------------------------------------------------------------
-        # 3. MANUAL-ONLY SHIFTED-BOX POLARITY FLIP (Option 2 — NEVER AutoTraded):
-        #    When `allow_box_flip=True` (Manual Signals / Execute / 24x7 Email ONLY) and the
-        #    original box has broken via sustained acceptance (`reconfig`: SHIFTED_UP / SHIFTED_DOWN),
-        #    detect a 15m retest + rejection off the flipped polarity zone:
-        #      - SHIFTED_UP: Old RH/SH becomes New Buy Support [New SL, New RL] -> TP1 New MID/EMA50, TP2 New RH
-        #      - SHIFTED_DOWN: Old RL/SL becomes New Sell Resistance [New RH, New SH] -> TP1 New MID/EMA50, TP2 New RL
-        # ------------------------------------------------------------------
-        reconfig = brk_state.get("reconfig")
-        if allow_box_flip and isinstance(reconfig, dict):
-            rc_state = reconfig.get("state")
-            r_rl = float(reconfig["RL"])
-            r_sl = float(reconfig["SL"])
-            r_mid = float(reconfig["MID"])
-            r_rh = float(reconfig["RH"])
-            r_sh = float(reconfig["SH"])
-            if rc_state == "SHIFTED_UP" and allow_long_box:
-                touched_flip_sup = (
-                    (prev_c15_low <= r_rl * 1.003 or c15_low <= r_rl * 1.003)
-                    and min(prev_c15_low, c15_low) >= r_sl * 0.992
-                )
-                held_flip_sup = (c15_close > r_rl * 0.999) and has_bull_confirm_15m
-                if touched_flip_sup and held_flip_sup:
-                    entry = eng.round_asset_price(c15_close, rh)
-                    scale_in_lvl = min(r_sl, prev_c15_low, c15_low, entry * 0.992)
-                    struct_tp1, tp1_ref = _nearest_box_tp1("LONG", entry, r_mid, ema50_15m, r_rh)
-                    struct_tp2 = r_rh if entry < r_rh * 0.988 else r_sh
-                    plan = build_two_entry_runner_plan(
-                        "LONG", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage, tp1_ref_name=tp1_ref
-                    )
-                    if plan:
-                        stop = eng.round_asset_price(plan["stop"], rh)
-                        tp1 = eng.round_asset_price(plan["tp1"], rh)
-                        tp2 = eng.round_asset_price(plan["tp2"], rh)
-                        if stop < entry < tp1 <= tp2:
-                            reason = (
-                                f"Manual Shifted-Box Flip ({reconfig['trigger']}) | Old Resistance flipped to Support "
-                                f"(New RL ${r_rl:,.4f} / SL ${r_sl:,.4f}) + 15m bullish bounce "
-                                f"(100% Maker Limit @ ${entry:,.4f} | SL ${stop:,.4f} | {plan['tp1_label']} & Shifted RH ${tp2:,.4f} • No AutoTrade)"
-                            )
-                            out.update({
-                                "signal": "LONG", "signal_kind": "BOX_FLIP",
-                                "is_box_flip": True, "manual_only": True,
-                                "trigger_zone": f"Shifted Buy Zone (New RL ${r_rl:,.4f} / SL ${r_sl:,.4f})",
-                                "trigger_reason": reason,
-                                "setup": f"BUY (Long — Shifted Box Flip): Old RH→New RL Bounce ({session['name']})",
-                                "entry": entry, "entry2_sweep": 0.0, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                                "candle_ts": int(c15["timestamp"]),
-                            })
-                            out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
-                            return self._stamp(out)
-            elif rc_state == "SHIFTED_DOWN" and allow_short_box:
-                touched_flip_res = (
-                    (prev_c15_high >= r_rh * 0.997 or c15_high >= r_rh * 0.997)
-                    and max(prev_c15_high, c15_high) <= r_sh * 1.008
-                )
-                held_flip_res = (c15_close < r_rh * 1.001) and has_bear_confirm_15m
-                if touched_flip_res and held_flip_res:
-                    entry = eng.round_asset_price(c15_close, rl)
-                    scale_in_lvl = max(r_sh, prev_c15_high, c15_high, entry * 1.008)
-                    struct_tp1, tp1_ref = _nearest_box_tp1("SHORT", entry, r_mid, ema50_15m, r_rl)
-                    struct_tp2 = r_rl if entry > r_rl * 1.012 else r_sl
-                    plan = build_two_entry_runner_plan(
-                        "SHORT", entry, scale_in_lvl, struct_tp1, struct_tp2, leverage, tp1_ref_name=tp1_ref
-                    )
-                    if plan:
-                        stop = eng.round_asset_price(plan["stop"], rl)
-                        tp1 = eng.round_asset_price(plan["tp1"], rl)
-                        tp2 = eng.round_asset_price(plan["tp2"], rl)
-                        if stop > entry > tp1 >= tp2 > 0:
-                            reason = (
-                                f"Manual Shifted-Box Flip ({reconfig['trigger']}) | Old Support flipped to Resistance "
-                                f"(New RH ${r_rh:,.4f} / SH ${r_sh:,.4f}) + 15m bearish rejection "
-                                f"(100% Maker Limit @ ${entry:,.4f} | SL ${stop:,.4f} | {plan['tp1_label']} & Shifted RL ${tp2:,.4f} • No AutoTrade)"
-                            )
-                            out.update({
-                                "signal": "SHORT", "signal_kind": "BOX_FLIP",
-                                "is_box_flip": True, "manual_only": True,
-                                "trigger_zone": f"Shifted Sell Zone (New RH ${r_rh:,.4f} / SH ${r_sh:,.4f})",
-                                "trigger_reason": reason,
-                                "setup": f"SELL (Short — Shifted Box Flip): Old RL→New RH Rejection ({session['name']})",
-                                "entry": entry, "entry2_sweep": 0.0, "stop_loss": stop, "tp1": tp1, "tp2": tp2,
-                                "candle_ts": int(c15["timestamp"]),
-                            })
-                            out.update(position_metrics(pair, entry, stop, tp1, tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
-                            return self._stamp(out)
-
-        if isinstance(reconfig, dict):
-            if reconfig.get("state") == "SHIFTED_UP":
-                out["setup"] = (
-                    f"WAIT / UPPER BOX BROKEN — SHIFTED UP ({reconfig['trigger']}: AutoTrade short fades blocked; "
-                    f"Manual Flip Support RL ${reconfig['RL']:,.4f} / SL ${reconfig['SL']:,.4f} -> New RH ${reconfig['RH']:,.4f})"
-                )
-                out["trigger_reason"] = (
-                    f"Upper Box Broken ({reconfig['trigger']}): Old RH/SH fades blocked. "
-                    f"Manual Shifted Buy Zone: RL ${reconfig['RL']:,.4f} / SL ${reconfig['SL']:,.4f}"
-                )
-            else:
-                out["setup"] = (
-                    f"WAIT / LOWER BOX BROKEN — SHIFTED DOWN ({reconfig['trigger']}: AutoTrade long fades blocked; "
-                    f"Manual Flip Resistance RH ${reconfig['RH']:,.4f} / SH ${reconfig['SH']:,.4f} -> New RL ${reconfig['RL']:,.4f})"
-                )
-                out["trigger_reason"] = (
-                    f"Lower Box Broken ({reconfig['trigger']}): Old RL/SL fades blocked. "
-                    f"Manual Shifted Sell Zone: RH ${reconfig['RH']:,.4f} / SH ${reconfig['SH']:,.4f}"
-                )
-            return self._stamp(out)
-
         out["setup"] = (
             f"WAIT / WATCHING ZONES ({bias_label} — "
             f"watching Buy Zone RL ${rl:,.2f} / SL ${sl:,.2f} & Sell Zone RH ${rh:,.2f} / SH ${sh:,.2f} on 15m)"
@@ -959,8 +751,6 @@ class BoxTheorySweep(Strategy):
         if not levels:
             return {"BUY": None, "SELL": None, "note": "Box levels unavailable."}
         sig = self.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-        brk = (sig or {}).get("box_breakout_state") or get_live_shifted_box_state(pair, levels)
-        reconfig = (brk or {}).get("reconfig")
         trend_bias = levels.get("trend_bias") or classify_daily_ema_bias(
             float(levels.get("daily_close", levels["MID"])),
             float(levels.get("EMA50", levels["MID"])),
@@ -973,72 +763,14 @@ class BoxTheorySweep(Strategy):
         if s:
             s["trigger_reason"] = f"Planned ({trend_bias}): 100% Maker Limit @ RH/SH | SL beyond SH (${levels.get('SH', 0):,.2f}) | TP1 Nearer of MID/15m EMA50 -> TP2 Runner"
 
-        if isinstance(reconfig, dict):
-            shift_lv = {
-                **levels,
-                "RL": reconfig["RL"], "SL": reconfig["SL"],
-                "MID": reconfig["MID"], "RH": reconfig["RH"], "SH": reconfig["SH"],
-            }
-            if reconfig.get("state") == "SHIFTED_UP":
-                b_flip = eng.calculate_trade_setup_details("BUY", shift_lv, live_price, margin_inr, leverage, usd_inr, pair=pair)
-                if b_flip:
-                    b_flip["is_box_flip"] = True
-                    b_flip["manual_only"] = True
-                    b_flip["shifted_box"] = reconfig
-                    b_flip["setup"] = "🔄 Shifted Box BUY (Old RH→New RL • Manual Only)"
-                    b_flip["trigger_reason"] = (
-                        f"Manual Shifted-Box Flip ({reconfig['trigger']}): Buy Zone shifted UP to "
-                        f"New RL ${reconfig['RL']:,.4f} / SL ${reconfig['SL']:,.4f} -> MID ${reconfig['MID']:,.4f} / New RH ${reconfig['RH']:,.4f} (No AutoTrade)"
-                    )
-                    b = b_flip
-                if s:
-                    s["box_broken_warning"] = True
-                    s["trigger_reason"] = (
-                        f"⚠️ UPPER BOX BROKEN ({reconfig['trigger']}) — AutoTrade RH/SH short fade BLOCKED. "
-                        f"Old Sell Zone (${levels.get('RH', 0):,.4f}-${levels.get('SH', 0):,.4f}) flipped to support; "
-                        f"next structural resistance is Shifted RH ${reconfig['RH']:,.4f}."
-                    )
-            elif reconfig.get("state") == "SHIFTED_DOWN":
-                s_flip = eng.calculate_trade_setup_details("SELL", shift_lv, live_price, margin_inr, leverage, usd_inr, pair=pair)
-                if s_flip:
-                    s_flip["is_box_flip"] = True
-                    s_flip["manual_only"] = True
-                    s_flip["shifted_box"] = reconfig
-                    s_flip["setup"] = "🔄 Shifted Box SELL (Old RL→New RH • Manual Only)"
-                    s_flip["trigger_reason"] = (
-                        f"Manual Shifted-Box Flip ({reconfig['trigger']}): Sell Zone shifted DOWN to "
-                        f"New RH ${reconfig['RH']:,.4f} / SH ${reconfig['SH']:,.4f} -> MID ${reconfig['MID']:,.4f} / New RL ${reconfig['RL']:,.4f} (No AutoTrade)"
-                    )
-                    s = s_flip
-                if b:
-                    b["box_broken_warning"] = True
-                    b["trigger_reason"] = (
-                        f"⚠️ LOWER BOX BROKEN ({reconfig['trigger']}) — AutoTrade RL/SL long fade BLOCKED. "
-                        f"Old Buy Zone (${levels.get('SL', 0):,.4f}-${levels.get('RL', 0):,.4f}) flipped to resistance; "
-                        f"next structural support is Shifted RL ${reconfig['RL']:,.4f}."
-                    )
-
         if sig and sig.get("signal") == "LONG":
             return {"BUY": self._stamp({**sig, "direction": "BUY"}), "SELL": self._stamp(s),
-                    "shifted_box": reconfig,
                     "note": f"⚡ Live confirmed 15m LONG signal: {sig.get('trigger_reason')}"}
         if sig and sig.get("signal") == "SHORT":
             return {"BUY": self._stamp(b), "SELL": self._stamp({**sig, "direction": "SELL"}),
-                    "shifted_box": reconfig,
                     "note": f"⚡ Live confirmed 15m SHORT signal: {sig.get('trigger_reason')}"}
 
-        if isinstance(reconfig, dict):
-            if reconfig.get("state") == "SHIFTED_UP":
-                note_txt = (
-                    f"🔄 UPPER BOX BROKEN ({reconfig['trigger']}) — AutoTrade short fades BLOCKED. "
-                    f"Manual Shifted Buy Zone: New RL ${reconfig['RL']:,.4f} / SL ${reconfig['SL']:,.4f} -> New RH ${reconfig['RH']:,.4f}."
-                )
-            else:
-                note_txt = (
-                    f"🔄 LOWER BOX BROKEN ({reconfig['trigger']}) — AutoTrade long fades BLOCKED. "
-                    f"Manual Shifted Sell Zone: New RH ${reconfig['RH']:,.4f} / SH ${reconfig['SH']:,.4f} -> New RL ${reconfig['RL']:,.4f}."
-                )
-        elif trend_bias == "BEARISH":
+        if trend_bias == "BEARISH":
             note_txt = f"🔴 Daily Trend Bias is BEARISH (< 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — Primary Short bias on 15m confirmation."
         elif trend_bias == "BULLISH":
             note_txt = f"🟢 Daily Trend Bias is BULLISH (> 50 EMA ${levels.get('EMA50', 0):,.2f} & 200 EMA ${levels.get('EMA200', 0):,.2f}) — Primary Long bias on 15m confirmation."
@@ -1047,7 +779,6 @@ class BoxTheorySweep(Strategy):
         return {
             "BUY": self._stamp(b),
             "SELL": self._stamp(s),
-            "shifted_box": reconfig,
             "note": note_txt,
         }
 
@@ -1098,8 +829,6 @@ class BoxTheorySweep(Strategy):
                 "MID": eng.round_asset_price(mid, rh),
                 "SH": eng.round_asset_price(sh, rh), "SL": eng.round_asset_price(sl, rl),
                 "EMA50": eng.round_asset_price(ema50, rh), "EMA200": eng.round_asset_price(ema200, rh),
-                "daily_close": eng.round_asset_price(prev_close, rh),
-                "above_d50": bool(prev_close > ema50),
                 "ATR": atr_val, "bias": bias
             }
         return {"boxes": daily_boxes, "ema50_15m": ema50_15m_list, "ema9_15m": ema9_15m_list}
@@ -1200,7 +929,7 @@ class BoxTheorySweep(Strategy):
             c_close > c_open and candle_range > 0 and (lower_wick / candle_range) >= 0.30
         )
         swept_rl_seq = (not lower_box_broken) and (p_low <= rl or c_low <= rl) and (c_close > rl) and (min(p_low, c_low) >= sl * 0.995)
-        swept_sl_seq = (not lower_box_broken) and (p_low <= sl or c_low <= sl) and (c_close > sl) and (c_close >= rl * 0.999) and (min(p_low, c_low) >= sl * 0.988)
+        swept_sl_seq = (not lower_box_broken) and (p_low <= sl or c_low <= sl) and (c_close > sl) and (c15_close >= rl * 0.999 if "c15_close" in locals() else c_close >= rl * 0.999) and (min(p_low, c_low) >= sl * 0.988)
 
         swept_rl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_rl_seq and has_bull_confirm
         swept_sl_rej = (bias in ("BULLISH", "NEUTRAL")) and swept_sl_seq and has_bull_confirm
@@ -2130,35 +1859,22 @@ def _detect_ema50_200_setup(
     prior_e200: list[float],
     allow_bear: bool = True,
     allow_bull: bool = True,
-    allowed_dirs: list[str] | None = None,
-    allow_box_extension: bool = False,
 ) -> dict | None:
     """
     Shared 15m 50/200 EMA Pullback detection (100% live <-> backtest parity):
-      - Strict v41 AutoTrade (`allowed_dirs=None`, `allow_box_extension=False`): follows Daily Bias & strict Box Floor/Ceiling -> RL/RH.
-      - Manual Intraday Score Router (`allowed_dirs` passed, `allow_box_extension=True` when ADX >= 25):
-        also detects Breakdown Continuation (< SL) & Breakout Continuation (> SH) with 1.0R/2.0R targets (tagged `manual_only=True`,
-        STRICTLY excluded from Automated AutoTrade).
+      - Bearish Daily Bias -> SHORT when 15m EMA50 < EMA200, price pulls up from below into [50, 200] EMA,
+        and 15m candle rejects back below EMA50. SL placed above max(15m EMA200, reach_high); TP2 = RL.
+      - Bullish Daily Bias -> LONG (Mirror Replica) when 15m EMA50 > EMA200, price pulls down from above
+        into [200, 50] EMA, and 15m candle rejects back above EMA50. SL placed below min(15m EMA200, reach_low); TP2 = RH.
     """
     if idx < 6 or not box or len(prior_e50) < 4 or len(prior_e200) < 4:
         return None
     bias = str(box.get("trend_bias") or box.get("bias") or "").upper()
-    if allowed_dirs is not None:
-        norm_allowed = {str(x).upper() for x in allowed_dirs}
-        can_short = bool(allow_bear and ("SHORT" in norm_allowed))
-        can_long = bool(allow_bull and ("LONG" in norm_allowed))
-        if not can_short and not can_long:
-            return None
-    else:
-        if bias not in ("BEARISH", "BULLISH"):
-            return None
-        can_short = bool(allow_bear and bias == "BEARISH")
-        can_long = bool(allow_bull and bias == "BULLISH")
+    if bias not in ("BEARISH", "BULLISH"):
+        return None
 
     rh = float(box.get("RH", 0.0) or 0.0)
     rl = float(box.get("RL", 0.0) or 0.0)
-    sh_edge = float(box.get("SH", 0.0) or 0.0)
-    sl_edge = float(box.get("SL", 0.0) or 0.0)
     e50 = float(ema50_val or 0.0)
     e200 = float(ema200_val or 0.0)
     if rh <= 0 or rl <= 0 or e50 <= 0 or e200 <= 0:
@@ -2177,10 +1893,7 @@ def _detect_ema50_200_setup(
     p_low = float(prev["low"])
     p_close = float(prev["close"])
 
-    if can_short and e50 < e200:
-        # Skip dead-flat tangled EMAs (<0.20% spread) that cause noise whipsaw stop-outs
-        if ((e200 - e50) / c_close) < 0.0020:
-            return None
+    if allow_bear and bias == "BEARISH" and e50 < e200:
         below_cnt = sum(1 for r, em in zip(prior, prior_e50) if float(r["close"]) < float(em))
         above_e200_cnt = sum(1 for r, em2 in zip(prior, prior_e200) if float(r["close"]) > float(em2))
         if below_cnt >= 3 and above_e200_cnt <= 1:
@@ -2192,57 +1905,20 @@ def _detect_ema50_200_setup(
                     and c_close < c_open
                     and ((c_close < p_close) or (c_rng > 0 and (u_wick / c_rng) >= 0.35))
                 )
-                in_box_short = bool(rl < c_close * 0.992)
-                ext_short = bool(allow_box_extension and (sl_edge > 0.0) and (c_close < sl_edge))
-                if bear_rej and (in_box_short or ext_short):
+                if bear_rej and rl < c_close * 0.992:
                     lb = min(idx, 12)
                     loc_low_3h = min(float(recs15[k]["low"]) for k in range(idx - lb, idx))
                     room_3h = c_close - loc_low_3h
                     box_w = max(1e-9, rh - rl)
                     z_pos = (c_close - rl) / box_w
-                    is_ext = (not in_box_short) and ext_short
-                    # 1. In-box Bottom-of-Box Floor Guard (v34): never short in extreme bottom 15% of [RL, RH];
-                    #    bypassed ONLY for confirmed Manual-Only Breakdown Continuation cleanly below SL (`c_close < SL`).
-                    # 2. 3h Structure Guard: always skip shorting directly into a 3h local double-bottom (<0.45% room).
-                    bottom_box_blocked = False if is_ext else (
-                        (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
-                    )
+                    # 1. Bottom-of-Box Floor Guard (v34): never short in the extreme bottom 15% of the Daily Box [RL, RH],
+                    #    and in the bottom 35% require >=0.55% 3h structural room (prevents APT $0.4304 bottom-of-box traps).
+                    # 2. 3h Structure Guard: skip shorting directly into a 3h local double-bottom (<0.45% room).
+                    bottom_box_blocked = (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
                     if not bottom_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = max(e200, reach_high) * 1.0025
-                        # Minimum 0.65% SL floor (eliminates 0.40% routine altcoin wick stop-outs)
-                        if ((stop_px - c_close) / c_close) < 0.0065:
-                            stop_px = c_close * 1.0065
-                        sl_dist = stop_px - c_close
-                        if is_ext:
-                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
-                            tp1_src_lbl = "1.0R"
-                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
-                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
-                                tp1_src_lbl = "3h-SwingLow"
-                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
-                            tp2_px = c_close - rew_dist
-                            if tp2_px <= 0:
-                                return None
-                            tp1_px = c_close - tp1_dist
-                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            return {
-                                "direction": "SHORT",
-                                "entry": c_close,
-                                "entry2_sweep": 0.0,
-                                "stop": stop_px,
-                                "tp1": tp1_px,
-                                "tp2": tp2_px,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ 2.0R Breakdown (ref {tp2_roe:.0f}% ROE)",
-                                "reason": f"Bear 15m 50<200 EMA Breakdown Continuation (<SL) -> 1R/2R (TP1: {tp1_src_lbl})",
-                                "trigger_zone": "15m 50/200 EMA BREAKDOWN (<SL • Manual Only)",
-                                "strategy_tag": "Strategy 4 (15m 50/200 EMA Breakdown)",
-                                "ema50_15m": e50,
-                                "ema200_15m": e200,
-                                "is_box_extension": True,
-                                "manual_only": True,
-                            }
+                        if ((stop_px - c_close) / c_close) * 100.0 < 0.30:
+                            stop_px = c_close * 1.004
                         rew_dist = c_close - rl
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RL)"
@@ -2261,21 +1937,16 @@ def _detect_ema50_200_setup(
                                 "stop": stop_px,
                                 "tp1": tp1_px,
                                 "tp2": rl,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ RL (60% Ratchet, ref {tp2_roe:.0f}% ROE)",
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
+                                "tp2_label": f"50% Runner @ RL (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
                                 "reason": f"Bear 15m 50<200 EMA Pullback Rejection -> RL (TP1: {tp1_src_lbl})",
                                 "trigger_zone": "15m 50/200 EMA CEILING",
                                 "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
                                 "ema50_15m": e50,
                                 "ema200_15m": e200,
-                                "is_box_extension": False,
-                                "manual_only": False,
                             }
 
-    if can_long and e50 > e200:
-        # Skip dead-flat tangled EMAs (<0.20% spread) that cause noise whipsaw stop-outs
-        if ((e50 - e200) / c_close) < 0.0020:
-            return None
+    if allow_bull and bias == "BULLISH" and e50 > e200:
         above_cnt = sum(1 for r, em in zip(prior, prior_e50) if float(r["close"]) > float(em))
         below_e200_cnt = sum(1 for r, em2 in zip(prior, prior_e200) if float(r["close"]) < float(em2))
         if above_cnt >= 3 and below_e200_cnt <= 1:
@@ -2287,52 +1958,20 @@ def _detect_ema50_200_setup(
                     and c_close > c_open
                     and ((c_close > p_close) or (c_rng > 0 and (l_wick / c_rng) >= 0.35))
                 )
-                in_box_long = bool(rh > c_close * 1.008)
-                ext_long = bool(allow_box_extension and (sh_edge > 0.0) and (c_close > sh_edge))
-                if bull_rej and (in_box_long or ext_long):
+                if bull_rej and rh > c_close * 1.008:
                     lb = min(idx, 12)
                     loc_high_3h = max(float(recs15[k]["high"]) for k in range(idx - lb, idx))
                     room_3h = loc_high_3h - c_close
                     box_w = max(1e-9, rh - rl)
                     z_top = (rh - c_close) / box_w
-                    is_ext = (not in_box_long) and ext_long
-                    top_box_blocked = False if is_ext else (
-                        (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
-                    )
+                    # 1. Top-of-Box Ceiling Guard (v34): never buy in the extreme top 15% of the Daily Box [RL, RH],
+                    #    and in the top 35% require >=0.55% 3h structural room.
+                    # 2. 3h Structure Guard: skip longing directly into a 3h local double-top (<0.45% room).
+                    top_box_blocked = (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
                     if not top_box_blocked and room_3h >= c_close * 0.0045:
                         stop_px = min(e200, reach_low) * 0.9975
-                        # Minimum 0.65% SL floor (eliminates 0.40% routine altcoin wick stop-outs)
-                        if ((c_close - stop_px) / c_close) < 0.0065:
-                            stop_px = c_close * 0.9935
-                        sl_dist = c_close - stop_px
-                        if is_ext:
-                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
-                            tp1_src_lbl = "1.0R"
-                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
-                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
-                                tp1_src_lbl = "3h-SwingHigh"
-                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
-                            tp2_px = c_close + rew_dist
-                            tp1_px = c_close + tp1_dist
-                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            return {
-                                "direction": "LONG",
-                                "entry": c_close,
-                                "entry2_sweep": 0.0,
-                                "stop": stop_px,
-                                "tp1": tp1_px,
-                                "tp2": tp2_px,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ 2.0R Breakout (ref {tp2_roe:.0f}% ROE)",
-                                "reason": f"Bull 15m 50>200 EMA Breakout Continuation (>SH) -> 1R/2R (TP1: {tp1_src_lbl})",
-                                "trigger_zone": "15m 50/200 EMA BREAKOUT (>SH • Manual Only)",
-                                "strategy_tag": "Strategy 4 (15m 50/200 EMA Breakout)",
-                                "ema50_15m": e50,
-                                "ema200_15m": e200,
-                                "is_box_extension": True,
-                                "manual_only": True,
-                            }
+                        if ((c_close - stop_px) / c_close) * 100.0 < 0.30:
+                            stop_px = c_close * 0.996
                         rew_dist = rh - c_close
                         tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
                         tp1_src_lbl = "Mid(Entry,RH)"
@@ -2351,15 +1990,13 @@ def _detect_ema50_200_setup(
                                 "stop": stop_px,
                                 "tp1": tp1_px,
                                 "tp2": rh,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ RH (60% Ratchet, ref {tp2_roe:.0f}% ROE)",
+                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Profit-Lock SL)",
+                                "tp2_label": f"50% Runner @ RH (Halfway Ratchet, ref {tp2_roe:.0f}% ROE)",
                                 "reason": f"Bull 15m 50>200 EMA Pullback Bounce -> RH (TP1: {tp1_src_lbl})",
                                 "trigger_zone": "15m 50/200 EMA FLOOR",
                                 "strategy_tag": "Strategy 4 (15m 50/200 EMA)",
                                 "ema50_15m": e50,
                                 "ema200_15m": e200,
-                                "is_box_extension": False,
-                                "manual_only": False,
                             }
 
     return None
@@ -2397,7 +2034,7 @@ class Ema50200PullbackStrategy(Strategy):
             lv["ema_15m_trend"] = "BEAR (50 < 200)" if e50 < e200 else ("BULL (50 > 200)" if e50 > e200 else "FLAT")
         return lv
 
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None, allow_box_extension=False):
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
         if not levels:
             return None
@@ -2438,23 +2075,18 @@ class Ema50200PullbackStrategy(Strategy):
         sig = _detect_ema50_200_setup(
             recs15, idx, levels, e50, e200, prior_e50, prior_e200,
             allow_bear=self.allow_bear, allow_bull=self.allow_bull,
-            allowed_dirs=allowed_dirs, allow_box_extension=bool(allow_box_extension),
         )
         if sig:
             e_px = eng.round_asset_price(sig["entry"], ref_px)
             sl_px = eng.round_asset_price(sig["stop"], ref_px)
             tp1_px = eng.round_asset_price(sig["tp1"], ref_px)
             tp2_px = eng.round_asset_price(sig["tp2"], ref_px)
-            is_ext = bool(sig.get("is_box_extension", False))
             out.update({
                 "signal": sig["direction"],
                 "signal_kind": "EMA50_200",
                 "trigger_zone": sig["trigger_zone"],
                 "trigger_reason": sig["reason"],
-                "setup": (
-                    f"{sig['direction']} 15m 50/200 EMA {'Breakdown' if sig['direction'] == 'SHORT' else 'Breakout'} -> 1R/2R"
-                    if is_ext else f"{sig['direction']} 15m 50/200 EMA -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}"
-                ),
+                "setup": f"{sig['direction']} 15m 50/200 EMA -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}",
                 "entry": e_px,
                 "entry2_sweep": 0.0,
                 "stop_loss": sl_px,
@@ -2462,8 +2094,6 @@ class Ema50200PullbackStrategy(Strategy):
                 "tp2": tp2_px,
                 "tp1_label": sig["tp1_label"],
                 "tp2_label": sig["tp2_label"],
-                "is_box_extension": is_ext,
-                "manual_only": bool(sig.get("manual_only", False)),
             })
             out.update(position_metrics(pair, e_px, sl_px, tp1_px, tp2_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
         return self._stamp(out)
@@ -2485,47 +2115,28 @@ class Ema50200PullbackStrategy(Strategy):
             e200 = e50 * (1.012 if e50 < px else 0.988)
 
         rh, rl = float(levels["RH"]), float(levels["RL"])
-        sh_edge, sl_edge = float(levels.get("SH", 0.0) or 0.0), float(levels.get("SL", 0.0) or 0.0)
 
-        # SELL Limit Plan: entry near 15m 50 EMA ceiling, SL > 15m 200 EMA (>=0.65% floor); TP2 = RL in-box or 1R/2R on Breakdown (<SL)
+        # SELL Limit Plan: entry near min(e50, live) / e50 ceiling, SL > e200, TP2 = RL
         s_ent = eng.round_asset_price(e50, px)
-        s_sl = eng.round_asset_price(max(e200 * 1.0025, s_ent * 1.0065), px)
-        s_is_ext = bool((sl_edge > 0.0) and (s_ent < sl_edge))
-        if s_is_ext:
-            s_sl_d = max(s_sl - s_ent, s_ent * 0.0065)
-            s_tp1 = eng.round_asset_price(s_ent - s_sl_d * 1.0, px)
-            s_tp2 = eng.round_asset_price(max(s_ent * 0.50, s_ent - s_sl_d * 2.0), px)
-            s_lbl = "SHORT 15m 50/200 EMA Breakdown -> 1R/2R (Manual Only)"
-        else:
-            s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
-            s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
-            s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
-            s_lbl = "SHORT at 15m 50 EMA -> RL"
+        s_sl = eng.round_asset_price(max(e200 * 1.0025, s_ent * 1.004), px)
+        s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
+        s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
+        s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
         sell_setup = {
-            "direction": "SELL", "setup": s_lbl,
+            "direction": "SELL", "setup": "SHORT at 15m 50 EMA -> RL",
             "entry": s_ent, "entry2_sweep": 0.0, "stop_loss": s_sl, "tp1": s_tp1, "tp2": s_tp2,
-            "is_box_extension": s_is_ext, "manual_only": s_is_ext,
             **position_metrics(pair, s_ent, s_sl, s_tp1, s_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
         }
 
-        # BUY Limit Plan: entry near 15m 50 EMA floor, SL < 15m 200 EMA (>=0.65% floor); TP2 = RH in-box or 1R/2R on Breakout (>SH)
+        # BUY Limit Plan: entry near 15m 50 EMA floor, SL < 15m 200 EMA, TP2 = RH
         b_ent = eng.round_asset_price(e50, px)
-        b_sl = eng.round_asset_price(min(e200 * 0.9975, b_ent * 0.9935), px)
-        b_is_ext = bool((sh_edge > 0.0) and (b_ent > sh_edge))
-        if b_is_ext:
-            b_sl_d = max(b_ent - b_sl, b_ent * 0.0065)
-            b_tp1 = eng.round_asset_price(b_ent + b_sl_d * 1.0, px)
-            b_tp2 = eng.round_asset_price(b_ent + b_sl_d * 2.0, px)
-            b_lbl = "LONG 15m 50/200 EMA Breakout -> 1R/2R (Manual Only)"
-        else:
-            b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
-            b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
-            b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
-            b_lbl = "LONG at 15m 50 EMA -> RH"
+        b_sl = eng.round_asset_price(min(e200 * 0.9975, b_ent * 0.996), px)
+        b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
+        b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
+        b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
         buy_setup = {
-            "direction": "BUY", "setup": b_lbl,
+            "direction": "BUY", "setup": "LONG at 15m 50 EMA -> RH",
             "entry": b_ent, "entry2_sweep": 0.0, "stop_loss": b_sl, "tp1": b_tp1, "tp2": b_tp2,
-            "is_box_extension": b_is_ext, "manual_only": b_is_ext,
             **position_metrics(pair, b_ent, b_sl, b_tp1, b_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
         }
 
@@ -2592,508 +2203,6 @@ class Ema50200PullbackStrategy(Strategy):
 
 
 # ----------------------------------------------------------------------------------------------
-# Strategy 5: 15m 21 EMA Touch & Bounce (Same Guards as Strategy 4: 50/200 EMA Pullback)
-# ----------------------------------------------------------------------------------------------
-def _compute_warmed_15m_emas_9_21_50(df_sub: pd.DataFrame) -> tuple[list[float], list[float], list[float]]:
-    """Computes warmed 15m EMA9, EMA21, and EMA50 using extended pre-window history if attached."""
-    df_full = df_sub.attrs.get("df_full_15m") if hasattr(df_sub, "attrs") else None
-    if df_full is not None and not df_full.empty and len(df_full) >= len(df_sub):
-        e9 = df_full["close"].ewm(span=9, adjust=False).mean()
-        e21 = df_full["close"].ewm(span=21, adjust=False).mean()
-        e50 = df_full["close"].ewm(span=50, adjust=False).mean()
-        tail_n = len(df_sub)
-        return e9.iloc[-tail_n:].tolist(), e21.iloc[-tail_n:].tolist(), e50.iloc[-tail_n:].tolist()
-    return (
-        df_sub["close"].ewm(span=9, adjust=False).mean().tolist(),
-        df_sub["close"].ewm(span=21, adjust=False).mean().tolist(),
-        df_sub["close"].ewm(span=50, adjust=False).mean().tolist(),
-    )
-
-
-def _detect_ema21_pullback_setup(
-    recs15: list[dict],
-    idx: int,
-    box: dict,
-    ema9_val: float,
-    ema21_val: float,
-    ema50_val: float,
-    prior_e21: list[float],
-    prior_e50: list[float],
-    allow_bear: bool = True,
-    allow_bull: bool = True,
-    allowed_dirs: list[str] | None = None,
-    allow_box_extension: bool = False,
-) -> dict | None:
-    """
-    Shared 15m 21 EMA Touch & Bounce detection (100% live <-> backtest parity, exact same guards as 50/200 EMA):
-      - Trend stack: BEARISH requires 9 < 21 < 50 EMA; BULLISH requires 9 > 21 > 50 EMA.
-      - Dead-Flat EMA Separation Guard: skips tangled EMAs when |EMA50 - EMA21| / close < 0.20%.
-      - Clean Trend Prior Guard: >= 3 of last 6 closes on trend side of 21 EMA and <= 1 close beyond 50 EMA wall.
-      - Touch & Bounce / Rejection: current/prev candle touches 21 EMA without blowing through 50 EMA, then rejects
-        back across 21 EMA with candle body & momentum/35% rejection wick.
-      - Strict Mode (`allow_box_extension=False`): Bottom-of-Box Floor Guard / Top-of-Box Ceiling Guard -> RL / RH.
-      - Manual-Only Breakdown/Breakout Continuation (`allow_box_extension=True`, ADX >= 25): when price has cleanly
-        broken below `SL` (SHORT) or above `SH` (LONG) with >= 0.45% 3h room, uses 1.0R (3h-structure capped) / 2.0R
-        targets & tags `manual_only=True` (STRICTLY excluded from Automated AutoTrade).
-      - SL Wall anchored beyond 15m 50 EMA with >= 0.65% minimum SL floor.
-    """
-    if idx < 6 or not box or len(prior_e21) < 4 or len(prior_e50) < 4:
-        return None
-    bias = str(box.get("trend_bias") or box.get("bias") or "").upper()
-    if allowed_dirs is not None:
-        norm_allowed = {str(x).upper() for x in allowed_dirs}
-        can_short = bool(allow_bear and ("SHORT" in norm_allowed))
-        can_long = bool(allow_bull and ("LONG" in norm_allowed))
-        if not can_short and not can_long:
-            return None
-    else:
-        if bias not in ("BEARISH", "BULLISH"):
-            return None
-        can_short = bool(allow_bear and bias == "BEARISH")
-        can_long = bool(allow_bull and bias == "BULLISH")
-
-    rh = float(box.get("RH", 0.0) or 0.0)
-    rl = float(box.get("RL", 0.0) or 0.0)
-    sh_edge = float(box.get("SH", 0.0) or 0.0)
-    sl_edge = float(box.get("SL", 0.0) or 0.0)
-    e9 = float(ema9_val or 0.0)
-    e21 = float(ema21_val or 0.0)
-    e50 = float(ema50_val or 0.0)
-    if rh <= 0 or rl <= 0 or e9 <= 0 or e21 <= 0 or e50 <= 0:
-        return None
-
-    candle = recs15[idx]
-    prev = recs15[idx - 1]
-    prior = recs15[idx - len(prior_e21):idx]
-
-    c_open = float(candle.get("open", candle["close"]))
-    c_high = float(candle["high"])
-    c_low = float(candle["low"])
-    c_close = float(candle["close"])
-    c_rng = c_high - c_low
-    p_high = float(prev["high"])
-    p_low = float(prev["low"])
-    p_close = float(prev["close"])
-
-    if can_short and e9 < e21 and e21 < e50:
-        # 1. Dead-flat tangled EMA guard (< 0.20% separation between 21 & 50 EMA)
-        if ((e50 - e21) / c_close) < 0.0020:
-            return None
-        below_cnt = sum(1 for r, em in zip(prior, prior_e21) if float(r["close"]) < float(em))
-        above_e50_cnt = sum(1 for r, em50 in zip(prior, prior_e50) if float(r["close"]) > float(em50))
-        if below_cnt >= 3 and above_e50_cnt <= 1:
-            reach_high = max(c_high, p_high)
-            if reach_high >= e21 * 0.9995 and reach_high <= e50 * 1.004:
-                u_wick = c_high - max(c_open, c_close)
-                bear_rej = (
-                    c_close < e21
-                    and c_close < c_open
-                    and ((c_close < p_close) or (c_rng > 0 and (u_wick / c_rng) >= 0.35))
-                )
-                in_box_short = bool(rl < c_close * 0.992)
-                ext_short = bool(allow_box_extension and (sl_edge > 0.0) and (c_close < sl_edge))
-                if bear_rej and (in_box_short or ext_short):
-                    lb = min(idx, 12)
-                    loc_low_3h = min(float(recs15[k]["low"]) for k in range(idx - lb, idx))
-                    room_3h = c_close - loc_low_3h
-                    box_w = max(1e-9, rh - rl)
-                    z_pos = (c_close - rl) / box_w
-                    is_ext = (not in_box_short) and ext_short
-                    bottom_box_blocked = False if is_ext else (
-                        (z_pos < 0.15) or (idx >= 12 and z_pos < 0.35 and room_3h < c_close * 0.0055)
-                    )
-                    if not bottom_box_blocked and room_3h >= c_close * 0.0045:
-                        stop_px = max(e50, reach_high) * 1.0025
-                        if ((stop_px - c_close) / c_close) < 0.0065:
-                            stop_px = c_close * 1.0065
-                        sl_dist = stop_px - c_close
-                        if is_ext:
-                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
-                            tp1_src_lbl = "1.0R"
-                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
-                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
-                                tp1_src_lbl = "3h-SwingLow"
-                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
-                            tp2_px = c_close - rew_dist
-                            if tp2_px <= 0:
-                                return None
-                            tp1_px = c_close - tp1_dist
-                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            return {
-                                "direction": "SHORT",
-                                "entry": c_close,
-                                "entry2_sweep": 0.0,
-                                "stop": stop_px,
-                                "tp1": tp1_px,
-                                "tp2": tp2_px,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ 2.0R Breakdown (ref {tp2_roe:.0f}% ROE)",
-                                "reason": f"Bear 15m 9<21<50 EMA Breakdown Continuation (<SL) -> 1R/2R (TP1: {tp1_src_lbl})",
-                                "trigger_zone": "15m 21 EMA BREAKDOWN (<SL • Manual Only)",
-                                "strategy_tag": "Strategy 5 (15m 21 EMA Breakdown)",
-                                "ema9_15m": e9,
-                                "ema21_15m": e21,
-                                "ema50_15m": e50,
-                                "is_box_extension": True,
-                                "manual_only": True,
-                            }
-                        rew_dist = c_close - rl
-                        tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
-                        tp1_src_lbl = "Mid(Entry,RL)"
-                        if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
-                            tp1_dist = max(c_close * 0.008, room_3h * 0.94)
-                            tp1_src_lbl = "3h-SwingLow"
-                        if tp1_dist >= c_close * 0.006:
-                            tp1_px = c_close - tp1_dist
-                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            return {
-                                "direction": "SHORT",
-                                "entry": c_close,
-                                "entry2_sweep": 0.0,
-                                "stop": stop_px,
-                                "tp1": tp1_px,
-                                "tp2": rl,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ RL (60% Ratchet, ref {tp2_roe:.0f}% ROE)",
-                                "reason": f"Bear 15m 9<21<50 EMA Touch & Rejection -> RL (TP1: {tp1_src_lbl})",
-                                "trigger_zone": "15m 21 EMA CEILING (SL 50 EMA)",
-                                "strategy_tag": "Strategy 5 (15m 21 EMA Touch & Bounce)",
-                                "ema9_15m": e9,
-                                "ema21_15m": e21,
-                                "ema50_15m": e50,
-                                "is_box_extension": False,
-                                "manual_only": False,
-                            }
-
-    if can_long and e9 > e21 and e21 > e50:
-        if ((e21 - e50) / c_close) < 0.0020:
-            return None
-        above_cnt = sum(1 for r, em in zip(prior, prior_e21) if float(r["close"]) > float(em))
-        below_e50_cnt = sum(1 for r, em50 in zip(prior, prior_e50) if float(r["close"]) < float(em50))
-        if above_cnt >= 3 and below_e50_cnt <= 1:
-            reach_low = min(c_low, p_low)
-            if reach_low <= e21 * 1.0005 and reach_low >= e50 * 0.996:
-                l_wick = min(c_open, c_close) - c_low
-                bull_rej = (
-                    c_close > e21
-                    and c_close > c_open
-                    and ((c_close > p_close) or (c_rng > 0 and (l_wick / c_rng) >= 0.35))
-                )
-                in_box_long = bool(rh > c_close * 1.008)
-                ext_long = bool(allow_box_extension and (sh_edge > 0.0) and (c_close > sh_edge))
-                if bull_rej and (in_box_long or ext_long):
-                    lb = min(idx, 12)
-                    loc_high_3h = max(float(recs15[k]["high"]) for k in range(idx - lb, idx))
-                    room_3h = loc_high_3h - c_close
-                    box_w = max(1e-9, rh - rl)
-                    z_top = (rh - c_close) / box_w
-                    is_ext = (not in_box_long) and ext_long
-                    top_box_blocked = False if is_ext else (
-                        (z_top < 0.15) or (idx >= 12 and z_top < 0.35 and room_3h < c_close * 0.0055)
-                    )
-                    if not top_box_blocked and room_3h >= c_close * 0.0045:
-                        stop_px = min(e50, reach_low) * 0.9975
-                        if ((c_close - stop_px) / c_close) < 0.0065:
-                            stop_px = c_close * 0.9935
-                        sl_dist = c_close - stop_px
-                        if is_ext:
-                            tp1_dist = max(sl_dist * 1.0, c_close * 0.0065)
-                            tp1_src_lbl = "1.0R"
-                            if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
-                                tp1_dist = max(c_close * 0.008, room_3h * 0.94)
-                                tp1_src_lbl = "3h-SwingHigh"
-                            rew_dist = max(sl_dist * 2.0, tp1_dist * 1.5)
-                            tp2_px = c_close + rew_dist
-                            tp1_px = c_close + tp1_dist
-                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            return {
-                                "direction": "LONG",
-                                "entry": c_close,
-                                "entry2_sweep": 0.0,
-                                "stop": stop_px,
-                                "tp1": tp1_px,
-                                "tp2": tp2_px,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ 2.0R Breakout (ref {tp2_roe:.0f}% ROE)",
-                                "reason": f"Bull 15m 9>21>50 EMA Breakout Continuation (>SH) -> 1R/2R (TP1: {tp1_src_lbl})",
-                                "trigger_zone": "15m 21 EMA BREAKOUT (>SH • Manual Only)",
-                                "strategy_tag": "Strategy 5 (15m 21 EMA Breakout)",
-                                "ema9_15m": e9,
-                                "ema21_15m": e21,
-                                "ema50_15m": e50,
-                                "is_box_extension": True,
-                                "manual_only": True,
-                            }
-                        rew_dist = rh - c_close
-                        tp1_dist = min(rew_dist * 0.50, c_close * 0.020)
-                        tp1_src_lbl = "Mid(Entry,RH)"
-                        if room_3h >= c_close * 0.008 and room_3h < tp1_dist:
-                            tp1_dist = max(c_close * 0.008, room_3h * 0.94)
-                            tp1_src_lbl = "3h-SwingHigh"
-                        if tp1_dist >= c_close * 0.006:
-                            tp1_px = c_close + tp1_dist
-                            tp1_roe = round((tp1_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            tp2_roe = round((rew_dist / c_close) * DEFAULT_LEVERAGE * 100.0, 1)
-                            return {
-                                "direction": "LONG",
-                                "entry": c_close,
-                                "entry2_sweep": 0.0,
-                                "stop": stop_px,
-                                "tp1": tp1_px,
-                                "tp2": rh,
-                                "tp1_label": f"50% Book {tp1_src_lbl} ({tp1_roe:.1f}% ROE -> Fee-BE SL)",
-                                "tp2_label": f"50% Runner @ RH (60% Ratchet, ref {tp2_roe:.0f}% ROE)",
-                                "reason": f"Bull 15m 9>21>50 EMA Touch & Bounce -> RH (TP1: {tp1_src_lbl})",
-                                "trigger_zone": "15m 21 EMA FLOOR (SL 50 EMA)",
-                                "strategy_tag": "Strategy 5 (15m 21 EMA Touch & Bounce)",
-                                "ema9_15m": e9,
-                                "ema21_15m": e21,
-                                "ema50_15m": e50,
-                                "is_box_extension": False,
-                                "manual_only": False,
-                            }
-
-    return None
-
-
-class Ema21PullbackStrategy(Strategy):
-    id = "ema21_pullback"
-    name = "15m 21 EMA Touch & Bounce"
-    short = "15m 21 EMA"
-    timeframe = "15m 9/21/50 EMA Touch & Bounce -> RL/RH (Single Entry)"
-    description = (
-        "Fast intraday pullback continuation strategy with the exact same guards as 15m 50/200 EMA Pullback: "
-        "requires aligned 9/21/50 EMA stack (>=0.20% spread), clean prior trend, 15m touch & bounce off 21 EMA "
-        "with SL beyond 15m 50 EMA (>=0.65% floor), Box Floor/Ceiling & 3h Structure guards, and TP2 at RL/RH."
-    )
-    daily_warmup_days = 1000
-    tp1_name, tp2_name = "TP1 (50% Book Mid)", "TP2 (50% Runner @ RL/RH)"
-    uses_live_price = True
-
-    def __init__(self, allow_bear: bool = True, allow_bull: bool = True):
-        self.allow_bear = allow_bear
-        self.allow_bull = allow_bull
-
-    def compute_levels(self, pair):
-        lv = eng.calculate_daily_box_levels(pair)
-        if not lv:
-            return None
-        df15 = _closed_15m(pair, 30)
-        if df15 is not None and not df15.empty:
-            e9 = float(df15["EMA9"].iloc[-1])
-            e21 = float(df15["EMA21"].iloc[-1])
-            e50 = float(df15["EMA50"].iloc[-1])
-            e200 = float(df15["EMA200"].iloc[-1])
-            ref_px = float(lv.get("RH") or lv.get("daily_close") or e21)
-            lv["EMA9_15m"] = eng.round_asset_price(e9, ref_px)
-            lv["EMA21_15m"] = eng.round_asset_price(e21, ref_px)
-            lv["EMA50_15m"] = eng.round_asset_price(e50, ref_px)
-            lv["EMA200_15m"] = eng.round_asset_price(e200, ref_px)
-            lv["ema_21_15m_trend"] = "BEAR (9<21<50)" if (e9 < e21 < e50) else ("BULL (9>21>50)" if (e9 > e21 > e50) else "FLAT")
-            lv["ema_15m_trend"] = "BEAR (50 < 200)" if e50 < e200 else ("BULL (50 > 200)" if e50 > e200 else "FLAT")
-        return lv
-
-    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0, allowed_dirs=None, allow_box_extension=False):
-        levels = levels or self.compute_levels(pair)
-        if not levels:
-            return None
-        df15 = _closed_15m(pair, 40)
-        if df15.empty or len(df15) < 8:
-            return None
-
-        recs15 = df15.to_dict("records")
-        idx = len(recs15) - 1
-        cur = recs15[idx]
-        e9 = float(cur["EMA9"])
-        e21 = float(cur["EMA21"])
-        e50 = float(cur["EMA50"])
-        ref_px = float(cur["close"])
-        levels["EMA9_15m"] = eng.round_asset_price(e9, ref_px)
-        levels["EMA21_15m"] = eng.round_asset_price(e21, ref_px)
-        levels["EMA50_15m"] = eng.round_asset_price(e50, ref_px)
-        levels["ema_21_15m_trend"] = "BEAR (9<21<50)" if (e9 < e21 < e50) else ("BULL (9>21>50)" if (e9 > e21 > e50) else "FLAT")
-
-        session = eng.get_current_session_info(datetime.now(IST))
-        candle_time = datetime.fromtimestamp(cur["timestamp"] / 1000, tz=IST).strftime("%H:%M IST")
-        out = {
-            "timestamp": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S IST"),
-            "candle_evaluated": f"15m ({candle_time}) [{session['emoji']} {session['name']}]",
-            "session": session, "session_name": f"{session['emoji']} {session['name']}",
-            "is_prime_session": session["is_prime"], "is_us_open_candle": session["session_id"] == "NEW_YORK",
-            "pair": pair, "levels": levels, "candle_ts": int(cur["timestamp"]),
-            "signal": "NEUTRAL", "signal_kind": None, "trigger_zone": None, "trigger_reason": "",
-            "setup": (
-                f"WAIT / NO TRADE (Bias: {levels.get('trend_bias', 'RANGE')} • "
-                f"15m 21/50 EMA: {eng.round_asset_price(e21, ref_px)} / {eng.round_asset_price(e50, ref_px)})"
-            ),
-            "entry": ref_px, "entry2_sweep": 0.0, "stop_loss": 0.0, "tp1": 0.0, "tp2": 0.0,
-        }
-        out.update(position_metrics(pair, out["entry"], 0.0, out["entry"], out["entry"], margin_inr, leverage, usd_inr, entry2_sweep=0.0))
-
-        prior = recs15[idx - 6:idx]
-        prior_e21 = [float(r["EMA21"]) for r in prior]
-        prior_e50 = [float(r["EMA50"]) for r in prior]
-        sig = _detect_ema21_pullback_setup(
-            recs15, idx, levels, e9, e21, e50, prior_e21, prior_e50,
-            allow_bear=self.allow_bear, allow_bull=self.allow_bull,
-            allowed_dirs=allowed_dirs, allow_box_extension=bool(allow_box_extension),
-        )
-        if sig:
-            e_px = eng.round_asset_price(sig["entry"], ref_px)
-            sl_px = eng.round_asset_price(sig["stop"], ref_px)
-            tp1_px = eng.round_asset_price(sig["tp1"], ref_px)
-            tp2_px = eng.round_asset_price(sig["tp2"], ref_px)
-            is_ext = bool(sig.get("is_box_extension", False))
-            out.update({
-                "signal": sig["direction"],
-                "signal_kind": "EMA21_PULLBACK",
-                "trigger_zone": sig["trigger_zone"],
-                "trigger_reason": sig["reason"],
-                "setup": (
-                    f"{sig['direction']} 15m 21 EMA {'Breakdown' if sig['direction'] == 'SHORT' else 'Breakout'} -> 1R/2R"
-                    if is_ext else f"{sig['direction']} 15m 21 EMA Bounce -> {'RL' if sig['direction'] == 'SHORT' else 'RH'}"
-                ),
-                "entry": e_px,
-                "entry2_sweep": 0.0,
-                "stop_loss": sl_px,
-                "tp1": tp1_px,
-                "tp2": tp2_px,
-                "tp1_label": sig["tp1_label"],
-                "tp2_label": sig["tp2_label"],
-                "is_box_extension": is_ext,
-                "manual_only": bool(sig.get("manual_only", False)),
-            })
-            out.update(position_metrics(pair, e_px, sl_px, tp1_px, tp2_px, margin_inr, leverage, usd_inr, entry2_sweep=0.0))
-        return self._stamp(out)
-
-    def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
-        if not levels:
-            return {"BUY": None, "SELL": None, "note": ""}
-        e21 = float(levels.get("EMA21_15m") or 0.0)
-        e50 = float(levels.get("EMA50_15m") or 0.0)
-        if e21 <= 0 or e50 <= 0:
-            df15 = _closed_15m(pair, 10)
-            if not df15.empty:
-                e21 = float(df15["EMA21"].iloc[-1])
-                e50 = float(df15["EMA50"].iloc[-1])
-        px = float(live_price or e21 or levels["MID"])
-        if e21 <= 0:
-            e21 = px
-        if e50 <= 0:
-            e50 = e21 * (1.010 if e21 < px else 0.990)
-
-        rh, rl = float(levels["RH"]), float(levels["RL"])
-        sh_edge, sl_edge = float(levels.get("SH", 0.0) or 0.0), float(levels.get("SL", 0.0) or 0.0)
-
-        # SELL Limit Plan: entry near 15m 21 EMA ceiling, SL > 15m 50 EMA (>= 0.65% floor); TP2 = RL in-box or 1R/2R on Breakdown (<SL)
-        s_ent = eng.round_asset_price(e21, px)
-        s_sl = eng.round_asset_price(max(e50 * 1.0025, s_ent * 1.0065), px)
-        s_is_ext = bool((sl_edge > 0.0) and (s_ent < sl_edge))
-        if s_is_ext:
-            s_sl_d = max(s_sl - s_ent, s_ent * 0.0065)
-            s_tp1 = eng.round_asset_price(s_ent - s_sl_d * 1.0, px)
-            s_tp2 = eng.round_asset_price(max(s_ent * 0.50, s_ent - s_sl_d * 2.0), px)
-            s_lbl = "SHORT 15m 21 EMA Breakdown -> 1R/2R (SL 50 EMA • Manual Only)"
-        else:
-            s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.992 else s_ent * 0.976, px)
-            s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
-            s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
-            s_lbl = "SHORT at 15m 21 EMA -> RL (SL 50 EMA)"
-        sell_setup = {
-            "direction": "SELL", "setup": s_lbl,
-            "entry": s_ent, "entry2_sweep": 0.0, "stop_loss": s_sl, "tp1": s_tp1, "tp2": s_tp2,
-            "is_box_extension": s_is_ext, "manual_only": s_is_ext,
-            **position_metrics(pair, s_ent, s_sl, s_tp1, s_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
-        }
-
-        # BUY Limit Plan: entry near 15m 21 EMA floor, SL < 15m 50 EMA (>= 0.65% floor); TP2 = RH in-box or 1R/2R on Breakout (>SH)
-        b_ent = eng.round_asset_price(e21, px)
-        b_sl = eng.round_asset_price(min(e50 * 0.9975, b_ent * 0.9935), px)
-        b_is_ext = bool((sh_edge > 0.0) and (b_ent > sh_edge))
-        if b_is_ext:
-            b_sl_d = max(b_ent - b_sl, b_ent * 0.0065)
-            b_tp1 = eng.round_asset_price(b_ent + b_sl_d * 1.0, px)
-            b_tp2 = eng.round_asset_price(b_ent + b_sl_d * 2.0, px)
-            b_lbl = "LONG 15m 21 EMA Breakout -> 1R/2R (SL 50 EMA • Manual Only)"
-        else:
-            b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.008 else b_ent * 1.024, px)
-            b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
-            b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
-            b_lbl = "LONG at 15m 21 EMA -> RH (SL 50 EMA)"
-        buy_setup = {
-            "direction": "BUY", "setup": b_lbl,
-            "entry": b_ent, "entry2_sweep": 0.0, "stop_loss": b_sl, "tp1": b_tp1, "tp2": b_tp2,
-            "is_box_extension": b_is_ext, "manual_only": b_is_ext,
-            **position_metrics(pair, b_ent, b_sl, b_tp1, b_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
-        }
-
-        note = (
-            f"15m 21/50 EMA: ${eng.round_asset_price(e21, px)} / ${eng.round_asset_price(e50, px)} "
-            f"({levels.get('ema_21_15m_trend', '')}) | RL=${eng.round_asset_price(rl, px)}, RH=${eng.round_asset_price(rh, px)}"
-        )
-        return {"BUY": self._stamp(buy_setup), "SELL": self._stamp(sell_setup), "note": note}
-
-    def chart_lines(self, levels, plan=None):
-        lines = list(BoxTheorySweep().chart_lines(levels, plan)) if levels else []
-        if levels and levels.get("EMA21_15m"):
-            lines.append({"label": "15m 21 EMA (Touch & Bounce Zone)", "price": levels["EMA21_15m"], "color": "#f97316", "dash": "solid"})
-        if levels and levels.get("EMA50_15m"):
-            lines.append({"label": "15m 50 EMA (SL Wall)", "price": levels["EMA50_15m"], "color": "#a855f7", "dash": "dot"})
-        return lines
-
-    def metric_badges(self, levels):
-        if not levels:
-            return []
-        badges = []
-        if levels.get("EMA21_15m"):
-            badges.append({"label": "15m 21 EMA", "value": levels["EMA21_15m"]})
-        if levels.get("EMA50_15m"):
-            badges.append({"label": "15m 50 EMA (SL Wall)", "value": levels["EMA50_15m"]})
-        if levels.get("RL"):
-            badges.append({"label": "RL Target (Short)", "value": levels["RL"]})
-        if levels.get("RH"):
-            badges.append({"label": "RH Target (Long)", "value": levels["RH"]})
-        return badges
-
-    def level_rows(self, levels, live_price):
-        if not levels:
-            return []
-        rows = []
-        for k, lbl in (("EMA50_15m", "15m 50 EMA (SL Wall)"), ("EMA21_15m", "15m 21 EMA (Touch & Bounce)"), ("RH", "Range High (Long TP2)"), ("RL", "Range Low (Short TP2)")):
-            val = float(levels.get(k, 0.0) or 0.0)
-            if val > 0:
-                rows.append({"Level": lbl, "Price": val, "Distance %": round(((val - live_price) / live_price) * 100.0, 2) if live_price > 0 else 0.0})
-        return rows
-
-    def prepare_backtest(self, df, df_daily):
-        box_ctx = BoxTheorySweep().prepare_backtest(df, df_daily)
-        e9, e21, e50 = _compute_warmed_15m_emas_9_21_50(df)
-        return {"boxes": box_ctx["boxes"], "ema9_15m": e9, "ema21_15m": e21, "ema50_15m": e50}
-
-    def backtest_has_context(self, candle, ctx):
-        return bool(ctx["boxes"].get(candle["date_str"]))
-
-    def backtest_entry(self, idx, candle, ctx, records):
-        if idx < 6:
-            return None
-        box = ctx["boxes"].get(candle["date_str"])
-        if not box:
-            return None
-        e9 = float(ctx["ema9_15m"][idx])
-        e21 = float(ctx["ema21_15m"][idx])
-        e50 = float(ctx["ema50_15m"][idx])
-        prior_e21 = ctx["ema21_15m"][idx - 6:idx]
-        prior_e50 = ctx["ema50_15m"][idx - 6:idx]
-        return _detect_ema21_pullback_setup(
-            records, idx, box, e9, e21, e50, prior_e21, prior_e50,
-            allow_bear=self.allow_bear, allow_bull=self.allow_bull,
-        )
-
-
-# ----------------------------------------------------------------------------------------------
 # Combo Strategy (Priority 1: Box Theory Sweep -> Priority 2: 15m 50/200 EMA Pullback)
 # ----------------------------------------------------------------------------------------------
 class BoxPlusEma50200Strategy(Strategy):
@@ -3108,12 +2217,11 @@ class BoxPlusEma50200Strategy(Strategy):
         self.allow_bull_ema = allow_bull_ema
         self.regime_adaptive = regime_adaptive
         if regime_adaptive:
-            self.timeframe = "Regime-Adaptive (v40 Row 9): Chop-Only Box Sweep (No Bear Long) + Trend-Only 15m 50/200 EMA"
+            self.timeframe = "Regime-Adaptive: Box Sweep (All Regimes) + Auto Bull/Bear 15m 50/200 EMA in Strong Trends"
             self.description = (
-                "2-Year Verified Regime-Split Routing (Row 9): strictly runs Strategy 1 (Box Theory Sweep, blocking "
-                "falling-knife Box LONGs when prior Daily Close <= Daily 50 EMA) ONLY during RANGING / CHOP markets; "
-                "automatically pauses Box Sweep and activates Bull 15m 50/200 EMA Longs in STRONG UPTREND or Bear "
-                "15m 50/200 EMA Shorts in STRONG DOWNTREND."
+                "2-Year Verified Regime-Adaptive Routing: always runs Strategy 1 (15m Box Theory Sweep L+S); "
+                "automatically activates Bull 15m 50/200 EMA Longs in STRONG UPTREND, Bear 15m 50/200 EMA Shorts "
+                "in STRONG DOWNTREND, and pauses EMA trend entries during RANGING / CHOP markets."
             )
         else:
             self.timeframe = (
@@ -3129,57 +2237,23 @@ class BoxPlusEma50200Strategy(Strategy):
         self.s4 = Ema50200PullbackStrategy(allow_bear=True, allow_bull=(allow_bull_ema or regime_adaptive))
 
     def compute_levels(self, pair):
-        lv = self.s4.compute_levels(pair)
-        if isinstance(lv, dict):
-            try:
-                st = eng.compute_pair_intraday_trend_stack(pair)
-                if st and float(st.get("vwap", 0.0) or 0.0) > 0:
-                    lv["Session_VWAP"] = eng.round_asset_price(st["vwap"], lv.get("RH", st["vwap"]))
-                    lv["ADX14_15m"] = st.get("adx", 0.0)
-                    lv["HTF_1H_Struct"] = st.get("s1_struct", "CHOP")
-                    lv["HTF_1H_CHoCH"] = st.get("s1_choch", "NONE")
-                    lv["Intraday_3Layer"] = st.get("regime", "CHOP_RANGE")
-            except Exception:
-                pass
-        return lv
+        return self.s4.compute_levels(pair)
 
     def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
         levels = levels or self.compute_levels(pair)
+        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
+            return sig1
         if self.regime_adaptive:
-            mkt_meta = eng.compute_market_regime() or {}
-            reg = str(mkt_meta.get("regime", "RANGING_CHOP"))
+            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             if reg == "RANGING_CHOP":
-                sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-                if sig1 and sig1.get("signal") == "LONG":
-                    lv = sig1.get("levels") if isinstance(sig1.get("levels"), dict) else (levels or {})
-                    d_close = float(lv.get("daily_close", 0.0) or 0.0)
-                    d_ema50 = float(lv.get("EMA50", 0.0) or 0.0)
-                    if d_close > 0 and d_ema50 > 0 and d_close <= d_ema50:
-                        return self._stamp({
-                            **sig1,
-                            "signal": "NEUTRAL",
-                            "trigger_reason": (
-                                f"Row-9 No-Bear-Long Guard: Box LONG blocked in Chop "
-                                f"(Prev Daily Close ${d_close:,.4g} <= Daily 50 EMA ${d_ema50:,.4g})"
-                            ),
-                        })
                 return sig1
-            # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!
             sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
             if sig4 and (
                 (reg == "STRONG_DOWNTREND" and sig4.get("signal") == "SHORT")
                 or (reg == "STRONG_UPTREND" and sig4.get("signal") == "LONG")
             ):
                 return sig4
-            return self._stamp({
-                "pair": pair,
-                "signal": "NEUTRAL",
-                "signal_kind": "NONE",
-                "levels": levels,
-                "trigger_reason": f"Regime-Adaptive ({reg}): Box Sweep paused; awaiting trend-aligned 15m 50/200 EMA setup.",
-            })
-        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
             return sig1
         sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
         if sig4 and sig4.get("signal") in ("LONG", "SHORT"):
@@ -3190,35 +2264,17 @@ class BoxPlusEma50200Strategy(Strategy):
         return self.s1.plan_setups(pair, levels, live_price, margin_inr, leverage, usd_inr)
 
     def chart_lines(self, levels, plan=None):
-        lines = list(self.s4.chart_lines(levels, plan))
-        if levels and levels.get("Session_VWAP"):
-            lines.append({"label": "Session VWAP (00:00 UTC)", "price": levels["Session_VWAP"], "color": "#06b6d4", "dash": "dash"})
-        return lines
+        return self.s4.chart_lines(levels, plan)
 
     def metric_badges(self, levels):
-        badges = self.s1.metric_badges(levels) + self.s4.metric_badges(levels)
-        if levels and levels.get("Session_VWAP"):
-            badges.append({"label": "Session VWAP", "value": levels["Session_VWAP"]})
-        if levels and levels.get("ADX14_15m"):
-            badges.append({"label": "15m ADX(14)", "value": levels["ADX14_15m"]})
-        return badges
+        return self.s1.metric_badges(levels) + self.s4.metric_badges(levels)
 
     def level_rows(self, levels, live_price):
-        rows = list(self.s1.level_rows(levels, live_price))
-        if levels and levels.get("Session_VWAP"):
-            vw = float(levels["Session_VWAP"])
-            rows.append({
-                "Level": f"Session VWAP ({levels.get('HTF_1H_Struct', 'CHOP')} | ADX {levels.get('ADX14_15m', 0):.1f})",
-                "Price": vw,
-                "Distance %": round(((vw - live_price) / live_price) * 100.0, 2) if live_price > 0 else 0.0,
-            })
-        return rows
+        return self.s1.level_rows(levels, live_price)
 
     def prepare_backtest(self, df, df_daily):
         ctx1 = self.s1.prepare_backtest(df, df_daily)
         reg_map = {}
-        intraday_mkt_map = {}
-        stack_by_ts = {}
         if self.regime_adaptive:
             reg_map = dict(eng._PERSIST.get("backtest_regime_map") or {})
             if not reg_map and df_daily is not None and len(df_daily) >= 18:
@@ -3238,33 +2294,24 @@ class BoxPlusEma50200Strategy(Strategy):
                     r5 = (pc / float(closes[i - 6]) - 1.0) * 100.0
                     r2 = (pc / float(closes[i - 3]) - 1.0) * 100.0
                     reg_map[dates[i]] = eng.classify_universe_regime_from_stats(bf, brf, r14, r5, r2)
-            intraday_mkt_map = dict(eng._PERSIST.get("backtest_intraday_regime_map") or {})
-            if df is not None and not df.empty and {"timestamp", "open", "high", "low", "close"}.issubset(df.columns):
-                st_list = eng.compute_intraday_3layer_series(df)
-                stack_by_ts = {int(x["timestamp"]): x for x in st_list}
         return {
             "ctx1": ctx1,
             "ctx4": self.s4.prepare_backtest(df, df_daily),
             "boxes": ctx1["boxes"],
             "regime_map": reg_map,
-            "intraday_mkt_map": intraday_mkt_map,
-            "stack_by_ts": stack_by_ts,
         }
 
     def backtest_has_context(self, candle, ctx):
         return self.s1.backtest_has_context(candle, ctx["ctx1"])
 
     def backtest_entry(self, idx, candle, ctx, records):
+        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+        if e1:
+            return e1
         if self.regime_adaptive:
             day_reg = (ctx.get("regime_map") or {}).get(candle["date_str"], "RANGING_CHOP")
             if day_reg == "RANGING_CHOP":
-                e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
-                if e1 and e1.get("direction") == "LONG":
-                    box = (ctx.get("boxes") or {}).get(candle["date_str"]) or {}
-                    if not bool(box.get("above_d50", True)):
-                        return None
-                return e1
-            # Strong Trend (STRONG_UPTREND / STRONG_DOWNTREND): Box Sweep paused; run trend-aligned 15m 50/200 EMA only!
+                return None
             e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
             if e4 and (
                 (day_reg == "STRONG_DOWNTREND" and e4.get("direction") == "SHORT")
@@ -3272,32 +2319,21 @@ class BoxPlusEma50200Strategy(Strategy):
             ):
                 return e4
             return None
-        e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
-        if e1:
-            return e1
         return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
 
 
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
-    ("box_plus_ema50_200_regime", "🤖 Auto (Market-Trend Adaptive)"),
-    ("box_theory", "📦 Box Theory Sweep (Chop)"),
-    ("ema50_200", "📈 15m 50/200 EMA Pullback (Trend)"),
-    ("ema21_pullback", "⚡ 15m 21 EMA Touch & Bounce (Trend)"),
+    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Box + Auto Trend EMA] (Recommended)"),
+    ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA"),
+    ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
+    ("box_theory", "Box Theory Sweep Only (v27)"),
+    ("ema50_200", "15m 50/200 EMA Pullback Only"),
 ]
-_LEGACY_AUTOTRADE_MODES: set[str] = {"box_plus_ema50_200_bear", "box_plus_ema50_200_both"}
 DEFAULT_AUTOTRADE_MODE = "box_plus_ema50_200_regime"
 
 
-def recommended_strategy_for_regime(regime: str | None) -> str:
-    """Returns the single best-suited strategy ID for a given live market trend regime."""
-    r = str(regime or "RANGING_CHOP").upper()
-    if r in ("STRONG_UPTREND", "STRONG_DOWNTREND"):
-        return Ema50200PullbackStrategy.id
-    return BoxTheorySweep.id
-
-
 def resolve_autotrade_mode(mode: str | None) -> str:
-    valid = {k for k, _ in AUTOTRADE_MODE_CHOICES} | _LEGACY_AUTOTRADE_MODES
+    valid = {k for k, _ in AUTOTRADE_MODE_CHOICES}
     m = str(mode or "").strip()
     return m if m in valid else DEFAULT_AUTOTRADE_MODE
 
@@ -3314,18 +2350,13 @@ def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
         return ["box_theory"]
     if m == "ema50_200":
         return ["ema50_200"]
-    if m == "ema21_pullback":
-        return ["ema21_pullback"]
     if m == "box_plus_ema50_200_regime":
         try:
             reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             if reg == "RANGING_CHOP":
                 return ["box_theory"]
-            if reg in ("STRONG_UPTREND", "STRONG_DOWNTREND"):
-                return ["ema50_200"]
         except Exception:
             pass
-        return ["box_theory"]
     return ["box_theory", "ema50_200"]
 
 
@@ -3337,7 +2368,6 @@ STRATEGY_REGISTRY: dict[str, Strategy] = {
     AtrReversal.id: AtrReversal(),
     Ema9RetestStrategy.id: Ema9RetestStrategy(),
     Ema50200PullbackStrategy.id: Ema50200PullbackStrategy(allow_bear=True, allow_bull=True),
-    Ema21PullbackStrategy.id: Ema21PullbackStrategy(allow_bear=True, allow_bull=True),
     "box_plus_ema50_200_regime": BoxPlusEma50200Strategy(
         sid="box_plus_ema50_200_regime",
         name="Combo: Regime-Adaptive [Box + Auto Trend EMA]",
@@ -3367,11 +2397,11 @@ def get_strategy(strategy_id: str | None) -> Strategy:
 
 
 def list_strategies() -> list[Strategy]:
-    """User-facing active strategies (legacy ATR Reversal & 5m 9 EMA Retest stay in STRATEGY_REGISTRY only)."""
     return [
         STRATEGY_REGISTRY[BoxTheorySweep.id],
         STRATEGY_REGISTRY[Ema50200PullbackStrategy.id],
-        STRATEGY_REGISTRY[Ema21PullbackStrategy.id],
+        STRATEGY_REGISTRY[AtrReversal.id],
+        STRATEGY_REGISTRY[Ema9RetestStrategy.id],
     ]
 
 
@@ -3382,221 +2412,3 @@ def strategy_by_name(name: str) -> Strategy | None:
 def setup_tag(strategy_id: str, kind: str) -> str:
     """Session-state tag for execution inputs; Box Theory keeps the legacy BUY / SELL / SIGNAL tags."""
     return kind if strategy_id == DEFAULT_STRATEGY_ID else f"{strategy_id}_{kind}"
-
-
-def evaluate_manual_intraday_setup(
-    pair: str,
-    margin_inr: float = 10000.0,
-    leverage: int = DEFAULT_LEVERAGE,
-    usd_inr: float = 85.0,
-    levels: dict | None = None,
-    live_price: float = 0.0,
-) -> dict:
-    """
-    Manual Trading Assistant powered by `exp-staging-intraday-score-router` (`resolve_intraday_execution_policy`):
-      - Evaluates the coin's live 3-Layer Intraday Score (-4..+4) & ADX(14).
-      - Runs the router's permitted strategies (`ema50_200`, `box_theory`) with `allowed_dirs=policy["allowed_dirs"]`
-        so manual traders see Counter-Daily setups (e.g. +4 LONG @ 0.60x margin & 70% TP1) without relaxing
-        strict v41 (main) rules on Automated AutoTrade.
-      - ALWAYS returns a prefilled ready-to-edit manual ticket (`entry`, `stop_loss`, `tp1`, `tp2`,
-        `suggested_margin_inr`, `tp1_book_frac`, `direction`, `strategy_id`) for Execute & Signals tabs.
-    """
-    s1 = STRATEGY_REGISTRY[BoxTheorySweep.id]
-    s4 = STRATEGY_REGISTRY[Ema50200PullbackStrategy.id]
-    s5 = STRATEGY_REGISTRY[Ema21PullbackStrategy.id]
-    lv = levels or s5.compute_levels(pair) or s4.compute_levels(pair) or eng.calculate_daily_box_levels(pair) or {}
-    daily_bias = str(lv.get("trend_bias") or lv.get("bias") or "NEUTRAL").upper()
-    p_stack = eng.compute_pair_intraday_trend_stack(pair) or {}
-    policy = eng.resolve_intraday_execution_policy(p_stack, daily_bias)
-
-    px = float(live_price or 0.0)
-    if px <= 0:
-        try:
-            px = float((eng.fetch_live_ticker(pair) or {}).get("last_price", 0.0) or 0.0)
-        except Exception:
-            px = 0.0
-    if px <= 0:
-        px = float(lv.get("MID") or lv.get("daily_close") or 0.0)
-
-    live_sig = None
-    two_sided = len(policy.get("allowed_dirs") or []) == 2
-    allow_manual_ext = bool(float(policy.get("adx", 0.0) or 0.0) >= 25.0)
-    if policy["regime"] != "CONFLICT_WAIT" and policy["allowed_dirs"] and policy["strategies"]:
-        for sid in policy["strategies"]:
-            try:
-                if sid == "ema50_200":
-                    cand = s4.evaluate_signal(
-                        pair, lv, margin_inr, leverage, usd_inr,
-                        allowed_dirs=policy["allowed_dirs"], allow_box_extension=allow_manual_ext,
-                    )
-                elif sid == "ema21_pullback":
-                    cand = s5.evaluate_signal(
-                        pair, lv, margin_inr, leverage, usd_inr,
-                        allowed_dirs=policy["allowed_dirs"], allow_box_extension=allow_manual_ext,
-                    )
-                else:
-                    cand = s1.evaluate_signal(
-                        pair, lv, margin_inr, leverage, usd_inr,
-                        allowed_dirs=policy["allowed_dirs"], allow_box_flip=True,
-                    )
-            except Exception:
-                cand = None
-            if cand and cand.get("signal") in ("LONG", "SHORT"):
-                rp = eng.resolve_direction_risk_profile(cand["signal"], daily_bias, two_sided_chop=two_sided)
-                live_sig = dict(cand)
-                live_sig["strategy_id"] = sid
-                live_sig["strategy_name"] = get_strategy(sid).name
-                live_sig["size_mult"] = rp["size_mult"]
-                live_sig["tp1_book_frac"] = rp["tp1_book_frac"]
-                live_sig["is_counter_daily"] = rp["is_counter_daily"]
-                live_sig["suggested_margin_inr"] = round(max(500.0, float(margin_inr) * rp["size_mult"]), 2)
-                live_sig["intraday_policy"] = policy
-                live_sig["intraday_stack"] = p_stack
-                break
-
-    # Build prefilled manual ticket even when no candle signal triggered yet
-    prefill_ticket = None
-    if live_sig:
-        prefill_ticket = {
-            **live_sig,
-            "direction": "BUY" if live_sig["signal"] == "LONG" else "SELL",
-            "is_live_signal": True,
-        }
-    elif lv and px > 0:
-        pref_strat = (policy["strategies"][0] if policy.get("strategies") else "box_theory")
-        if policy.get("allowed_dirs"):
-            if len(policy["allowed_dirs"]) == 1:
-                pref_dir = "BUY" if policy["allowed_dirs"][0] == "LONG" else "SELL"
-            else:
-                # Two-sided chop: pick whichever box edge is closer to live price
-                dist_rh = abs(float(lv.get("RH", px)) - px)
-                dist_rl = abs(px - float(lv.get("RL", px)))
-                pref_dir = "BUY" if dist_rl <= dist_rh else "SELL"
-        else:
-            # CONFLICT_WAIT: still provide a reference ticket aligned with Daily Bias (clearly labeled Wait/Conflict)
-            pref_dir = "SELL" if daily_bias == "BEARISH" else "BUY"
-
-        rp_p = eng.resolve_direction_risk_profile(pref_dir, daily_bias, two_sided_chop=two_sided)
-        sugg_m = round(max(500.0, float(margin_inr) * (rp_p["size_mult"] if policy["regime"] != "CONFLICT_WAIT" else 0.60)), 2)
-        plan_obj = (
-            s4.plan_setups(pair, lv, px, sugg_m, leverage, usd_inr)
-            if pref_strat == "ema50_200"
-            else (s5.plan_setups(pair, lv, px, sugg_m, leverage, usd_inr) if pref_strat == "ema21_pullback" else s1.plan_setups(pair, lv, px, sugg_m, leverage, usd_inr))
-        ) or {}
-        base_t = plan_obj.get(pref_dir)
-        if isinstance(base_t, dict) and float(base_t.get("entry", 0.0) or 0.0) > 0:
-            prefill_ticket = {
-                **base_t,
-                "pair": pair,
-                "signal": "LONG" if pref_dir == "BUY" else "SHORT",
-                "direction": pref_dir,
-                "strategy_id": pref_strat,
-                "strategy_name": get_strategy(pref_strat).name,
-                "size_mult": rp_p["size_mult"],
-                "tp1_book_frac": rp_p["tp1_book_frac"],
-                "is_counter_daily": rp_p["is_counter_daily"],
-                "suggested_margin_inr": sugg_m,
-                "intraday_policy": policy,
-                "intraday_stack": p_stack,
-                "levels": lv,
-                "is_live_signal": False,
-                "trigger_reason": (
-                    f"Intraday Router Prefill ({policy['badge']} | ADX {policy['adx']:.1f} | "
-                    f"Daily {daily_bias} -> {rp_p['size_mult']:.2g}x / {int(round(rp_p['tp1_book_frac']*100))}% TP1)"
-                ),
-            }
-
-    return {
-        "pair": pair,
-        "daily_bias": daily_bias,
-        "levels": lv,
-        "stack": p_stack,
-        "policy": policy,
-        "live_signal": live_sig,
-        "prefill_ticket": prefill_ticket,
-    }
-
-
-def compute_9_21_ema_crossover_plan(
-    pair: str,
-    df_chart: pd.DataFrame,
-    levels: dict | None,
-    live_price: float,
-    margin_inr: float = 10000.0,
-    leverage: int = DEFAULT_LEVERAGE,
-    usd_inr: float = 85.0,
-) -> dict:
-    """
-    Computes 9/21 EMA Crossover Strategy curves, crossover markers, and LONG/SHORT trade plans
-    (Entry, SL, TP1, TP2) for the Interactive Chart & Levels Trading Workstation.
-    """
-    if df_chart is None or df_chart.empty or len(df_chart) < 10:
-        return {"BUY": None, "SELL": None, "trend": "NEUTRAL", "cross_up_idx": [], "cross_dn_idx": []}
-
-    cl = df_chart["close"].astype(float)
-    hi = df_chart["high"].astype(float)
-    lo = df_chart["low"].astype(float)
-    e9 = cl.ewm(span=9, adjust=False).mean()
-    e21 = cl.ewm(span=21, adjust=False).mean()
-    e50 = cl.ewm(span=50, adjust=False).mean()
-
-    cross_up_idx = []
-    cross_dn_idx = []
-    for i in range(1, len(df_chart)):
-        if e9.iloc[i - 1] <= e21.iloc[i - 1] and e9.iloc[i] > e21.iloc[i]:
-            cross_up_idx.append(i)
-        elif e9.iloc[i - 1] >= e21.iloc[i - 1] and e9.iloc[i] < e21.iloc[i]:
-            cross_dn_idx.append(i)
-
-    px = float(live_price or cl.iloc[-1])
-    cur_e9 = float(e9.iloc[-1])
-    cur_e21 = float(e21.iloc[-1])
-    cur_e50 = float(e50.iloc[-1])
-    rec_lo = float(lo.tail(8).min())
-    rec_hi = float(hi.tail(8).max())
-    rh = float((levels or {}).get("RH") or px * 1.03)
-    rl = float((levels or {}).get("RL") or px * 0.97)
-
-    # BUY Setup: Entry near live/9 EMA, SL below min(21 EMA, recent 8-bar low) with >=0.65% floor, TP2 = RH
-    b_ent = eng.round_asset_price(px, px)
-    b_sl_raw = min(cur_e21 * 0.9975, rec_lo * 0.998, b_ent * 0.9935)
-    if (b_ent - b_sl_raw) / max(1e-9, b_ent) > 0.025:
-        b_sl_raw = b_ent * 0.985
-    b_sl = eng.round_asset_price(b_sl_raw, px)
-    b_tp2 = eng.round_asset_price(rh if rh > b_ent * 1.012 else b_ent * 1.028, px)
-    b_tp1_d = min(abs(b_tp2 - b_ent) * 0.50, b_ent * 0.020)
-    b_tp1 = eng.round_asset_price(b_ent + max(b_tp1_d, b_ent * 0.008), px)
-    buy_plan = {
-        "direction": "BUY", "strategy_id": "ema9_21_cross", "strategy_name": "9/21 EMA Crossover",
-        "setup": f"LONG 9/21 EMA Cross (9 EMA ${eng.round_asset_price(cur_e9, px)} / 21 EMA ${eng.round_asset_price(cur_e21, px)})",
-        "entry": b_ent, "stop_loss": b_sl, "tp1": b_tp1, "tp2": b_tp2,
-        **position_metrics(pair, b_ent, b_sl, b_tp1, b_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
-    }
-
-    # SELL Setup: Entry near live/9 EMA, SL above max(21 EMA, recent 8-bar high) with >=0.65% floor, TP2 = RL
-    s_ent = eng.round_asset_price(px, px)
-    s_sl_raw = max(cur_e21 * 1.0025, rec_hi * 1.002, s_ent * 1.0065)
-    if (s_sl_raw - s_ent) / max(1e-9, s_ent) > 0.025:
-        s_sl_raw = s_ent * 1.015
-    s_sl = eng.round_asset_price(s_sl_raw, px)
-    s_tp2 = eng.round_asset_price(rl if rl < s_ent * 0.988 else s_ent * 0.972, px)
-    s_tp1_d = min(abs(s_ent - s_tp2) * 0.50, s_ent * 0.020)
-    s_tp1 = eng.round_asset_price(s_ent - max(s_tp1_d, s_ent * 0.008), px)
-    sell_plan = {
-        "direction": "SELL", "strategy_id": "ema9_21_cross", "strategy_name": "9/21 EMA Crossover",
-        "setup": f"SHORT 9/21 EMA Cross (9 EMA ${eng.round_asset_price(cur_e9, px)} / 21 EMA ${eng.round_asset_price(cur_e21, px)})",
-        "entry": s_ent, "stop_loss": s_sl, "tp1": s_tp1, "tp2": s_tp2,
-        **position_metrics(pair, s_ent, s_sl, s_tp1, s_tp2, margin_inr, leverage, usd_inr, entry2_sweep=0.0),
-    }
-
-    trend_lbl = "BULL (9 > 21)" if cur_e9 > cur_e21 else ("BEAR (9 < 21)" if cur_e9 < cur_e21 else "FLAT")
-    return {
-        "BUY": buy_plan,
-        "SELL": sell_plan,
-        "trend": trend_lbl,
-        "ema9": cur_e9,
-        "ema21": cur_e21,
-        "ema50": cur_e50,
-        "cross_up_idx": cross_up_idx,
-        "cross_dn_idx": cross_dn_idx,
-    }

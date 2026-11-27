@@ -707,16 +707,15 @@ def build_live_market_context(selected_pair: str = "B-SOL_USDT") -> str:
         slot_cnt = int(slot.get("count", 0) or 0)
         slot_pairs = ", ".join(slot.get("active_pairs") or []) or "None"
         cfg_margin = float(auto_cfg.get("single_trade_margin_inr", 0.0) or 0.0)
-        cfg_at_wallet = coindcx_engine.get_effective_autotrade_wallet_inr(auto_cfg, bal)
         cfg_lev = int(auto_cfg.get("leverage", 10) or 10)
 
         lines.append(f"- **Active AutoTrade / Strategy Mode**: `{auto_mode_lbl}` (`{auto_mode_id}`)")
         lines.append(f"- **Detected Market Trend Regime**: `{reg_info.get('summary', '')}`")
         lines.append(
             f"- **Wallet Balance**: `Rs.{float(bal.get('total_inr', 0.0) or 0.0):,.2f}` "
-            f"(Available: `Rs.{float(bal.get('available_inr', 0.0) or 0.0):,.2f}`, AutoTrade Wallet: `Rs.{cfg_at_wallet:,.2f}`, Live API: `{bal.get('is_live_api')}`)"
+            f"(Available: `Rs.{float(bal.get('available_inr', 0.0) or 0.0):,.2f}`, Live API: `{bal.get('is_live_api')}`)"
         )
-        lines.append(f"- **Configured Sidebar Sizing**: `Rs.{cfg_margin:,.2f}` margin ({max_slots} slot(s)) @ `{cfg_lev}x` leverage")
+        lines.append(f"- **Configured Sidebar Sizing**: `Rs.{cfg_margin:,.2f}` margin @ `{cfg_lev}x` leverage")
         lines.append(
             f"- **3-Slot Portfolio Status**: `{slot_cnt}/{max_slots} Active` (`{slot_pairs}` | {slot.get('source', '')})"
         )
@@ -924,11 +923,9 @@ def _generate_live_quant_advisor_response(user_prompt: str, selected_pair: str =
     auto_mode_lbl = strat_reg.autotrade_mode_label(auto_mode_id)
     wallet_tot = float(bal.get("total_inr", 0.0) or 0.0)
     wallet_avail = float(bal.get("available_inr", wallet_tot) or 0.0)
-    at_wallet_eff = eng.get_effective_autotrade_wallet_inr(auto_cfg, bal)
-    cfg_slots = eng.get_configured_max_slots(auto_cfg)
     cfg_margin = float(auto_cfg.get("single_trade_margin_inr", 0.0) or 0.0)
     cfg_lev = int(auto_cfg.get("leverage", 10) or 10)
-    opt_slot_margin = round(at_wallet_eff / max(1, cfg_slots), 2) if at_wallet_eff > 0 else cfg_margin
+    opt_slot_margin = round(wallet_tot / 3.0, 2) if wallet_tot > 0 else cfg_margin
     daily_loss_cap = round(wallet_tot * 0.05, 2) if wallet_tot > 0 else 0.0
 
     # Detect whether user explicitly mentioned a coin in their prompt
