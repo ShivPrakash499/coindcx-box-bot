@@ -22,7 +22,6 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cache", 
 DEFAULT_WATCHLIST = list(eng.HIGH_VOL_FUTURES_UNIVERSE)
 COOLDOWN_MIN = 60          # per strategy + pair + direction, plus pair-level anti-spam guard
 SAME_SETUP_LOCK_MIN = 240  # 4h deduplication lock for the same setup / price zone in the same direction
-POST_SL_LOCK_MIN = 240     # 4h unified cross-strategy lock on (pair, direction) after any SL hit
 MAX_DAILY_ALERTS_PER_PAIR = 3
 MAX_DAILY_PORTFOLIO_TRADES = 999
 MAX_CONCURRENT_PORTFOLIO_TRADES = int(getattr(eng, "MAX_CONCURRENT_TRADES", 3) or 3)  # 3-slot wallet
@@ -88,7 +87,7 @@ def enabled_strategy_ids() -> list:
     return strat_registry.autotrade_mode_strategy_ids(auto_mode)
 
 
-def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str, levels: dict | None = None) -> bool:
+def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str) -> bool:
     """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
     m = strat_registry.resolve_autotrade_mode(auto_mode)
     d = str(direction or "").upper()
@@ -96,26 +95,15 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str,
         return strategy_id == "box_theory"
     if m == "ema50_200":
         return strategy_id == "ema50_200"
-    if m == "ema21_pullback":
-        return strategy_id == "ema21_pullback"
     if m == "box_plus_ema50_200_bear":
         return (strategy_id == "box_theory") or (strategy_id == "ema50_200" and d == "SHORT")
     if m == "box_plus_ema50_200_both":
         return strategy_id in ("box_theory", "ema50_200")
     if m == "box_plus_ema50_200_regime":
-        reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
         if strategy_id == "box_theory":
-            # Row 9 (v40): Box Sweep runs strictly in RANGING_CHOP (paused in Strong Trends)
-            if reg != "RANGING_CHOP":
-                return False
-            # Row 9 No-Bear-Long Guard: block Box LONG when coin's prior Daily Close <= Daily 50 EMA
-            if d == "LONG" and isinstance(levels, dict):
-                dc = float(levels.get("daily_close", 0.0) or 0.0)
-                de50 = float(levels.get("EMA50", 0.0) or 0.0)
-                if dc > 0 and de50 > 0 and dc <= de50:
-                    return False
             return True
         if strategy_id == "ema50_200":
+            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             return (reg == "STRONG_DOWNTREND" and d == "SHORT") or (reg == "STRONG_UPTREND" and d == "LONG")
         return False
     return strategy_id == strat_registry.DEFAULT_STRATEGY_ID
@@ -132,43 +120,6 @@ def scan_pair(pair: str, margin_inr: float, leverage: int, usd_inr: float, strat
 def _state_key(strategy_id: str, pair: str, sig: dict) -> str:
     base = f"{pair}|{sig['signal_kind']}|{sig['signal']}"
     return base if strategy_id == strat_registry.DEFAULT_STRATEGY_ID else f"{strategy_id}|{base}"
-
-
-def record_post_sl_lock(pair: str, direction: str, reason: str = "SL Hit") -> None:
-    """
-    Records a 4-hour unified cross-strategy lock on `(pair_base, direction)` whenever any trade
-    stops out (Live or Staging Paper). Prevents Box Theory and 15m 50/200 EMA from immediately
-    re-entering the exact same losing direction on a coin that just hit SL.
-    """
-    pair_base = _canon_pair(pair)
-    if not pair_base:
-        return
-    norm_dir = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
-    state = _load()
-    state[f"POST_SL_LOCK|{pair_base}|{norm_dir}"] = {
-        "locked_at": time.time(),
-        "pair": pair,
-        "direction": norm_dir,
-        "reason": str(reason or "SL Hit"),
-    }
-    _save(state)
-
-
-def is_post_sl_locked(pair: str, direction: str, state: dict | None = None) -> tuple[bool, float]:
-    """Returns `(is_locked, remaining_minutes)` for a `(pair, direction)` post-SL cooldown."""
-    pair_base = _canon_pair(pair)
-    if not pair_base:
-        return False, 0.0
-    norm_dir = "LONG" if str(direction or "").upper() in ("LONG", "BUY") else "SHORT"
-    st = state if isinstance(state, dict) else _load()
-    rec = st.get(f"POST_SL_LOCK|{pair_base}|{norm_dir}")
-    if not isinstance(rec, dict):
-        return False, 0.0
-    elapsed = time.time() - float(rec.get("locked_at", 0.0) or 0.0)
-    limit_sec = POST_SL_LOCK_MIN * 60.0
-    if 0.0 <= elapsed < limit_sec:
-        return True, round((limit_sec - elapsed) / 60.0, 1)
-    return False, 0.0
 
 
 def _note(strategy_id: str, sig: dict) -> str:
@@ -245,8 +196,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         autotrade_daily_key = f"AUTOTRADE_DAILY_COUNT|{today_ist}"
         autotrade_daily_count = int(state.get(autotrade_daily_key, 0))
 
-        eff_max_slots = int(eng.get_configured_max_slots(auto_cfg) if hasattr(eng, "get_configured_max_slots") else MAX_CONCURRENT_PORTFOLIO_TRADES)
-
         # Collect all pairs currently in a Live CoinDCX position, resting Entry Limit order, or active App Trade Lock
         # (normalized by base symbol via `_canon_pair` so `B-INJ_USDT` == `I-INJ_INR` == `INJUSDT`)
         open_live_pairs = set()
@@ -255,13 +204,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
             if _ap:
                 open_live_pairs.add(_ap)
                 open_live_bases.add(_canon_pair(_ap))
-        if len(open_live_bases) >= eff_max_slots:
+        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
             portfolio_occupied = True
             if not active_Slot_pair:
                 active_Slot_pair = next(iter(open_live_pairs), None)
 
         live_pos_verified = False
-        live_pos_list = []
         try:
             if is_daemon_thread or send:
                 # Whenever `send=True` (email alerts enabled), ALWAYS perform a synchronous live check
@@ -282,11 +230,11 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     p_raw = pos["pair"]
                     open_live_pairs.add(p_raw)
                     open_live_bases.add(_canon_pair(p_raw))
-                    if len(open_live_bases) >= eff_max_slots:
+                    if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                         portfolio_occupied = True
                         active_Slot_pair = p_raw
 
-            # Also count unfilled resting Entry Limit Orders on CoinDCX toward the slot cap
+            # Also count unfilled resting Entry Limit Orders on CoinDCX toward the 3-slot cap (prevents 4th concurrent trade race)
             if (is_daemon_thread or autotrade) and hasattr(eng, "get_open_entry_limit_orders"):
                 _w_chk = eng.fetch_coindcx_futures_balance(force_refresh=False) or {}
                 if _w_chk.get("is_live_api"):
@@ -295,27 +243,18 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         if _ep_pair:
                             open_live_pairs.add(_ep_pair)
                             open_live_bases.add(_canon_pair(_ep_pair))
-                            if len(open_live_bases) >= eff_max_slots:
+                            if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                                 portfolio_occupied = True
                                 active_Slot_pair = _ep_pair
         except Exception:
             pass
 
-        # Live & Staging-Paper 5% Daily Loss Stop + Unrealized PnL Daily SL Pause:
-        #   - Realized daily loss >= 5% -> lock AutoTrade for the IST day.
-        #   - Open unrealized loss >= 5% Daily SL -> pause new trades until open live positions close!
+        # Live & Staging-Paper 5% Daily Loss Stop (SL Threshold): if hit, keep scanning/alerting but lock new AutoTrades for the IST day!
         daily_stop_hit, daily_stop_msg = False, ""
         if autotrade and not eng.is_experiment_environment():
             try:
                 _dl_w = eng.get_paper_wallet_snapshot(auto_cfg) if eng.is_staging_environment() else None
                 daily_stop_hit, daily_stop_msg, _ = eng.check_live_daily_loss_stop(_dl_w)
-                if not daily_stop_hit and hasattr(eng, "check_unrealized_pnl_daily_sl_pause"):
-                    _unr_pos_arg = None if eng.is_staging_environment() else live_pos_list
-                    _unr_hit, _unr_msg, _ = eng.check_unrealized_pnl_daily_sl_pause(
-                        _dl_w, positions=_unr_pos_arg, allow_live_ticker=True
-                    )
-                    if _unr_hit:
-                        daily_stop_hit, daily_stop_msg = True, _unr_msg
             except Exception as e:
                 print(f"[Daily Loss Stop Check Notice]: {e}")
 
@@ -330,7 +269,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
 
             pair_primary_triggered = False
             for sid in strategy_ids:
-                if sid in ("ema9_retest", "ema50_200", "ema21_pullback") and pair_primary_triggered:
+                if sid in ("ema9_retest", "ema50_200") and pair_primary_triggered:
                     continue  # Fallback / continuation strategies only run when Box / primary yielded no setup on this pair
                 s = strat_registry.get_strategy(sid)
                 row = {
@@ -349,15 +288,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if sid in ("box_theory", "atr_reversal"):
                     pair_primary_triggered = True
 
-                if auto_mode == "box_plus_ema50_200_regime" and s.id in ("box_theory", "ema50_200", "ema21_pullback"):
-                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode, levels=sig.get("levels")):
-                        reg_info_sm = eng.compute_market_regime()
-                        reg_lbl = reg_info_sm.get("label", "RANGING / CHOP")
-                        if s.id == "box_theory" and reg_info_sm.get("regime") == "RANGING_CHOP" and str(sig.get("signal", "")).upper() == "LONG":
-                            _p_msg = "blocked by Row-9 No-Bear-Long Guard (Prev Daily Close <= Daily 50 EMA)"
-                        else:
-                            _p_msg = f"paused by Regime-Adaptive v40 mode ({reg_lbl})"
-                        results.append({**row, "signal": None, "message": _p_msg})
+                if auto_mode == "box_plus_ema50_200_regime" and s.id == "ema50_200":
+                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode):
+                        reg_lbl = eng.compute_market_regime().get("label", "RANGING / CHOP")
+                        results.append({**row, "signal": None, "message": f"paused by Regime-Adaptive mode ({reg_lbl})"})
                         continue
 
                 if float(sig.get("roe_tp1", 0.0)) < 3.0:
@@ -391,17 +325,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 key = _state_key(s.id, pair, sig)
                 last = state.get(key, {})
                 now_ts = time.time()
-                norm_sig_dir = "LONG" if str(sig.get("signal", "")).upper() in ("LONG", "BUY") else "SHORT"
-
-                # Unified Cross-Strategy Post-SL 4h Lock: if ANY strategy hit SL on (pair, direction) within 4h, block ALL strategies!
-                post_sl_lk, post_sl_rem = is_post_sl_locked(pair, norm_sig_dir, state=state)
-                if post_sl_lk:
-                    results.append({
-                        **row,
-                        "message": f"post-SL 4h cross-strategy lock active on {pair_base} {norm_sig_dir} ({post_sl_rem:.0f}m left)"
-                    })
-                    continue
-
                 is_new_candle = last.get("candle_ts") != sig["candle_ts"]
                 cooled = (now_ts - last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
                 pair_cooled = (now_ts - pair_last.get("sent_at", 0)) >= COOLDOWN_MIN * 60
@@ -417,28 +340,10 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 )
                 same_setup_locked = same_price_zone and ((now_ts - last.get("sent_at", 0)) < SAME_SETUP_LOCK_MIN * 60)
 
-                # Unified Cross-Strategy Re-Entry Lock on (pair_base, direction):
-                # Blocks Box <-> EMA flip-flop re-entries on the same breaking coin for 4h (1h only if previous trade won TP1).
-                cross_key = f"CROSS_STRAT_LOCK|{pair_base}|{norm_sig_dir}"
-                cross_last = state.get(cross_key, {}) if isinstance(state.get(cross_key), dict) else {}
-                cross_at = float(cross_last.get("autotraded_at", 0.0) or 0.0)
-                _cross_prev_tp1_won = any(
-                    isinstance(_h, dict)
-                    and _canon_pair(_h.get("pair", "")) == pair_base
-                    and str(_h.get("direction", "")).upper() == norm_sig_dir
-                    and bool(_h.get("tp1_hit", False))
-                    and float(_h.get("opened_ts", 0.0) or 0.0) >= (cross_at - 15.0)
-                    for _h in (auto_cfg.get("history") or [])[:15]
-                )
-                _cross_lock_sec = (COOLDOWN_MIN * 60) if _cross_prev_tp1_won else (SAME_SETUP_LOCK_MIN * 60)
-                cross_strat_locked = cross_at > 0 and ((now_ts - cross_at) < _cross_lock_sec)
-
                 if not is_new_candle:
                     msg = "already alerted for this candle"
                 elif same_setup_locked:
                     msg = "already alerted for this setup zone"
-                elif cross_strat_locked:
-                    msg = f"cross-strategy 4h lock on {pair_base} {norm_sig_dir}"
                 elif not (cooled and pair_cooled):
                     msg = "on cooldown"
                 else:
@@ -460,12 +365,9 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 )
                 _zone_lock_sec = (COOLDOWN_MIN * 60) if _prev_hist_tp1_won else (SAME_SETUP_LOCK_MIN * 60)
                 already_autotraded_setup = (
-                    (
-                        bool(last.get("autotraded", False))
-                        and same_price_zone
-                        and ((now_ts - last_autotraded_at) < _zone_lock_sec)
-                    )
-                    or cross_strat_locked
+                    bool(last.get("autotraded", False))
+                    and same_price_zone
+                    and ((now_ts - last_autotraded_at) < _zone_lock_sec)
                 )
 
                 if (
@@ -528,7 +430,7 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                     if ok_auto:
                         open_live_pairs.add(pair)
                         open_live_bases.add(pair_base)
-                        if len(open_live_bases) >= eff_max_slots:
+                        if len(open_live_bases) >= MAX_CONCURRENT_PORTFOLIO_TRADES:
                             portfolio_occupied = True
                             active_Slot_pair = pair
                         state[key] = {
@@ -539,13 +441,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                             "tp1": float(sig.get("tp1", 0.0) or 0.0),
                             "autotraded": True,
                             "autotraded_at": now_exec,
-                        }
-                        state[cross_key] = {
-                            "autotraded_at": now_exec,
-                            "strategy_id": s.id,
-                            "entry": cur_entry,
-                            "direction": norm_sig_dir,
-                            "pair": pair,
                         }
                         autotrade_daily_count += 1
                         state[autotrade_daily_key] = autotrade_daily_count
@@ -565,180 +460,3 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         _LAST_SCAN_CACHE["results"] = list(results)
         _LAST_SCAN_CACHE["ts"] = time.time()
         return results
-
-
-def scan_manual_intraday_signals(
-    pairs: list[str],
-    margin_inr: float = 10000.0,
-    leverage: int = 10,
-    usd_inr: float = 85.0,
-) -> list[dict]:
-    """
-    Read-only manual trading scanner powered by `exp-staging-intraday-score-router`:
-    Evaluates every watchlist coin with per-coin intraday score (-4..+4) + ADX(14) + Daily risk weighting
-    (`1.0x / 0.8x / 0.6x` & `70%` Counter-Daily TP1) and tags whether each setup also passes strict v41
-    AutoTrade eligibility. Never places automated orders.
-    """
-    auto_cfg = eng.get_autotrade_config()
-    auto_mode = strat_registry.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
-    out = []
-    for pair in (pairs or []):
-        try:
-            info = strat_registry.evaluate_manual_intraday_setup(
-                pair=pair,
-                margin_inr=float(margin_inr or 10000.0),
-                leverage=int(leverage or 10),
-                usd_inr=float(usd_inr or 85.0),
-            )
-            lsig = info.get("live_signal")
-            strict_ok = False
-            if isinstance(lsig, dict) and lsig.get("signal") in ("LONG", "SHORT"):
-                d_b = str(info.get("daily_bias") or "NEUTRAL").upper()
-                d_dir = str(lsig["signal"]).upper()
-                bias_ok = not ((d_b == "BEARISH" and d_dir != "SHORT") or (d_b == "BULLISH" and d_dir != "LONG"))
-                is_manual_ext = bool(lsig.get("is_box_extension") or lsig.get("manual_only"))
-                strict_ok = bool(
-                    (not is_manual_ext)
-                    and bias_ok
-                    and _autotrade_signal_eligible(
-                        str(lsig.get("strategy_id") or "box_theory"),
-                        d_dir,
-                        auto_mode,
-                        levels=info.get("levels"),
-                    )
-                )
-            info["strict_v41_autotrade_eligible"] = strict_ok
-            out.append(info)
-        except Exception as e:
-            out.append({"pair": pair, "error": str(e), "policy": {}, "live_signal": None, "prefill_ticket": None, "strict_v41_autotrade_eligible": False})
-    return out
-
-
-def alert_manual_intraday_signals(
-    pairs: list[str],
-    margin_inr: float = 10000.0,
-    leverage: int = 10,
-    usd_inr: float = 85.0,
-    send: bool = True,
-    already_alerted_pairs: set[str] | list[str] | None = None,
-) -> list[dict]:
-    """
-    24/7 Background Email Alerter for Manual Intraday Score Router (`exp-staging-intraday-score-router`):
-      - Read-only / Manual-alert ONLY (NEVER places automated AutoTrade orders; AutoTrade stays strictly v41!).
-      - Honors `manual_intraday_email_alerts_enabled` (defaults False on Staging/Experiment, True on Main).
-      - Deduplicates against `already_alerted_pairs` (pairs already emailed by strict v41 in this cycle),
-        same candle timestamp, per-pair cooldown (`COOLDOWN_MIN`), and daily cap (`MAX_DAILY_ALERTS_PER_PAIR`).
-      - Sends Gmail alert with scaled AutoTrade Wallet margin (`1.0x/0.8x/0.6x`), `50%/70%` TP1 split, and a
-        1-click Execute link that pre-fills Entry, SL, TP1, TP2, scaled Margin, Leverage, and TP1 Book %.
-    """
-    auto_cfg = eng.get_autotrade_config()
-    _non_live_env = eng.is_staging_environment() or eng.is_experiment_environment()
-    manual_email_on = bool(auto_cfg.get("manual_intraday_email_alerts_enabled", False if _non_live_env else True))
-    eff_send = bool(send) and manual_email_on
-    skip_pairs = set(already_alerted_pairs or [])
-
-    scanned = scan_manual_intraday_signals(
-        pairs=pairs,
-        margin_inr=float(margin_inr or 10000.0),
-        leverage=int(leverage or 10),
-        usd_inr=float(usd_inr or 85.0),
-    )
-    if not eff_send:
-        return scanned
-
-    with _SCAN_LOCK:
-        state = _load()
-        now_ts = time.time()
-        today_str = eng.get_crypto_trading_day_str()
-
-        for item in scanned:
-            item["manual_emailed"] = False
-            item["manual_email_msg"] = ""
-            lsig = item.get("live_signal")
-            pair = str(item.get("pair") or "")
-            if not pair or not isinstance(lsig, dict) or lsig.get("signal") not in ("LONG", "SHORT"):
-                continue
-            if pair in skip_pairs:
-                item["manual_email_msg"] = "Skipped (already emailed by Strict v41 this cycle)"
-                continue
-
-            sid = str(lsig.get("strategy_id") or "box_theory")
-            key = f"{pair}::manual_intraday::{sid}"
-            pair_lock_key = f"{pair}::manual_intraday_pair_lock"
-            daily_key = f"{pair}::manual_intraday_daily::{today_str}"
-            last = state.get(key, {})
-            pair_last = state.get(pair_lock_key, {})
-            daily_cnt = int(state.get(daily_key, 0) or 0)
-
-            c_ts = int(lsig.get("candle_ts", 0) or 0)
-            is_new_candle = (c_ts <= 0) or (last.get("candle_ts") != c_ts)
-            cooled = (now_ts - float(last.get("sent_at", 0.0) or 0.0)) >= COOLDOWN_MIN * 60
-            pair_cooled = (now_ts - float(pair_last.get("sent_at", 0.0) or 0.0)) >= COOLDOWN_MIN * 60
-
-            if not (is_new_candle and cooled and pair_cooled and daily_cnt < MAX_DAILY_ALERTS_PER_PAIR):
-                item["manual_email_msg"] = "Cooldown / duplicate candle / daily cap"
-                continue
-
-            pol = item.get("policy") or {}
-            score_v = int(pol.get("score", 0) or 0)
-            size_mult = float(lsig.get("size_mult", pol.get("size_mult", 1.0)) or 1.0)
-            tp1_frac = float(lsig.get("tp1_book_frac", pol.get("tp1_book_frac", 0.50)) or 0.50)
-            tp1_pct = int(round(tp1_frac * 100))
-            sugg_m = float(lsig.get("suggested_margin_inr") or max(500.0, float(margin_inr) * size_mult))
-            base_sname = str(lsig.get("strategy_name") or strat_registry.get_strategy(sid).name)
-            is_ext_sig = bool(lsig.get("is_box_extension") or lsig.get("manual_only"))
-            ext_lbl = ("Breakdown 1R/2R" if str(lsig.get("signal", "")).upper() == "SHORT" else "Breakout 1R/2R") if is_ext_sig else ""
-            strat_label = (
-                f"Manual {ext_lbl} ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
-                if is_ext_sig
-                else f"Manual Intraday ({score_v:+d} | {size_mult:.2g}x | {tp1_pct}% TP1) - {base_sname}"
-            )
-            strict_tag = (
-                "Manual Only — Breakdown/Breakout Continuation (1R/2R, excluded from AutoTrade)."
-                if is_ext_sig
-                else (
-                    "Also eligible under Strict v41 AutoTrade."
-                    if item.get("strict_v41_autotrade_eligible")
-                    else "Manual Only (Counter-Daily / Intraday Router — skipped by Strict v41 AutoTrade)."
-                )
-            )
-            note_txt = (
-                f"{strict_tag} Score {score_v:+d} | ADX {float(pol.get('adx', 0.0)):.1f} | "
-                f"Regime {pol.get('regime', 'INTRADAY')} | Scaled Margin ₹{sugg_m:,.0f} ({size_mult:.2g}x) | "
-                f"Book {tp1_pct}% at TP1 & move SL to breakeven."
-            )
-            emailed, msg = email_notifier.send_trade_email(
-                pair=pair,
-                direction=lsig["signal"],
-                entry=float(lsig["entry"]),
-                stop_loss=float(lsig["stop_loss"]),
-                tp1=float(lsig["tp1"]),
-                tp2=float(lsig["tp2"]),
-                margin_inr=sugg_m,
-                leverage=int(leverage),
-                zone=str(lsig.get("trigger_zone") or pol.get("regime") or ""),
-                kind="SIGNAL",
-                note=note_txt,
-                strategy_name=strat_label,
-                strategy_id=sid,
-                trigger_reason=str(lsig.get("trigger_reason") or ""),
-                levels=item.get("levels"),
-                entry2_sweep=0.0,
-                tp1_book_frac=tp1_frac,
-                size_mult=size_mult,
-                is_manual_router=True,
-            )
-            item["manual_emailed"] = bool(emailed)
-            item["manual_email_msg"] = msg
-            if emailed:
-                sent_t = time.time()
-                state[key] = {
-                    "candle_ts": c_ts,
-                    "sent_at": sent_t,
-                    "direction": lsig["signal"],
-                    "entry": float(lsig["entry"]),
-                }
-                state[pair_lock_key] = {"candle_ts": c_ts, "sent_at": sent_t, "strategy_id": sid}
-                state[daily_key] = daily_cnt + 1
-                _save(state)
-    return scanned
