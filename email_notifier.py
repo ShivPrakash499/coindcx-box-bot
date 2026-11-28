@@ -109,11 +109,12 @@ def _send(subject: str, html: str, text: str) -> tuple[bool, str]:
 def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, tp1: float, tp2: float,
                      margin_inr: float, leverage: int = 5, zone: str = "", kind: str = "SIGNAL",
                      note: str = "", app_url: str = "", strategy_name: str = "", trigger_reason: str = "",
-                     strategy_id: str = "", levels: dict | None = None, entry2_sweep: float = 0.0) -> tuple[bool, str]:
+                     strategy_id: str = "", levels: dict | None = None, entry2_sweep: float = 0.0,
+                     manual_only: bool = False) -> tuple[bool, str]:
     """
-    Sends structured trade email notification with a 1-click action link
-    that opens the Trade Execution tab with all values pre-filled, plus a visual Daily Trend Bias card
-    and the 2-Entry Sweep + Runner breakdown.
+    Sends structured trade email notification with 1-click action links that open the Trade Execution
+    tab (pre-filled) or Chart & Levels tab (with strategy overlay & quick manual execute), plus a
+    visual Daily Trend Bias card and Manual-Only badge when applicable.
     """
     direction = direction.upper()
     is_long = direction in ("LONG", "BUY")
@@ -121,21 +122,34 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     zone = zone or ("Buy Zone RL-SL" if is_long else "Sell Zone RH-SH")
     sym = short_name(pair)
     now = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p IST")
-    base_url = (app_url or _cfg("APP_WEB_URL", "https://shiv-prakash-trade-assistant.streamlit.app")).rstrip("/")
+    _default_web_url = (
+        "https://np-shiv-prakash-trade-assistant.streamlit.app"
+        if str(_cfg("APP_ENV", "")).strip().lower() == "staging"
+        else "https://shiv-prakash-trade-assistant.streamlit.app"
+    )
+    base_url = (app_url or _cfg("APP_WEB_URL", _default_web_url)).rstrip("/")
 
     lv = levels or {}
     has_e2 = float(entry2_sweep or 0.0) > 0.0
     avg_entry_2x = (entry + entry2_sweep) / 2.0 if has_e2 else entry
     tranche_margin_inr = margin_inr * 0.5 if has_e2 else margin_inr
 
-    # Action URL with pre-filled parameters to open execution tab
+    # Action URLs with pre-filled parameters to open Execute tab OR Chart & Levels tab directly
     action_url = (
         f"{base_url}/?tab=execute{f'&strategy={strategy_id}' if strategy_id else ''}&pair={pair}&direction={direction}&entry={entry:.4f}"
         f"&sl={stop_loss:.4f}&tp1={tp1:.4f}&tp2={tp2:.4f}&margin={int(margin_inr)}&lev={leverage}"
     )
+    chart_url = (
+        f"{base_url}/?tab=chart{f'&strategy={strategy_id}' if strategy_id else ''}&pair={pair}&direction={direction}"
+    )
 
     colour = "#16a34a" if is_long else "#dc2626"
-    heading = {"SIGNAL": "Trade Signal Alert", "EXECUTED": "Order Executed", "CLOSED": "Position Closed"}.get(kind, kind)
+    heading = {
+        "SIGNAL": "Manual Trade Signal Alert" if manual_only else "Trade Signal Alert",
+        "MANUAL_SIGNAL": "Manual Trade Signal Alert",
+        "EXECUTED": "Order Executed",
+        "CLOSED": "Position Closed",
+    }.get(kind, kind)
 
     tp1_roe = round((abs(tp1 - entry) / entry) * leverage * 100.0, 2) if entry > 0 else 0.0
     tp2_roe = round((abs(tp2 - entry) / entry) * leverage * 100.0, 2) if entry > 0 else 0.0
@@ -186,6 +200,7 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
 
     rows = [
         ("Strategy", strategy_name or "Box Theory Sweep"),
+        ("Execution Mode", "✋ Manual Only (No AutoTrade)" if manual_only else "🤖 AutoTrade + Manual"),
         ("Asset / Pair", pair),
         ("Trade Direction", direction),
         ("Trigger Zone", zone),
@@ -215,6 +230,13 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
     tr = "".join(f"<tr style='border-bottom:1px solid #f1f5f9'><td style='padding:8px 12px;color:#64748b'>{k}</td>"
                  f"<td style='padding:8px 12px;font-weight:700;text-align:right;color:#0f172a'>{v}</td></tr>" for k, v in rows)
 
+    manual_banner_html = (
+        '<div style="margin-top:8px;display:inline-block;padding:4px 12px;border-radius:14px;background:#f59e0b;color:#0f172a;font-weight:800;font-size:11px;letter-spacing:0.4px;">✋ MANUAL SIGNAL ONLY — NO AUTOTRADE</div>'
+        if manual_only
+        else ""
+    )
+    cta_label = "✋ Review &amp; Manually Execute in Assistant" if manual_only else "🚀 Review &amp; Execute Trade in Assistant"
+
     html = f"""<html><body style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#f8fafc;padding:20px;color:#1e293b;">
       <div style="max-width:540px;margin:auto;background:#ffffff;border-radius:14px;border:1px solid #e2e8f0;overflow:hidden;box-shadow:0 4px 16px rgba(0,0,0,0.06);">
         <div style="background:#0f172a;color:#ffffff;padding:20px;text-align:center">
@@ -223,31 +245,38 @@ def send_trade_email(pair: str, direction: str, entry: float, stop_loss: float, 
           <div style="margin-top:10px;display:inline-block;padding:5px 18px;border-radius:20px;background:{colour};font-weight:800;font-size:14px;color:#fff;">
             {direction} SETUP
           </div>
+          {manual_banner_html}
         </div>
         <div style="padding:16px;">
           {trend_visual_html}
           <table style="width:100%;border-collapse:collapse;font-size:14px;">{tr}</table>
           {f'<div style="margin-top:14px;padding:10px 14px;background:#f1f5f9;border-left:4px solid {colour};border-radius:4px;color:#334155;font-size:13px;"><strong>Note:</strong> {note}</div>' if note else ''}
           <div style="text-align:center;margin-top:24px;margin-bottom:8px;">
-            <a href="{action_url}" style="background:#2563eb;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:800;font-size:15px;display:inline-block;box-shadow:0 4px 12px rgba(37,99,235,0.3);">
-              🚀 Review &amp; Execute Trade in Assistant
+            <a href="{action_url}" style="background:#2563eb;color:#ffffff;padding:14px 24px;border-radius:8px;text-decoration:none;font-weight:800;font-size:15px;display:inline-block;box-shadow:0 4px 12px rgba(37,99,235,0.3);margin:4px;">
+              {cta_label}
+            </a>
+            <a href="{chart_url}" style="background:#0f172a;color:#ffffff;padding:12px 20px;border-radius:8px;text-decoration:none;font-weight:700;font-size:13px;display:inline-block;margin:4px;">
+              📈 Open Chart &amp; Quick-Execute
             </a>
           </div>
           <p style="text-align:center;color:#64748b;font-size:12px;margin-top:10px;line-height:1.4;">
-            Clicking opens the <strong>Crypto Trade Assistant</strong> with prefilled entry (${entry:,.2f}), SL, and Single TP ready for manual review.
+            Clicking opens the <strong>Crypto Trade Assistant</strong> with prefilled entry (${entry:,.4f}), SL, TP1 &amp; TP2 ready for manual execution.
           </p>
         </div>
       </div>
     </body></html>"""
 
     text = (
-        f"⚡ {heading}: {direction} {pair}{f' [{strategy_name}]' if strategy_name else ''}\n"
+        f"⚡ {heading}: {direction} {pair}{f' [{strategy_name}]' if strategy_name else ''}"
+        + (" [MANUAL ONLY - NO AUTOTRADE]\n" if manual_only else "\n")
         + "=" * 40 + "\n"
         + "\n".join(f"{k}: {v}" for k, v in rows)
         + (f"\nNote: {note}\n" if note else "\n")
         + f"\nOpen & Execute in Assistant (Pre-filled):\n{action_url}\n"
+        + f"Open Interactive Chart & Quick-Execute:\n{chart_url}\n"
     )
-    subject = f"{sym} - {strategy_name} - trade notification" if strategy_name else f"{sym} - trade notification"
+    _subj_tag = " [Manual Signal]" if manual_only else ""
+    subject = f"{sym} - {strategy_name}{_subj_tag} - trade notification" if strategy_name else f"{sym}{_subj_tag} - trade notification"
     return _send(subject, html, text)
 
 

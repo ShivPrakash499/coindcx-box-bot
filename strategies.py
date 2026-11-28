@@ -2504,6 +2504,252 @@ class Ema50200PullbackStrategy(Strategy):
 
 
 # ----------------------------------------------------------------------------------------------
+# Strategy 5 (Manual Only): 15m 9/21 EMA Crossover & Pullback Strategy
+# ----------------------------------------------------------------------------------------------
+def _price_precision(px: float) -> int:
+    p = abs(float(px or 0.0))
+    if p >= 1000.0:
+        return 2
+    if p >= 1.0:
+        return 4
+    if p >= 0.01:
+        return 5
+    return 6
+
+
+def compute_9_21_ema_crossover_plan(
+    pair: str,
+    levels: dict | None,
+    live_price: float,
+    margin_inr: float,
+    leverage: int = DEFAULT_LEVERAGE,
+    usd_inr: float = 85.0,
+    df_15m: pd.DataFrame | None = None,
+) -> dict:
+    """
+    Computes 15m 9 EMA & 21 EMA crossover + pullback setup plans (BUY & SELL) for manual execution
+    on the Signals, Execute, and Chart tabs. Strictly Manual-Only (never AutoTraded).
+    """
+    df = df_15m if (df_15m is not None and not df_15m.empty) else _closed_15m(pair, limit=180)
+    if df is None or df.empty or len(df) < 25:
+        return {}
+
+    d = df.copy().reset_index(drop=True)
+    d["EMA9"] = d["close"].ewm(span=9, adjust=False).mean()
+    d["EMA21"] = d["close"].ewm(span=21, adjust=False).mean()
+
+    c = d.iloc[-1]
+    p = d.iloc[-2]
+    e9 = float(c["EMA9"])
+    e21 = float(c["EMA21"])
+    pe9 = float(p["EMA9"])
+    pe21 = float(p["EMA21"])
+    c_close = float(c["close"])
+    c_open = float(c["open"])
+    c_high = float(c["high"])
+    c_low = float(c["low"])
+    p_close = float(p["close"])
+    ref_px = float(live_price) if (live_price and float(live_price) > 0) else c_close
+    if ref_px <= 0:
+        return {}
+
+    cross_up_idx, cross_dn_idx = [], []
+    e9_vals = d["EMA9"].tolist()
+    e21_vals = d["EMA21"].tolist()
+    for i in range(1, len(d)):
+        if e9_vals[i - 1] <= e21_vals[i - 1] and e9_vals[i] > e21_vals[i]:
+            cross_up_idx.append(i)
+        elif e9_vals[i - 1] >= e21_vals[i - 1] and e9_vals[i] < e21_vals[i]:
+            cross_dn_idx.append(i)
+
+    recent_low = float(d["low"].tail(8).min())
+    recent_high = float(d["high"].tail(8).max())
+    lv = levels or {}
+    rh = float(lv.get("RH", 0.0) or 0.0)
+    rl = float(lv.get("RL", 0.0) or 0.0)
+    prec = _price_precision(ref_px)
+
+    # BUY plan (9 EMA > 21 EMA bullish crossover / pullback)
+    buy_entry = round(ref_px, prec)
+    raw_buy_sl = min(e21 * 0.9975, recent_low * 0.998, buy_entry * 0.9935)
+    if (buy_entry - raw_buy_sl) / buy_entry > 0.025:
+        raw_buy_sl = buy_entry * 0.985
+    buy_sl = round(min(raw_buy_sl, buy_entry * 0.994), prec)
+    buy_tp2_raw = rh if (rh > buy_entry * 1.012) else (buy_entry * 1.028)
+    buy_tp2 = round(buy_tp2_raw, prec)
+    buy_tp1_dist = max(buy_entry * 0.008, min((buy_tp2 - buy_entry) * 0.5, buy_entry * 0.02))
+    buy_tp1 = round(min(buy_entry + buy_tp1_dist, buy_tp2 * 0.996), prec)
+    buy_m = position_metrics(pair, buy_entry, buy_sl, buy_tp1, buy_tp2, margin_inr, leverage, usd_inr)
+
+    # SELL plan (9 EMA < 21 EMA bearish crossover / pullback)
+    sell_entry = round(ref_px, prec)
+    raw_sell_sl = max(e21 * 1.0025, recent_high * 1.002, sell_entry * 1.0065)
+    if (raw_sell_sl - sell_entry) / sell_entry > 0.025:
+        raw_sell_sl = sell_entry * 1.015
+    sell_sl = round(max(raw_sell_sl, sell_entry * 1.006), prec)
+    sell_tp2_raw = rl if (0 < rl < sell_entry * 0.988) else (sell_entry * 0.972)
+    sell_tp2 = round(sell_tp2_raw, prec)
+    sell_tp1_dist = max(sell_entry * 0.008, min((sell_entry - sell_tp2) * 0.5, sell_entry * 0.02))
+    sell_tp1 = round(max(sell_entry - sell_tp1_dist, sell_tp2 * 1.004), prec)
+    sell_m = position_metrics(pair, sell_entry, sell_sl, sell_tp1, sell_tp2, margin_inr, leverage, usd_inr)
+
+    fresh_bull_cross = (pe9 <= pe21) and (e9 > e21) and (c_close >= c_open)
+    bull_pullback = (e9 > e21) and (c_low <= max(e9, e21) * 1.0015) and (c_close > e9) and (c_close > c_open) and (c_close > p_close)
+    fresh_bear_cross = (pe9 >= pe21) and (e9 < e21) and (c_close <= c_open)
+    bear_pullback = (e9 < e21) and (c_high >= min(e9, e21) * 0.9985) and (c_close < e9) and (c_close < c_open) and (c_close < p_close)
+
+    buy_plan = {
+        "direction": "BUY",
+        "setup": "15m 9/21 EMA Bullish Setup (Manual Only)",
+        "entry": buy_entry,
+        "entry2_sweep": 0.0,
+        "stop_loss": buy_sl,
+        "tp1": buy_tp1,
+        "tp2": buy_tp2,
+        **buy_m,
+        "strategy_id": "ema9_21_cross",
+        "strategy_name": "15m 9/21 EMA Crossover (Manual)",
+        "manual_only": True,
+        "ema9": round(e9, prec),
+        "ema21": round(e21, prec),
+        "trigger_reason": (
+            f"15m 9 EMA (${e9:.{prec}f}) > 21 EMA (${e21:.{prec}f}) bullish crossover/pullback (Manual Only)"
+        ),
+    }
+    sell_plan = {
+        "direction": "SELL",
+        "setup": "15m 9/21 EMA Bearish Setup (Manual Only)",
+        "entry": sell_entry,
+        "entry2_sweep": 0.0,
+        "stop_loss": sell_sl,
+        "tp1": sell_tp1,
+        "tp2": sell_tp2,
+        **sell_m,
+        "strategy_id": "ema9_21_cross",
+        "strategy_name": "15m 9/21 EMA Crossover (Manual)",
+        "manual_only": True,
+        "ema9": round(e9, prec),
+        "ema21": round(e21, prec),
+        "trigger_reason": (
+            f"15m 9 EMA (${e9:.{prec}f}) < 21 EMA (${e21:.{prec}f}) bearish crossover/pullback (Manual Only)"
+        ),
+    }
+
+    return {
+        "BUY": buy_plan,
+        "SELL": sell_plan,
+        "ema9": round(e9, prec),
+        "ema21": round(e21, prec),
+        "bias": "BULLISH" if e9 > e21 else "BEARISH",
+        "cross_up_idx": cross_up_idx,
+        "cross_dn_idx": cross_dn_idx,
+        "fresh_bull_cross": fresh_bull_cross,
+        "bull_pullback": bull_pullback,
+        "fresh_bear_cross": fresh_bear_cross,
+        "bear_pullback": bear_pullback,
+        "candle_ts": int(c["timestamp"]) if "timestamp" in c else 0,
+        "df": d,
+    }
+
+
+class Ema921CrossoverStrategy(Strategy):
+    id = "ema9_21_cross"
+    name = "15m 9/21 EMA Crossover (Manual)"
+    short = "9/21 EMA (Manual)"
+    timeframe = "15m 9 EMA / 21 EMA Crossover & Pullback (Manual Only)"
+    description = (
+        "Manual-Only 15m 9/21 EMA Crossover & Pullback strategy. Emits live LONG signals on bullish 9/21 golden cross "
+        "or 9>21 pullback bounce, and SHORT signals on bearish 9/21 death cross or 9<21 rejection. Never AutoTraded."
+    )
+    tp1_name, tp2_name = "TP1 (50% Book)", "TP2 (50% Structural Runner)"
+    uses_live_price = True
+    manual_only = True
+
+    def compute_levels(self, pair):
+        lv = eng.calculate_daily_box_levels(pair) or {}
+        df = _closed_15m(pair, limit=180)
+        if df is not None and not df.empty and len(df) >= 25:
+            e9 = float(df["close"].ewm(span=9, adjust=False).mean().iloc[-1])
+            e21 = float(df["close"].ewm(span=21, adjust=False).mean().iloc[-1])
+            prec = _price_precision(e9 or 1.0)
+            lv = {
+                **lv,
+                "EMA9_15M": round(e9, prec),
+                "EMA21_15M": round(e21, prec),
+                "ema9_21_bias": "BULLISH" if e9 > e21 else "BEARISH",
+            }
+        return lv
+
+    def evaluate_signal(self, pair, levels=None, margin_inr=100000, leverage=DEFAULT_LEVERAGE, usd_inr=85.0):
+        levels = levels or self.compute_levels(pair)
+        df = _closed_15m(pair, limit=180)
+        if df is None or df.empty or len(df) < 25:
+            return {"signal": "NEUTRAL", "strategy_id": self.id, "strategy_name": self.name, "manual_only": True}
+        ref_close = float(df.iloc[-1]["close"])
+        plan = compute_9_21_ema_crossover_plan(pair, levels, ref_close, margin_inr, leverage, usd_inr, df_15m=df)
+        if not plan:
+            return {"signal": "NEUTRAL", "strategy_id": self.id, "strategy_name": self.name, "manual_only": True}
+
+        sig_dir = None
+        sig_kind = None
+        trig_reason = ""
+        prec = _price_precision(ref_close)
+        e9, e21 = plan["ema9"], plan["ema21"]
+
+        if plan["fresh_bull_cross"]:
+            sig_dir, sig_kind = "LONG", "EMA9_21_CROSS"
+            trig_reason = f"15m 9 EMA (${e9:.{prec}f}) crossed ABOVE 21 EMA (${e21:.{prec}f}) — Bullish Golden Cross (Manual Only)"
+        elif plan["fresh_bear_cross"]:
+            sig_dir, sig_kind = "SHORT", "EMA9_21_CROSS"
+            trig_reason = f"15m 9 EMA (${e9:.{prec}f}) crossed BELOW 21 EMA (${e21:.{prec}f}) — Bearish Death Cross (Manual Only)"
+        elif plan["bull_pullback"]:
+            sig_dir, sig_kind = "LONG", "EMA9_21_PULLBACK"
+            trig_reason = f"15m 9>21 EMA Bullish Pullback Bounce (${e9:.{prec}f} / ${e21:.{prec}f}) (Manual Only)"
+        elif plan["bear_pullback"]:
+            sig_dir, sig_kind = "SHORT", "EMA9_21_PULLBACK"
+            trig_reason = f"15m 9<21 EMA Bearish Pullback Rejection (${e9:.{prec}f} / ${e21:.{prec}f}) (Manual Only)"
+
+        if not sig_dir:
+            return {"signal": "NEUTRAL", "strategy_id": self.id, "strategy_name": self.name, "manual_only": True}
+
+        p_side = plan["BUY"] if sig_dir == "LONG" else plan["SELL"]
+        return {
+            **p_side,
+            "signal": sig_dir,
+            "signal_kind": sig_kind,
+            "trigger_zone": f"15m 9/21 EMA ({'Bullish' if sig_dir == 'LONG' else 'Bearish'})",
+            "trigger_reason": trig_reason,
+            "candle_ts": plan["candle_ts"],
+            "levels": levels,
+            "strategy_id": self.id,
+            "strategy_name": self.name,
+            "manual_only": True,
+        }
+
+    def plan_setups(self, pair, levels, live_price, margin_inr, leverage, usd_inr):
+        plan = compute_9_21_ema_crossover_plan(pair, levels, live_price, margin_inr, leverage, usd_inr)
+        if not plan:
+            return {}
+        return {"BUY": plan["BUY"], "SELL": plan["SELL"]}
+
+    def chart_lines(self, levels, plan=None):
+        return BoxTheorySweep().chart_lines(levels, plan)
+
+    def metric_badges(self, levels):
+        if not levels:
+            return []
+        badges = []
+        if levels.get("EMA9_15M"):
+            badges.append(("15m 9 EMA", levels["EMA9_15M"]))
+        if levels.get("EMA21_15M"):
+            badges.append(("15m 21 EMA", levels["EMA21_15M"]))
+        return badges
+
+    def level_rows(self, levels, live_price):
+        return BoxTheorySweep().level_rows(levels, live_price)
+
+
+# ----------------------------------------------------------------------------------------------
 # Combo Strategy (Priority 1: Box Theory Sweep -> Priority 2: 15m 50/200 EMA Pullback)
 # ----------------------------------------------------------------------------------------------
 class BoxPlusEma50200Strategy(Strategy):
@@ -2518,11 +2764,11 @@ class BoxPlusEma50200Strategy(Strategy):
         self.allow_bull_ema = allow_bull_ema
         self.regime_adaptive = regime_adaptive
         if regime_adaptive:
-            self.timeframe = "Regime-Adaptive: Box Sweep (All Regimes) + Auto Bull/Bear 15m 50/200 EMA in Strong Trends"
+            self.timeframe = "AB-3 Regime-Adaptive: Bull=EMA-L | Bear=Box-S+EMA-S | Chop=Box L+S"
             self.description = (
-                "2-Year Verified Regime-Adaptive Routing: always runs Strategy 1 (15m Box Theory Sweep L+S); "
-                "automatically activates Bull 15m 50/200 EMA Longs in STRONG UPTREND, Bear 15m 50/200 EMA Shorts "
-                "in STRONG DOWNTREND, and pauses EMA trend entries during RANGING / CHOP markets."
+                "AB-3 Regime-Adaptive Hybrid: STRONG UPTREND pauses Box Sweep & runs 15m 50/200 EMA LONGs only; "
+                "STRONG DOWNTREND blocks Box LONGs (No-Bear-Long Guard) & runs Box SHORTs + 15m 50/200 EMA SHORTs; "
+                "RANGING / CHOP runs Box Sweep (L+S, Broken-Box Guard) & pauses 15m 50/200 EMA."
             )
         else:
             self.timeframe = (
@@ -2550,19 +2796,28 @@ class BoxPlusEma50200Strategy(Strategy):
         allow_box_flip: bool = False,
     ):
         levels = levels or self.compute_levels(pair)
-        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
-            return sig1
         if self.regime_adaptive:
             reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
-            if reg == "RANGING_CHOP":
-                return sig1
-            sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
-            if sig4 and (
-                (reg == "STRONG_DOWNTREND" and sig4.get("signal") == "SHORT")
-                or (reg == "STRONG_UPTREND" and sig4.get("signal") == "LONG")
-            ):
-                return sig4
+            # AB-3 STRONG_UPTREND: Pause Box Sweep -> run 15m 50/200 EMA LONGs only
+            if reg == "STRONG_UPTREND":
+                sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+                if sig4 and sig4.get("signal") == "LONG":
+                    return sig4
+                return {"signal": "NEUTRAL", "strategy_id": self.id, "strategy_name": self.name}
+            # AB-3 STRONG_DOWNTREND: No-Bear-Long Guard -> Box Sweep SHORTs + 15m 50/200 EMA SHORTs only
+            if reg == "STRONG_DOWNTREND":
+                sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+                if sig1 and sig1.get("signal") == "SHORT":
+                    return sig1
+                sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+                if sig4 and sig4.get("signal") == "SHORT":
+                    return sig4
+                return {"signal": "NEUTRAL", "strategy_id": self.id, "strategy_name": self.name}
+            # AB-3 RANGING_CHOP: Box Sweep L+S only (15m 50/200 EMA paused)
+            return self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+
+        sig1 = self.s1.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+        if sig1 and sig1.get("signal") in ("LONG", "SHORT"):
             return sig1
         sig4 = self.s4.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
         if sig4 and sig4.get("signal") in ("LONG", "SHORT"):
@@ -2614,25 +2869,29 @@ class BoxPlusEma50200Strategy(Strategy):
         return self.s1.backtest_has_context(candle, ctx["ctx1"])
 
     def backtest_entry(self, idx, candle, ctx, records):
+        if self.regime_adaptive:
+            day_reg = (ctx.get("regime_map") or {}).get(candle["date_str"], "RANGING_CHOP")
+            # AB-3 STRONG_UPTREND: Pause Box Sweep -> 15m 50/200 EMA LONGs only
+            if day_reg == "STRONG_UPTREND":
+                e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
+                return e4 if (e4 and e4.get("direction") == "LONG") else None
+            # AB-3 STRONG_DOWNTREND: No-Bear-Long Guard -> Box Sweep SHORTs + 15m 50/200 EMA SHORTs only
+            if day_reg == "STRONG_DOWNTREND":
+                e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
+                if e1 and e1.get("direction") == "SHORT":
+                    return e1
+                e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
+                return e4 if (e4 and e4.get("direction") == "SHORT") else None
+            # AB-3 RANGING_CHOP: Box Sweep L+S only (EMA paused)
+            return self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
         e1 = self.s1.backtest_entry(idx, candle, ctx["ctx1"], records)
         if e1:
             return e1
-        if self.regime_adaptive:
-            day_reg = (ctx.get("regime_map") or {}).get(candle["date_str"], "RANGING_CHOP")
-            if day_reg == "RANGING_CHOP":
-                return None
-            e4 = self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
-            if e4 and (
-                (day_reg == "STRONG_DOWNTREND" and e4.get("direction") == "SHORT")
-                or (day_reg == "STRONG_UPTREND" and e4.get("direction") == "LONG")
-            ):
-                return e4
-            return None
         return self.s4.backtest_entry(idx, candle, ctx["ctx4"], records)
 
 
 AUTOTRADE_MODE_CHOICES: list[tuple[str, str]] = [
-    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive [Box + Auto Trend EMA] (Recommended)"),
+    ("box_plus_ema50_200_regime", "Combo: Regime-Adaptive AB-3 [Bull: EMA-L • Bear: Box-S+EMA-S • Chop: Box L+S] (Recommended)"),
     ("box_plus_ema50_200_bear", "Combo: Box (L+S) + Bear 15m 50/200 EMA"),
     ("box_plus_ema50_200_both", "Combo: Box + Bull & Bear 15m 50/200 EMA"),
     ("box_theory", "Box Theory Sweep Only (v27)"),
@@ -2664,6 +2923,8 @@ def autotrade_mode_strategy_ids(mode: str | None) -> list[str]:
             reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             if reg == "RANGING_CHOP":
                 return ["box_theory"]
+            if reg == "STRONG_UPTREND":
+                return ["ema50_200"]  # AB-3: Pause Box Sweep in Strong Uptrend
         except Exception:
             pass
     return ["box_theory", "ema50_200"]
@@ -2677,10 +2938,11 @@ STRATEGY_REGISTRY: dict[str, Strategy] = {
     AtrReversal.id: AtrReversal(),
     Ema9RetestStrategy.id: Ema9RetestStrategy(),
     Ema50200PullbackStrategy.id: Ema50200PullbackStrategy(allow_bear=True, allow_bull=True),
+    Ema921CrossoverStrategy.id: Ema921CrossoverStrategy(),
     "box_plus_ema50_200_regime": BoxPlusEma50200Strategy(
         sid="box_plus_ema50_200_regime",
-        name="Combo: Regime-Adaptive [Box + Auto Trend EMA]",
-        short_lbl="Combo (Regime-Adaptive)",
+        name="Combo: Regime-Adaptive AB-3 [Box + Auto Trend EMA]",
+        short_lbl="Combo (AB-3 Regime-Adaptive)",
         allow_bull_ema=True,
         regime_adaptive=True,
     ),
@@ -2709,6 +2971,7 @@ def list_strategies() -> list[Strategy]:
     return [
         STRATEGY_REGISTRY[BoxTheorySweep.id],
         STRATEGY_REGISTRY[Ema50200PullbackStrategy.id],
+        STRATEGY_REGISTRY[Ema921CrossoverStrategy.id],
         STRATEGY_REGISTRY[AtrReversal.id],
         STRATEGY_REGISTRY[Ema9RetestStrategy.id],
     ]
