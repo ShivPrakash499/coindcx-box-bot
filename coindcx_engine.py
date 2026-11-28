@@ -6261,12 +6261,15 @@ def execute_autotrade_two_entry_signal(
         daily_bias = "NEUTRAL"
 
     # AutoTrade Strategy Enforcement: supports `box_theory` (Strategy 1) and `ema50_200` (Strategy 4)
-    # per the configured `autotrade_strategy_mode` (default: `box_plus_ema50_200_bear`)
+    # per the configured `autotrade_strategy_mode` (default: `box_plus_ema50_200_regime` — AB-3).
+    # Manual-only strategies (e.g. `ema9_21_cross`) are strictly blocked for AutoTrade and allowed
+    # ONLY when `manual_override=True` (explicit manual click from UI).
     import strategies as _strat_mod
     auto_mode = _strat_mod.resolve_autotrade_mode(cfg.get("autotrade_strategy_mode"))
     sig_strat_id = str(sig.get("strategy_id") or "box_theory")
     allow_mode_override = bool(sig.get("manual_override", False))
-    if sig_strat_id not in ("box_theory", "ema50_200"):
+    _allowed_exec_strats = ("box_theory", "ema50_200", "ema9_21_cross") if allow_mode_override else ("box_theory", "ema50_200")
+    if sig_strat_id not in _allowed_exec_strats:
         return False, (
             f"AutoTrade Strategy Guard: AutoTrade only executes Box Theory Sweep or 15m 50/200 EMA Pullback; "
             f"skipping {sig_strat_id} on {pair}."
@@ -6285,23 +6288,36 @@ def execute_autotrade_two_entry_signal(
                 f"AutoTrade Mode Guard: Bear-Only 15m 50/200 EMA mode skips {norm_dir} EMA entries on {pair} "
                 f"(switch to Combo: Regime-Adaptive or Bull & Bear EMA to enable Bullish EMA Longs)."
             ), {"strategy_id": sig_strat_id, "mode": auto_mode, "direction": norm_dir}
-        if auto_mode == "box_plus_ema50_200_regime" and sig_strat_id == "ema50_200":
+        if auto_mode == "box_plus_ema50_200_regime":
             reg_info = compute_market_regime()
             cur_reg = str(reg_info.get("regime", "RANGING_CHOP"))
-            if cur_reg == "RANGING_CHOP":
-                return False, (
-                    f"Market Regime Guard ({reg_info.get('label', 'RANGING / CHOP')}): Market is ranging "
-                    f"(2d median {reg_info.get('median_2d_pct', 0.0):+.2f}%), auto-pausing 15m 50/200 EMA on {pair} "
-                    f"and trading Box Theory Sweep only."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-            if cur_reg == "STRONG_DOWNTREND" and norm_dir != "SHORT":
-                return False, (
-                    f"Market Regime Guard (STRONG DOWNTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
-            if cur_reg == "STRONG_UPTREND" and norm_dir != "LONG":
-                return False, (
-                    f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
-                ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+            # AB-3 Regime Guards on Box Theory Sweep:
+            if sig_strat_id == "box_theory":
+                if cur_reg == "STRONG_UPTREND":
+                    return False, (
+                        f"AB-3 Regime Guard (STRONG UPTREND): Box Sweep is paused in strong uptrends "
+                        f"(running 15m 50/200 EMA LONGs only); skipping Box {norm_dir} on {pair}."
+                    ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg, "direction": norm_dir}
+                if cur_reg == "STRONG_DOWNTREND" and norm_dir == "LONG":
+                    return False, (
+                        f"AB-3 No-Bear-Long Guard (STRONG DOWNTREND): Blocking counter-regime Box LONG on {pair} "
+                        f"(Box SHORTs & 15m 50/200 EMA SHORTs active)."
+                    ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg, "direction": norm_dir}
+            if sig_strat_id == "ema50_200":
+                if cur_reg == "RANGING_CHOP":
+                    return False, (
+                        f"Market Regime Guard ({reg_info.get('label', 'RANGING / CHOP')}): Market is ranging "
+                        f"(2d median {reg_info.get('median_2d_pct', 0.0):+.2f}%), auto-pausing 15m 50/200 EMA on {pair} "
+                        f"and trading Box Theory Sweep only."
+                    ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+                if cur_reg == "STRONG_DOWNTREND" and norm_dir != "SHORT":
+                    return False, (
+                        f"Market Regime Guard (STRONG DOWNTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
+                    ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
+                if cur_reg == "STRONG_UPTREND" and norm_dir != "LONG":
+                    return False, (
+                        f"Market Regime Guard (STRONG UPTREND): Blocking counter-regime {norm_dir} EMA entry on {pair}."
+                    ), {"strategy_id": sig_strat_id, "mode": auto_mode, "regime": cur_reg}
         if sig_strat_id == "ema50_200":
             open_ema_cnt = count_open_ema50_200_slots(
                 live_positions=live_ex_pos if live_ex_pos is not None else [],

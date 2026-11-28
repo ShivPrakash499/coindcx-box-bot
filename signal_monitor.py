@@ -88,7 +88,10 @@ def enabled_strategy_ids() -> list:
 
 
 def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str) -> bool:
-    """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection."""
+    """Checks whether a confirmed signal satisfies the Sidebar AutoTrade Strategy selection (AB-3 aware)."""
+    # Manual-only strategies (e.g. 15m 9/21 EMA Crossover) are NEVER AutoTrade-eligible!
+    if strategy_id == "ema9_21_cross" or getattr(strat_registry.get_strategy(strategy_id), "manual_only", False):
+        return False
     m = strat_registry.resolve_autotrade_mode(auto_mode)
     d = str(direction or "").upper()
     if m == "box_theory":
@@ -100,10 +103,15 @@ def _autotrade_signal_eligible(strategy_id: str, direction: str, auto_mode: str)
     if m == "box_plus_ema50_200_both":
         return strategy_id in ("box_theory", "ema50_200")
     if m == "box_plus_ema50_200_regime":
+        reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
         if strategy_id == "box_theory":
+            # AB-3: Pause Box Sweep in STRONG_UPTREND; block Box LONG in STRONG_DOWNTREND; allow L+S in RANGING_CHOP
+            if reg == "STRONG_UPTREND":
+                return False
+            if reg == "STRONG_DOWNTREND":
+                return d == "SHORT"
             return True
         if strategy_id == "ema50_200":
-            reg = str(eng.compute_market_regime().get("regime", "RANGING_CHOP"))
             return (reg == "STRONG_DOWNTREND" and d == "SHORT") or (reg == "STRONG_UPTREND" and d == "LONG")
         return False
     return strategy_id == strat_registry.DEFAULT_STRATEGY_ID
@@ -288,12 +296,6 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                 if sid in ("box_theory", "atr_reversal"):
                     pair_primary_triggered = True
 
-                if auto_mode == "box_plus_ema50_200_regime" and s.id == "ema50_200":
-                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode):
-                        reg_lbl = eng.compute_market_regime().get("label", "RANGING / CHOP")
-                        results.append({**row, "signal": None, "message": f"paused by Regime-Adaptive mode ({reg_lbl})"})
-                        continue
-
                 if float(sig.get("roe_tp1", 0.0)) < 3.0:
                     results.append({**row, "message": f"skipped: TP ROE ({sig.get('roe_tp1')}%) < 3% minimum"})
                     continue
@@ -305,6 +307,12 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
                         "message": f"skipped: {pair} is already in an active Live Trade"
                     })
                     continue
+
+                if auto_mode == "box_plus_ema50_200_regime" and s.id in ("box_theory", "ema50_200"):
+                    if not _autotrade_signal_eligible(s.id, sig.get("signal"), auto_mode):
+                        reg_lbl = eng.compute_market_regime().get("label", "RANGING / CHOP")
+                        results.append({**row, "signal": None, "message": f"paused by AB-3 Regime-Adaptive mode ({reg_lbl})"})
+                        continue
 
                 # 1-Crypto-at-a-Time Guard: If any crypto is already active, do not alert/open another crypto
                 if portfolio_occupied and active_Slot_pair and _canon_pair(active_Slot_pair) != pair_base:
@@ -460,3 +468,167 @@ def scan_and_alert(pairs=None, margin_inr: float = None, leverage: int = 10, usd
         _LAST_SCAN_CACHE["results"] = list(results)
         _LAST_SCAN_CACHE["ts"] = time.time()
         return results
+
+
+MANUAL_SIGNAL_STRATEGIES: tuple[str, ...] = ("box_theory", "ema50_200", "ema9_21_cross")
+_LAST_MANUAL_SCAN_CACHE = {"ts": 0.0, "results": []}
+
+
+def scan_manual_trade_signals(
+    pairs=None,
+    margin_inr: float = None,
+    leverage: int = 10,
+    usd_inr: float = 85.0,
+    send_emails: bool = False,
+    strategy_ids=None,
+    bypass_cache: bool = False,
+) -> list:
+    """
+    Scans all watchlist pairs for confirmed Manual Trade Signals across:
+      1. Box Theory Sweep (including Manual Shifted-Box Polarity Flip when box is broken)
+      2. 15m 50/200 EMA Pullback (both Bull & Bear)
+      3. 15m 9/21 EMA Crossover / Pullback (strictly Manual Only)
+
+    NEVER auto-executes trades. Tags every signal as either `🤖 AB-3 AutoTrade + Manual` or
+    `✋ Manual Only (No AutoTrade)`. When `send_emails=True` and `email_alerts_enabled` is ON,
+    sends deduplicated 1-click-execute emails (with Execute & Chart deep-links) for manual-only
+    signals (plus any Box Flip / 9-21 EMA / regime-paused setup not already emailed by AutoTrade).
+    """
+    auto_cfg = eng.get_autotrade_config()
+    auto_mode = strat_registry.resolve_autotrade_mode(auto_cfg.get("autotrade_strategy_mode"))
+    if margin_inr is None or margin_inr <= 0:
+        margin_inr = float(auto_cfg.get("single_trade_margin_inr", 100000.0))
+    if leverage is None or leverage <= 0:
+        leverage = int(auto_cfg.get("leverage", 10))
+
+    _non_live_env = eng.is_staging_environment() or eng.is_experiment_environment()
+    email_cfg_enabled = bool(auto_cfg.get("email_alerts_enabled", False if _non_live_env else True))
+    do_send = bool(send_emails) and email_cfg_enabled
+
+    if not pairs:
+        pairs = eng.get_high_volatility_watchlist(top_n=12)
+    else:
+        pairs = list(pairs)
+
+    sids = tuple(strategy_ids) if strategy_ids else MANUAL_SIGNAL_STRATEGIES
+    is_daemon_thread = threading.current_thread().name.startswith("CryptoTradeAssistantDaemon")
+
+    if not bypass_cache and not do_send and not is_daemon_thread and _LAST_MANUAL_SCAN_CACHE.get("results"):
+        if (time.time() - float(_LAST_MANUAL_SCAN_CACHE.get("ts", 0.0))) < 45.0:
+            return list(_LAST_MANUAL_SCAN_CACHE["results"])
+
+    reg_info = {}
+    try:
+        reg_info = eng.compute_market_regime() or {}
+    except Exception:
+        reg_info = {"regime": "RANGING_CHOP", "label": "RANGING / CHOP"}
+    cur_reg_lbl = str(reg_info.get("label", "RANGING / CHOP"))
+
+    state = _load() if do_send else {}
+    today_ist = datetime.now(eng.IST).strftime("%Y-%m-%d")
+    now_ts = time.time()
+    out = []
+
+    for pair in pairs:
+        if is_daemon_thread:
+            time.sleep(0.02)
+        for sid in sids:
+            s = strat_registry.get_strategy(sid)
+            try:
+                levels = s.compute_levels(pair)
+                if not levels:
+                    continue
+                if sid == "box_theory":
+                    sig = s.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr, allow_box_flip=True)
+                else:
+                    sig = s.evaluate_signal(pair, levels, margin_inr, leverage, usd_inr)
+            except Exception:
+                continue
+
+            if not sig or sig.get("signal") not in ("LONG", "SHORT"):
+                continue
+
+            is_flip = bool(sig.get("is_box_flip", False))
+            is_manual_strat = bool(sig.get("manual_only", False)) or bool(getattr(s, "manual_only", False)) or is_flip
+            at_elig = (not is_manual_strat) and _autotrade_signal_eligible(sid, sig.get("signal"), auto_mode)
+            exec_tag = "🤖 AB-3 AutoTrade + Manual" if at_elig else "✋ Manual Only (No AutoTrade)"
+            if is_flip:
+                exec_tag = "🔄 Manual Shifted-Box Flip (No AutoTrade)"
+            elif sid == "ema9_21_cross":
+                exec_tag = "✋ 9/21 EMA Manual Only (No AutoTrade)"
+            elif not at_elig:
+                exec_tag = f"✋ Manual Only — Paused by AB-3 ({cur_reg_lbl})"
+
+            emailed = False
+            email_msg = ""
+            # Send manual trade signal email when enabled (deduplicated per candle & 4h price zone)
+            # For AutoTrade-eligible signals, `scan_and_alert` already handles their email; here we
+            # email Manual-Only signals (9/21 EMA, Shifted-Box Flip, and AB-3 paused Box/EMA setups)
+            # so the user gets 100% coverage with zero duplicate emails!
+            if do_send and (not at_elig):
+                m_key = f"MANUAL_SIG|{sid}|{pair}|{sig.get('signal_kind', sid)}|{sig['signal']}"
+                last = state.get(m_key, {})
+                m_daily_key = f"MANUAL_EMAIL_COUNT|{pair}|{today_ist}"
+                m_daily_cnt = int(state.get(m_daily_key, 0))
+                cur_entry = float(sig.get("entry", 0.0) or 0.0)
+                last_entry = float(last.get("entry", 0.0) or 0.0)
+                is_new_candle = last.get("candle_ts") != sig.get("candle_ts")
+                cooled = (now_ts - float(last.get("sent_at", 0.0) or 0.0)) >= COOLDOWN_MIN * 60
+                same_zone = (
+                    last.get("direction") == sig["signal"]
+                    and last_entry > 0
+                    and cur_entry > 0
+                    and (abs(cur_entry - last_entry) / cur_entry) < 0.008
+                )
+                same_locked = same_zone and ((now_ts - float(last.get("sent_at", 0.0) or 0.0)) < SAME_SETUP_LOCK_MIN * 60)
+                if is_new_candle and cooled and (not same_locked) and m_daily_cnt < MAX_DAILY_ALERTS_PER_PAIR:
+                    note_txt = (
+                        f"{exec_tag}. {_note(sid, sig)} "
+                        f"Click below to review on Execute or Chart tab and place manually."
+                    )
+                    emailed, email_msg = email_notifier.send_trade_email(
+                        pair=pair,
+                        direction=sig["signal"],
+                        entry=float(sig["entry"]),
+                        stop_loss=float(sig["stop_loss"]),
+                        tp1=float(sig["tp1"]),
+                        tp2=float(sig["tp2"]),
+                        margin_inr=float(sig.get("margin_inr") or margin_inr),
+                        leverage=int(sig.get("leverage") or leverage),
+                        zone=sig.get("trigger_zone") or "",
+                        kind="MANUAL_SIGNAL",
+                        note=note_txt,
+                        strategy_name=s.name,
+                        strategy_id=sid,
+                        trigger_reason=sig.get("trigger_reason", ""),
+                        levels=sig.get("levels"),
+                        entry2_sweep=float(sig.get("entry2_sweep", 0.0) or 0.0),
+                        manual_only=True,
+                    )
+                    if emailed:
+                        state[m_key] = {
+                            "candle_ts": sig.get("candle_ts"),
+                            "sent_at": time.time(),
+                            "direction": sig["signal"],
+                            "entry": cur_entry,
+                            "strategy_id": sid,
+                        }
+                        state[m_daily_key] = m_daily_cnt + 1
+                        _save(state)
+
+            out.append({
+                "pair": pair,
+                "strategy_id": sid,
+                "strategy_name": s.name,
+                "signal": sig,
+                "autotrade_eligible": at_elig,
+                "manual_only": not at_elig,
+                "is_box_flip": is_flip,
+                "execution_tag": exec_tag,
+                "emailed": emailed,
+                "email_msg": email_msg,
+            })
+
+    _LAST_MANUAL_SCAN_CACHE["results"] = list(out)
+    _LAST_MANUAL_SCAN_CACHE["ts"] = time.time()
+    return out

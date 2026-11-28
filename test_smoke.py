@@ -1342,7 +1342,10 @@ def test_13_regime_adaptive_routing_and_structure_tp1():
         assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
 
     with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "label": "STRONG UPTREND", "median_2d_pct": 1.8}):
-        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory", "ema50_200"]
+        # AB-3: Box Sweep is paused in STRONG_UPTREND; only 15m 50/200 EMA LONGs run for AutoTrade
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["ema50_200"]
+        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime") is False
+        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is False
         assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is True
         assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
 
@@ -1998,6 +2001,146 @@ def test_18_broken_box_acceptance_guard_and_shifted_flip():
     print("  -> PASS: Broken-Box Acceptance Guard (AutoTrade) + Manual-Only Shifted-Box Polarity Flip verified!")
 
 
+def test_19_ab3_regime_guards_and_manual_9_21_execution():
+    print("[19/19] Verifying AB-3 Regime Guards, Manual 15m 9/21 EMA Strategy, Manual Signals Email & Chart/Execute UI...")
+    import tempfile
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+    import signal_monitor as sm
+    import email_notifier as em
+
+    # 1. AB-3 Regime-Adaptive routing across all 3 market regimes
+    with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "label": "STRONG UPTREND", "median_2d_pct": 3.5}):
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["ema50_200"]
+        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime") is False
+        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is False
+        assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("ema9_21_cross", "LONG", "box_plus_ema50_200_regime") is False
+
+    with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -4.2}):
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory", "ema50_200"]
+        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime") is False  # No-Bear-Long Guard
+        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("ema50_200", "LONG", "box_plus_ema50_200_regime") is False
+        assert sm._autotrade_signal_eligible("ema9_21_cross", "SHORT", "box_plus_ema50_200_regime") is False
+
+    with patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP", "median_2d_pct": 0.4}):
+        assert strat.autotrade_mode_strategy_ids("box_plus_ema50_200_regime") == ["box_theory"]
+        assert sm._autotrade_signal_eligible("box_theory", "LONG", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("box_theory", "SHORT", "box_plus_ema50_200_regime") is True
+        assert sm._autotrade_signal_eligible("ema50_200", "SHORT", "box_plus_ema50_200_regime") is False
+
+    # 2. AB-3 hard guards in execute_autotrade_two_entry_signal
+    box_lv = {"RH": 105.0, "RL": 95.0, "MID": 100.0, "SH": 107.0, "SL": 93.0, "trend_bias": "NEUTRAL"}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        t_cfg = os.path.join(tmpdir, "autotrade_config.json")
+        with patch.object(eng, "AUTOTRADE_CONFIG_FILE", t_cfg), \
+             patch.object(eng, "is_staging_environment", return_value=True), \
+             patch.object(eng, "fetch_coindcx_futures_balance", return_value={"is_live_api": False, "total_inr": 60000.0, "available_inr": 60000.0}), \
+             patch.object(eng, "get_active_portfolio_trade_status", return_value={"is_occupied": False}), \
+             patch.object(eng, "_fetch_coindcx_active_positions_sync", return_value=[]), \
+             patch.object(eng, "fetch_live_ticker", return_value={"last_price": 95.5}), \
+             patch.object(eng, "compute_market_bias", return_value={"bias": "NEUTRAL"}), \
+             patch("sheets_logger.log_trade_to_google_sheet", return_value=True):
+            eng._AUTOTRADE_CFG_MEM_CACHE["data"] = None
+            eng.save_autotrade_config({"autotrade_strategy_mode": "box_plus_ema50_200_regime"})
+
+            # STRONG_UPTREND blocks Box Sweep AutoTrade
+            with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_UPTREND", "label": "STRONG UPTREND", "median_2d_pct": 4.0}):
+                ok_u, msg_u, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-SOL_USDT",
+                    sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 95.5, "tp1": 99.0, "tp2": 105.0, "stop_loss": 92.5, "levels": box_lv},
+                    single_trade_margin_inr=10000.0, leverage=10,
+                )
+                assert (not ok_u) and ("AB-3 Regime Guard" in msg_u), (ok_u, msg_u)
+
+            # STRONG_DOWNTREND blocks Box LONG (No-Bear-Long Guard)
+            with patch.object(eng, "compute_market_regime", return_value={"regime": "STRONG_DOWNTREND", "label": "STRONG DOWNTREND", "median_2d_pct": -5.0}):
+                ok_d, msg_d, _ = eng.execute_autotrade_two_entry_signal(
+                    pair="B-SOL_USDT",
+                    sig={"signal": "LONG", "strategy_id": "box_theory", "entry": 95.5, "tp1": 99.0, "tp2": 105.0, "stop_loss": 92.5, "levels": box_lv},
+                    single_trade_margin_inr=10000.0, leverage=10,
+                )
+                assert (not ok_d) and ("AB-3 No-Bear-Long Guard" in msg_d), (ok_d, msg_d)
+
+            # 15m 9/21 EMA is blocked for AutoTrade, allowed ONLY with manual_override=True
+            sig_921 = {
+                "signal": "LONG", "strategy_id": "ema9_21_cross", "manual_only": True,
+                "entry": 95.5, "tp1": 97.5, "tp2": 101.0, "stop_loss": 93.8, "levels": box_lv,
+            }
+            ok_921_at, msg_921_at, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-SOL_USDT", sig=sig_921, single_trade_margin_inr=10000.0, leverage=10,
+            )
+            assert (not ok_921_at) and ("Manual-Only" in msg_921_at), (ok_921_at, msg_921_at)
+
+            ok_921_man, msg_921_man, _ = eng.execute_autotrade_two_entry_signal(
+                pair="B-SOL_USDT", sig={**sig_921, "manual_override": True}, single_trade_margin_inr=10000.0, leverage=10,
+            )
+            assert ok_921_man, f"Expected manual_override=True to execute 9/21 EMA trade, got {ok_921_man} {msg_921_man}"
+
+    # 3. 15m 9/21 EMA strategy registration, golden cross detection & plan generation
+    assert "ema9_21_cross" in strat.STRATEGY_REGISTRY
+    assert any(s.id == "ema9_21_cross" for s in strat.list_strategies())
+    s921 = strat.get_strategy("ema9_21_cross")
+    assert getattr(s921, "manual_only", False) is True
+    # Build synthetic 15m series where 9 EMA crosses cleanly ABOVE 21 EMA on the final closed bar
+    closes = [100.0] * 20 + [92.0] * 8 + [116.0]
+    df_cross = pd.DataFrame([
+        {"open": c * 0.996, "high": c * 1.003, "low": c * 0.994, "close": c, "timestamp": 1795600000000 + i * 900000}
+        for i, c in enumerate(closes)
+    ])
+    with patch.object(strat, "_closed_15m", return_value=df_cross):
+        sig_gc = s921.evaluate_signal("B-SOL_USDT", box_lv, 10000.0, 10, 90.0)
+        assert sig_gc["signal"] == "LONG" and sig_gc["manual_only"] is True and sig_gc["strategy_id"] == "ema9_21_cross", sig_gc
+        assert sig_gc["stop_loss"] < sig_gc["entry"] < sig_gc["tp1"] < sig_gc["tp2"], sig_gc
+        pl_921 = s921.plan_setups("B-SOL_USDT", box_lv, 102.5, 10000.0, 10, 90.0)
+        assert pl_921["BUY"]["manual_only"] is True and pl_921["SELL"]["manual_only"] is True
+
+    # 4. Manual Trade Signals Scanner + Email alert deep links (Execute & Chart)
+    sent_emails = []
+    def _fake_send(subject, html, text):
+        sent_emails.append((subject, html, text))
+        return True, "ok"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        st_file = os.path.join(tmpdir, "signal_state.json")
+        with patch.object(sm, "STATE_FILE", st_file), \
+             patch.object(eng, "get_autotrade_config", return_value={"autotrade_strategy_mode": "box_plus_ema50_200_regime", "email_alerts_enabled": True}), \
+             patch.object(eng, "is_staging_environment", return_value=False), \
+             patch.object(eng, "is_experiment_environment", return_value=False), \
+             patch.object(eng, "compute_market_regime", return_value={"regime": "RANGING_CHOP", "label": "RANGING / CHOP"}), \
+             patch.object(strat, "_closed_15m", return_value=df_cross), \
+             patch.object(eng, "calculate_daily_box_levels", return_value=box_lv), \
+             patch.object(em, "_send", side_effect=_fake_send):
+            ms_res = sm.scan_manual_trade_signals(
+                pairs=["B-SOL_USDT"], margin_inr=10000.0, leverage=10, usd_inr=90.0,
+                send_emails=True, strategy_ids=("ema9_21_cross",), bypass_cache=True,
+            )
+            assert len(ms_res) == 1 and ms_res[0]["manual_only"] is True and ms_res[0]["emailed"] is True, ms_res
+            assert len(sent_emails) == 1
+            subj, html_b, txt_b = sent_emails[0]
+            assert "Manual Signal" in subj and "MANUAL SIGNAL ONLY" in html_b
+            assert "tab=execute&strategy=ema9_21_cross" in html_b and "tab=chart&strategy=ema9_21_cross" in html_b
+
+    # 5. UI markers in app.py (Signals manual feed, Chart 9/21 EMA + Quick-Execute, Execute 9/21 plan)
+    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as f_app:
+        app_src = f_app.read()
+    for marker in (
+        "Manual Trade Signals",
+        "Manual Quick-Execute from Chart",
+        "EMA9_CALC",
+        "EMA21_CALC",
+        "9/21 Golden Cross",
+        "ema9_21_cross",
+        "get_cached_manual_signals_scan",
+    ):
+        assert marker in app_src, f"Missing UI marker in app.py: {marker}"
+
+    print("  -> PASS: AB-3 Regime Guards, Manual 15m 9/21 EMA Strategy, Manual Signals Email & Chart/Execute UI verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -2017,6 +2160,7 @@ if __name__ == "__main__":
     test_16_three_tier_main_staging_experiment_parity()
     test_17_paper_trading_journal_fixes()
     test_18_broken_box_acceptance_guard_and_shifted_flip()
+    test_19_ab3_regime_guards_and_manual_9_21_execution()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
