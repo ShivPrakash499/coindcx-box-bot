@@ -1903,6 +1903,101 @@ def test_17_paper_trading_journal_fixes():
     print("  -> PASS: Paper Trading Journal Fixes verified (Multi-Slot Monitor, No 8h Silent Eviction, Strict Row Match, v35 Tag)!")
 
 
+def test_18_broken_box_acceptance_guard_and_shifted_flip():
+    print("[18/18] Verifying Broken-Box Acceptance Guard (AutoTrade) + Manual-Only Shifted-Box Polarity Flip (v35 Staging)...")
+    import pandas as pd
+    import coindcx_engine as eng
+    import strategies as strat
+
+    s1 = strat.BoxTheorySweep()
+    doge_box = {
+        "RH": 0.0563, "RL": 0.0531, "MID": 0.0547, "SH": 0.0572, "SL": 0.0522,
+        "EMA50": 0.0585, "EMA200": 0.0610, "daily_close": 0.0550, "ATR": 0.0032,
+        "bias": "BEARISH", "trend_bias": "BEARISH",
+    }
+
+    # 1. DOGE/SOL scenario: >=4 consecutive 15m closes > RH (even with 0 closes > SH) blocks SHORT fade!
+    doge_recs = [
+        {"open": 0.0564, "high": 0.0569, "low": 0.0563, "close": 0.0567, "EMA9": 0.0566, "EMA50": 0.0559, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(6)
+    ]
+    doge_recs.append({"open": 0.0567, "high": 0.0568, "low": 0.0561, "close": 0.0562, "EMA9": 0.0565, "EMA50": 0.0559, "date_str": "2026-11-26", "timestamp": 1795600000000 + 6 * 900000})
+    brk_doge = strat._check_box_breakout_state(doge_recs, 6, doge_box["RH"], doge_box["RL"], doge_box["SH"], doge_box["SL"], 0.0559)
+    assert brk_doge["upper_box_broken"] is True and brk_doge["rh_accepted"] is True and brk_doge["sh_broken"] is False
+    doge_ctx = {"boxes": {"2026-11-26": doge_box}, "ema50_15m": [0.0559] * len(doge_recs), "ema9_15m": [0.0565] * len(doge_recs)}
+    assert s1.backtest_entry(6, doge_recs[6], doge_ctx, doge_recs) is None, "Acceptance guard must block broken-box SHORT"
+
+    # 2. Symmetric lower-box acceptance: >=4 consecutive closes < RL blocks LONG fade!
+    dn_box = {**doge_box, "bias": "BULLISH", "trend_bias": "BULLISH", "EMA50": 0.0510, "EMA200": 0.0490}
+    dn_recs = [
+        {"open": 0.0530, "high": 0.05305, "low": 0.0525, "close": 0.0527, "EMA9": 0.0528, "EMA50": 0.0536, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(5)
+    ]
+    dn_recs.append({"open": 0.0527, "high": 0.0533, "low": 0.0526, "close": 0.0532, "EMA9": 0.0529, "EMA50": 0.0536, "date_str": "2026-11-26", "timestamp": 1795600000000 + 5 * 900000})
+    brk_dn = strat._check_box_breakout_state(dn_recs, 5, dn_box["RH"], dn_box["RL"], dn_box["SH"], dn_box["SL"], 0.0536)
+    assert brk_dn["lower_box_broken"] is True and brk_dn["rl_accepted"] is True and brk_dn["sl_broken"] is False
+    dn_ctx = {"boxes": {"2026-11-26": dn_box}, "ema50_15m": [0.0536] * len(dn_recs), "ema9_15m": [0.0529] * len(dn_recs)}
+    assert s1.backtest_entry(5, dn_recs[5], dn_ctx, dn_recs) is None, "Acceptance guard must block broken-box LONG"
+
+    # 3. Genuine 1-bar liquidity sweep above RH still fires valid SHORT
+    sweep_recs = [
+        {"open": 0.0550, "high": 0.0556, "low": 0.0548, "close": 0.0554, "EMA9": 0.0552, "EMA50": 0.0550, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(5)
+    ]
+    sweep_recs.append({"open": 0.0554, "high": 0.0567, "low": 0.0553, "close": 0.0564, "EMA9": 0.0556, "EMA50": 0.0551, "date_str": "2026-11-26", "timestamp": 1795600000000 + 5 * 900000})
+    sweep_recs.append({"open": 0.0564, "high": 0.0566, "low": 0.0558, "close": 0.0559, "EMA9": 0.0557, "EMA50": 0.0551, "date_str": "2026-11-26", "timestamp": 1795600000000 + 6 * 900000})
+    brk_sw = strat._check_box_breakout_state(sweep_recs, 6, doge_box["RH"], doge_box["RL"], doge_box["SH"], doge_box["SL"], 0.0551)
+    assert brk_sw["upper_box_broken"] is False and brk_sw["reconfig"] is None
+    sw_ctx = {"boxes": {"2026-11-26": doge_box}, "ema50_15m": [0.0551] * len(sweep_recs), "ema9_15m": [0.0556] * len(sweep_recs)}
+    sw_bt = s1.backtest_entry(6, sweep_recs[6], sw_ctx, sweep_recs)
+    assert sw_bt is not None and sw_bt["direction"] == "SHORT", f"Valid 1-bar RH sweep must still fire SHORT, got {sw_bt}"
+
+    # 4. Polarity Flip math: SH broken -> New RL = old SH, New SL = old RH; SL broken -> New RH = old SL, New SH = old RL
+    sh_recs = [
+        {"open": 0.0573, "high": 0.0578, "low": 0.0572, "close": 0.0576, "EMA9": 0.0574, "EMA50": 0.0562, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(4)
+    ]
+    brk_sh = strat._check_box_breakout_state(sh_recs, 3, doge_box["RH"], doge_box["RL"], doge_box["SH"], doge_box["SL"], 0.0562)
+    assert brk_sh["sh_broken"] is True and brk_sh["reconfig"]["state"] == "SHIFTED_UP"
+    assert abs(brk_sh["reconfig"]["RL"] - doge_box["SH"]) < 1e-6 and abs(brk_sh["reconfig"]["SL"] - doge_box["RH"]) < 1e-6
+
+    sl_recs = [
+        {"open": 0.0521, "high": 0.05215, "low": 0.0516, "close": 0.0518, "EMA9": 0.0519, "EMA50": 0.0530, "date_str": "2026-11-26", "timestamp": 1795600000000 + i * 900000}
+        for i in range(4)
+    ]
+    brk_sl = strat._check_box_breakout_state(sl_recs, 3, dn_box["RH"], dn_box["RL"], dn_box["SH"], dn_box["SL"], 0.0530)
+    assert brk_sl["sl_broken"] is True and brk_sl["reconfig"]["state"] == "SHIFTED_DOWN"
+    assert abs(brk_sl["reconfig"]["RH"] - dn_box["SL"]) < 1e-6 and abs(brk_sl["reconfig"]["SH"] - dn_box["RL"]) < 1e-6
+
+    # 5. evaluate_signal(allow_box_flip=False) stays NEUTRAL (AutoTrade safe); allow_box_flip=True emits Manual-Only BOX_FLIP
+    flip_df = pd.DataFrame(
+        [{"open": 0.0565, "high": 0.0570, "low": 0.0564, "close": 0.0568, "EMA50": 0.0558, "timestamp": 1795600000000 + i * 900000} for i in range(6)]
+        + [
+            {"open": 0.0568, "high": 0.0569, "low": 0.05625, "close": 0.0564, "EMA50": 0.0559, "timestamp": 1795600000000 + 6 * 900000},
+            {"open": 0.0564, "high": 0.0568, "low": 0.05628, "close": 0.05675, "EMA50": 0.0559, "timestamp": 1795600000000 + 7 * 900000},
+        ]
+    )
+    with patch.object(strat, "_closed_15m", return_value=flip_df):
+        sig_at_off = s1.evaluate_signal("B-DOGE_USDT", doge_box, 10000.0, 10, 90.0, allow_box_flip=False)
+        assert sig_at_off["signal"] == "NEUTRAL" and sig_at_off.get("shifted_box", {}).get("state") == "SHIFTED_UP"
+        sig_man_flip = s1.evaluate_signal("B-DOGE_USDT", doge_box, 10000.0, 10, 90.0, allow_box_flip=True)
+        assert sig_man_flip["signal"] == "LONG" and sig_man_flip.get("signal_kind") == "BOX_FLIP"
+        assert sig_man_flip.get("is_box_flip") is True and sig_man_flip.get("manual_only") is True
+        pl_flip = s1.plan_setups("B-DOGE_USDT", doge_box, 0.05675, 10000.0, 10, 90.0)
+        assert pl_flip["BUY"]["is_box_flip"] is True and pl_flip["SELL"].get("box_broken_warning") is True
+
+    # 6. execute_autotrade_two_entry_signal hard-blocks `is_box_flip` for AutoTrade
+    ok_blk, msg_blk, _ = eng.execute_autotrade_two_entry_signal(
+        pair="B-DOGE_USDT", sig=sig_man_flip, single_trade_margin_inr=5000.0, leverage=10, usd_inr=90.0,
+    )
+    assert (not ok_blk) and ("Manual-Only Continuation/Flip Guard" in msg_blk), (ok_blk, msg_blk)
+
+    with open(os.path.join(ROOT_DIR, "app.py"), "r", encoding="utf-8") as f_app:
+        app_src = f_app.read()
+    assert "get_cached_shifted_box_state" in app_src and "Manual Shifted-Box Flip" in app_src and "Flip RL (New Buy)" in app_src
+    print("  -> PASS: Broken-Box Acceptance Guard (AutoTrade) + Manual-Only Shifted-Box Polarity Flip verified!")
+
+
 if __name__ == "__main__":
     test_1_syntax_and_imports()
     test_2_simulated_200_ok_wallet_and_positions_no_recursion()
@@ -1921,6 +2016,7 @@ if __name__ == "__main__":
     test_15_v35_funds_section_and_wallet_ledger()
     test_16_three_tier_main_staging_experiment_parity()
     test_17_paper_trading_journal_fixes()
+    test_18_broken_box_acceptance_guard_and_shifted_flip()
     if "--live" in sys.argv:
         test_10_live_cloud_deployments_sync()
     print("\nALL AUTOMATED CHECKS PASSED (100%)!")
