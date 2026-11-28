@@ -6563,6 +6563,11 @@ def execute_autotrade_two_entry_signal(
       3. Rejects Maker Limit placement if live price has drifted within `< 0.35%` of Stop Loss.
     """
     cfg = get_autotrade_config()
+    if (not bool(sig.get("manual_override"))) and (bool(sig.get("is_box_flip")) or bool(sig.get("manual_only"))):
+        return False, (
+            f"Manual-Only Continuation/Flip Guard: {sig.get('strategy_id') or 'box_theory'} shifted-box flip on {pair} "
+            f"is restricted to Manual Trading (Execute / Chart / Signals) and excluded from AutoTrade."
+        ), {"strategy_id": sig.get("strategy_id") or "box_theory", "manual_only": True}
     raw_requested_margin = float(single_trade_margin_inr or cfg.get("single_trade_margin_inr", 30000.0))
     honor_custom_margin = bool(cfg.get("user_custom_margin", False))
     lev = int(leverage or cfg.get("leverage", 10))

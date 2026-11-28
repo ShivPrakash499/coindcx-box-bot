@@ -440,10 +440,12 @@ def _check_box_breakout_state(
 ) -> dict:
     """
     Inspects the prior `lookback` closed 15m candles (default 16 candles = 4 hours) before `idx` to
-    detect whether the upper box (`RH`/`SH`) or lower box (`RL`/`SL`) has already been broken out
-    (`upper_box_broken` / `lower_box_broken`), preventing active breakouts from being faded prematurely.
-    Setup 0 (Box Breakout-Retest Continuation buying at SH / selling at SL) is disabled so broken
-    boxes stay flat rather than entering at exhausted extremes or against the Daily 50/200 EMA bias.
+    distinguish a brief Liquidity Sweep (1-2 candles) from genuine Acceptance / Broken Box:
+      - `sh_broken` / `sl_broken`: >= 2 consecutive closes (or >= 3 total) beyond outer `SH` / `SL`.
+      - `rh_accepted` / `rl_accepted`: >= 4 consecutive closes (1 full hour) or >= 6 of last 8 closes
+        beyond `RH` / `RL` (prevents shorting `RH` after sustained acceptance above it).
+      - Computes a Hybrid Reconfigured Box (`reconfig`: `SHIFTED_UP` / `SHIFTED_DOWN`) using Polarity
+        Zone Flip + Measured Move (New RL = SH / New SL = RH on SH break; mirror on SL break).
     """
     cur = recs_15m[idx]
     prior = recs_15m[max(0, idx - lookback):idx]
@@ -451,32 +453,87 @@ def _check_box_breakout_state(
     c_high = float(cur["high"])
     c_low = float(cur["low"])
     c_close = float(cur["close"])
-    ema9_15m = float(cur.get("EMA9", c_close) or c_close)
 
     max_prior_high = max((float(x["high"]) for x in prior), default=c_high)
     min_prior_low = min((float(x["low"]) for x in prior), default=c_low)
-    closes_above_sh = sum(1 for x in prior if float(x["close"]) > sh)
+    closes_above_sh = sum(1 for x in prior if sh > 0 and float(x["close"]) > sh)
     closes_below_sl = sum(1 for x in prior if sl > 0 and float(x["close"]) < sl)
 
-    # Outer Box [SL, SH] is only broken when price decisively breaks beyond the outer SH/SL boundary
-    # (>= 3 closed 15m candles beyond SH/SL + >= 0.8% extension + 15m EMA9/EMA50 alignment).
-    # Trading inside [RH, SH] (Sell Zone) or [SL, RL] (Buy Zone) is normal zone activity, NOT a broken box.
-    upper_box_broken = bool(
-        sh > 0
-        and closes_above_sh >= 3
-        and max_prior_high >= sh * 1.008
-        and ema9_15m > ema50_15m
-    )
-    lower_box_broken = bool(
-        sl > 0
-        and closes_below_sl >= 3
-        and min_prior_low <= sl * 0.992
-        and ema9_15m < ema50_15m
-    )
+    def _max_consec(seq, pred):
+        best = run = 0
+        for x in seq:
+            if pred(x):
+                run += 1
+                if run > best:
+                    best = run
+            else:
+                run = 0
+        return best
+
+    consec_above_sh = _max_consec(prior, lambda x: sh > 0 and float(x["close"]) > sh)
+    consec_below_sl = _max_consec(prior, lambda x: sl > 0 and float(x["close"]) < sl)
+    consec_above_rh = _max_consec(prior, lambda x: rh > 0 and float(x["close"]) > rh)
+    consec_below_rl = _max_consec(prior, lambda x: rl > 0 and float(x["close"]) < rl)
+    recent8 = prior[-8:] if len(prior) >= 8 else prior
+    above_rh_8 = sum(1 for x in recent8 if rh > 0 and float(x["close"]) > rh)
+    below_rl_8 = sum(1 for x in recent8 if rl > 0 and float(x["close"]) < rl)
+
+    sh_broken = bool(sh > 0 and (consec_above_sh >= 2 or closes_above_sh >= 3))
+    sl_broken = bool(sl > 0 and (consec_below_sl >= 2 or closes_below_sl >= 3))
+    rh_accepted = bool(rh > 0 and (consec_above_rh >= 4 or above_rh_8 >= 6))
+    rl_accepted = bool(rl > 0 and (consec_below_rl >= 4 or below_rl_8 >= 6))
+
+    upper_box_broken = bool(sh_broken or rh_accepted)
+    lower_box_broken = bool(sl_broken or rl_accepted)
+
+    reconfig = None
+    if rh > 0 and rl > 0 and rh > rl:
+        box_h = max(rh - rl, rh * 0.020)
+        up_band = min(max((sh - rh) if sh > rh else rh * 0.012, rh * 0.008), rh * 0.020)
+        dn_band = min(max((rl - sl) if rl > sl > 0 else rl * 0.012, rl * 0.008), rl * 0.020)
+        if upper_box_broken and not lower_box_broken:
+            new_rl = sh if sh_broken else rh
+            new_sl = rh if sh_broken else max(rl, rh - up_band)
+            new_rh = new_rl + box_h
+            new_mid = (new_rl + new_rh) / 2.0
+            new_sh = new_rh + up_band
+            reconfig = {
+                "state": "SHIFTED_UP",
+                "trigger": "SH Broken" if sh_broken else f"RH Accepted ({max(consec_above_rh, above_rh_8)} bars > RH)",
+                "RL": eng.round_asset_price(new_rl, rh),
+                "SL": eng.round_asset_price(new_sl, rh),
+                "MID": eng.round_asset_price(new_mid, rh),
+                "RH": eng.round_asset_price(new_rh, rh),
+                "SH": eng.round_asset_price(new_sh, rh),
+                "old_RH": rh,
+                "old_SH": sh,
+            }
+        elif lower_box_broken and not upper_box_broken:
+            new_rh = sl if sl_broken else rl
+            new_sh = rl if sl_broken else min(rh, rl + dn_band)
+            new_rl = max(new_rh * 0.50, new_rh - box_h)
+            new_mid = (new_rl + new_rh) / 2.0
+            new_sl = max(new_rl * 0.50, new_rl - dn_band)
+            reconfig = {
+                "state": "SHIFTED_DOWN",
+                "trigger": "SL Broken" if sl_broken else f"RL Accepted ({max(consec_below_rl, below_rl_8)} bars < RL)",
+                "RL": eng.round_asset_price(new_rl, rl),
+                "SL": eng.round_asset_price(new_sl, rl),
+                "MID": eng.round_asset_price(new_mid, rl),
+                "RH": eng.round_asset_price(new_rh, rl),
+                "SH": eng.round_asset_price(new_sh, rl),
+                "old_RL": rl,
+                "old_SL": sl,
+            }
 
     return {
         "upper_box_broken": upper_box_broken,
         "lower_box_broken": lower_box_broken,
+        "sh_broken": sh_broken,
+        "sl_broken": sl_broken,
+        "rh_accepted": rh_accepted,
+        "rl_accepted": rl_accepted,
+        "reconfig": reconfig,
         "bull_breakout_retest": False,
         "bear_breakdown_retest": False,
         "max_prior_high": max_prior_high,
@@ -484,6 +541,25 @@ def _check_box_breakout_state(
         "retest_low": c_low,
         "retest_high": c_high,
     }
+
+
+def get_live_shifted_box_state(pair: str, levels: dict | None = None) -> dict:
+    lv = levels or eng.calculate_daily_box_levels(pair)
+    if not lv:
+        return {"upper_box_broken": False, "lower_box_broken": False, "reconfig": None}
+    try:
+        df_15m = _closed_15m(pair, 40)
+        if df_15m is None or df_15m.empty or len(df_15m) < 3:
+            return {"upper_box_broken": False, "lower_box_broken": False, "reconfig": None}
+        recs = df_15m.to_dict("records")
+        ema50_15m = float(recs[-1].get("EMA50", lv.get("MID", 0.0)) or lv.get("MID", 0.0))
+        return _check_box_breakout_state(
+            recs, len(recs) - 1,
+            float(lv["RH"]), float(lv["RL"]), float(lv["SH"]), float(lv["SL"]),
+            ema50_15m,
+        )
+    except Exception:
+        return {"upper_box_broken": False, "lower_box_broken": False, "reconfig": None}
 
 
 class BoxTheorySweep(Strategy):
@@ -2112,7 +2188,8 @@ class BoxPlusEma50200Strategy(Strategy):
                 f"edges, Priority 2 runs 15m 50/200 EMA Pullback ({'Bear Short only' if not allow_bull_ema else 'Bull & Bear'})."
             )
         self.s1 = BoxTheorySweep()
-        self.s4 = Ema50200PullbackStrategy(allow_bear=True, allow_bull=(allow_bull_ema or regime_adaptive))
+        # EXP-3 Tournament Winner on Experiment: Strict NO-CHOP + Broken-Box Guard Only + Box L&S + 15m 50/200 EMA LONG-Only
+        self.s4 = Ema50200PullbackStrategy(allow_bear=(not regime_adaptive), allow_bull=(allow_bull_ema or regime_adaptive))
 
     def compute_levels(self, pair):
         return self.s4.compute_levels(pair)
